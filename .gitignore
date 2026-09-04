@@ -1,0 +1,8 @@
+reference/
+.env.local
+yokemate.db*
+work/
+projects/
+node_modules/
+docs/plans/
+.claude/settings.local.json

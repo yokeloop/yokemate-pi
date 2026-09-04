@@ -1,0 +1,119 @@
+// The warmup digest: a deterministic, offline projection of yokemate.db,
+// work/ and the journal tail — what a fresh session reads before the first
+// prompt. Fixtures live in a temp root; nothing touches the real pool.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openDb } from "../src/db.ts";
+import { buildDigest } from "../src/warmup.ts";
+
+function isoDay(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function daysAgo(n: number): Date {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d;
+}
+
+function makeRoot(): string {
+  return mkdtempSync(join(tmpdir(), "warmup-"));
+}
+
+function seedDb(root: string) {
+  const db = openDb(join(root, "yokemate.db"));
+  db.prepare("INSERT INTO work (ticket, url, title, stage) VALUES (?, ?, ?, ?)").run(
+    "BBB-1",
+    "https://t/BBB-1",
+    "first fixture ticket",
+    "planned",
+  );
+  db.prepare("INSERT INTO work (ticket, url, title, stage) VALUES (?, ?, ?, ?)").run(
+    "BBB-2",
+    "https://t/BBB-2",
+    "second fixture ticket",
+    "review",
+  );
+  db.close();
+}
+
+function appendJournal(root: string, day: string, body: string) {
+  const dir = join(root, "journal");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${day.slice(0, 7)}.md`), body, { flag: "a" });
+}
+
+test("digest shows the queue, work/ folders and the fresh journal tail", () => {
+  const root = makeRoot();
+  try {
+    seedDb(root);
+    mkdirSync(join(root, "work", "AAA-1"), { recursive: true });
+    mkdirSync(join(root, "work", "BBB-1"), { recursive: true });
+
+    const fresh = isoDay(daysAgo(0));
+    const stale = isoDay(daysAgo(5));
+    appendJournal(root, stale, `## ${stale} — org/old — CCC-9\n\n- stale narrative line\n\n`);
+    appendJournal(root, fresh, `## ${fresh} — org/new — BBB-1\n\n- fresh narrative line\n\n`);
+    appendJournal(root, stale, `- ${stale} 10:00 CCC-9 сделано: stale outcome\n`);
+    appendJournal(root, fresh, `- ${fresh} 11:00 BBB-1 запланировано: fresh outcome\n`);
+
+    const digest = buildDigest(root);
+    assert.match(digest, /BBB-1\s+planned/);
+    assert.match(digest, /BBB-2\s+review/);
+    assert.ok(digest.includes("AAA-1"));
+    assert.ok(digest.includes("есть в work/, нет в очереди"));
+    assert.ok(digest.includes("fresh narrative line"));
+    assert.ok(digest.includes("fresh outcome"));
+    assert.ok(!digest.includes("stale narrative line"), "narrative older than 3 days must be dropped");
+    assert.ok(!digest.includes("stale outcome"), "outcome older than 3 days must be dropped");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a work/ folder with a queue row carries no orphan mark", () => {
+  const root = makeRoot();
+  try {
+    seedDb(root);
+    mkdirSync(join(root, "work", "BBB-1"), { recursive: true });
+    const digest = buildDigest(root);
+    assert.ok(digest.includes("BBB-1"));
+    assert.ok(!digest.includes("нет в очереди"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("missing db, journal and work/ do not throw", () => {
+  const root = makeRoot();
+  try {
+    const digest = buildDigest(root);
+    assert.ok(digest.includes("нет данных"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the digest never exceeds 120 lines and names the full journal on trim", () => {
+  const root = makeRoot();
+  try {
+    seedDb(root);
+    const fresh = isoDay(daysAgo(0));
+    const lines = Array.from(
+      { length: 200 },
+      (_, i) => `- ${fresh} 09:${String(i % 60).padStart(2, "0")} DDD-${i} сделано: bulk outcome ${i}\n`,
+    ).join("");
+    appendJournal(root, fresh, lines);
+    const digest = buildDigest(root);
+    const count = digest.split("\n").length;
+    assert.ok(count <= 120, `digest is ${count} lines`);
+    assert.ok(digest.includes("обрезано"));
+    assert.match(digest, /journal\/\d{4}-\d{2}\.md/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

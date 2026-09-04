@@ -1,0 +1,40 @@
+{
+  "name": "yokemate",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "on-me": "node --experimental-strip-types --no-warnings src/whats-on-me.ts",
+    "test": "node --experimental-strip-types --no-warnings --test 'test/**/*.test.ts'",
+    "add-project": "node --experimental-strip-types --no-warnings src/add-project.ts",
+    "set-model": "node --experimental-strip-types --no-warnings src/set-model.ts",
+    "export-projects": "node --experimental-strip-types --no-warnings src/export-projects.ts",
+    "import-projects": "node --experimental-strip-types --no-warnings src/import-projects.ts",
+    "spawn": "node --experimental-strip-types --no-warnings src/spawn.ts",
+    "record-report": "node --experimental-strip-types --no-warnings src/record-report.ts",
+    "adopt": "node --experimental-strip-types --no-warnings src/adopt.ts",
+    "accept": "node --experimental-strip-types --no-warnings src/accept.ts",
+    "drop": "node --experimental-strip-types --no-warnings src/drop.ts",
+    "pr-link": "node --experimental-strip-types --no-warnings src/pr-link.ts",
+    "metrics": "node --experimental-strip-types --no-warnings src/metrics.ts",
+    "queue": "node --experimental-strip-types --no-warnings src/queue.ts",
+    "plan": "node --experimental-strip-types --no-warnings src/plan-ticket.ts",
+    "note-save": "node --experimental-strip-types --no-warnings src/note-save.ts",
+    "review": "node --experimental-strip-types --no-warnings src/mode-tab.ts review",
+    "ship": "node --experimental-strip-types --no-warnings src/mode-tab.ts ship",
+    "worklog": "node --experimental-strip-types --no-warnings src/mode-tab.ts worklog",
+    "note": "node --experimental-strip-types --no-warnings src/mode-tab.ts note",
+    "split": "node --experimental-strip-types --no-warnings src/mode-tab.ts",
+    "close-mode": "node --experimental-strip-types --no-warnings src/close-mode.ts",
+    "stage": "node --experimental-strip-types --no-warnings src/stage.ts",
+    "where": "node --experimental-strip-types --no-warnings src/mode-guard.ts",
+    "warmup": "node --experimental-strip-types --no-warnings src/warmup.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}
