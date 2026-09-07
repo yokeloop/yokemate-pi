@@ -143,7 +143,7 @@ test("the ladder falls back to a live main and sweeps the dead pairs it passes",
   try {
     mkdirSync(dir, { recursive: true });
     const send = (to?: string) =>
-      sendReport({ ...env, XDG_RUNTIME_DIR: tmp }, 0, "проба", to, 200);
+      sendReport({ ...env, XDG_RUNTIME_DIR: tmp }, 0, "проба", to, 200, "/root");
 
     assert.deepEqual(await send(), { ok: false, line: "unreachable: ENOENT" });
 
@@ -180,27 +180,99 @@ test("the ladder falls back to a live main and sweeps the dead pairs it passes",
   }
 });
 
+const PANE_ENV = {
+  YOKEMATE_PARENT_PANE: "w0:pX",
+  YOKEMATE_MODE: "review",
+  YOKEMATE_TICKET: "YM-0",
+  HERDR_PANE_ID: "wT:p9",
+};
+
+test("отчёт не уходит в главный чат чужого корня", async () => {
+  const tmp = makeTmp();
+  const env = { ...PANE_ENV, XDG_RUNTIME_DIR: tmp };
+  const dir = socketDir(env, 0);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const got: Report[] = [];
+    const alien = await bindInbox(
+      dir,
+      "wA:p1",
+      { mode: "main", ticket: null, cwd: "/elsewhere", pid: 1 },
+      (r) => got.push(r),
+    );
+    try {
+      assert.deepEqual(await sendReport(env, 0, "проба", undefined, 200, "/root"), {
+        ok: false,
+        line: "unreachable: ENOENT",
+      });
+      assert.deepEqual(got, []);
+    } finally {
+      closeInbox(dir, alien);
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("при двух главных чатах своего корня отчёт никуда не уходит", async () => {
+  const tmp = makeTmp();
+  const env = { ...PANE_ENV, XDG_RUNTIME_DIR: tmp };
+  const dir = socketDir(env, 0);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const got: Report[] = [];
+    const side = { mode: "main", ticket: null, cwd: "/root", pid: 1 };
+    const one = await bindInbox(dir, "wA:p1", side, (r) => got.push(r));
+    const two = await bindInbox(dir, "wB:p1", side, (r) => got.push(r));
+    try {
+      const r = await sendReport(env, 0, "проба", undefined, 200, "/root");
+      assert.equal(r.ok, false);
+      assert.match(r.line, /главных чатов корня больше одного/);
+      assert.deepEqual(got, []);
+    } finally {
+      closeInbox(dir, one);
+      closeInbox(dir, two);
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("scanMains lists only live-shaped mains, sorted, without self", () => {
   const tmp = makeTmp();
   try {
-    assert.deepEqual(scanMains(join(tmp, "absent")), []);
+    assert.deepEqual(scanMains(join(tmp, "absent"), undefined, "/root"), []);
     writeSidecar(tmp, "wC:p1", { mode: "main", ticket: null, cwd: "/root", pid: 3 });
     writeSidecar(tmp, "wA:p1", { mode: "main", ticket: null, cwd: "/root", pid: 1 });
     writeSidecar(tmp, "wB:p1", { mode: "ship", ticket: "YM-1", cwd: "/root", pid: 2 });
     writeFileSync(sidecarPath(tmp, "wD:p1"), "{ not json");
     assert.deepEqual(
-      scanMains(tmp, "wA:p1").map((c) => c.pane),
+      scanMains(tmp, "wA:p1", "/root").map((c) => c.pane),
       ["wC:p1"],
     );
     assert.deepEqual(
-      scanMains(tmp).map((c) => c.pane),
+      scanMains(tmp, undefined, "/root").map((c) => c.pane),
       ["wA:p1", "wC:p1"],
     );
-    assert.deepEqual(scanMains(tmp, "wA:p1")[0], {
+    assert.deepEqual(scanMains(tmp, "wA:p1", "/root")[0], {
       pane: "wC:p1",
       sock: socketPath(tmp, "wC:p1"),
       json: sidecarPath(tmp, "wC:p1"),
     });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("scanMains не берёт главный чат чужого корня", () => {
+  const tmp = makeTmp();
+  try {
+    writeSidecar(tmp, "wA:p1", { mode: "main", ticket: null, cwd: "/root", pid: 1 });
+    writeSidecar(tmp, "wB:p1", { mode: "main", ticket: null, cwd: "/elsewhere", pid: 2 });
+    assert.deepEqual(
+      scanMains(tmp, undefined, "/root").map((c) => c.pane),
+      ["wA:p1"],
+    );
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }

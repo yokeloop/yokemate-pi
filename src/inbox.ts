@@ -8,9 +8,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import * as net from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export const TIMEOUT_MS = 2000;
+export const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
 export interface InboxEnv {
   HERDR_PANE_ID?: string;
@@ -202,7 +203,7 @@ export interface Candidate {
   json: string;
 }
 
-export function scanMains(dir: string, self?: string): Candidate[] {
+export function scanMains(dir: string, self?: string, root: string = ROOT): Candidate[] {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -221,6 +222,7 @@ export function scanMains(dir: string, self?: string): Candidate[] {
       continue;
     }
     if (side?.mode !== "main") continue;
+    if (resolve(side.cwd) !== root) continue;
     found.push({ pane, sock: socketPath(dir, pane), json: sidecarPath(dir, pane) });
   }
   return found;
@@ -247,6 +249,7 @@ export async function sendReport(
   text: string,
   to?: string,
   timeoutMs = TIMEOUT_MS,
+  root: string = ROOT,
 ): Promise<{ ok: boolean; line: string }> {
   const dir = socketDir(env, uid);
   const self = ownPane(env);
@@ -272,11 +275,23 @@ export async function sendReport(
     sweepIfDead(target, d.reason);
   }
 
-  for (const c of scanMains(dir, self)) {
+  const live: Candidate[] = [];
+  for (const c of scanMains(dir, self, root)) {
     if (c.pane === target) continue;
-    const d = await deliver(c.sock, report, timeoutMs);
-    if (d.ok) return { ok: true, line: `delivered: fallback ${c.pane}` };
-    sweepIfDead(c.pane, d.reason);
+    if ((await probe(c.sock, timeoutMs)) === "alive") live.push(c);
+    else sweepIfDead(c.pane, "ECONNREFUSED");
+  }
+
+  if (live.length > 1)
+    return {
+      ok: false,
+      line: "unreachable: главных чатов корня больше одного — скажи отчёт в своей панели",
+    };
+
+  if (live.length === 1) {
+    const d = await deliver(live[0]!.sock, report, timeoutMs);
+    if (d.ok) return { ok: true, line: `delivered: fallback ${live[0]!.pane}` };
+    sweepIfDead(live[0]!.pane, d.reason);
   }
 
   return { ok: false, line: `unreachable: ${reason ?? "no live inbox"}` };
