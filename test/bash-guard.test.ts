@@ -228,6 +228,22 @@ test("browser MCP and settings edits are fenced by mode", () => {
     "deny",
   );
   assert.equal(
+    judge("do", "Edit", { file_path: `${root}/.pi/settings.json` }, own)?.decision,
+    "deny",
+  );
+  assert.equal(
+    judge("do", "Edit", { file_path: `${root}/.pi/settings.local.json` }, own)?.decision,
+    "deny",
+  );
+  assert.equal(
+    judge("review", "Edit", { file_path: `${root}/work/ACME-1/.pi/settings.json` }, own)?.decision,
+    "deny",
+  );
+  assert.equal(
+    judge("do", "Write", { file_path: `${root}/work/ACME-1/.pi/settings.local.json` }, own)?.decision,
+    "deny",
+  );
+  assert.equal(
     judge("do", "Edit", { file_path: `${root}/work/ACME-1/repo/.claude/settings.json` }, own),
     null,
   );

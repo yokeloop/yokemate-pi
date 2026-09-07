@@ -111,10 +111,14 @@ export function judge(
       const fenced = [
         join(own.root, ".claude", "settings.json"),
         join(own.root, ".claude", "settings.local.json"),
+        join(own.root, ".pi", "settings.json"),
+        join(own.root, ".pi", "settings.local.json"),
         ...(own.ticket
           ? [
               join(own.root, "work", own.ticket, ".claude", "settings.json"),
               join(own.root, "work", own.ticket, ".claude", "settings.local.json"),
+              join(own.root, "work", own.ticket, ".pi", "settings.json"),
+              join(own.root, "work", own.ticket, ".pi", "settings.local.json"),
             ]
           : []),
       ];
