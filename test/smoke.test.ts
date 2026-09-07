@@ -395,10 +395,10 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
   assert.equal(review.label, "ACME-342 review");
   // The pane is prompted with the worker skill: the launcher half stays in the
   // main chat, the pane never sees a launch branch.
-  assert.equal(review.prompt, "/review-worker ACME-342 обнови ветку");
+  assert.equal(review.prompt, "/skill:review-worker ACME-342 обнови ветку");
 
   // No trailing space when nothing was passed on.
-  assert.equal(resolveLaunch("/root", "review", "ACME-342", "").prompt, "/review-worker ACME-342");
+  assert.equal(resolveLaunch("/root", "review", "ACME-342", "").prompt, "/skill:review-worker ACME-342");
 
   // Review works the stand in the task folder's worktrees, but its pane sits
   // at the root: accept deletes a folder the pane does not sit in, and the
@@ -445,7 +445,7 @@ test("review without the task folder adopts instead of refusing", () => {
     folder: false,
     plan: true,
   });
-  assert.match(adoptable.prompt, /^\/review-worker YM-1 /);
+  assert.match(adoptable.prompt, /^\/skill:review-worker YM-1 /);
   assert.match(adoptable.prompt, /pnpm adopt YM-1/);
 
   // The engineer's note still rides behind the adopt instruction.
@@ -462,7 +462,7 @@ test("review without the task folder adopts instead of refusing", () => {
       folder: true,
       plan: false,
     }).prompt,
-    "/review-worker YM-1",
+    "/skill:review-worker YM-1",
   );
 
   // Neither folder nor plan — the mistyped key dies on launch, as before.
@@ -476,7 +476,7 @@ test("review without the task folder adopts instead of refusing", () => {
   );
 
   // Without the facts the launch behaves as it always did.
-  assert.equal(resolveLaunch("/root", "review", "YM-1", "").prompt, "/review-worker YM-1");
+  assert.equal(resolveLaunch("/root", "review", "YM-1", "").prompt, "/skill:review-worker YM-1");
 });
 
 // 12a. /split plan raises a conversational pane beside the chat: a split at
@@ -487,13 +487,13 @@ test("plan splits at the root and is prompted with /plan itself", () => {
   const keyed = resolveLaunch("/root", "plan", "ACME-3", "note");
   assert.equal(keyed.surface, "split");
   assert.equal(keyed.cwd, "/root");
-  assert.equal(keyed.prompt, "/plan ACME-3 note");
+  assert.equal(keyed.prompt, "/skill:plan ACME-3 note");
   assert.equal(keyed.agentName, "acme-3-plan");
   assert.deepEqual(keyed.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=ACME-3"]);
 
   const problem = resolveLaunch("/root", "plan", "", "кнопка не жмётся");
   assert.equal(problem.surface, "split");
-  assert.equal(problem.prompt, "/plan кнопка не жмётся");
+  assert.equal(problem.prompt, "/skill:plan кнопка не жмётся");
   assert.equal(problem.agentName, "plan");
   assert.deepEqual(problem.env, ["YOKEMATE_MODE=plan"]);
 });
@@ -505,7 +505,7 @@ test("note splits at the root with the topic in the worker prompt", () => {
   const note = resolveLaunch("/root", "note", "", "итоги ресёрча");
   assert.equal(note.surface, "split");
   assert.equal(note.cwd, "/root");
-  assert.equal(note.prompt, "/note-worker итоги ресёрча");
+  assert.equal(note.prompt, "/skill:note-worker итоги ресёрча");
   assert.equal(note.agentName, "note");
   assert.deepEqual(note.env, ["YOKEMATE_MODE=note"]);
 

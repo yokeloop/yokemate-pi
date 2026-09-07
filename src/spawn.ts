@@ -146,7 +146,7 @@ const passportLines = passports
   .join("\n");
 
 const prompt =
-  `/do-worker ${ticket}. The plan is at ${planAbs} — read it fully; it lists the affected ` +
+  `/skill:do-worker ${ticket}. The plan is at ${planAbs} — read it fully; it lists the affected ` +
   `repositories and the contract between parts. Work only inside ${folder}. ` +
   (passportLines ? `Project passports (worktrees fork from these clones):\n${passportLines}\n` : "") +
   `When the PRs are open and green, run \`pnpm record-report ${ticket} --part ` +
@@ -168,7 +168,7 @@ try {
   // The tab works unattended: nobody sits at its permission dialogs. Yolo mode;
   // the blast radius is the task worktrees — the engineer's clones are never
   // switched — and the PreToolUse guard above fences the rest.
-  startAgent(agentName, pane, ticket, ["--model", model]);
+  startAgent(agentName, pane, ticket, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
   herdr(["agent", "prompt", agentName, prompt]);
 } catch (e) {
   // The failure to report is the launch's, not the cleanup's.
