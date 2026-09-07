@@ -1,4 +1,5 @@
 import { mkdirSync, statSync } from "node:fs";
+import * as net from "node:net";
 import { join } from "node:path";
 
 export const TIMEOUT_MS = 2000;
@@ -48,4 +49,51 @@ export function ensureDir(
   const owner = stat(dir).uid;
   if (owner !== uid)
     throw new Error(`inbox dir ${dir} принадлежит uid ${owner}, не ${uid} — инбокс не поднимается`);
+}
+
+export interface Report {
+  from: string;
+  mode: string;
+  ticket: string | null;
+  text: string;
+}
+
+export type Delivery = { ok: true } | { ok: false; reason: string };
+
+export function deliver(sock: string, report: Report, timeoutMs = TIMEOUT_MS): Promise<Delivery> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(sock);
+    let settled = false;
+    const finish = (d: Delivery): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(d);
+    };
+    const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), timeoutMs);
+
+    socket.on("connect", () => socket.write(JSON.stringify(report) + "\n"));
+    let buf = "";
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      let ack: unknown;
+      try {
+        ack = JSON.parse(buf.slice(0, nl));
+      } catch {
+        return finish({ ok: false, reason: "bad ack" });
+      }
+      finish(
+        (ack as { ok?: unknown } | null)?.ok === true
+          ? { ok: true }
+          : { ok: false, reason: "bad ack" },
+      );
+    });
+    socket.on("error", (err: NodeJS.ErrnoException) =>
+      finish({ ok: false, reason: err.code ?? err.message }),
+    );
+    socket.on("close", () => finish({ ok: false, reason: "bad ack" }));
+  });
 }
