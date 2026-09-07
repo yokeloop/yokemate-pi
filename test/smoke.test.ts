@@ -10,7 +10,7 @@ import { openDb, ownerFor } from "../src/db.ts";
 import { modelForOrg, modelForTicket } from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
-import { MODES, freeAgentName, requireParentAgent, resolveLaunch } from "../src/mode-tab.ts";
+import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
 import { decide } from "../src/mode-guard.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
@@ -441,7 +441,7 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
 // a key with neither folder nor plan dies on launch — the mistyped-key check
 // stays. The facts arrive as an argument: the launch stays testable.
 test("review without the task folder adopts instead of refusing", () => {
-  const adoptable = resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, undefined, {
+  const adoptable = resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, {
     folder: false,
     plan: true,
   });
@@ -449,7 +449,7 @@ test("review without the task folder adopts instead of refusing", () => {
   assert.match(adoptable.prompt, /pnpm adopt YM-1/);
 
   // The engineer's note still rides behind the adopt instruction.
-  const withNote = resolveLaunch("/root", "review", "YM-1", "обнови ветку", undefined, undefined, undefined, {
+  const withNote = resolveLaunch("/root", "review", "YM-1", "обнови ветку", undefined, undefined, {
     folder: false,
     plan: true,
   });
@@ -458,7 +458,7 @@ test("review without the task folder adopts instead of refusing", () => {
 
   // A standing folder keeps the prompt untouched, whatever the plan fact says.
   assert.equal(
-    resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, undefined, {
+    resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, {
       folder: true,
       plan: false,
     }).prompt,
@@ -468,7 +468,7 @@ test("review without the task folder adopts instead of refusing", () => {
   // Neither folder nor plan — the mistyped key dies on launch, as before.
   assert.throws(
     () =>
-      resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, undefined, {
+      resolveLaunch("/root", "review", "YM-1", "", undefined, undefined, {
         folder: false,
         plan: false,
       }),
@@ -512,10 +512,10 @@ test("note splits at the root with the topic in the worker prompt", () => {
   assert.equal(freeAgentName("note", ["note"]), "note-2");
 });
 
-test("spawn and mode-tab refuse without a return address, before any effect", async () => {
+test("spawn and mode-tab refuse without a pane id, before any effect", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");
-  const env = { HERDR_ENV: "1", HERDR_PANE_ID: "w0:p0", PATH: process.env.PATH ?? "" };
+  const env = { HERDR_ENV: "1", PATH: process.env.PATH ?? "" };
   const run = (script: string, ...args: string[]) =>
     spawnSync(
       process.execPath,
@@ -525,33 +525,16 @@ test("spawn and mode-tab refuse without a return address, before any effect", as
 
   const spawn = run("src/spawn.ts", "YM-0");
   assert.equal(spawn.status, 1);
-  assert.match(spawn.stderr, /обратный адрес обязателен/);
-  assert.match(spawn.stderr, /pnpm spawn/);
+  assert.match(spawn.stderr, /HERDR_PANE_ID/);
   assert.equal(fs.existsSync(join(root, "work", "YM-0")), false);
 
   const review = run("src/mode-tab.ts", "review", "YM-0");
   assert.equal(review.status, 1);
-  assert.match(review.stderr, /обратный адрес обязателен/);
-  assert.match(review.stderr, /pnpm review/);
+  assert.match(review.stderr, /HERDR_PANE_ID/);
 
   const split = run("src/mode-tab.ts", "plan", "задача");
   assert.equal(split.status, 1);
-  assert.match(split.stderr, /обратный адрес обязателен/);
-  assert.match(split.stderr, /pnpm split plan/);
-});
-
-test("requireParentAgent returns the trimmed name or refuses with the usage", () => {
-  assert.equal(requireParentAgent({ YOKEMATE_PARENT_AGENT: "yokemate" }, "u"), "yokemate");
-  assert.equal(requireParentAgent({ YOKEMATE_PARENT_AGENT: "  yokemate-c9  " }, "u"), "yokemate-c9");
-
-  for (const env of [{}, { YOKEMATE_PARENT_AGENT: "" }, { YOKEMATE_PARENT_AGENT: "   " }]) {
-    assert.throws(
-      () => requireParentAgent(env, 'YOKEMATE_PARENT_AGENT="<имя из ListAgents>" pnpm review …'),
-      (e: Error) =>
-        e.message.includes("обратный адрес обязателен") &&
-        e.message.includes('YOKEMATE_PARENT_AGENT="<имя из ListAgents>" pnpm review …'),
-    );
-  }
+  assert.match(split.stderr, /HERDR_PANE_ID/);
 });
 
 // A ticketless mode's name is the bare mode, so two of them would collide: the
@@ -605,15 +588,6 @@ test("a mode skill knows whether to launch the pane or do the work", () => {
   assert.deepEqual(
     resolveLaunch("/root", "worklog", "acme", "", undefined, "w4:p1").env,
     ["YOKEMATE_MODE=worklog", "YOKEMATE_TICKET=acme", "YOKEMATE_PARENT_PANE=w4:p1"],
-  );
-  assert.deepEqual(
-    resolveLaunch("/root", "ship", "ACME-342", "", undefined, "w4:p1", "yokemate").env,
-    [
-      "YOKEMATE_MODE=ship",
-      "YOKEMATE_TICKET=ACME-342",
-      "YOKEMATE_PARENT_PANE=w4:p1",
-      "YOKEMATE_PARENT_AGENT=yokemate",
-    ],
   );
 });
 
