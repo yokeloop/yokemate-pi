@@ -1,5 +1,5 @@
-// The passport manifest: projects.json in the yokemate root, in git — the
-// portable half of the project table. The machine-local path stays out; the
+// The passport manifest: projects.json in the data root home/, in the
+// engineer's own git — the portable half of the project table. The machine-local path stays out; the
 // remote goes in, so import-projects on another machine can re-clone. Written
 // by add-project/set-model after every passport change, read by
 // import-projects.
@@ -85,7 +85,10 @@ export function readManifest(root: string): ManifestEntry[] {
   try {
     raw = readFileSync(manifestPath(root), "utf8");
   } catch {
-    throw new Error(`no projects.json in ${root} — run pnpm export-projects on a live machine first`);
+    throw new Error(
+      `no projects.json in ${root} — personal data (home/) is not set up: see scripts/bootstrap.sh, ` +
+        `or run pnpm export-projects on a live machine`,
+    );
   }
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed)) throw new Error("projects.json: expected a top-level array");
