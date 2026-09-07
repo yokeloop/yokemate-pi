@@ -116,6 +116,15 @@ export default function guards(pi: ExtensionAPI) {
     if (process.env.YOKEMATE_MODE) return;
     if (event.reason !== "startup") return;
     digestPending = true;
+    // ctx.ui is a getter that throws once the session is replaced or reloaded,
+    // and this body outlives the handler: a reload inside the pull window would
+    // make even the catch throw, and the detached promise reject with nobody
+    // attached. Warning the engineer is never worth an unhandled rejection.
+    const warn = (message: string): void => {
+      try {
+        ctx.ui.notify(message, "warning");
+      } catch {}
+    };
     pulled = (async () => {
       try {
         // A subprocess, not an import: syncPull is synchronous throughout and
@@ -127,10 +136,10 @@ export default function guards(pi: ExtensionAPI) {
           ["--experimental-strip-types", "--no-warnings", join(ROOT, "src", "git-sync.ts"), "pull"],
           { cwd: ROOT, timeout: 60_000 },
         );
-        if (r.stderr.trim()) ctx.ui.notify(r.stderr.trim(), "warning");
-        if (r.code !== 0 || r.killed) ctx.ui.notify("git-sync не отработал", "warning");
+        if (r.stderr.trim()) warn(r.stderr.trim());
+        if (r.code !== 0 || r.killed) warn("git-sync не отработал");
       } catch (e) {
-        ctx.ui.notify(`git-sync не отработал: ${(e as Error).message}`, "warning");
+        warn(`git-sync не отработал: ${(e as Error).message}`);
       }
     })();
   });
