@@ -201,9 +201,10 @@ export interface Candidate {
   pane: string;
   sock: string;
   json: string;
+  cwd: string;
 }
 
-export function scanMains(dir: string, self?: string, root: string = ROOT): Candidate[] {
+function readMains(dir: string, self?: string): Candidate[] {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -222,10 +223,13 @@ export function scanMains(dir: string, self?: string, root: string = ROOT): Cand
       continue;
     }
     if (side?.mode !== "main") continue;
-    if (resolve(side.cwd) !== root) continue;
-    found.push({ pane, sock: socketPath(dir, pane), json: sidecarPath(dir, pane) });
+    found.push({ pane, sock: socketPath(dir, pane), json: sidecarPath(dir, pane), cwd: side.cwd });
   }
   return found;
+}
+
+export function scanMains(dir: string, self?: string, root: string = ROOT): Candidate[] {
+  return readMains(dir, self).filter((c) => resolve(c.cwd) === root);
 }
 
 export function allowTarget(
@@ -276,10 +280,10 @@ export async function sendReport(
   }
 
   const live: Candidate[] = [];
-  for (const c of scanMains(dir, self, root)) {
+  for (const c of readMains(dir, self)) {
     if (c.pane === target) continue;
-    if ((await probe(c.sock, timeoutMs)) === "alive") live.push(c);
-    else sweepIfDead(c.pane, "ECONNREFUSED");
+    if ((await probe(c.sock, timeoutMs)) !== "alive") sweepIfDead(c.pane, "ECONNREFUSED");
+    else if (resolve(c.cwd) === root) live.push(c);
   }
 
   if (live.length > 1)
