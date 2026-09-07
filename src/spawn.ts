@@ -89,16 +89,22 @@ const env = process.env as MoveEnv;
 const folder = join(ROOT, "work", ticket);
 mkdirSync(folder, { recursive: true });
 
-// Session settings for the tab: the same two extensions the root
-// .pi/settings.json raises — the tab lives in its own project root and never
-// sees the repository's settings file, so the wiring is written here too. The
-// paths are absolute: the tab has no relative path to the engine.
+// Session settings for the tab: the extensions the root raises — the two the
+// root .pi/settings.json names, plus the subagent tool the root discovers by
+// itself under .pi/extensions/. The tab lives in its own project root: it
+// never sees the repository's settings file, and auto-discovery there looks in
+// work/<TICKET>/.pi/extensions, which holds nothing — so all three are wired
+// here. The paths are absolute: the tab has no relative path to the engine.
 mkdirSync(join(folder, ".pi"), { recursive: true });
 writeFileSync(
   join(folder, ".pi", "settings.json"),
   JSON.stringify(
     {
-      extensions: [join(ROOT, "src", "guards.ts"), join(ROOT, "src", "bus.ts")],
+      extensions: [
+        join(ROOT, "src", "guards.ts"),
+        join(ROOT, "src", "bus.ts"),
+        join(ROOT, ".pi", "extensions", "subagent", "index.ts"),
+      ],
     },
     null,
     2,
