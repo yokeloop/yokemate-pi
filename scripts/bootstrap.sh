@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Bring a clean Ubuntu 22.04+ machine to a working yokemate instance.
-# Idempotent: every step checks its own "already done" and skips. Secrets are
-# never installed here — .env.local, gh login, ssh keys and tailscale stay
-# manual and are named in the final summary.
+# Idempotent: every step checks its own "already done" and skips. What this
+# script does not do for the engineer — .env.local, the personal data
+# repository home/, gh login, ssh keys and tailscale — it names in the final
+# summary, which reports the state of this machine and a command per item.
 set -euo pipefail
 
 YOKEMATE_DIR="${YOKEMATE_DIR:-$HOME/yokemate}"
 YOKEMATE_REMOTE="${YOKEMATE_REMOTE:-git@github.com:yokeloop/yokemate-pi.git}"
+YOKEMATE_HOME_REMOTE="${YOKEMATE_HOME_REMOTE:-}"
 
 say()  { printf '\n== %s\n' "$*"; }
 skip() { printf '   %s — already in place\n' "$*"; }
+
+github_ssh_ok() {
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 |
+    grep -q 'successfully authenticated'
+}
 
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "bootstrap.sh targets Ubuntu 22.04+ (apt not found on this system) — aborting" >&2
@@ -122,6 +129,21 @@ else
 fi
 (cd "$YOKEMATE_DIR" && pnpm install)
 
+say "personal data repository at $YOKEMATE_DIR/home"
+home_dir="$YOKEMATE_DIR/home"
+if [ -d "$home_dir/.git" ]; then
+  skip "home/"
+elif [ -n "$YOKEMATE_HOME_REMOTE" ]; then
+  git clone "$YOKEMATE_HOME_REMOTE" "$home_dir"
+else
+  echo "   YOKEMATE_HOME_REMOTE not set — personal data skipped, home/ not created (named in the summary below)"
+fi
+if [ -d "$home_dir/.git" ]; then
+  [ -f "$home_dir/.gitattributes" ] || printf 'journal/*.md merge=union\n' > "$home_dir/.gitattributes"
+  [ -f "$home_dir/projects.json" ] || printf '[]\n' > "$home_dir/projects.json"
+  mkdir -p "$home_dir/journal" "$home_dir/knowledge" "$home_dir/notes"
+fi
+
 say "user-level MCP (youtrack trackers)"
 env_local="$YOKEMATE_DIR/.env.local"
 if [ ! -f "$env_local" ]; then
@@ -158,16 +180,39 @@ fi
 say "project clones and passports (import-projects)"
 if [ ! -f "$env_local" ]; then
   echo "   .env.local not found — import skipped (place it and run: pnpm import-projects)"
-elif ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -q 'successfully authenticated'; then
+elif [ ! -d "$YOKEMATE_DIR/home/.git" ]; then
+  echo "   home/ not set up — import skipped (see the summary below)"
+elif ! github_ssh_ok; then
   echo "   ssh key not registered on github — import skipped (register it and run: pnpm import-projects)"
 else
   (cd "$YOKEMATE_DIR" && pnpm import-projects)
 fi
 
-say "done — still manual"
-cat <<'EOF'
-   - .env.local: copy from a live machine into the yokemate root
-   - gh auth login
-   - ssh key: generate and register on the git hostings
-   - tailscale
-EOF
+say "done — what this machine still needs"
+manual=()
+
+[ -f "$env_local" ] || manual+=(".env.local: copy it from a live machine into $YOKEMATE_DIR")
+
+if [ ! -d "$YOKEMATE_DIR/home/.git" ]; then
+  manual+=("home/: personal data (knowledge, journal, notes, projects.json) is not set up.
+       Already have a data repository:  YOKEMATE_HOME_REMOTE=<url> ./scripts/bootstrap.sh
+       Need a new one, after gh auth login:
+         gh repo create <name> --private && git clone <url-of-that-repo> $YOKEMATE_DIR/home
+       then re-run ./scripts/bootstrap.sh")
+fi
+
+gh auth status >/dev/null 2>&1 || manual+=("gh auth login")
+
+github_ssh_ok || manual+=("ssh key: generate it and register on the git hostings")
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  manual+=("tailscale: install it, then tailscale up")
+elif ! tailscale status >/dev/null 2>&1; then
+  manual+=("tailscale: installed but not connected — tailscale up")
+fi
+
+if [ "${#manual[@]}" -eq 0 ]; then
+  echo "   nothing — this machine is ready"
+else
+  printf '   - %s\n' "${manual[@]}"
+fi
