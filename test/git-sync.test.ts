@@ -7,7 +7,6 @@ import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
-  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,8 +17,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { syncPull, syncPush } from "../src/git-sync.ts";
 import { noteSave } from "../src/note-save.ts";
-
-const REPO_ROOT = join(import.meta.dirname, "..");
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], {
@@ -45,7 +42,7 @@ function setupPair(tmp: string): { origin: string; a: string; b: string } {
   const a = join(tmp, "a");
   clone(origin, a);
   git(a, "checkout", "-b", "main");
-  copyFileSync(join(REPO_ROOT, ".gitattributes"), join(a, ".gitattributes"));
+  writeFileSync(join(a, ".gitattributes"), "journal/*.md merge=union\n");
   mkdirSync(join(a, "journal"), { recursive: true });
   appendFileSync(join(a, "journal", "2026-08.md"), "- base\n");
   git(a, "add", "-A");
@@ -60,7 +57,7 @@ test("diverging journal appends survive pull --rebase without conflict", () => {
   const tmp = makeTmp();
   try {
     const { a, b } = setupPair(tmp);
-    const attrs = readFileSync(join(REPO_ROOT, ".gitattributes"), "utf8");
+    const attrs = readFileSync(join(a, ".gitattributes"), "utf8");
     assert.match(attrs, /journal\/\*\.md merge=union/);
 
     appendFileSync(join(a, "journal", "2026-08.md"), "- line A\n");

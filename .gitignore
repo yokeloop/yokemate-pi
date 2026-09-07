@@ -6,3 +6,4 @@ projects/
 node_modules/
 docs/plans/
 .claude/settings.local.json
+home/
