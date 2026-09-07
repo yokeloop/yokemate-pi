@@ -92,8 +92,8 @@ test("only ship launches ask in the main chat", () => {
     "pnpm review ACME-1 обнови ветку",
     "pnpm worklog acme && echo ok",
     "pnpm split plan ACME-3",
-    'YOKEMATE_PARENT_AGENT="yokemate" pnpm split plan кнопка не жмётся',
-    "YOKEMATE_PARENT_AGENT=yokemate pnpm spawn ACME-1",
+    'HERDR_ENV=1 pnpm split plan кнопка не жмётся',
+    "HERDR_ENV=1 pnpm spawn ACME-1",
     "node --experimental-strip-types src/mode-tab.ts review ACME-1",
     "node --experimental-strip-types src/spawn.ts ACME-1",
     "pnpm review SHIP-1",
@@ -102,7 +102,7 @@ test("only ship launches ask in the main chat", () => {
   }
   for (const cmd of [
     "pnpm ship ACME-1 ACME-2",
-    'cd /x && YOKEMATE_PARENT_AGENT="yokemate" pnpm ship ACME-1',
+    'cd /x && HERDR_ENV=1 pnpm ship ACME-1',
     "pnpm run ship ACME-1",
     "pnpm split ship ACME-1",
     "node --experimental-strip-types src/mode-tab.ts ship ACME-1",

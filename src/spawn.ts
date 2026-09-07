@@ -18,7 +18,6 @@ import { modelForTicket } from "./project-model.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
-import { requireParentAgent } from "./mode-tab.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
@@ -33,20 +32,11 @@ if (process.env.YOKEMATE_MODE)
   fail(`spawn runs in the main chat only — this pane is stamped ${process.env.YOKEMATE_MODE}`);
 
 // The pane this command runs in — the chat that asked for the tab. The tab
-// lands in its workspace, and the task reports back to it by pane id.
+// lands in its workspace, and the task's inbox report goes back to it by pane
+// id (see src/inbox.ts).
 const parentPane = process.env.HERDR_PANE_ID;
 if (!parentPane) fail("no HERDR_PANE_ID — spawn runs from the main chat's own pane");
 const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
-
-let parentAgent: string;
-try {
-  parentAgent = requireParentAgent(
-    process.env,
-    `YOKEMATE_PARENT_AGENT="<имя из ListAgents>" pnpm spawn <TICKET> …`,
-  );
-} catch (e) {
-  parentAgent = fail((e as Error).message);
-}
 
 const argv = process.argv.slice(2).filter((a) => a !== "--");
 const ticket = argv[0] ?? fail("usage: spawn <TICKET> [--plan <path-to-plan.md>] [--model <m>]");
@@ -193,7 +183,6 @@ const created = herdr([
   "tab", "create", "--workspace", parentWorkspace, "--cwd", folder, "--label", ticket,
   "--env", `YOKEMATE_MODE=do`, "--env", `YOKEMATE_TICKET=${ticket}`,
   "--env", `YOKEMATE_PARENT_PANE=${parentPane}`,
-  "--env", `YOKEMATE_PARENT_AGENT=${parentAgent}`,
 ]) as {
   result: { tab: { tab_id: string }; root_pane: { pane_id: string } };
 };

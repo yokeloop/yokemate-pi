@@ -95,7 +95,6 @@ export function resolveLaunch(
   rest: string,
   model?: string,
   parentPane?: string,
-  parentAgent?: string,
   stand?: StandFacts,
 ): Launch {
   if (mode === "review" && stand && !stand.folder) {
@@ -121,20 +120,10 @@ export function resolveLaunch(
       `YOKEMATE_MODE=${mode}`,
       ...(ticket ? [`YOKEMATE_TICKET=${ticket}`] : []),
       ...(parentPane ? [`YOKEMATE_PARENT_PANE=${parentPane}`] : []),
-      ...(parentAgent ? [`YOKEMATE_PARENT_AGENT=${parentAgent}`] : []),
     ],
     surface: mode === "ship" ? "tab" : "split",
     model,
   };
-}
-
-export function requireParentAgent(
-  env: { YOKEMATE_PARENT_AGENT?: string },
-  usage: string,
-): string {
-  const name = env.YOKEMATE_PARENT_AGENT?.trim();
-  if (!name) throw new Error(`обратный адрес обязателен: ${usage}`);
-  return name;
 }
 
 /**
@@ -187,15 +176,13 @@ if (import.meta.filename === process.argv[1]) {
   if (process.env.HERDR_ENV !== "1")
     fail("not inside a herdr session — open the main chat in herdr first");
 
-  let parentAgent: string;
-  try {
-    parentAgent = requireParentAgent(
-      process.env,
-      `YOKEMATE_PARENT_AGENT="<имя из ListAgents>" pnpm ${mode === "plan" ? "split plan" : mode} …`,
-    );
-  } catch (e) {
-    parentAgent = fail((e as Error).message);
-  }
+  // The pane this command runs in — the chat that asked for the mode. The split
+  // grows out of it, the tab lands in its workspace, and the mode's inbox
+  // report goes back to it by pane id (see src/inbox.ts).
+  const parentPane =
+    process.env.HERDR_PANE_ID ||
+    fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
+  const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
 
   // The model is pulled out of the tail; everything else stays the note.
   let model: string | undefined;
@@ -222,14 +209,6 @@ if (import.meta.filename === process.argv[1]) {
     }
   }
 
-  // The pane this command runs in — the chat that asked for the mode. The split
-  // grows out of it, the tab lands in its workspace, and the mode reports back
-  // to it by name (see the worker skills).
-  const parentPane =
-    process.env.HERDR_PANE_ID ||
-    fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
-  const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
-
   // The folder is checked by its path, not by cwd: the panes sit at the root
   // while the stand lives in work/<TICKET>. Ship checks every key of its list
   // and still refuses without a folder; review hands the facts to the launch —
@@ -248,7 +227,7 @@ if (import.meta.filename === process.argv[1]) {
 
   let launch: Launch;
   try {
-    launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, parentAgent, stand);
+    launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand);
   } catch (e) {
     launch = fail((e as Error).message);
   }
