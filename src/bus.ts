@@ -6,6 +6,7 @@ import {
   closeInbox,
   ensureDir,
   ownPane,
+  ROOT,
   scanMains,
   sendReport,
   socketDir,
@@ -83,7 +84,7 @@ export default function bus(pi: ExtensionAPI) {
     if (event.toolName !== "send_message") return;
     const to = (event.input as { to?: string }).to;
     const dir = socketDir(process.env, process.getuid!());
-    const mains = scanMains(dir, ownPane(process.env)).map((c) => c.pane);
+    const mains = scanMains(dir, ownPane(process.env), ROOT).map((c) => c.pane);
     const v = allowTarget(process.env, to, mains);
     if (!v.ok) return { block: true, reason: v.reason };
   });
