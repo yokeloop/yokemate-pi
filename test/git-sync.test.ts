@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { syncPull, syncPush } from "../src/git-sync.ts";
+import { pullFastForward, syncPull, syncPush } from "../src/git-sync.ts";
 import { noteSave } from "../src/note-save.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -243,6 +243,34 @@ test("syncPull offline skips silently with one line", () => {
     const lines = stderrLines(() => syncPull(a));
     assert.equal(lines.length, 1);
     assert.ok(lines[0].includes("нет сети"), `stderr: ${lines.join(" | ")}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("движок берёт только ff, расхождение — одна строка и никакого мержа", () => {
+  const tmp = makeTmp();
+  try {
+    const { origin, a, b } = setupPair(tmp);
+    appendFileSync(join(b, "journal", "2026-08.md"), "- from B\n");
+    git(b, "add", "-A");
+    git(b, "commit", "-m", "upstream");
+    git(b, "push");
+
+    appendFileSync(join(a, "journal", "2026-08.md"), "- from A\n");
+    git(a, "add", "-A");
+    git(a, "commit", "-m", "local");
+    const lines = stderrLines(() => pullFastForward(a));
+
+    assert.equal(lines.length, 1, `stderr: ${lines.join(" | ")}`);
+    assert.ok(lines[0].includes("разошёлся с апстримом"), `stderr: ${lines.join(" | ")}`);
+    assert.equal(git(a, "log", "-1", "--format=%s").trim(), "local");
+    assert.equal(git(a, "status", "--porcelain").trim(), "");
+
+    const c = join(tmp, "c");
+    clone(origin, c);
+    pullFastForward(c);
+    assert.equal(git(c, "rev-parse", "HEAD").trim(), git(c, "rev-parse", "origin/main").trim());
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
