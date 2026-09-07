@@ -8,9 +8,18 @@ importers:
 
   .:
     devDependencies:
+      '@earendil-works/pi-agent-core':
+        specifier: 0.85.1
+        version: 0.85.1(ws@8.21.3)
+      '@earendil-works/pi-ai':
+        specifier: 0.85.1
+        version: 0.85.1(ws@8.21.3)
       '@earendil-works/pi-coding-agent':
         specifier: 0.85.1
         version: 0.85.1(ws@8.21.3)
+      '@earendil-works/pi-tui':
+        specifier: 0.85.1
+        version: 0.85.1
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
