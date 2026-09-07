@@ -25,7 +25,7 @@ Research across the pool is reading only: the clones in `projects/`, `home/knowl
 
 ## Saving
 
-On the engineer's word («сохрани») — Write the note to `home/notes/<YYYY-MM-DD>-<слаг-темы>.md` (the slug is yours to make from the topic; the first Write creates the folder), then run `pnpm note-save "<тема>"` — it commits and pushes `home/notes/` alone, riding the same sync as the journal. Raw git is forbidden and cut by the guard.
+On the engineer's word («сохрани») — Write the note to `home/notes/<YYYY-MM-DD>-<слаг-темы>.md` (the slug is yours to make from the topic; the first `write` creates the folder), then run `pnpm note-save "<тема>"` — it commits and pushes `home/notes/` alone, riding the same sync as the journal. Raw git is forbidden and cut by the guard.
 
 ## Gist
 
@@ -33,7 +33,7 @@ On the engineer's word («выгрузи в гист») — `gh gist create home
 
 ## Boundaries, honestly
 
-The guard holds the mechanism: Write/Edit/NotebookEdit outside `home/notes/`, writing Bash (file verbs, redirects, in-place sed), mutating git/gh and the state-changing pnpm commands are all denied. Interpreters (`node -e`, `python -c`) and writing MCP tools (youtrack and the like) are not gated by the mechanism — this skill forbids them, and that is the mode's residual risk, accepted by the engineer.
+The guard holds the mechanism: `write`/`edit` outside `home/notes/`, writing `bash` (file verbs, redirects, in-place sed), mutating git/gh and the state-changing pnpm commands are all denied. Interpreters (`node -e`, `python -c`) and writing MCP tools (youtrack and the like) are not gated by the mechanism — this skill forbids them, and that is the mode's residual risk, accepted by the engineer.
 
 ## Closing
 

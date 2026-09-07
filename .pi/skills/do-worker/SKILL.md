@@ -61,7 +61,7 @@ How many hands the ticket needs is decided by the plan:
 - **One repository** (the common case): you write the code yourself and drive every stage. No executor — it would only repeat your context at a price.
 - **Several repositories**: one `task-executor` per repository, in parallel, each with its plan slice and the contract between parts. As each executor reports, drive that part through the remaining stages yourself — review fixes included: the executor is gone, you apply them in its worktree.
 
-Subagent types are the definitions linked into `work/<TICKET>/.claude/agents/` at launch — name the type when you spawn. `task-investigator` answers an open question about existing behavior at any stage.
+Subagent types are the definitions linked into `work/<TICKET>/.pi/agents/` at launch — name the type when you spawn. `task-investigator` answers an open question about existing behavior at any stage.
 
 **A subagent's final message is its report, and it comes back to you as the tool result** — nothing to fetch, nowhere to wait. The spawn prompt gives each subagent its slice of the plan or scope of the diff, its worktree path, the contract with sibling parts, the completion criterion, and the instruction that the final message is exactly one JSON object per its definition's schema. A result that is not parseable JSON — one repeat ask naming the defect; still broken — judge the part by its diff yourself and say so in the report. A sibling-contract question inside one executor's part reaches you as its open point — you answer it or ask the sibling; executors never talk to each other. Never wait in loops: sleep, seq-cycles and inotifywait bring nothing (completion comes to you) and the guard denies them.
 

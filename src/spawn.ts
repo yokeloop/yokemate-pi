@@ -150,8 +150,8 @@ const prompt =
   `repositories and the contract between parts. Work only inside ${folder}. ` +
   (passportLines ? `Project passports (worktrees fork from these clones):\n${passportLines}\n` : "") +
   `When the PRs are open and green, run \`pnpm record-report ${ticket} --part ` +
-  `<org/repo>:<role>:<branch>:<pr-url>\` from the task folder root yourself, then message ` +
-  `the orchestrator — the message is a courtesy, the stage is already recorded.`;
+  `<org/repo>:<role>:<branch>:<pr-url>\` from the task folder root yourself, then send the ` +
+  `report with \`send_message\` — the message is a courtesy, the stage is already recorded.`;
 
 const created = herdr([
   "tab", "create", "--workspace", parentWorkspace, "--cwd", folder, "--label", ticket,
