@@ -1,4 +1,4 @@
-import { mkdirSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as net from "node:net";
 import { join } from "node:path";
 
@@ -96,4 +96,94 @@ export function deliver(sock: string, report: Report, timeoutMs = TIMEOUT_MS): P
     );
     socket.on("close", () => finish({ ok: false, reason: "bad ack" }));
   });
+}
+
+export interface Inbox {
+  pane: string;
+  sock: string;
+  server: net.Server;
+}
+
+function probe(sock: string, timeoutMs: number): Promise<"alive" | "dead"> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(sock);
+    let settled = false;
+    const finish = (v: "alive" | "dead"): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish("alive"), timeoutMs);
+    socket.on("connect", () => finish("alive"));
+    socket.on("error", (err: NodeJS.ErrnoException) =>
+      finish(err.code === "ECONNREFUSED" || err.code === "ENOENT" ? "dead" : "alive"),
+    );
+  });
+}
+
+export function bindInbox(
+  dir: string,
+  pane: string,
+  sidecar: Sidecar,
+  onReport: (r: Report) => void,
+  timeoutMs = TIMEOUT_MS,
+): Promise<Inbox> {
+  const sock = socketPath(dir, pane);
+  const server = net.createServer((conn) => {
+    let buf = "";
+    conn.on("error", () => {});
+    conn.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl === -1) return;
+      const line = buf.slice(0, nl);
+      buf = "";
+      let report: Report;
+      try {
+        report = JSON.parse(line) as Report;
+      } catch {
+        conn.end('{"ok":false}\n');
+        return;
+      }
+      onReport(report);
+      conn.end('{"ok":true}\n');
+    });
+  });
+
+  return new Promise<Inbox>((resolve, reject) => {
+    let settled = false;
+    let retried = false;
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (settled) return;
+      if (err.code !== "EADDRINUSE" || retried) {
+        settled = true;
+        return reject(err);
+      }
+      retried = true;
+      void probe(sock, timeoutMs).then((state) => {
+        if (state === "alive") {
+          settled = true;
+          return reject(new Error(`inbox ${sock} занят живой сессией`));
+        }
+        try {
+          unlinkSync(sock);
+        } catch {}
+        server.listen(sock);
+      });
+    });
+    server.on("listening", () => {
+      settled = true;
+      writeFileSync(sidecarPath(dir, pane), JSON.stringify(sidecar));
+      resolve({ pane, sock, server });
+    });
+    server.listen(sock);
+  });
+}
+
+export function closeInbox(dir: string, inbox: Inbox): void {
+  inbox.server.close();
+  rmSync(inbox.sock, { force: true });
+  rmSync(sidecarPath(dir, inbox.pane), { force: true });
 }
