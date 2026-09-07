@@ -300,3 +300,26 @@ test("корень данных без своего .git не трогает д�
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("syncPush не пишет в движок из чужого каталога", () => {
+  const tmp = makeTmp();
+  try {
+    const { origin, a, b } = setupPair(tmp);
+    git(b, "commit", "--allow-empty", "-m", "upstream");
+    git(b, "push");
+    git(a, "commit", "--allow-empty", "-m", "local");
+    const head = git(a, "rev-parse", "HEAD").trim();
+
+    mkdirSync(join(a, "home", "journal"), { recursive: true });
+    writeFileSync(join(a, "home", "journal", "2026-09.md"), "- запись\n");
+    const lines = stderrLines(() => syncPush(join(a, "home"), "проба"));
+
+    assert.equal(lines.length, 1, `stderr: ${lines.join(" | ")}`);
+    assert.ok(lines[0].includes("не свой git-репозиторий"), `stderr: ${lines.join(" | ")}`);
+    assert.equal(git(a, "rev-parse", "HEAD").trim(), head, "движок остаётся на своём коммите");
+    assert.equal(git(a, "diff", "--cached", "--name-only").trim(), "", "индекс движка не тронут");
+    assert.equal(git(origin, "log", "-1", "--format=%s", "main").trim(), "upstream");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});

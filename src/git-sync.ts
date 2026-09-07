@@ -64,6 +64,10 @@ export function syncPush(
   message: string,
   paths: readonly string[] = SYNC_PATHS,
 ): void {
+  if (!existsSync(join(root, ".git"))) {
+    note(`${root} — не свой git-репозиторий, синк пропущен`);
+    return;
+  }
   try {
     const present = paths.filter((p) => existsSync(join(root, p)));
     if (present.length === 0) return;
