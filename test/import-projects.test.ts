@@ -30,7 +30,8 @@ function makeSourceRepo(root: string, name: string): string {
 }
 
 function writeManifestFile(root: string, entries: object[]) {
-  writeFileSync(join(root, "projects.json"), JSON.stringify(entries, null, 2) + "\n");
+  mkdirSync(join(root, "home"), { recursive: true });
+  writeFileSync(join(root, "home", "projects.json"), JSON.stringify(entries, null, 2) + "\n");
 }
 
 function entryFor(remote: string, org: string, repo: string) {
@@ -61,7 +62,7 @@ test("an empty db gets clones and passports from the manifest", () => {
     writeManifestFile(root, [entryFor(src, "aaa", "alpha")]);
     const db = openDb(join(root, "yokemate.db"));
 
-    importProjects(db, root);
+    importProjects(db, root, join(root, "home"));
 
     const clonePath = join(root, "projects", "aaa", "alpha");
     assert.ok(existsSync(join(clonePath, "README.md")), "clone must exist");
@@ -89,7 +90,7 @@ test("an existing passport is not touched", () => {
        VALUES (?, ?, ?, ?, ?, ?)`,
     ).run("aaa", "alpha", "/custom/place/alpha", "yokeloop", "YM", "fable");
 
-    importProjects(db, root);
+    importProjects(db, root, join(root, "home"));
 
     const row = db
       .prepare("SELECT path, model FROM project WHERE org = ? AND repo = ?")
@@ -114,7 +115,7 @@ test("a standing clone is reused, only the passport is written", () => {
     writeManifestFile(root, [entryFor(src, "aaa", "alpha")]);
     const db = openDb(join(root, "yokemate.db"));
 
-    importProjects(db, root);
+    importProjects(db, root, join(root, "home"));
 
     assert.ok(existsSync(join(clonePath, "local-change.txt")), "existing clone must be untouched");
     const row = db
@@ -135,7 +136,7 @@ test("--only narrows the import to one org/repo", () => {
     writeManifestFile(root, [entryFor(a, "aaa", "alpha"), entryFor(b, "bbb", "beta")]);
     const db = openDb(join(root, "yokemate.db"));
 
-    importProjects(db, root, "bbb/beta");
+    importProjects(db, root, join(root, "home"), "bbb/beta");
 
     assert.ok(!existsSync(join(root, "projects", "aaa", "alpha")));
     assert.ok(existsSync(join(root, "projects", "bbb", "beta")));
@@ -151,7 +152,7 @@ test("--only naming an absent entry fails loudly", () => {
   try {
     writeManifestFile(root, [entryFor("/nowhere", "aaa", "alpha")]);
     const db = openDb(join(root, "yokemate.db"));
-    assert.throws(() => importProjects(db, root, "zzz/nope"), /zzz\/nope/);
+    assert.throws(() => importProjects(db, root, join(root, "home"), "zzz/nope"), /zzz\/nope/);
     db.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -5,6 +5,7 @@
 // fast and never blocks on the network.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { dataRoot as dataRootOf } from "./data-root.ts";
 import { openDb, queueLine, type Stage } from "./db.ts";
 
 const DIGEST_MAX_LINES = 120;
@@ -91,9 +92,9 @@ function parseJournal(text: string): { sections: Dated[]; outcomes: Dated[] } {
   return { sections, outcomes };
 }
 
-function journalSection(root: string, now: Date): string[] {
+function journalSection(dataRoot: string, now: Date): string[] {
   const files = monthsToRead(now)
-    .map((m) => join(root, "journal", `${m}.md`))
+    .map((m) => join(dataRoot, "journal", `${m}.md`))
     .filter((p) => existsSync(p));
   if (files.length === 0) return ["нет данных"];
 
@@ -121,7 +122,7 @@ function journalSection(root: string, now: Date): string[] {
   return lines.length ? lines : ["нет данных"];
 }
 
-export function buildDigest(root: string): string {
+export function buildDigest(root: string, dataRoot: string): string {
   const now = new Date();
   const queue = queueSection(root);
   const lines = [
@@ -132,7 +133,7 @@ export function buildDigest(root: string): string {
     ...workSection(root, queue.tickets),
     "",
     "Хвост журнала (journal/):",
-    ...journalSection(root, now),
+    ...journalSection(dataRoot, now),
   ];
   if (lines.length > DIGEST_MAX_LINES) {
     const month = isoDay(now).slice(0, 7);
@@ -146,5 +147,5 @@ if (import.meta.filename === process.argv[1]) {
   if (process.env.YOKEMATE_MODE) process.exit(0);
   const root = join(import.meta.dirname, "..");
   console.log("Warmup — состояние пула на старте сессии\n");
-  console.log(buildDigest(root));
+  console.log(buildDigest(root, dataRootOf(root)));
 }

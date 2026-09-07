@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { dataRoot as dataRootOf } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { readManifest, type ManifestEntry } from "./manifest.ts";
 
@@ -38,8 +39,13 @@ function upsertPassport(db: DatabaseSync, e: ManifestEntry, path: string): void 
   ).run(e.org, e.repo, path, e.tracker, e.tracker_key, e.model, e.figma_mcp, e.figma_url, e.subsystem);
 }
 
-export function importProjects(db: DatabaseSync, root: string, only?: string): void {
-  let entries = readManifest(root);
+export function importProjects(
+  db: DatabaseSync,
+  root: string,
+  dataRoot: string,
+  only?: string,
+): void {
+  let entries = readManifest(dataRoot);
   if (only) {
     entries = entries.filter((e) => `${e.org}/${e.repo}` === only);
     if (entries.length === 0)
@@ -90,7 +96,7 @@ if (import.meta.filename === process.argv[1]) {
   const ROOT = resolve(new URL("..", import.meta.url).pathname);
   const db = openDb(join(ROOT, "yokemate.db"));
   try {
-    importProjects(db, ROOT, only);
+    importProjects(db, ROOT, dataRootOf(ROOT), only);
   } catch (e) {
     console.error((e as Error).message);
     process.exit(1);

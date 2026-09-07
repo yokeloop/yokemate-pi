@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, globSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { dataRoot as dataRootOf } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPull } from "./git-sync.ts";
 import { ticketUrl } from "./ticket-url.ts";
@@ -20,9 +21,9 @@ import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts"
  *  key prefix. Old slugs are lowercase (`acme-326-…` for ACME-326), so the match
  *  ignores case. Several hits — a rework plan lives beside the base plan —
  *  resolve to the file named after its folder. */
-export function findPlan(root: string, key: string): string | null {
+export function findPlan(dataRoot: string, key: string): string | null {
   const prefix = `${key.toLowerCase()}-`;
-  const hits = globSync(join(root, "knowledge", "*", "*", "ai", "*", "*-plan.md")).filter((p) =>
+  const hits = globSync(join(dataRoot, "knowledge", "*", "*", "ai", "*", "*-plan.md")).filter((p) =>
     basename(p).toLowerCase().startsWith(prefix),
   );
   if (hits.length === 0) return null;
@@ -94,13 +95,14 @@ export interface AdoptOutcome {
 
 export function adopt(
   root: string,
+  dataRoot: string,
   key: string,
   env: MoveEnv,
   deps: Partial<AdoptDeps> = {},
 ): AdoptOutcome {
-  (deps.pull ?? syncPull)(root);
+  (deps.pull ?? syncPull)(dataRoot);
 
-  const planPath = findPlan(root, key);
+  const planPath = findPlan(dataRoot, key);
   if (!planPath)
     throw new Error(`${key}: плана в knowledge нет — он не запушен с dev-машины или тикет не планировался`);
   const planned = parseAffected(readFileSync(planPath, "utf8"));
@@ -201,7 +203,7 @@ if (import.meta.filename === process.argv[1]) {
   }
   const root = resolve(new URL("..", import.meta.url).pathname);
   try {
-    const out = adopt(root, key, process.env as MoveEnv);
+    const out = adopt(root, dataRootOf(root), key, process.env as MoveEnv);
     console.log(
       `${key} adopted${out.repeat ? " (repeat)" : ""}: ${out.parts.length} part(s), stage review, folder work/${key}`,
     );
