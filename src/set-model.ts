@@ -8,6 +8,7 @@
 // Usage: pnpm set-model <KEY> <model>
 
 import { join, resolve } from "node:path";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { writeManifest } from "./manifest.ts";
 
@@ -30,7 +31,7 @@ const repos = (
   db.prepare("SELECT org, repo FROM project WHERE tracker_key = ?").all(key) as unknown as
     { org: string; repo: string }[]
 ).map((r) => `${r.org}/${r.repo}`);
-writeManifest(db, ROOT);
+writeManifest(db, dataRoot(ROOT));
 console.log(
   `${key} → ${model} (${repos.length} passports: ${repos.join(", ")}) · projects.json updated`,
 );

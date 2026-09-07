@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { writeManifest } from "./manifest.ts";
 import { validGithubPrefix } from "./github.ts";
@@ -101,8 +102,8 @@ if (!m) fail(`cannot parse org/repo from remote "${remote}"`);
 const org = m[1].toLowerCase();
 const repo = m[2];
 
-const ROOT = new URL("..", import.meta.url).pathname;
-const db = openDb(`${ROOT}yokemate.db`);
+const ROOT = resolve(new URL("..", import.meta.url).pathname);
+const db = openDb(join(ROOT, "yokemate.db"));
 if (github) {
   const taken = db
     .prepare("SELECT org, repo FROM project WHERE tracker_key = ? AND NOT (org = ? AND repo = ?)")
@@ -121,13 +122,13 @@ db.prepare(
          figma_url = excluded.figma_url,
          subsystem = excluded.subsystem`,
 ).run(org, repo, resolve(clonePath), trackerName, trackerKey, model, figma, figmaUrl, subsystem);
-writeManifest(db, ROOT);
+writeManifest(db, dataRoot(ROOT));
 
 // Knowledge moves in once, at connection time (R5.8): whatever the clone's
 // .yoke/ accumulated — glossary, ADRs, task artifacts — lands in knowledge/.
 // The clone itself is left untouched, committed .yoke/ included (R0.5).
 const src = join(resolve(clonePath), ".yoke");
-const dst = join(ROOT, "knowledge", org, repo);
+const dst = join(dataRoot(ROOT), "knowledge", org, repo);
 let imported = "";
 if (existsSync(src)) {
   mkdirSync(dst, { recursive: true });

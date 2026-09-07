@@ -30,6 +30,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { findPlan } from "./adopt.ts";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
@@ -237,7 +238,7 @@ if (import.meta.filename === process.argv[1]) {
   let stand: StandFacts | undefined;
   if (mode === "review") {
     const folder = existsSync(join(ROOT, "work", ticket));
-    stand = { folder, plan: folder || Boolean(findPlan(ROOT, ticket)) };
+    stand = { folder, plan: folder || Boolean(findPlan(dataRoot(ROOT), ticket)) };
   } else if (mode === "ship") {
     for (const key of ticket.split("+")) {
       const taskFolder = join(ROOT, "work", key);

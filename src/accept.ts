@@ -8,6 +8,7 @@
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
@@ -61,6 +62,7 @@ export function accept(
 // pane itself just wrote, so there is nothing to search the disk for.
 if (import.meta.url === `file://${process.argv[1]}`) {
   const ROOT = resolve(new URL("..", import.meta.url).pathname);
+  const DATA = dataRoot(ROOT);
   const argv = process.argv.slice(2).filter((a) => a !== "--");
   const ticket = argv[0];
   if (!ticket) {
@@ -98,11 +100,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(0);
   }
   if (r.outcome === "rework") {
-    logMove(ROOT, ticket, "на доработку", reworkPlan ? basename(reworkPlan, ".md") : "");
-    syncPush(ROOT, `${ticket} на доработку`);
+    logMove(DATA, ticket, "на доработку", reworkPlan ? basename(reworkPlan, ".md") : "");
+    syncPush(DATA, `${ticket} на доработку`);
   } else {
-    logMove(ROOT, ticket, "принято");
-    syncPush(ROOT, `${ticket} принято`);
+    logMove(DATA, ticket, "принято");
+    syncPush(DATA, `${ticket} принято`);
   }
   console.log(
     r.outcome === "rework"

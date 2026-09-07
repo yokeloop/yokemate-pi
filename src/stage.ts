@@ -14,12 +14,14 @@
 
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { dataRoot } from "./data-root.ts";
 import { openDb, STAGES, type Stage } from "./db.ts";
 import { logMove } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type From, type MoveEnv } from "./transitions.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
+const DATA = dataRoot(ROOT);
 
 function fail(msg: string): never {
   console.error(msg);
@@ -65,7 +67,7 @@ if (stage === "scouted") {
   if (force) fail("--force does not apply to scouted — it is a legal move, let the checks run");
   const out = applyMove(db, "stage", env, ticket, write);
   if (!out.ok) fail(out.refuse);
-  logMove(ROOT, ticket, "разведано", planAbs ? `план ${basename(planAbs, ".md")}` : "");
+  logMove(DATA, ticket, "разведано", planAbs ? `план ${basename(planAbs, ".md")}` : "");
   console.log(
     `${ticket}: ${out.prev} → scouted` +
       (out.repeat ? " (repeat)" : "") +
