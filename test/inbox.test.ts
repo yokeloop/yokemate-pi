@@ -214,6 +214,37 @@ test("отчёт не уходит в главный чат чужого кор�
   }
 });
 
+test("мёртвая пара чужого корня подметается, доставка проходит", async () => {
+  const tmp = makeTmp();
+  const env = { ...PANE_ENV, XDG_RUNTIME_DIR: tmp };
+  const dir = socketDir(env, 0);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeSidecar(dir, "wA:p1", { mode: "main", ticket: null, cwd: "/elsewhere", pid: 1 });
+    writeFileSync(socketPath(dir, "wA:p1"), "");
+    const got: Report[] = [];
+    const mine = await bindInbox(
+      dir,
+      "wB:p1",
+      { mode: "main", ticket: null, cwd: "/root", pid: 2 },
+      (r) => got.push(r),
+    );
+    try {
+      assert.deepEqual(await sendReport(env, 0, "проба", undefined, 200, "/root"), {
+        ok: true,
+        line: "delivered: fallback wB:p1",
+      });
+      assert.equal(got.length, 1);
+      assert.equal(existsSync(socketPath(dir, "wA:p1")), false);
+      assert.equal(existsSync(sidecarPath(dir, "wA:p1")), false);
+    } finally {
+      closeInbox(dir, mine);
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("при двух главных чатах своего корня отчёт никуда не уходит", async () => {
   const tmp = makeTmp();
   const env = { ...PANE_ENV, XDG_RUNTIME_DIR: tmp };
@@ -258,6 +289,7 @@ test("scanMains lists only live-shaped mains, sorted, without self", () => {
       pane: "wC:p1",
       sock: socketPath(tmp, "wC:p1"),
       json: sidecarPath(tmp, "wC:p1"),
+      cwd: "/root",
     });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
