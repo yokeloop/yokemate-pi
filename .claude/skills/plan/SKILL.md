@@ -65,9 +65,9 @@ Then take each created ticket through «By ticket» below. The interview already
 
 ## By ticket
 
-1. **Reconnaissance** — read the ticket and its comments from the tracker yourself (`youtrack-<org>` MCP; for a github-project — `gh issue view <номер> -R <owner>/<repo> --comments`) — the subagent has no tracker access — then spawn the `plan-scout` subagent: the ticket's text and comments (or the interview's four fields, which already carry the same), the key, the project, its clone at `projects/<org>/<project>/` and its knowledge at `knowledge/<org>/<project>/`. It returns facts with sources, assumptions, and forks with recommendations; its final message comes back as the tool result. Not solvable with what is given → report exactly what is missing and stop; no plan gets written around a hole.
+1. **Reconnaissance** — read the ticket and its comments from the tracker yourself (`youtrack-<org>` MCP; for a github-project — `gh issue view <номер> -R <owner>/<repo> --comments`) — the subagent has no tracker access — then spawn the `plan-scout` subagent: the ticket's text and comments (or the interview's four fields, which already carry the same), the key, the project, its clone at `projects/<org>/<project>/` and its knowledge at `home/knowledge/<org>/<project>/`. It returns facts with sources, assumptions, and forks with recommendations; its final message comes back as the tool result. Not solvable with what is given → report exactly what is missing and stop; no plan gets written around a hole.
 2. **Questions** — close the scout's forks with the engineer, inline, one at a time: the same `AskUserQuestion` shape as the interview above. Start from the forks; a gap becomes a question only when the answer changes the implementation — everything else you close from the code yourself. Order: what blocks the contract between parts first, cosmetics last. When an answer can be found in the code faster than asked — look it up and present it as a fact with the source, not as a question. The engineer's word is input, not a hypothesis: if it diverges from what the code shows, say in one line what else will be needed — then record the decision as given. The engineer's answer ends the question: never re-ask it, never argue it back, never offer the rejected option again in a later question. The plan may only get simpler as the questions go — a question that adds a step is you widening the ticket, and scope is not yours to name. The moment the talk drifts into free-form argument, return to one question, one call. An ADR is the record of a past ticket's decision, not a rule for this one: cite it as context with its date and ticket; never argue it back at the engineer as law. Never a question: extra logs, extra checks, release, versioning, merging — nothing that does not change the solution itself.
-3. **Plan** — spawn the `plan-writer` subagent: the key, the project, the scout's facts and every decision made above. It writes the plan in the shape `PLAN-FORMAT.md` defines to `knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` and returns the path. Read the result: an open question left in it is a defect — send it back with the decisions it missed.
+3. **Plan** — spawn the `plan-writer` subagent: the key, the project, the scout's facts and every decision made above. It writes the plan in the shape `PLAN-FORMAT.md` defines to `home/knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` and returns the path. Read the result: an open question left in it is a defect — send it back with the decisions it missed.
 4. **Record** — `pnpm plan <KEY> <plan-path>`, then one report line right here in the feed: the key, the plan's path, ready for `/do`. Inline, no `SendMessage` — the chat you would report to is the one you are in.
 
 ## In a pane
@@ -86,11 +86,11 @@ Then wait: the pane is conversational, and closing it is the engineer's — neve
 Two layers, both under yokemate (never in the client repository):
 
 - **Process words** — terms of the workflow itself → `<yokemate>/context.md`.
-- **Repository words** — the product's domain terms → `knowledge/<org>/<project>/context.md`.
+- **Repository words** — the product's domain terms → `home/knowledge/<org>/<project>/context.md`.
 
 The rule for choosing the layer: a word about the *product* goes to the project file, a word about the *process* goes to the shared file. Duplication between projects is acceptable; ambiguity inside one project is not.
 
-A decision that constrains future work (architecture, contract, irreversible choice) → one ADR in `knowledge/<org>/<project>/adr/NNNN-<slug>.md`: context, decision, consequences. Number sequentially.
+A decision that constrains future work (architecture, contract, irreversible choice) → one ADR in `home/knowledge/<org>/<project>/adr/NNNN-<slug>.md`: context, decision, consequences. Number sequentially.
 
 ## Outcome
 

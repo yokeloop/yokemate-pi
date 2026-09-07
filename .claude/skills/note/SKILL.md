@@ -1,6 +1,6 @@
 ---
 name: note
-description: Read-only conversation about the pool or a project, ending in a note saved to notes/ on the engineer's word. Triggered by "/note [тема]".
+description: Read-only conversation about the pool or a project, ending in a note saved to home/notes/ on the engineer's word. Triggered by "/note [тема]".
 ---
 
 # /note — launcher

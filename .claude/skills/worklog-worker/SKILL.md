@@ -23,7 +23,7 @@ pnpm where worklog <org>
 
 For the period the engineer named:
 
-- `journal/YYYY-MM.md` — the outcome lines the commands append («дата тикет запланировано/сделано/принято»; в старых записях — «загрилено») and the narrative entries; the texts for the tracker start here.
+- `home/journal/YYYY-MM.md` — the outcome lines the commands append («дата тикет запланировано/сделано/принято»; в старых записях — «загрилено») and the narrative entries; the texts for the tracker start here.
 - Commits in the org's clones (`projects/<org>/`) and its task worktrees (`work/<TICKET>/`): `git log --all --since "<from>" --until "<to>"` — the ticket key in the branch or the message says whose commit it is.
 - The calendar for the meetings (Google Calendar). Keep only meetings the engineer took part in; the calendar not reachable from this split, or an event unclear — ask the engineer, do not guess.
 
