@@ -4,6 +4,7 @@
 // row: worktrees, branches, PRs and the task folder are not touched.
 import { join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { logMove } from "./move-log.ts";
 
@@ -18,6 +19,7 @@ export function drop(db: DatabaseSync, ticket: string): boolean {
 // CLI: pnpm drop ACME-347
 if (import.meta.url === `file://${process.argv[1]}`) {
   const ROOT = resolve(new URL("..", import.meta.url).pathname);
+  const DATA = dataRoot(ROOT);
   const argv = process.argv.slice(2).filter((a) => a !== "--");
   const ticket = argv[0];
   if (!ticket || argv.length > 1) {
@@ -29,6 +31,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`${ticket} не в очереди`);
     process.exit(0);
   }
-  logMove(ROOT, ticket, "снято с очереди");
+  logMove(DATA, ticket, "снято с очереди");
   console.log(`${ticket} снят с очереди`);
 }

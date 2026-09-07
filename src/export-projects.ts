@@ -6,10 +6,11 @@
 // Usage: pnpm export-projects
 
 import { join, resolve } from "node:path";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { writeManifest } from "./manifest.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const db = openDb(join(ROOT, "yokemate.db"));
-const count = writeManifest(db, ROOT);
+const count = writeManifest(db, dataRoot(ROOT));
 console.log(`projects.json written: ${count} passports`);

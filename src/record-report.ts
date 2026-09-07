@@ -10,6 +10,7 @@
 //     --part acme/acme-ui-kit:library:ACME-347:https://github.com/.../pull/34 \
 //     --part acme/acme-subscription-page:app:ACME-347:https://github.com/.../pull/213
 
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
@@ -17,6 +18,7 @@ import { applyMove, type MoveEnv } from "./transitions.ts";
 import { join, resolve } from "node:path";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
+const DATA = dataRoot(ROOT);
 
 function fail(msg: string): never {
   console.error(msg);
@@ -60,8 +62,8 @@ const prLabel = (url: string) => {
   const m = /(\d+)\/?$/.exec(url);
   return m ? `PR #${m[1]}` : url;
 };
-logMove(ROOT, ticket, "сделано", parts.map((p) => prLabel(p.pr)).join(", "));
-syncPush(ROOT, `${ticket} сделано`);
+logMove(DATA, ticket, "сделано", parts.map((p) => prLabel(p.pr)).join(", "));
+syncPush(DATA, `${ticket} сделано`);
 console.log(
   `${ticket} → review${out.repeat ? " (repeat)" : ""}, ${parts.length} part(s): ` +
     parts.map((p) => p.repo).join(", "),

@@ -4,10 +4,11 @@
 // the inline /plan and the repair entry. The command checks the stamp, the
 // legal move and the current stage (src/transitions.ts).
 //
-// Usage: pnpm plan ACME-347 knowledge/acme/acme-ui-kit/ai/<slug>/<slug>-plan.md
+// Usage: pnpm plan ACME-347 home/knowledge/acme/acme-ui-kit/ai/<slug>/<slug>-plan.md
 
 import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
@@ -15,6 +16,7 @@ import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
+const DATA = dataRoot(ROOT);
 
 function fail(msg: string): never {
   console.error(msg);
@@ -40,6 +42,6 @@ const out = applyMove(db, "plan", process.env as MoveEnv, ticket, () => {
 });
 if (!out.ok) fail(out.refuse);
 
-logMove(ROOT, ticket, "запланировано", `план ${basename(planAbs, ".md")}`);
-syncPush(ROOT, `${ticket} план`);
+logMove(DATA, ticket, "запланировано", `план ${basename(planAbs, ".md")}`);
+syncPush(DATA, `${ticket} план`);
 console.log(`${ticket} → planned${out.repeat ? " (repeat)" : ""}, plan: ${planAbs}`);
