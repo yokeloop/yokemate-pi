@@ -1,11 +1,15 @@
-// Journal, knowledge and projects.json ride git between instances: syncPush
-// commits and pushes them after a state-changing command, syncPull refreshes
-// the root at session start and pushes what an offline session left behind.
-// The move-log contract holds throughout: no sync failure may fail the command
-// that did the real work — every problem is one line on stderr, exit 0.
+// Two roots, two modes. The engine is public and updates from upstream one
+// way only — pullFastForward refuses to merge and says so. The engineer's data
+// — journal, knowledge, notes, projects.json, all under SYNC_PATHS in home/ —
+// peers between their machines: syncPush commits and pushes it after a
+// state-changing command, syncPull refreshes it at session start and pushes
+// what an offline session left behind. The move-log contract holds throughout:
+// no sync failure may fail the command that did the real work — every problem
+// is one line on stderr, exit 0.
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { dataRoot } from "./data-root.ts";
 
 const SYNC_PATHS = ["journal", "knowledge", "notes", "projects.json"];
 const TIMEOUT_MS = 10_000;
@@ -75,6 +79,14 @@ export function syncPush(
   }
 }
 
+export function pullFastForward(root: string): void {
+  try {
+    git(root, "pull", "--ff-only");
+  } catch {
+    note("движок разошёлся с апстримом: git pull --ff-only не прошёл, разбери руками");
+  }
+}
+
 export function syncPull(root: string): void {
   try {
     switch (pullRebase(root)) {
@@ -95,8 +107,12 @@ export function syncPull(root: string): void {
 if (import.meta.filename === process.argv[1]) {
   if (process.env.YOKEMATE_MODE) process.exit(0);
   const root = join(import.meta.dirname, "..");
-  if (process.argv[2] === "pull") syncPull(root);
-  else {
+  if (process.argv[2] === "pull") {
+    pullFastForward(root);
+    const data = dataRoot(root);
+    if (existsSync(data)) syncPull(data);
+    else note("home/ нет — личные данные не подняты: см. scripts/bootstrap.sh");
+  } else {
     console.error("usage: git-sync.ts pull");
     process.exit(1);
   }
