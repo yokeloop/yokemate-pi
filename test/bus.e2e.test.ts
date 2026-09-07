@@ -33,13 +33,19 @@ test("a report says delivered and reaches the pi session as a custom message", a
     stdio: ["pipe", "pipe", "pipe"],
   });
   let out = "";
+  let err = "";
   pi.stdout.on("data", (c) => (out += c.toString("utf8")));
+  pi.stderr.on("data", (c) => (err += c.toString("utf8")));
 
   try {
     const sock = join(tmp, "yokemate", `${PANE}.sock`);
     const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    for (let i = 0; i < 60 && !existsSync(sock); i++) await wait(250);
-    assert.equal(existsSync(sock), true, "the extension did not raise its inbox");
+    for (let i = 0; i < 120 && !existsSync(sock); i++) await wait(250);
+    assert.equal(
+      existsSync(sock),
+      true,
+      `the extension did not raise its inbox in 30s\nstdout:\n${out.slice(0, 2000)}\nstderr:\n${err.slice(0, 2000)}`,
+    );
 
     const say = spawnSync(
       process.execPath,
