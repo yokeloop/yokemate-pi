@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { stopVerdict } from "./report-guard.ts";
+import { buildDigest } from "./warmup.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -91,5 +92,46 @@ export default function guards(pi: ExtensionAPI) {
       { customType: "yokemate-stop-guard", content: reason, display: true },
       { deliverAs: "followUp", triggerTurn: true },
     );
+  });
+
+  // The digest is handed to the first turn of the session and never again.
+  let digestPending = false;
+
+  // The same gate the CLI blocks of git-sync.ts and warmup.ts carry: a pane
+  // neither pulls git nor prints the digest. It stands in the extension too,
+  // because buildDigest is a direct import and raises no subprocess of its own.
+  pi.on("session_start", async (event, ctx) => {
+    if (process.env.YOKEMATE_MODE) return;
+    if (event.reason !== "startup") return;
+    digestPending = true;
+    try {
+      // A subprocess, not an import: syncPull is synchronous throughout and
+      // would freeze pi's event loop on startup. git-sync never fails by
+      // contract — every trouble is a line on stderr and exit 0, and that line
+      // has to reach the engineer.
+      const r = await pi.exec(
+        "node",
+        ["--experimental-strip-types", "--no-warnings", join(ROOT, "src", "git-sync.ts"), "pull"],
+        { cwd: ROOT, timeout: 60_000 },
+      );
+      if (r.stderr.trim()) ctx.ui.notify(r.stderr.trim(), "warning");
+      if (r.code !== 0 || r.killed) ctx.ui.notify("git-sync не отработал", "warning");
+    } catch (e) {
+      ctx.ui.notify(`git-sync не отработал: ${(e as Error).message}`, "warning");
+    }
+  });
+
+  // The result's message lands in the turn's messages — pi's counterpart of
+  // Claude's additionalContext on SessionStart.
+  pi.on("before_agent_start", () => {
+    if (!digestPending) return undefined;
+    digestPending = false;
+    return {
+      message: {
+        customType: "yokemate-warmup",
+        content: `Warmup — состояние пула на старте сессии\n\n${buildDigest(ROOT, dataRootOf(ROOT))}`,
+        display: true,
+      },
+    };
   });
 }
