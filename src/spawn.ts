@@ -89,43 +89,17 @@ const env = process.env as MoveEnv;
 const folder = join(ROOT, "work", ticket);
 mkdirSync(folder, { recursive: true });
 
-// Session settings for the tab: inbound messages accepted without a dialog
-// (nobody watches the tab's dialogs), the stop guard that blocks a silent
-// finish until the report is sent, and the same PreToolUse guard the root
-// settings wire — the tab lives in its own project root and never sees the
-// repository's .claude/settings.json, so the rules are written here too.
-mkdirSync(join(folder, ".claude"), { recursive: true });
-const guard = `node --experimental-strip-types --no-warnings ${ROOT}/src/bash-guard.ts`;
+// Session settings for the tab: the same two extensions the root
+// .pi/settings.json raises — the tab lives in its own project root and never
+// sees the repository's settings file, so the wiring is written here too. The
+// paths are absolute: the tab has no relative path to the engine.
+mkdirSync(join(folder, ".pi"), { recursive: true });
 writeFileSync(
-  join(folder, ".claude", "settings.json"),
+  join(folder, ".pi", "settings.json"),
   JSON.stringify(
     {
-      // Cross-session messaging itself is switched on globally, in the user's
-      // ~/.claude/settings.json (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Not
-      // duplicated here: the tab inherits the flag like any session.
-      crossSessionInbound: "accept",
-      enabledPlugins: {
-        "yoke@yoke": false,
-        "mattpocock-skills@claude-plugins-official": false,
-      },
-      hooks: {
-        PreToolUse: [
-          { matcher: "Bash", hooks: [{ type: "command", command: guard }] },
-          { matcher: "Write|Edit", hooks: [{ type: "command", command: guard }] },
-          { matcher: "mcp__claude-in-chrome__.*", hooks: [{ type: "command", command: guard }] },
-        ],
-        Stop: [
-          {
-            matcher: "",
-            hooks: [
-              {
-                type: "command",
-                command: `node --experimental-strip-types --no-warnings ${ROOT}/src/report-guard.ts`,
-              },
-            ],
-          },
-        ],
-      },
+      extensions: [join(ROOT, "src", "guards.ts"), join(ROOT, "src", "bus.ts")],
+      skills: [join(ROOT, ".claude", "skills")],
     },
     null,
     2,
