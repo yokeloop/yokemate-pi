@@ -108,7 +108,7 @@ writeFileSync(
 
 // The tab's teammates (R4.4) — linked into the task folder, never into the
 // engineer's home directory.
-linkTeammates(join(ROOT, ".claude", "skills", "do", "agents"), join(folder, ".claude", "agents"));
+linkTeammates(join(ROOT, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 
 // Tab in herdr, agent named after the ticket (lowercase per herdr's rules).
 // The env stamp is how /do inside the tab knows it is inside the tab and not
