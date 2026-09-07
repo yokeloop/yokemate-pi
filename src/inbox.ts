@@ -257,22 +257,26 @@ export async function sendReport(
     text,
   };
 
+  const sweepIfDead = (pane: string, reason: string): void => {
+    if (reason !== "ECONNREFUSED" && reason !== "ENOENT") return;
+    rmSync(socketPath(dir, pane), { force: true });
+    rmSync(sidecarPath(dir, pane), { force: true });
+  };
+
   const target = to ?? parentPane(env);
   let reason: string | undefined;
   if (target) {
     const d = await deliver(socketPath(dir, target), report, timeoutMs);
     if (d.ok) return { ok: true, line: "delivered" };
     reason = d.reason;
+    sweepIfDead(target, d.reason);
   }
 
   for (const c of scanMains(dir, self)) {
     if (c.pane === target) continue;
     const d = await deliver(c.sock, report, timeoutMs);
     if (d.ok) return { ok: true, line: `delivered: fallback ${c.pane}` };
-    if (d.reason === "ECONNREFUSED" || d.reason === "ENOENT") {
-      rmSync(c.sock, { force: true });
-      rmSync(c.json, { force: true });
-    }
+    sweepIfDead(c.pane, d.reason);
   }
 
   return { ok: false, line: `unreachable: ${reason ?? "no live inbox"}` };

@@ -102,7 +102,7 @@ test("only ship launches ask in the main chat", () => {
   }
   for (const cmd of [
     "pnpm ship ACME-1 ACME-2",
-    'cd /x && HERDR_ENV=1 pnpm ship ACME-1',
+    'cd /x && HERDR_ENV="1" pnpm ship ACME-1',
     "pnpm run ship ACME-1",
     "pnpm split ship ACME-1",
     "node --experimental-strip-types src/mode-tab.ts ship ACME-1",

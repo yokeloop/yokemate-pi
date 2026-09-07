@@ -152,6 +152,8 @@ test("the ladder falls back to a live main and sweeps the dead pairs it passes",
     writeSidecar(dir, "wB:p1", { mode: "review", ticket: "YM-1", cwd: "/root", pid: 2 });
     writeSidecar(dir, "wC:p1", { mode: "main", ticket: null, cwd: "/root", pid: 3 });
     writeFileSync(sidecarPath(dir, "wD:p1"), "{ not json");
+    writeSidecar(dir, "w0:pX", { mode: "ship", ticket: "YM-2", cwd: "/root", pid: 4 });
+    writeFileSync(socketPath(dir, "w0:pX"), "");
 
     const got: Report[] = [];
     const inbox = await bindInbox(dir, "wC:p1", SIDECAR, (r) => got.push(r));
@@ -163,6 +165,11 @@ test("the ladder falls back to a live main and sweeps the dead pairs it passes",
       assert.equal(existsSync(socketPath(dir, "wA:p1")), false);
       assert.equal(existsSync(sidecarPath(dir, "wA:p1")), false);
       assert.equal(existsSync(sidecarPath(dir, "wD:p1")), true);
+
+      // The dead parent is swept too, though scanMains never lists it: it is
+      // stamped, not a main, and the ladder only ever tried it as the target.
+      assert.equal(existsSync(socketPath(dir, "w0:pX")), false);
+      assert.equal(existsSync(sidecarPath(dir, "w0:pX")), false);
 
       assert.deepEqual(await send("wC:p1"), { ok: true, line: "delivered" });
     } finally {
