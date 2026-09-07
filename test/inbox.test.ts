@@ -1,14 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  allowTarget,
   bindInbox,
   closeInbox,
   deliver,
   ensureDir,
+  scanMains,
+  sendReport,
   sidecarPath,
   socketDir,
   socketPath,
@@ -121,4 +124,93 @@ test("an orphaned socket is taken over, a live one is never stolen", async () =>
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+function writeSidecar(dir: string, pane: string, side: Record<string, unknown>): void {
+  writeFileSync(sidecarPath(dir, pane), JSON.stringify(side));
+}
+
+test("the ladder falls back to a live main and sweeps the dead pairs it passes", async () => {
+  const tmp = makeTmp();
+  const env = {
+    XDG_RUNTIME_DIR: "",
+    YOKEMATE_PARENT_PANE: "w0:pX",
+    YOKEMATE_MODE: "review",
+    YOKEMATE_TICKET: "YM-0",
+    HERDR_PANE_ID: "wT:p9",
+  };
+  const dir = socketDir({ ...env, XDG_RUNTIME_DIR: tmp }, 0);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const send = (to?: string) =>
+      sendReport({ ...env, XDG_RUNTIME_DIR: tmp }, 0, "проба", to, 200);
+
+    assert.deepEqual(await send(), { ok: false, line: "unreachable: ENOENT" });
+
+    writeSidecar(dir, "wA:p1", { mode: "main", ticket: null, cwd: "/root", pid: 1 });
+    writeFileSync(socketPath(dir, "wA:p1"), "");
+    writeSidecar(dir, "wB:p1", { mode: "review", ticket: "YM-1", cwd: "/root", pid: 2 });
+    writeSidecar(dir, "wC:p1", { mode: "main", ticket: null, cwd: "/root", pid: 3 });
+    writeFileSync(sidecarPath(dir, "wD:p1"), "{ not json");
+
+    const got: Report[] = [];
+    const inbox = await bindInbox(dir, "wC:p1", SIDECAR, (r) => got.push(r));
+    try {
+      assert.deepEqual(await send(), { ok: true, line: "delivered: fallback wC:p1" });
+      assert.deepEqual(got, [
+        { from: "wT:p9", mode: "review", ticket: "YM-0", text: "проба" },
+      ]);
+      assert.equal(existsSync(socketPath(dir, "wA:p1")), false);
+      assert.equal(existsSync(sidecarPath(dir, "wA:p1")), false);
+      assert.equal(existsSync(sidecarPath(dir, "wD:p1")), true);
+
+      assert.deepEqual(await send("wC:p1"), { ok: true, line: "delivered" });
+    } finally {
+      closeInbox(dir, inbox);
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("scanMains lists only live-shaped mains, sorted, without self", () => {
+  const tmp = makeTmp();
+  try {
+    assert.deepEqual(scanMains(join(tmp, "absent")), []);
+    writeSidecar(tmp, "wC:p1", { mode: "main", ticket: null, cwd: "/root", pid: 3 });
+    writeSidecar(tmp, "wA:p1", { mode: "main", ticket: null, cwd: "/root", pid: 1 });
+    writeSidecar(tmp, "wB:p1", { mode: "ship", ticket: "YM-1", cwd: "/root", pid: 2 });
+    writeFileSync(sidecarPath(tmp, "wD:p1"), "{ not json");
+    assert.deepEqual(
+      scanMains(tmp, "wA:p1").map((c) => c.pane),
+      ["wC:p1"],
+    );
+    assert.deepEqual(
+      scanMains(tmp).map((c) => c.pane),
+      ["wA:p1", "wC:p1"],
+    );
+    assert.deepEqual(scanMains(tmp, "wA:p1")[0], {
+      pane: "wC:p1",
+      sock: socketPath(tmp, "wC:p1"),
+      json: sidecarPath(tmp, "wC:p1"),
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("allowTarget frees the main chat and fences a stamped pane", () => {
+  const main = {};
+  const pane = { YOKEMATE_MODE: "review", YOKEMATE_PARENT_PANE: "w4:p1" };
+  assert.deepEqual(allowTarget(main, undefined, []), { ok: true });
+  assert.deepEqual(allowTarget(main, "w9:p9", []), { ok: true });
+  assert.deepEqual(allowTarget(pane, undefined, []), { ok: true });
+  assert.deepEqual(allowTarget(pane, "w4:p1", []), { ok: true });
+  assert.deepEqual(allowTarget(pane, "w7:p2", ["w7:p2"]), { ok: true });
+  const denied = allowTarget(pane, "w7:p2", ["w8:p3"]);
+  assert.equal(denied.ok, false);
+  assert.match(
+    (denied as { reason: string }).reason,
+    /только родителю или главному чату/,
+  );
 });

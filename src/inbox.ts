@@ -1,4 +1,12 @@
-import { mkdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import * as net from "node:net";
 import { join } from "node:path";
 
@@ -186,4 +194,86 @@ export function closeInbox(dir: string, inbox: Inbox): void {
   inbox.server.close();
   rmSync(inbox.sock, { force: true });
   rmSync(sidecarPath(dir, inbox.pane), { force: true });
+}
+
+export interface Candidate {
+  pane: string;
+  sock: string;
+  json: string;
+}
+
+export function scanMains(dir: string, self?: string): Candidate[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const found: Candidate[] = [];
+  for (const name of names.sort()) {
+    if (!name.endsWith(".json")) continue;
+    const pane = name.slice(0, -".json".length);
+    if (pane === self) continue;
+    let side: Sidecar;
+    try {
+      side = JSON.parse(readFileSync(join(dir, name), "utf8")) as Sidecar;
+    } catch {
+      continue;
+    }
+    if (side?.mode !== "main") continue;
+    found.push({ pane, sock: socketPath(dir, pane), json: sidecarPath(dir, pane) });
+  }
+  return found;
+}
+
+export function allowTarget(
+  env: InboxEnv,
+  to: string | undefined,
+  mains: string[],
+): { ok: true } | { ok: false; reason: string } {
+  if (!env.YOKEMATE_MODE) return { ok: true };
+  if (!to) return { ok: true };
+  if (to === parentPane(env) || mains.includes(to)) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      "из панели отчёт уходит только родителю или главному чату — убери `to`, адрес выводится сам",
+  };
+}
+
+export async function sendReport(
+  env: InboxEnv,
+  uid: number,
+  text: string,
+  to?: string,
+  timeoutMs = TIMEOUT_MS,
+): Promise<{ ok: boolean; line: string }> {
+  const dir = socketDir(env, uid);
+  const self = ownPane(env);
+  const report: Report = {
+    from: self ?? "cli",
+    mode: env.YOKEMATE_MODE ?? "main",
+    ticket: env.YOKEMATE_TICKET ?? null,
+    text,
+  };
+
+  const target = to ?? parentPane(env);
+  let reason: string | undefined;
+  if (target) {
+    const d = await deliver(socketPath(dir, target), report, timeoutMs);
+    if (d.ok) return { ok: true, line: "delivered" };
+    reason = d.reason;
+  }
+
+  for (const c of scanMains(dir, self)) {
+    if (c.pane === target) continue;
+    const d = await deliver(c.sock, report, timeoutMs);
+    if (d.ok) return { ok: true, line: `delivered: fallback ${c.pane}` };
+    if (d.reason === "ECONNREFUSED" || d.reason === "ENOENT") {
+      rmSync(c.sock, { force: true });
+      rmSync(c.json, { force: true });
+    }
+  }
+
+  return { ok: false, line: `unreachable: ${reason ?? "no live inbox"}` };
 }
