@@ -41,14 +41,19 @@ export function guardCall(
 }
 
 export default function guards(pi: ExtensionAPI) {
-  // Raw read-only handle, not openDb: a guard runs no DDL.
+  // Raw read-only handle, not openDb: a guard runs no DDL. Closed on the way
+  // out — report-guard.ts leaves that to the process exit, an extension lives on.
   const readStage = (ticket: string): string | undefined => {
     const db = new DatabaseSync(join(ROOT, "yokemate.db"), { readOnly: true });
-    return (
-      db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
-        | { stage: string }
-        | undefined
-    )?.stage;
+    try {
+      return (
+        db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
+          | { stage: string }
+          | undefined
+      )?.stage;
+    } finally {
+      db.close();
+    }
   };
 
   // No matcher in pi: the filter is the early exit inside the one handler,
