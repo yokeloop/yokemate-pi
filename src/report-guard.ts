@@ -26,9 +26,9 @@ export function stopVerdict(
   return (
     `The ticket's stage is still ${stage ?? "unrecorded"}. When every PR is open and green, record the result ` +
     `yourself from the task folder root: pnpm record-report ${env.YOKEMATE_TICKET} ` +
-    `--part <org/repo>:<role>:<branch>:<pr-url> — one --part per repository — then message the orchestrator ` +
-    `and finish. A ticket that cannot be completed records nothing: report what is missing to the orchestrator ` +
-    `and wait — the orchestrator closes this tab.`
+    `--part <org/repo>:<role>:<branch>:<pr-url> — one --part per repository — then send the report with ` +
+    `send_message and finish. A ticket that cannot be completed records nothing: report what is missing with ` +
+    `send_message and wait — the orchestrator closes this tab.`
   );
 }
 
