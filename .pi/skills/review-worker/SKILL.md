@@ -74,7 +74,7 @@ Either way the report says what was covered and what was not: a stand limitation
 
 The outcome is already recorded by the `pnpm accept` you ran; the main chat is told after the fact.
 
-1. The report goes to the chat the mode was launched from — its session name is in `YOKEMATE_PARENT_AGENT`: `SendMessage` with `to` = the variable's value (the bare name) and the report, a few lines — ticket key, and either the rework plan's path or that the ticket is verified. If the send comes back ambiguous — a fresh `ListAgents`, one retry with the ref of the line carrying that name appended; two lines with one name, or no line at all — say the report in this pane and stop. When the variable is absent (a pane raised before this was wired), say the report in this pane and stop — the stage is already recorded either way.
+1. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — ticket key, and either the rework plan's path or that the ticket is verified. A result of `unreachable: <reason>` → say the report in this pane and stop; the stage is already recorded either way.
 2. Say the same line in this split.
 
 This split is not closed for you. Say that acceptance is finished and wait: the engineer is standing here, and only the engineer knows it is over.

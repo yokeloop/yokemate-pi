@@ -117,11 +117,7 @@ Before opening each PR: `git fetch origin`. The report names how far the branch 
 When every PR is open and green — `gh pr checks <url>` per part, not an assumption:
 
 1. Record the result yourself, from the task folder root (`work/<TICKET>/`, never from inside a worktree — there pnpm resolves the repository's own package.json and the script does not exist): `pnpm record-report <TICKET> --part <org/repo>:<role>:<branch>:<pr-url>` — one `--part` per repository. The stop guard reads the stage this command writes and lets the tab finish only once it is recorded.
-2. The report goes to the chat the mode was launched from. It is a few lines — ticket key, outcome, PR URL per repository, behind/intersection facts from step 9, and any open point. Deliver it by these steps:
-   1. `SendMessage` with `to` = the value of `YOKEMATE_PARENT_AGENT` (the bare name) and the report.
-   2. The send comes back ambiguous → a fresh `ListAgents`, one retry with the ref of the line carrying that name appended.
-   3. The send comes back unreachable («No agent named …»), or the retry from step 2 failed too, or the variable is empty → a fresh `ListAgents`, find the **current** main chat: the interactive unstamped session of this pool — the line whose bare name is `yokemate` or of the form `yokemate-*` and which is not a mode pane (not a ticket key, not `*-review`/`*-ship`/`*-worklog`/`*-plan*`). Exactly one candidate → one retry `SendMessage` to it.
-   4. Zero or several candidates, or the retry from step 3 failed too → say the report in this pane and stop — the stage is already recorded either way.
+2. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — ticket key, outcome, PR URL per repository, behind/intersection facts from step 9, and any open point. A result of `unreachable: <reason>` → say the report in this pane and stop; the stage is already recorded either way.
 
    The message is a courtesy: the launching chat closes this tab on it (`pnpm close-mode do <TICKET>`).
 

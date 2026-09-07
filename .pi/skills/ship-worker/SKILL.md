@@ -43,11 +43,7 @@ The scope is the update and the merge: no new features, no cleanups, no plan cha
 
 Merging is not the finish. The main chat has to learn about it — it closes this tab on your report, and the engineer follows the work from there.
 
-1. The report goes to the chat the mode was launched from. It is a few lines — per key: the merged PRs, the checks before the merge, the removed folder; for a key stopped on red — the literal failing output and what stands untouched; open points if any. Deliver it by these steps:
-   1. `SendMessage` with `to` = the value of `YOKEMATE_PARENT_AGENT` (the bare name) and the report.
-   2. The send comes back ambiguous → a fresh `ListAgents`, one retry with the ref of the line carrying that name appended.
-   3. The send comes back unreachable («No agent named …»), or the retry from step 2 failed too, or the variable is empty → a fresh `ListAgents`, find the **current** main chat: the interactive unstamped session of this pool — the line whose bare name is `yokemate` or of the form `yokemate-*` and which is not a mode pane (not a ticket key, not `*-review`/`*-ship`/`*-worklog`/`*-plan*`). Exactly one candidate → one retry `SendMessage` to it.
-   4. Zero or several candidates, or the retry from step 3 failed too → say the report in this pane and stop.
+1. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — per key: the merged PRs, the checks before the merge, the removed folder; for a key stopped on red — the literal failing output and what stands untouched; open points if any. A result of `unreachable: <reason>` → say the report in this pane and stop.
 2. Say the same line in this tab, then stop.
 
 The stage does not change — no «merged» stage exists; the accepted row has already left the queue. The launching chat closes this tab (`pnpm close-mode ship <KEY1+KEY2>` — the same `+`-joined string from your report).
