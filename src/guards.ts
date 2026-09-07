@@ -94,38 +94,48 @@ export default function guards(pi: ExtensionAPI) {
     );
   });
 
-  // The digest is handed to the first turn of the session and never again.
+  // The digest is handed to the first turn of the session and never again,
+  // and it waits for the pull so it reads what the pull brought.
   let digestPending = false;
+  let pulled: Promise<void> | undefined;
 
   // The same gate the CLI blocks of git-sync.ts and warmup.ts carry: a pane
   // neither pulls git nor prints the digest. It stands in the extension too,
   // because buildDigest is a direct import and raises no subprocess of its own.
-  pi.on("session_start", async (event, ctx) => {
+  //
+  // The handler starts the pull and returns: pi attaches the session's event
+  // stream only once every session_start handler has resolved, and a report
+  // arriving from a pane in the meantime would reach the model but never the
+  // transcript. The first turn waits for the pull instead, below.
+  pi.on("session_start", (event, ctx) => {
     if (process.env.YOKEMATE_MODE) return;
     if (event.reason !== "startup") return;
     digestPending = true;
-    try {
-      // A subprocess, not an import: syncPull is synchronous throughout and
-      // would freeze pi's event loop on startup. git-sync never fails by
-      // contract — every trouble is a line on stderr and exit 0, and that line
-      // has to reach the engineer.
-      const r = await pi.exec(
-        "node",
-        ["--experimental-strip-types", "--no-warnings", join(ROOT, "src", "git-sync.ts"), "pull"],
-        { cwd: ROOT, timeout: 60_000 },
-      );
-      if (r.stderr.trim()) ctx.ui.notify(r.stderr.trim(), "warning");
-      if (r.code !== 0 || r.killed) ctx.ui.notify("git-sync не отработал", "warning");
-    } catch (e) {
-      ctx.ui.notify(`git-sync не отработал: ${(e as Error).message}`, "warning");
-    }
+    pulled = (async () => {
+      try {
+        // A subprocess, not an import: syncPull is synchronous throughout and
+        // would freeze pi's event loop. git-sync never fails by contract —
+        // every trouble is a line on stderr and exit 0, and that line has to
+        // reach the engineer.
+        const r = await pi.exec(
+          "node",
+          ["--experimental-strip-types", "--no-warnings", join(ROOT, "src", "git-sync.ts"), "pull"],
+          { cwd: ROOT, timeout: 60_000 },
+        );
+        if (r.stderr.trim()) ctx.ui.notify(r.stderr.trim(), "warning");
+        if (r.code !== 0 || r.killed) ctx.ui.notify("git-sync не отработал", "warning");
+      } catch (e) {
+        ctx.ui.notify(`git-sync не отработал: ${(e as Error).message}`, "warning");
+      }
+    })();
   });
 
   // The result's message lands in the turn's messages — pi's counterpart of
   // Claude's additionalContext on SessionStart.
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", async () => {
     if (!digestPending) return undefined;
     digestPending = false;
+    await pulled;
     return {
       message: {
         customType: "yokemate-warmup",
