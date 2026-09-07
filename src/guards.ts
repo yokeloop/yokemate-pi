@@ -11,9 +11,11 @@
 // guard must not paralyze the work it protects (same policy as bash-guard).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
+import { stopVerdict } from "./report-guard.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -38,6 +40,16 @@ export function guardCall(
 }
 
 export default function guards(pi: ExtensionAPI) {
+  // Raw read-only handle, not openDb: a guard runs no DDL.
+  const readStage = (ticket: string): string | undefined => {
+    const db = new DatabaseSync(join(ROOT, "yokemate.db"), { readOnly: true });
+    return (
+      db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
+        | { stage: string }
+        | undefined
+    )?.stage;
+  };
+
   // No matcher in pi: the filter is the early exit inside the one handler,
   // exactly as bus.ts does it. The whole body is fenced by try/catch because a
   // throw from a tool_call handler kills the tool — the opposite of the policy
@@ -61,5 +73,23 @@ export default function guards(pi: ExtensionAPI) {
     } catch {
       return undefined;
     }
+  });
+
+  // agent_settled, not agent_end: agent_end ends a low-level run pi may still
+  // follow with a retry, a compaction or a queued continuation, while
+  // agent_settled arrives when nothing more will run and the session idles —
+  // so triggerTurn raises a new turn, which is what a blocking Stop was.
+  pi.on("agent_settled", () => {
+    let reason: string | null = null;
+    try {
+      reason = stopVerdict(process.env, readStage);
+    } catch {
+      return;
+    }
+    if (!reason) return;
+    pi.sendMessage(
+      { customType: "yokemate-stop-guard", content: reason, display: true },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
   });
 }
