@@ -88,6 +88,10 @@ export function pullFastForward(root: string): void {
 }
 
 export function syncPull(root: string): void {
+  if (!existsSync(join(root, ".git"))) {
+    note(`${root} — не свой git-репозиторий, синк пропущен`);
+    return;
+  }
   try {
     switch (pullRebase(root)) {
       case "conflict":
@@ -110,7 +114,7 @@ if (import.meta.filename === process.argv[1]) {
   if (process.argv[2] === "pull") {
     pullFastForward(root);
     const data = dataRoot(root);
-    if (existsSync(data)) syncPull(data);
+    if (existsSync(join(data, ".git"))) syncPull(data);
     else note("home/ нет — личные данные не подняты: см. scripts/bootstrap.sh");
   } else {
     console.error("usage: git-sync.ts pull");

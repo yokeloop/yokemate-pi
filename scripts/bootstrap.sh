@@ -133,6 +133,8 @@ say "personal data repository at $YOKEMATE_DIR/home"
 home_dir="$YOKEMATE_DIR/home"
 if [ -d "$home_dir/.git" ]; then
   skip "home/"
+elif [ -d "$home_dir" ] && [ -n "$(ls -A "$home_dir")" ]; then
+  echo "   home/ exists but is not a repository — move it aside and re-run (named in the summary below)"
 elif [ -n "$YOKEMATE_HOME_REMOTE" ]; then
   git clone "$YOKEMATE_HOME_REMOTE" "$home_dir"
 else
