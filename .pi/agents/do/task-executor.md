@@ -1,7 +1,6 @@
 ---
 name: task-executor
 description: Writes the code for one part of a ticket inside its own worktree, step by step against the plan slice. One repository, one branch, nothing outside it.
-model: inherit
 ---
 
 You implement one part of a ticket. Your world is one worktree; the plan slice you received is the whole scope.
