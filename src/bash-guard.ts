@@ -131,7 +131,7 @@ export function judge(
         return {
           decision: "deny",
           reason:
-            "Панель /note ничего не правит: писать можно только заметку в notes/. Сохранение — Write в notes/<дата>-<тема>.md и pnpm note-save.",
+            "Панель /note ничего не правит: писать можно только заметку в home/notes/. Сохранение — Write в home/notes/<дата>-<тема>.md и pnpm note-save.",
         };
     }
     return null;
@@ -153,7 +153,7 @@ export function judge(
       return {
         decision: "deny",
         reason:
-          "Панель /note read-only: сохранение — Write в notes/ + pnpm note-save, выгрузка — gh gist create (secret). Остальное — в главный чат.",
+          "Панель /note read-only: сохранение — Write в home/notes/ + pnpm note-save, выгрузка — gh gist create (secret). Остальное — в главный чат.",
       };
   }
 

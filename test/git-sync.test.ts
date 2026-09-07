@@ -275,3 +275,28 @@ test("движок берёт только ff, расхождение — одн
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("корень данных без своего .git не трогает движок", () => {
+  const tmp = makeTmp();
+  try {
+    const { origin, a, b } = setupPair(tmp);
+    git(b, "commit", "--allow-empty", "-m", "upstream");
+    git(b, "push");
+    git(a, "commit", "--allow-empty", "-m", "local");
+    const head = git(a, "rev-parse", "HEAD").trim();
+
+    // home/ exists as a plain directory — what logMove leaves on a machine
+    // bootstrapped without YOKEMATE_HOME_REMOTE. git discovery from inside it
+    // finds the engine, so a pull here would rebase and push the engine itself.
+    mkdirSync(join(a, "home", "journal"), { recursive: true });
+    const lines = stderrLines(() => syncPull(join(a, "home")));
+
+    assert.equal(lines.length, 1, `stderr: ${lines.join(" | ")}`);
+    assert.ok(lines[0].includes("не свой git-репозиторий"), `stderr: ${lines.join(" | ")}`);
+    assert.equal(git(a, "rev-parse", "HEAD").trim(), head, "движок остаётся на своём коммите");
+    assert.equal(git(a, "log", "-1", "--format=%s").trim(), "local");
+    assert.equal(git(origin, "log", "-1", "--format=%s", "main").trim(), "upstream");
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});

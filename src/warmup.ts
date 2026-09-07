@@ -132,13 +132,13 @@ export function buildDigest(root: string, dataRoot: string): string {
     "Живые задачи (work/):",
     ...workSection(root, queue.tickets),
     "",
-    "Хвост журнала (journal/):",
+    "Хвост журнала (home/journal/):",
     ...journalSection(dataRoot, now),
   ];
   if (lines.length > DIGEST_MAX_LINES) {
     const month = isoDay(now).slice(0, 7);
     lines.length = DIGEST_MAX_LINES - 1;
-    lines.push(`… обрезано, полный журнал в journal/${month}.md`);
+    lines.push(`… обрезано, полный журнал в home/journal/${month}.md`);
   }
   return lines.join("\n");
 }
