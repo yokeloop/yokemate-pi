@@ -99,7 +99,6 @@ writeFileSync(
   JSON.stringify(
     {
       extensions: [join(ROOT, "src", "guards.ts"), join(ROOT, "src", "bus.ts")],
-      skills: [join(ROOT, ".claude", "skills")],
     },
     null,
     2,

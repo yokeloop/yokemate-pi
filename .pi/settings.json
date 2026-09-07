@@ -1,4 +1,6 @@
 {
-  "extensions": ["../src/guards.ts", "../src/bus.ts"],
-  "skills": ["../.claude/skills"]
+  "extensions": [
+    "../src/guards.ts",
+    "../src/bus.ts"
+  ]
 }
