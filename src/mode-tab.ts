@@ -115,7 +115,7 @@ export function resolveLaunch(
     cwd: root,
     label: named,
     agentName,
-    prompt: `${mode === "plan" ? "/plan" : `/${mode}-worker`}${ticket ? ` ${ticket}` : ""}${rest ? ` ${rest}` : ""}`,
+    prompt: `/skill:${mode === "plan" ? "plan" : `${mode}-worker`}${ticket ? ` ${ticket}` : ""}${rest ? ` ${rest}` : ""}`,
     env: [
       `YOKEMATE_MODE=${mode}`,
       ...(ticket ? [`YOKEMATE_TICKET=${ticket}`] : []),
@@ -278,7 +278,7 @@ if (import.meta.filename === process.argv[1]) {
   try {
     // Same posture as the task tab: nobody sits at this agent's permission
     // dialogs while it gathers facts. The engineer joins it to answer questions.
-    startAgent(agentName, paneId, label, ["--model", model]);
+    startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
     herdr(["agent", "prompt", agentName, prompt]);
   } catch (e) {
     // The failure to report is the launch's, not the cleanup's.
