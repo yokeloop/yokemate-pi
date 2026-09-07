@@ -1,8 +1,8 @@
-// The task tab's teammates (R4.4). A tab runs from work/<TICKET>/, so the
-// repository's own .claude/agents is out of reach — the agents are linked into
-// the task folder at launch and die with it at /review. Nothing is placed
-// outside yokemate for this: the engineer's home directory is not ours to
-// arrange, and an agent left there would show up in every unrelated session.
+// The task tab's teammates (R4.4). A tab runs from work/<TICKET>/, so
+// <ROOT>/.pi/agents is out of reach — the agents are linked into the task
+// folder's own .pi/agents at launch and die with it at /review. Nothing is
+// placed outside yokemate for this: the engineer's home directory is not ours
+// to arrange, and an agent left there would show up in every unrelated session.
 import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
