@@ -79,7 +79,7 @@ function setupRoot(): { root: string; clone: string } {
   git(clone, "checkout", "main");
   git(clone, "branch", "-D", "YM-9");
 
-  const planDir = join(root, "knowledge", "testorg", "repo1", "ai", "YM-9-thing");
+  const planDir = join(root, "home", "knowledge", "testorg", "repo1", "ai", "YM-9-thing");
   mkdirSync(planDir, { recursive: true });
   writeFileSync(
     join(planDir, "YM-9-thing-plan.md"),
@@ -100,7 +100,7 @@ test("adopt assembles the stand and the review row, repeats as a no-op", () => {
   const { root } = setupRoot();
   try {
     const deps = { pull: () => {}, listPrs: () => ["https://github.com/testorg/repo1/pull/7"] };
-    const first = adopt(root, "YM-9", {}, deps);
+    const first = adopt(root, join(root, "home"), "YM-9", {}, deps);
     assert.equal(first.repeat, false);
     assert.deepEqual(first.parts, [
       { repo: "testorg/repo1", role: "app", pr: "https://github.com/testorg/repo1/pull/7" },
@@ -136,7 +136,7 @@ test("adopt assembles the stand and the review row, repeats as a no-op", () => {
       },
     ]);
 
-    const second = adopt(root, "YM-9", {}, deps);
+    const second = adopt(root, join(root, "home"), "YM-9", {}, deps);
     assert.equal(second.repeat, true, "a second adopt is a repeat, not an error");
     assert.equal((db.prepare("SELECT COUNT(*) c FROM part").get() as { c: number }).c, 1);
   } finally {
@@ -150,41 +150,41 @@ test("adopt names the missing fact and writes nothing on failure", () => {
   const { root, clone } = setupRoot();
   try {
     const prs = () => ["https://github.com/testorg/repo1/pull/7"];
-    assert.throws(() => adopt(root, "YM-777", {}, { pull: () => {}, listPrs: prs }), /плана в knowledge нет/);
+    assert.throws(() => adopt(root, join(root, "home"), "YM-777", {}, { pull: () => {}, listPrs: prs }), /плана в knowledge нет/);
 
-    const planDir = join(root, "knowledge", "testorg", "repo1", "ai", "YM-8-other");
+    const planDir = join(root, "home", "knowledge", "testorg", "repo1", "ai", "YM-8-other");
     mkdirSync(planDir, { recursive: true });
     writeFileSync(
       join(planDir, "YM-8-other-plan.md"),
       "# YM-8\n\n## Affected repositories\n\n- `testorg/repo1` — app\n",
     );
     assert.throws(
-      () => adopt(root, "YM-8", {}, { pull: () => {}, listPrs: prs }),
+      () => adopt(root, join(root, "home"), "YM-8", {}, { pull: () => {}, listPrs: prs }),
       /PR-ветки YM-8 в testorg\/repo1 нет/,
     );
 
-    const planDir9 = join(root, "knowledge", "testorg", "ghost", "ai", "YM-7-ghost");
+    const planDir9 = join(root, "home", "knowledge", "testorg", "ghost", "ai", "YM-7-ghost");
     mkdirSync(planDir9, { recursive: true });
     writeFileSync(
       join(planDir9, "YM-7-ghost-plan.md"),
       "# YM-7\n\n## Affected repositories\n\n- `testorg/ghost` — app\n",
     );
     assert.throws(
-      () => adopt(root, "YM-7", {}, { pull: () => {}, listPrs: prs }),
+      () => adopt(root, join(root, "home"), "YM-7", {}, { pull: () => {}, listPrs: prs }),
       /паспорта testorg\/ghost нет/,
     );
 
     git(clone, "checkout", "-b", "YM-6");
     git(clone, "push", "-u", "origin", "YM-6");
     git(clone, "checkout", "main");
-    const planDir6 = join(root, "knowledge", "testorg", "repo1", "ai", "YM-6-noPr");
+    const planDir6 = join(root, "home", "knowledge", "testorg", "repo1", "ai", "YM-6-noPr");
     mkdirSync(planDir6, { recursive: true });
     writeFileSync(
       join(planDir6, "YM-6-noPr-plan.md"),
       "# YM-6\n\n## Affected repositories\n\n- `testorg/repo1` — app\n",
     );
     assert.throws(
-      () => adopt(root, "YM-6", {}, { pull: () => {}, listPrs: () => [] }),
+      () => adopt(root, join(root, "home"), "YM-6", {}, { pull: () => {}, listPrs: () => [] }),
       /открытого PR по ветке YM-6/,
     );
 
@@ -207,7 +207,7 @@ test("a refused adopt creates no worktree", () => {
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-9', 'ticket:YM-9', 'planned')").run();
     assert.throws(
       () =>
-        adopt(root, "YM-9", {}, { pull: () => {}, listPrs: () => ["https://github.com/t/r/pull/7"] }),
+        adopt(root, join(root, "home"), "YM-9", {}, { pull: () => {}, listPrs: () => ["https://github.com/t/r/pull/7"] }),
       /YM-9 is at planned/,
     );
     assert.ok(!existsSync(join(root, "work", "YM-9")), "no folder may appear on a refused move");
@@ -224,7 +224,7 @@ test("a broken remote is reported as a failed fetch, not a missing branch", () =
     git(clone, "remote", "set-url", "origin", join(root, "no-such-origin.git"));
     assert.throws(
       () =>
-        adopt(root, "YM-9", {}, { pull: () => {}, listPrs: () => ["https://github.com/t/r/pull/7"] }),
+        adopt(root, join(root, "home"), "YM-9", {}, { pull: () => {}, listPrs: () => ["https://github.com/t/r/pull/7"] }),
       (e: Error) => /git fetch origin YM-9 в testorg\/repo1 не прошёл/.test(e.message),
     );
   } finally {

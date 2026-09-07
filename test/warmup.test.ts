@@ -42,7 +42,7 @@ function seedDb(root: string) {
 }
 
 function appendJournal(root: string, day: string, body: string) {
-  const dir = join(root, "journal");
+  const dir = join(root, "home", "journal");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, `${day.slice(0, 7)}.md`), body, { flag: "a" });
 }
@@ -61,7 +61,7 @@ test("digest shows the queue, work/ folders and the fresh journal tail", () => {
     appendJournal(root, stale, `- ${stale} 10:00 CCC-9 сделано: stale outcome\n`);
     appendJournal(root, fresh, `- ${fresh} 11:00 BBB-1 запланировано: fresh outcome\n`);
 
-    const digest = buildDigest(root);
+    const digest = buildDigest(root, join(root, "home"));
     assert.match(digest, /BBB-1\s+planned/);
     assert.match(digest, /BBB-2\s+review/);
     assert.ok(digest.includes("AAA-1"));
@@ -80,7 +80,7 @@ test("a work/ folder with a queue row carries no orphan mark", () => {
   try {
     seedDb(root);
     mkdirSync(join(root, "work", "BBB-1"), { recursive: true });
-    const digest = buildDigest(root);
+    const digest = buildDigest(root, join(root, "home"));
     assert.ok(digest.includes("BBB-1"));
     assert.ok(!digest.includes("нет в очереди"));
   } finally {
@@ -91,7 +91,7 @@ test("a work/ folder with a queue row carries no orphan mark", () => {
 test("missing db, journal and work/ do not throw", () => {
   const root = makeRoot();
   try {
-    const digest = buildDigest(root);
+    const digest = buildDigest(root, join(root, "home"));
     assert.ok(digest.includes("нет данных"));
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -108,7 +108,7 @@ test("the digest never exceeds 120 lines and names the full journal on trim", ()
       (_, i) => `- ${fresh} 09:${String(i % 60).padStart(2, "0")} DDD-${i} сделано: bulk outcome ${i}\n`,
     ).join("");
     appendJournal(root, fresh, lines);
-    const digest = buildDigest(root);
+    const digest = buildDigest(root, join(root, "home"));
     const count = digest.split("\n").length;
     assert.ok(count <= 120, `digest is ${count} lines`);
     assert.ok(digest.includes("обрезано"));

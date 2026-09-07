@@ -63,9 +63,21 @@ test("blanket kills and home writes are denied on tabs and stands", () => {
   assert.equal(bash(undefined, "rm -rf ~/.config/x"), null); // main chat is the engineer's hands
 
   const root = "/home/x/yokemate";
-  assert.equal(judge("do", "Bash", { command: `rm -rf ${root}/work/ACME-1/tmp` }, { root, home: "/home/x" }), null);
+  assert.equal(
+    judge(
+      "do",
+      "Bash",
+      { command: `rm -rf ${root}/work/ACME-1/tmp` },
+      { root, dataRoot: `${root}/home`, home: "/home/x" },
+    ),
+    null,
+  );
 
-  const own = { root: "/home/x/Projects/yokemate", home: "/home/x" };
+  const own = {
+    root: "/home/x/Projects/yokemate",
+    dataRoot: "/home/x/Projects/yokemate/home",
+    home: "/home/x",
+  };
   assert.equal(judge("do", "Bash", { command: "rm -rf /home/x/Projects/yokemate/work/YM-116" }, own), null);
   assert.equal(judge("ship", "Bash", { command: "rm -rf ~/Projects/yokemate/work/YM-116" }, own), null);
   assert.equal(judge("do", "Bash", { command: "rm -rf $HOME/Projects/yokemate/work/YM-116/tmp" }, own), null);
@@ -132,9 +144,12 @@ test("reading or mentioning the launcher files never asks", () => {
 // secret gist — pass by construction.
 test("note pane writes files only under notes/", () => {
   const root = "/home/x/yokemate";
-  const own = { root };
-  assert.equal(judge("note", "Write", { file_path: `${root}/notes/2026-08-28-tema.md` }, own), null);
-  assert.equal(judge("note", "Write", { file_path: `${root}/journal/2026-08.md` }, own)?.decision, "deny");
+  const own = { root, dataRoot: `${root}/home` };
+  assert.equal(judge("note", "Write", { file_path: `${root}/home/notes/2026-08-28-tema.md` }, own), null);
+  assert.equal(
+    judge("note", "Write", { file_path: `${root}/home/journal/2026-08.md` }, own)?.decision,
+    "deny",
+  );
   assert.equal(judge("note", "Edit", { file_path: `${root}/projects/o/r/src/a.ts` }, own)?.decision, "deny");
   assert.equal(
     judge("note", "NotebookEdit", { notebook_path: `${root}/projects/o/r/a.ipynb` }, own)?.decision,
@@ -144,7 +159,12 @@ test("note pane writes files only under notes/", () => {
   assert.equal(judge("note", "Write", {}, own)?.decision, "deny");
   // Other modes keep their old behavior.
   assert.equal(
-    judge("do", "Write", { file_path: `${root}/work/ACME-1/src/index.ts` }, { root, ticket: "ACME-1" }),
+    judge(
+      "do",
+      "Write",
+      { file_path: `${root}/work/ACME-1/src/index.ts` },
+      { root, dataRoot: `${root}/home`, ticket: "ACME-1" },
+    ),
     null,
   );
 });
@@ -190,7 +210,7 @@ test("browser MCP and settings edits are fenced by mode", () => {
   // and the ticket's task-folder settings. A settings.json committed inside a
   // repository worktree is ordinary work; another ticket's pane is not ours.
   const root = "/home/x/yokemate";
-  const own = { root, ticket: "ACME-1" };
+  const own = { root, dataRoot: `${root}/home`, ticket: "ACME-1" };
   assert.equal(
     judge("do", "Edit", { file_path: `${root}/.claude/settings.json` }, own)?.decision,
     "deny",
@@ -216,7 +236,8 @@ test("browser MCP and settings edits are fenced by mode", () => {
     null,
   );
   assert.equal(
-    judge("review", "Edit", { file_path: `${root}/.claude/settings.json` }, { root })?.decision,
+    judge("review", "Edit", { file_path: `${root}/.claude/settings.json` }, { root, dataRoot: `${root}/home` })
+      ?.decision,
     "deny",
   );
   assert.equal(

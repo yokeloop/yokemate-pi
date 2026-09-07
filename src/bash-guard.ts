@@ -10,6 +10,7 @@
 // a broken guard must not paralyze the work it protects.
 
 import { join, resolve } from "node:path";
+import { dataRoot as dataRootOf } from "./data-root.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -88,7 +89,7 @@ export function judge(
   mode: string | undefined,
   toolName: string,
   input: { command?: string; file_path?: string; notebook_path?: string },
-  own?: { root: string; ticket?: string; home?: string },
+  own?: { root: string; dataRoot: string; ticket?: string; home?: string },
 ): Verdict | null {
   const coding = mode === "do" || mode === "ship";
   const paneled = mode !== undefined && mode !== "";
@@ -125,7 +126,7 @@ export function judge(
         };
     }
     if (mode === "note" && own) {
-      const notesDir = join(own.root, "notes") + "/";
+      const notesDir = join(own.dataRoot, "notes") + "/";
       if (!(path ?? "").startsWith(notesDir))
         return {
           decision: "deny",
@@ -201,8 +202,10 @@ if (import.meta.filename === process.argv[1]) {
       const input = event.tool_input ?? {};
       if (input.file_path) input.file_path = resolve(input.file_path);
       if (input.notebook_path) input.notebook_path = resolve(input.notebook_path);
+      const root = resolve(new URL("..", import.meta.url).pathname);
       const v = judge(process.env.YOKEMATE_MODE, event.tool_name ?? "", input, {
-        root: resolve(new URL("..", import.meta.url).pathname),
+        root,
+        dataRoot: dataRootOf(root),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
       });
