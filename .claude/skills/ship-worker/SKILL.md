@@ -34,7 +34,7 @@ Still per key, once its branches stand on the base and the local checks are gree
 
 5. **Push to the same PRs.** The PR updates itself. Then `gh pr checks <url> --watch --fail-fast` per PR — the one form of waiting there is: the command finishes on its own. No sleep, no polling loops.
 6. **Green → merge; red → stop.** Green checks → `gh pr merge <url>` by the method the repository's convention names (the `mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed` answer is already in hand from step 1). Red you cannot make green inside the ticket's scope → do not merge: put the literal failing output in the report, leave the folder and the PRs as they stand, and do not touch the keys that follow.
-7. **Log and clean up.** After every PR of the key is merged: append `- YYYY-MM-DD HH:MM <KEY> отгружено` to `journal/YYYY-MM.md` at the yokemate root (same shape as the other outcome lines), then `rm -rf work/<KEY>` — the yokemate tree, the guard lets it pass.
+7. **Log and clean up.** After every PR of the key is merged: append `- YYYY-MM-DD HH:MM <KEY> отгружено` to `home/journal/YYYY-MM.md` at the yokemate root (same shape as the other outcome lines), then `rm -rf work/<KEY>` — the yokemate tree, the guard lets it pass.
 8. **The next key starts fresh.** `git fetch origin` and the update from the base the previous key's merge already entered — that is the point of the order.
 
 The scope is the update and the merge: no new features, no cleanups, no plan changes. Commit messages English only; no comments in code.

@@ -5,7 +5,7 @@ description: Append a concise, newest-first entry about the session's real work 
 
 # /journal — record what happened
 
-One journal for the whole pool: `<yokemate>/journal/YYYY-MM.md`, newest entry on top.
+One journal for the whole pool: `<yokemate>/home/journal/YYYY-MM.md`, newest entry on top.
 
 ## When it writes itself
 
@@ -20,7 +20,7 @@ Manual `/journal` stays for outcomes outside a stage move: conversations, decisi
 
 - what was actually done, one line per real outcome
 - decisions made, each with its why in the same line when a future reader would ask
-- links: PRs, plans, ADRs, reports in knowledge/<org>/<project>/ai/<slug>/
+- links: PRs, plans, ADRs, reports in home/knowledge/<org>/<project>/ai/<slug>/
 ```
 
 ## Rules

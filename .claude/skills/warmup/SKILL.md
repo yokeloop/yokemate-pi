@@ -11,4 +11,4 @@ The digest is the local projection — `yokemate.db`, `work/`, the journal tail 
 
 ## When the engineer asks deeper
 
-The digest is an index, not the memory. «Что было по ACME-358?» — read the full entries in `journal/YYYY-MM.md` and the plans and reports in `knowledge/<org>/<project>/ai/<slug>/` by the paths the entries name. Never retell from the digest or from memory what a file states.
+The digest is an index, not the memory. «Что было по ACME-358?» — read the full entries in `home/journal/YYYY-MM.md` and the plans and reports in `home/knowledge/<org>/<project>/ai/<slug>/` by the paths the entries name. Never retell from the digest or from memory what a file states.

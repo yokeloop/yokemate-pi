@@ -15,4 +15,4 @@ pnpm add-project <клон> --tracker acme:ACME --model opus   # подключ�
 
 - [`CLAUDE.md`](./CLAUDE.md) — правила и команды оркестратора; их читают агенты.
 - [`docs/usage.md`](./docs/usage.md) — инструкция инженера: от подключения проекта до приёмки.
-- `knowledge/<org>/<project>/` — глоссарии, ADR и артефакты задач; `journal/` — журнал пула.
+- `home/knowledge/<org>/<project>/` — глоссарии, ADR и артефакты задач; `home/journal/` — журнал пула.

@@ -68,7 +68,7 @@ Subagent types are the definitions linked into `work/<TICKET>/.claude/agents/` a
 Rules that hold for every subagent:
 
 - Work only inside your own worktree. Never touch a sibling repository.
-- Write artifacts only to the task's `ai/<slug>/` folder in `knowledge/` — never into the client repository.
+- Write artifacts only to the task's `ai/<slug>/` folder in `home/knowledge/` — never into the client repository.
 - No pauses for confirmation: there is no human watching this tab. If something is genuinely undecidable, finish everything else and name the open point in the report.
 
 ### 4. Implement
@@ -83,7 +83,7 @@ Execute the plan's steps in order. Never build past a red step.
 While coding:
 
 - Nothing long-running starts here: no dev servers, no app launches, no browsers. Only commands that finish on their own — build, lint, typecheck, unit tests, a one-shot script whose output you read. The live application is /review's job.
-- Write only inside your worktrees and the task's `ai/<slug>/` folder. The engineer's home directory and clones are read-only territory.
+- Write only inside your worktrees and the task's `ai/<slug>/` folder under `home/knowledge/`. The engineer's home directory and clones are read-only territory.
 - Write no comments in code. None. If a line needs explaining, the explanation belongs in the plan or the ADR, not in the file.
 
 ### 5. Version bump — both sides at once
