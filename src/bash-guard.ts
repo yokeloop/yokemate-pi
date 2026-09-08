@@ -38,28 +38,82 @@ const WAIT = [
 
 // A wait is judged by what the command runs, not by what it looks for:
 // `grep -n "tail -f" test/bash-guard.test.ts` searches for the text and was
-// denied on it (YM-134). Before the WAIT rules every quoted span is emptied,
-// its quotes kept so the word boundaries around them hold; a backslash keeps
-// its next character, an unclosed quote runs to the end. The other rules read
-// the command as typed.
-function outsideQuotes(cmd: string): string {
+// denied on it (YM-134). What a quoted span is depends on the pipeline it
+// stands in. Under an ordinary command it is data: emptied before the WAIT
+// rules, the quotes kept so the word boundaries around them hold. Under a
+// command that runs its argument — a nested shell, ssh, a container, RUNNER
+// below — it is a command: its quotes become `;` so the rules meet it at
+// command position, and quotes nested inside it are judged the same way.
+// A `$(…)` inside double quotes runs wherever it stands. Pipelines are cut at
+// `;`, `&`, `||` and newlines outside quotes, and the whole pipeline decides,
+// so `echo '<wait>' | sh` counts. A backslash keeps its next character, an
+// unclosed quote runs to the end. The other rules read the command as typed.
+const RUNNER = /(^|[\s|(])(ssh|sh|bash|zsh|dash|ksh|fish|eval|su|docker|podman|kubectl|nsenter|chroot)(\s|$)/;
+
+// The index of the quote closing the one at `i`, or the text's length when
+// none does; inside double quotes a backslash escapes the next character.
+function closingQuote(text: string, i: number): number {
+  const q = text[i];
+  let j = i + 1;
+  while (j < text.length && text[j] !== q) j += q === '"' && text[j] === "\\" ? 2 : 1;
+  return j;
+}
+
+// One pipeline: its quoted spans emptied (`data`) or opened as commands
+// (`command`).
+function quotedSpans(text: string, mode: "data" | "command"): string {
   let out = "";
   let i = 0;
-  while (i < cmd.length) {
-    const c = cmd[i];
+  while (i < text.length) {
+    const c = text[i];
     if (c === "\\") {
-      out += cmd.slice(i, i + 2);
+      out += text.slice(i, i + 2);
       i += 2;
     } else if (c === '"' || c === "'") {
-      let j = i + 1;
-      while (j < cmd.length && cmd[j] !== c) j += c === '"' && cmd[j] === "\\" ? 2 : 1;
-      out += j < cmd.length ? c + c : c;
+      const j = closingQuote(text, i);
+      const inner = text.slice(i + 1, j);
+      const closed = j < text.length;
+      if (mode === "command" || (c === '"' && inner.includes("$(")))
+        out += ";" + outsideQuotes(inner) + (closed ? ";" : "");
+      else out += closed ? c + c : c;
       i = j + 1;
     } else {
       out += c;
       i += 1;
     }
   }
+  return out;
+}
+
+function outsideQuotes(cmd: string): string {
+  let out = "";
+  let pipeline = "";
+  const flush = () => {
+    const data = quotedSpans(pipeline, "data");
+    out += RUNNER.test(data) ? quotedSpans(pipeline, "command") : data;
+    pipeline = "";
+  };
+  let i = 0;
+  while (i < cmd.length) {
+    const c = cmd[i];
+    if (c === "\\") {
+      pipeline += cmd.slice(i, i + 2);
+      i += 2;
+    } else if (c === '"' || c === "'") {
+      const j = closingQuote(cmd, i);
+      pipeline += cmd.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === ";" || c === "\n" || c === "&" || (c === "|" && cmd[i + 1] === "|")) {
+      flush();
+      const sep = c === "|" ? "||" : c;
+      out += sep;
+      i += sep.length;
+    } else {
+      pipeline += c;
+      i += 1;
+    }
+  }
+  flush();
   return out;
 }
 

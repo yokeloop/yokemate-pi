@@ -53,6 +53,39 @@ test("a wait inside quotes is a search, a wait outside them is a wait", () => {
   }
 });
 
+// Under a command that runs its argument — a nested shell, ssh, a container —
+// the quoted span is a command, and a wait inside it blocks the pane the same
+// way; a remote grep for the text is still a search.
+test("a quoted wait under a shell, ssh or a container is a wait", () => {
+  for (const cmd of [
+    "ssh host 'tail -f /var/log/app.log'",
+    'bash -c "tail -f dev.log"',
+    "sh -c 'sleep 300'",
+    "zsh -c 'tail -n 20 -f dev.log'",
+    'docker exec app sh -c "tail -f /var/log/x"',
+    "kubectl exec pod -- bash -c 'sleep 60'",
+    "sudo bash -c 'tail -f x'",
+    "ssh host \"bash -c 'sleep 300'\"",
+    "cd work/X && ssh host 'tail -f x'",
+    "echo 'sleep 300' | sh",
+    'echo "$(tail -f x)"',
+  ]) {
+    assert.equal(bash(undefined, cmd)?.rule, "wait", cmd);
+    assert.equal(bash("review", cmd)?.rule, "wait", cmd);
+  }
+  for (const cmd of [
+    "ssh host 'journalctl -u app --since today' | tail -100",
+    "ssh host \"grep -n 'tail -f' /etc/x\"",
+    'grep -n "ssh host \'tail -f\'" file',
+    'grep -rn "sh -c \'sleep 300\'" src',
+    "grep -n 'tail -f' file.sh",
+    'echo "done" | ssh host cat',
+  ]) {
+    assert.equal(bash(undefined, cmd), null, cmd);
+    assert.equal(bash("review", cmd), null, cmd);
+  }
+});
+
 test("plain finishing commands pass", () => {
   for (const cmd of [
     "git status --porcelain",
