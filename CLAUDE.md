@@ -4,7 +4,7 @@ Orchestrator chat for development work across multiple organizations and reposit
 
 ## Behavior
 
-- Conversation is in Russian, default Claude Code style, informal "ты". Instructions and skills are in English; command names are English identifiers.
+- Conversation is in Russian, default pi style, informal "ты". Instructions and skills are in English; command names are English identifiers.
 - Answer form = question form. Short question — short answer. The "evidence → options → recommendation" template is only for escalating a decision to the user.
 - The user's word is input, not a hypothesis. If it diverges from the code, say in one line: "to get X, Y is also needed" — then do what was asked.
 - What was named is the whole scope. Do not widen, split, file tickets, or start builds without a direct word.
@@ -58,7 +58,7 @@ A stage move is made by the mode where the result was born — the /plan flow, t
 - `pnpm pr-link <TICKET> <pr-url>...` — post the PR link into the ticket
 - `pnpm accept <TICKET> [--rework <plan-path>]` — acceptance outcome, run by the review pane at the engineer's verdict; `--rework` names the rework plan's path outright. A clean pass removes the queue row itself; the task folder stays — /ship works in it and removes it after the merge
 - `pnpm drop <TICKET>` — explicit removal of a ticket from the queue, the only row removal besides accept; worktrees, branches, PRs and the task folder are not touched. PR смержен руками мимо /ship → `pnpm drop <KEY>` + `rm -rf work/<KEY>`
-- `pnpm warmup` — the pool digest (queue, live `work/` folders, journal tail), offline and without a tracker sync; the SessionStart hook injects it at session start, `/warmup` prints it on demand
+- `pnpm warmup` — the pool digest (queue, live `work/` folders, journal tail), offline and without a tracker sync; the `session_start` hook injects it at session start, `/warmup` prints it on demand
 - `pnpm test` — smoke set, finishes in seconds; `pnpm metrics` — dialog-quality numbers on demand
 
 The six commands the engineer types to raise something — `/do`, `/review`, `/ship`, `/worklog`, `/note`, `/split` — are prompt templates in `.pi/prompts/`. `/plan`, `/journal` and `/warmup` run inline in the main chat — no pane — and stay skills in `.pi/skills/`, each called by a one-line pointer template of its own name. Merging is /ship's job: the /ship command the engineer typed is their word to merge, and no other path presses the button.
@@ -69,7 +69,7 @@ Every paned mode is two halves — the launcher the engineer types (`/review`), 
 
 The task tab's subagents live in `.pi/agents/do/`; `spawn` links them into `work/<TICKET>/.pi/agents/` at launch and they die with the task folder — nothing is placed outside yokemate for this. They are raised by the `subagent` tool of the `.pi/extensions/subagent/` extension, which runs a child `pi` per call; a subagent's final message returns to its caller as the tool result — subagents send no messages.
 
-Task tabs and mode panes run with `--dangerously-skip-permissions`; the blast radius is the task's worktrees. What used to hold on discipline, a PreToolUse guard now holds: `src/bash-guard.ts`, wired by the root `.claude/settings.json` and written into every tab's settings by `spawn` — the rules and their reasons live in that file.
+Task tabs and mode panes run with `-a` (`--approve`) — pi asks for no permission dialogs at all, and the flag only tells the tab to trust the project-local files of its own root; the blast radius is the task's worktrees. What used to hold on discipline, a guard now holds: `src/bash-guard.ts`, reached through the `tool_call` handler of `src/guards.ts`, which the root `.pi/settings.json` and the per-tab one `spawn` writes both load — the rules and their reasons live in that file.
 
 ## New machine
 

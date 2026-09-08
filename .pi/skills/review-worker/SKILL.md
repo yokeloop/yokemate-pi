@@ -32,7 +32,7 @@ First read how the project runs itself: `justfile`, `package.json` scripts, READ
 - **app** → the project's dev recipe (`just dev`, `pnpm dev` — whatever the repo declares).
 - **browser extension, or anything that cannot run standalone** → do not run it: build the unpacked artifact into `~/Downloads/<TICKET>-<repo>/`, give the engineer the path and the loading steps, and wait for their word.
 
-Never drive the engineer's browser — no claude-in-chrome, no CDP into their instance; when a look is needed, ask the engineer for a screenshot. Kill only processes you started, by saved PID — never pkill — and stop them all when the review ends. What the engineer corrects about the stand goes into `home/knowledge/<org>/<repo>/flow.md` — the next review must not relearn it.
+Never drive the engineer's browser — no CDP into their instance, no automation of it at all; when a look is needed, ask the engineer for a screenshot. Kill only processes you started, by saved PID — never pkill — and stop them all when the review ends. What the engineer corrects about the stand goes into `home/knowledge/<org>/<repo>/flow.md` — the next review must not relearn it.
 
 ## 2. Prove it before showing it
 

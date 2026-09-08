@@ -20,12 +20,12 @@ test("pi tool calls translate into the names judge() knows", () => {
     name: "Edit",
     input: { file_path: "/home/x/yokemate/.pi/settings.json" },
   });
-  assert.deepEqual(guardCall("mcp", { server: "claude-in-chrome", tool: "computer" }, CWD), {
-    name: "mcp__claude-in-chrome__computer",
+  assert.deepEqual(guardCall("mcp", { server: "youtrack-yokeloop", tool: "get_issue" }, CWD), {
+    name: "mcp__youtrack-yokeloop__get_issue",
     input: {},
   });
-  assert.deepEqual(guardCall("mcp", { tool: "computer" }, CWD), {
-    name: "mcp____computer",
+  assert.deepEqual(guardCall("mcp", { tool: "get_issue" }, CWD), {
+    name: "mcp____get_issue",
     input: {},
   });
 });
