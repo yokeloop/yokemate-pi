@@ -12,6 +12,10 @@
 //   - a `:<thinking>` suffix breaks the search — `openai-codex/gpt-6-astra`
 //     finds a row, `openai-codex/gpt-6-astra:high` prints `No models
 //     matching`. The suffix is cut off before the call and checked separately.
+//   - but a colon is not always a suffix: the catalogue carries ids of its own
+//     with one, `litellm/gpt-oss:120b`. So a tail that is not one of the seven
+//     levels sends the whole pattern to the catalogue, and only a miss there
+//     is reported as a bad level.
 //   - stdout carries the table alone (header `provider  model  context
 //     max-out  thinking  images` and its rows) or the single line `No models
 //     matching "…"`; provider chatter (`LiteLLM: …`) goes to stderr. The
@@ -59,19 +63,21 @@ export function exactMatch(model: string, rows: CatalogRow[]): CatalogRow | unde
 
 export function checkModel(pattern: string, list: (p: string) => string | null): Check {
   const { model, level } = splitThinking(pattern);
-  if (level !== undefined && !(THINKING_LEVELS as readonly string[]).includes(level))
+  const suffixed = level !== undefined && (THINKING_LEVELS as readonly string[]).includes(level);
+  const asked = suffixed ? model : pattern;
+
+  const stdout = list(asked);
+  if (stdout === null) return { ok: true, skipped: true };
+
+  const rows = parseModels(stdout);
+  if (exactMatch(asked, rows)) return { ok: true };
+  if (level !== undefined && !suffixed)
     return {
       ok: false,
       reason:
         `уровень мышления "${level}" в паттерне "${pattern}" не существует — ` +
         `есть только: ${THINKING_LEVELS.join(", ")}`,
     };
-
-  const stdout = list(model);
-  if (stdout === null) return { ok: true, skipped: true };
-
-  const rows = parseModels(stdout);
-  if (exactMatch(model, rows)) return { ok: true };
   if (rows.length === 0)
     return {
       ok: false,

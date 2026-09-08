@@ -618,7 +618,7 @@ test("teammates are linked into the task folder, relinked on relaunch", () => {
   const { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readlinkSync, rmSync } = fs;
   const tmp = mkdtempSync(join(tmpdir(), "yokemate-"));
   const src = join(tmp, "agents");
-  const dst = join(tmp, "work", "ACME-342", ".claude", "agents");
+  const dst = join(tmp, "work", "ACME-342", ".pi", "agents");
   mkdirSync(src, { recursive: true });
   writeFileSync(join(src, "task-executor.md"), "x");
   writeFileSync(join(src, "notes.txt"), "not an agent");
@@ -843,11 +843,19 @@ test("a model pattern is checked against the pi catalogue, suffix apart", () => 
   assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-luna/);
   assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-terra/);
 
-  asked.length = 0;
   const level = checkModel("gpt-5.6-terra:ultra", table);
   assert.equal(level.ok, false);
   for (const l of THINKING_LEVELS) assert.match(level.ok ? "" : level.reason, new RegExp(l));
-  assert.deepEqual(asked, []);
+
+  // A colon is not proof of a suffix: pi's own catalogue carries `gpt-oss:120b`.
+  // An unknown tail asks the catalogue for the whole pattern, and only a miss
+  // there is called a bad level.
+  const withColon =
+    "provider  model         context  max-out  thinking  images\n" +
+    "litellm   gpt-oss:120b  128K     32K      yes       no    \n";
+  asked.length = 0;
+  assert.deepEqual(checkModel("litellm/gpt-oss:120b", () => { asked.push("x"); return withColon; }), { ok: true });
+  assert.deepEqual(checkModel("gpt-oss:120b", () => withColon), { ok: true });
 
   // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
   // passports before the first pi session exists.

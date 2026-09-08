@@ -6,7 +6,7 @@
 
 ```bash
 pnpm on-me                                        # тикеты на мне, по всем YouTrack
-pnpm add-project <клон> --tracker acme:ACME --model opus   # подключить репозиторий
+pnpm add-project <клон> --tracker acme:ACME --model openai-codex/gpt-5.6-terra   # подключить репозиторий
 ```
 
 Дальше в главном чате: `/plan ACME-347` → `/do` → `/review` → `pnpm accept`.
