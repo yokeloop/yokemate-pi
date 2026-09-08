@@ -1,10 +1,11 @@
-// PreToolUse guard for every yokemate session (REFACTORING-PLAN A1). One
-// script serves three matchers — Bash, Write|Edit, and the engineer's browser
-// MCP — and decides by YOKEMATE_MODE, the same stamp mode-guard reads.
+// The rules of the tool_call guard, for every yokemate session
+// (REFACTORING-PLAN A1). Two kinds of tool reach them — Bash, and Write|Edit
+// — and they decide by YOKEMATE_MODE, the same stamp mode-guard reads.
 //
-// Everything lives in the repository: the root .claude/settings.json wires it
-// for the main chat and the mode panes, spawn.ts writes the same hooks
-// into the task tab's settings. Nothing goes to ~/.claude.
+// Everything lives in the repository: src/guards.ts hands pi's tool calls to
+// judge(), wired by the root .pi/settings.json for the main chat and the mode
+// panes and by work/<TICKET>/.pi/settings.json, which spawn.ts writes for the
+// task tab. Nothing goes to ~/.pi.
 //
 // Every deny says what to do instead. On an internal error the guard allows:
 // a broken guard must not paralyze the work it protects.
@@ -95,28 +96,14 @@ export function judge(
   const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
 
-  if (toolName.startsWith("mcp__claude-in-chrome__")) {
-    if (onStand)
-      return {
-        decision: "deny",
-        reason:
-          "The engineer's browser is theirs. Prepare the artifact and the instructions; ask the engineer for a screenshot instead of driving Chrome.",
-      };
-    return null;
-  }
-
   if (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit") {
     const path = input.file_path ?? input.notebook_path;
     if (paneled && own) {
       const fenced = [
-        join(own.root, ".claude", "settings.json"),
-        join(own.root, ".claude", "settings.local.json"),
         join(own.root, ".pi", "settings.json"),
         join(own.root, ".pi", "settings.local.json"),
         ...(own.ticket
           ? [
-              join(own.root, "work", own.ticket, ".claude", "settings.json"),
-              join(own.root, "work", own.ticket, ".claude", "settings.local.json"),
               join(own.root, "work", own.ticket, ".pi", "settings.json"),
               join(own.root, "work", own.ticket, ".pi", "settings.local.json"),
             ]
