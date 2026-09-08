@@ -22,6 +22,37 @@ test("waiting is denied in every session", () => {
   }
 });
 
+// The wait rules judge what the command runs, not what it looks for: the
+// guard once denied `grep -n "tail -f" test/bash-guard.test.ts` on the text
+// inside the quotes (YM-134). A wait outside the quotes, or one whose
+// argument is quoted, is still a wait.
+test("a wait inside quotes is a search, a wait outside them is a wait", () => {
+  for (const cmd of [
+    'grep -n "tail -f" test/bash-guard.test.ts',
+    "grep -rn 'tail -f' src",
+    'grep -rn "while true; do" src',
+    "rg 'inotifywait' .claude/skills",
+    'git log --grep="sleep 300" --oneline',
+    'echo "it\'s done"; grep -n "tail -f" x',
+  ]) {
+    assert.equal(bash(undefined, cmd), null, cmd);
+    assert.equal(bash("do", cmd), null, cmd);
+    assert.equal(bash("review", cmd), null, cmd);
+  }
+  for (const cmd of [
+    "tail -f dev.log",
+    "tail -n 20 -f file",
+    'tail -f "$LOG"',
+    "tail -n 20 -f 'dev.log'",
+    'echo "waiting"; sleep 30',
+    "grep 'x' log; tail -f log",
+    'grep -n "tail -f" x; tail -f x',
+  ]) {
+    assert.equal(bash(undefined, cmd)?.rule, "wait", cmd);
+    assert.equal(bash("do", cmd)?.rule, "wait", cmd);
+  }
+});
+
 test("plain finishing commands pass", () => {
   for (const cmd of [
     "git status --porcelain",

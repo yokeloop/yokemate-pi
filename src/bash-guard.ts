@@ -36,6 +36,33 @@ const WAIT = [
   /(^|[;&|]\s*)watch\s/,
 ];
 
+// A wait is judged by what the command runs, not by what it looks for:
+// `grep -n "tail -f" test/bash-guard.test.ts` searches for the text and was
+// denied on it (YM-134). Before the WAIT rules every quoted span is emptied,
+// its quotes kept so the word boundaries around them hold; a backslash keeps
+// its next character, an unclosed quote runs to the end. The other rules read
+// the command as typed.
+function outsideQuotes(cmd: string): string {
+  let out = "";
+  let i = 0;
+  while (i < cmd.length) {
+    const c = cmd[i];
+    if (c === "\\") {
+      out += cmd.slice(i, i + 2);
+      i += 2;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < cmd.length && cmd[j] !== c) j += c === '"' && cmd[j] === "\\" ? 2 : 1;
+      out += j < cmd.length ? c + c : c;
+      i = j + 1;
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
+}
+
 // Long-running launches: forbidden while coding (/do, /ship). The live
 // application is /review's job.
 const LAUNCH = [
@@ -131,7 +158,8 @@ export function judge(
   if (toolName !== "Bash") return null;
   const cmd = input.command ?? "";
 
-  if (WAIT.some((r) => r.test(cmd)))
+  const unquoted = outsideQuotes(cmd);
+  if (WAIT.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
