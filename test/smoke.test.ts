@@ -647,16 +647,16 @@ test("the agent launch waits for the pane's shell, and only for that", () => {
   }, 20, 0);
   assert.equal(calls.length, 4);
   assert.deepEqual(calls[0], [
-    "agent", "start", "acme-342-review", "--kind", "claude", "--pane", "w4:pC", "--",
-    "--name", "ACME-342 review", "--dangerously-skip-permissions",
+    "agent", "start", "acme-342-review", "--kind", "pi", "--pane", "w4:pC", "--",
+    "-n", "ACME-342 review", "-a",
   ]);
 
   // The engineer's model choice rides along as extra agent args.
   const withModel: string[][] = [];
-  startAgent("acme-342-worklog", "w4:pD", "ACME-342 worklog", ["--model", "opus"], (args) => {
+  startAgent("acme-342-worklog", "w4:pD", "ACME-342 worklog", ["--model", "openai-codex/gpt-5.6-terra"], (args) => {
     withModel.push(args);
   }, 20, 0);
-  assert.deepEqual(withModel[0].slice(-2), ["--model", "opus"]);
+  assert.deepEqual(withModel[0].slice(-2), ["--model", "openai-codex/gpt-5.6-terra"]);
 
   let once = 0;
   assert.throws(
