@@ -71,12 +71,15 @@ export function checkModel(pattern: string, list: (p: string) => string | null):
 
   const rows = parseModels(stdout);
   if (exactMatch(asked, rows)) return { ok: true };
+  // The tail after the colon could have been either half of the mistake, and
+  // nothing here can tell which: `gpt-oss:120c` is a typo of a real id,
+  // `gpt-5.6-terra:ultra` a level that does not exist. The message names both.
   if (level !== undefined && !suffixed)
     return {
       ok: false,
       reason:
-        `уровень мышления "${level}" в паттерне "${pattern}" не существует — ` +
-        `есть только: ${THINKING_LEVELS.join(", ")}`,
+        `модель "${pattern}" не найдена в каталоге pi — либо такой модели нет, ` +
+        `либо "${level}" не уровень мышления; уровни: ${THINKING_LEVELS.join(", ")}`,
     };
   if (rows.length === 0)
     return {
