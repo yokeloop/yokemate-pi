@@ -5,6 +5,5 @@ work/
 projects/
 node_modules/
 docs/plans/
-.claude/settings.local.json
 .pi/settings.local.json
 home/
