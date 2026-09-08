@@ -16,6 +16,7 @@ import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
 import { closeTab, findOpenTab, findRunningAgent, startAgent } from "../src/herdr.ts";
 import { stopVerdict } from "../src/report-guard.ts";
+import { THINKING_LEVELS, checkModel } from "../src/pi-model.ts";
 
 function memDb() {
   return openDb(":memory:");
@@ -809,4 +810,46 @@ test("outcome lines append to the month journal", () => {
   assert.equal(content.split("\n").filter(Boolean).length, 2);
   assert.match(content, /ACME-1 принято\n$/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+// 23. A model pattern is judged against pi's catalogue, and the judging is
+// pure: `pi --list-models` exits 0 on a miss too and matches fuzzily, so the
+// verdict comes from an exact `provider/id` (or bare `id`) in the parsed table.
+// The thinking suffix never reaches pi — it breaks the search.
+test("a model pattern is checked against the pi catalogue, suffix apart", () => {
+  const TABLE =
+    "provider      model          context  max-out  thinking  images\n" +
+    "openai-codex  gpt-5.6-luna   272K     128K     yes       yes   \n" +
+    "openai-codex  gpt-5.6-terra  272K     128K     yes       yes   \n";
+  const NONE = 'No models matching "opus"\n';
+
+  const asked: string[] = [];
+  const table = (p: string) => { asked.push(p); return TABLE; };
+
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", table), { ok: true });
+  assert.deepEqual(checkModel("gpt-5.6-terra", table), { ok: true });
+
+  asked.length = 0;
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra:high", table), { ok: true });
+  assert.deepEqual(asked, ["openai-codex/gpt-5.6-terra"]);
+
+  const missing = checkModel("opus", () => NONE);
+  assert.equal(missing.ok, false);
+  assert.match(missing.ok ? "" : missing.reason, /"opus"/);
+
+  // A fuzzy hit is not an exact one: the table answers, the pattern still fails
+  // and the rows it did bring back are named as the nearest.
+  const fuzzy = checkModel("openai-codex/gpt-5.6", table);
+  assert.equal(fuzzy.ok, false);
+  assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-luna/);
+  assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-terra/);
+
+  asked.length = 0;
+  const level = checkModel("gpt-5.6-terra:ultra", table);
+  assert.equal(level.ok, false);
+  for (const l of THINKING_LEVELS) assert.match(level.ok ? "" : level.reason, new RegExp(l));
+  assert.deepEqual(asked, []);
+
+  // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
+  // passports before the first pi session exists.
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", () => null), { ok: true, skipped: true });
 });
