@@ -282,9 +282,9 @@ test("project passport migrates to figma_url and subsystem", () => {
   assert.equal(row.figma_url, null);
 });
 
-// 9a. The model column lands on passports that predate it, filled once: the
-// orchestrator's own project on fable, every client project on opus. A fresh
-// database refuses a passport without a model outright.
+// 9a. The model column lands on passports that predate it, filled once with a
+// single pi pattern — the passports say nothing that would tell them apart. A
+// fresh database refuses a passport without a model outright.
 test("project passport migrates to model with one-time backfill", () => {
   const dir = fs.mkdtempSync(join(tmpdir(), "yokemate-model-"));
   const path = join(dir, "old.db");
@@ -305,8 +305,8 @@ test("project passport migrates to model with one-time backfill", () => {
     (db.prepare("SELECT repo, model FROM project").all() as unknown as
       { repo: string; model: string }[]).map((r) => [r.repo, r.model]),
   );
-  assert.equal(models["yokemate"], "fable");
-  assert.equal(models["lk-subscription"], "opus");
+  assert.equal(models["yokemate"], "openai-codex/gpt-5.6-terra");
+  assert.equal(models["lk-subscription"], "openai-codex/gpt-5.6-terra");
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 

@@ -47,7 +47,7 @@ const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 /** The model for a problem-input /plan: the passports answer by key, and a
  *  problem has no key yet — the standing default rides here (YM-84, the role
  *  the retired SPEC_MODEL played). */
-export const PLAN_MODEL = "fable";
+export const PLAN_MODEL = "openai-codex/gpt-6-astra";
 
 /** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
 export type Surface = "tab" | "split";

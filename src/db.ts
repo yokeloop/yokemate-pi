@@ -45,8 +45,9 @@ export function openDb(path: string): DatabaseSync {
       path         TEXT NOT NULL,             -- the engineer's clone; worktrees fork from here
       tracker      TEXT NOT NULL,             -- acme-eu | acme | yokeloop | github
       tracker_key  TEXT NOT NULL,             -- ACME, AEU, YM …
-      model        TEXT NOT NULL,             -- fable | opus | … — every launch for this
-                                              -- project's tickets runs on this model
+      model        TEXT NOT NULL,             -- openai-codex/gpt-5.6-terra | … — the pi model
+                                              -- pattern every launch for this project's
+                                              -- tickets runs on
       figma_mcp    TEXT,                      -- figma-acme-eu | figma-acme | NULL
       figma_url    TEXT,                      -- the repo's own design file; NULL when there is none
       subsystem    TEXT,                      -- tracker enum value that scopes this repo; NULL when
@@ -91,15 +92,10 @@ export function openDb(path: string): DatabaseSync {
   }
   if (!have.has("model")) {
     db.exec("ALTER TABLE project ADD COLUMN model TEXT");
-    // One-time backfill of the passports that predate the column: the
-    // orchestrator's own project runs on the top model, every client project
-    // on opus. New passports state their model at add-project time.
-    db.exec(
-      `UPDATE project SET model = CASE
-         WHEN org = 'yokeloop' AND repo = 'yokemate' THEN 'fable'
-         ELSE 'opus' END
-       WHERE model IS NULL`,
-    );
+    // One-time backfill of the passports that predate the column: they all
+    // take one pi pattern. New passports state their model at add-project
+    // time, checked against pi's catalogue.
+    db.exec("UPDATE project SET model = 'openai-codex/gpt-5.6-terra' WHERE model IS NULL");
   }
   // `work.project` named one repository per ticket. A ticket touches one or
   // several, the plan says which, and the parts are kept per repository in
