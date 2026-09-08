@@ -814,7 +814,8 @@ test("outcome lines append to the month journal", () => {
 // 23. A model pattern is judged against pi's catalogue, and the judging is
 // pure: `pi --list-models` exits 0 on a miss too and matches fuzzily, so the
 // verdict comes from an exact `provider/id` (or bare `id`) in the parsed table.
-// The thinking suffix never reaches pi — it breaks the search.
+// A known thinking level is cut off before the call — it breaks the search —
+// but any other tail after a colon may belong to the id and goes along.
 test("a model pattern is checked against the pi catalogue, suffix apart", () => {
   const TABLE =
     "provider      model          context  max-out  thinking  images\n" +
@@ -854,8 +855,10 @@ test("a model pattern is checked against the pi catalogue, suffix apart", () => 
     "provider  model         context  max-out  thinking  images\n" +
     "litellm   gpt-oss:120b  128K     32K      yes       no    \n";
   asked.length = 0;
-  assert.deepEqual(checkModel("litellm/gpt-oss:120b", () => { asked.push("x"); return withColon; }), { ok: true });
-  assert.deepEqual(checkModel("gpt-oss:120b", () => withColon), { ok: true });
+  const colon = (p: string) => { asked.push(p); return withColon; };
+  assert.deepEqual(checkModel("litellm/gpt-oss:120b", colon), { ok: true });
+  assert.deepEqual(asked, ["litellm/gpt-oss:120b"]);
+  assert.deepEqual(checkModel("gpt-oss:120b", colon), { ok: true });
 
   // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
   // passports before the first pi session exists.
