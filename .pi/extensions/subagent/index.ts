@@ -747,9 +747,13 @@ export default function (pi: ExtensionAPI) {
 					}
 					const agentName = params.agent;
 					let child: ChildProcess | undefined;
+					// Убитый сигналом ребёнок закрывается с code === null, а
+					// runSingleAgent превращает его в exitCode 0 — без этого флага
+					// снятый руками процесс отчитался бы как успех.
+					let killedBySignal = false;
 					const settle = (failed: boolean, text: string) => {
 						if (child) detached.delete(child);
-						reportDetached(agentName, failed, text);
+						reportDetached(agentName, failed || killedBySignal, text);
 					};
 					void runSingleAgent(
 						ctx.cwd,
@@ -765,7 +769,10 @@ export default function (pi: ExtensionAPI) {
 						(proc) => {
 							child = proc;
 							detached.add(proc);
-							proc.once("close", () => detached.delete(proc));
+							proc.once("close", (_code, signalName) => {
+								if (signalName) killedBySignal = true;
+								detached.delete(proc);
+							});
 						},
 					).then(
 						(result) => settle(isFailedResult(result), getResultOutput(result)),
