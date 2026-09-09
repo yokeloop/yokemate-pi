@@ -70,6 +70,8 @@ Then take each created ticket through «By ticket» below. The interview already
 3. **Plan** — spawn the `plan-writer` subagent: the key, the project, the scout's facts and every decision made above. It writes the plan in the shape `PLAN-FORMAT.md` defines to `home/knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` and returns the path. Read the result: an open question left in it is a defect — send it back with the decisions it missed.
 4. **Record** — `pnpm plan <KEY> <plan-path>`, then one report line right here in the feed: the key, the plan's path, ready for `/do`. Inline, no `send_message` — the chat you would report to is the one you are in.
 
+The four steps above run to their end even when the engineer types into the feed midway: answer what they asked, then take up the same step and say which one you are returning to — «отвечаю и возвращаюсь к шагу 2, вопросы». Only a message aimed at the planning itself — stop, another ticket, a decision changed — replaces the step instead of resuming it. A flow that ends on a stray question leaves no plan, no `planned` row, and nothing in the feed saying so.
+
 ## In a pane
 
 The `run` verdict changes only the ending. When every plan of the run is recorded, send the outcome to the pane the mode was launched from as a courtesy: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines: the keys and their plan paths, ready for `/do`. A result of `unreachable: <reason>` → say the report in this pane — the plans are already recorded either way.
