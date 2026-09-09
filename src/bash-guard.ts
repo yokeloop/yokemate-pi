@@ -32,9 +32,108 @@ const WAIT = [
   /\buntil\s+[^;\n]{0,200};\s*do\b/,
   /\bwhile\s+(true|:)\s*;\s*do\b/,
   /\binotifywait\b/,
-  /\btail\b[^\n|]*\s-[a-zA-Z]*f\b/,
+  /\btail\b[^\n|;&]*\s-[a-zA-Z]*f\b/,
   /(^|[;&|]\s*)watch\s/,
 ];
+
+// A wait is judged by what the command runs, not by what it looks for:
+// `grep -n "tail -f" test/bash-guard.test.ts` searches for the text and was
+// denied on it (YM-134). What a quoted span is depends on the pipeline it
+// stands in. Under an ordinary command it is data: emptied before the WAIT
+// rules, the quotes kept so the word boundaries around them hold. Under a
+// command that runs its argument — a nested shell, ssh, a container, RUNNER
+// below — it is a command: its quotes become `;` so the rules meet it at
+// command position, and quotes nested inside it are judged the same way.
+// A `$(…)` inside double quotes runs wherever it stands. Pipelines are cut at
+// `;`, `&`, `||` and newlines outside quotes, and the whole pipeline decides,
+// so `echo '<wait>' | sh` counts. A backslash keeps its next character, an
+// unclosed quote runs to the end. Every rule that reads the command text
+// reads it this way (YM-160); the one exception is the shape of a commit
+// message, which is the quoted span itself.
+const RUNNER = /(^|[\s|(])(ssh|sh|bash|zsh|dash|ksh|fish|eval|su|docker|podman|kubectl|nsenter|chroot)(\s|$)/;
+
+// Commands whose quoted arguments are what a rule judges — rm's paths
+// (home-rm), cat's file (env-dump): in a pipeline they lead, the quotes stay
+// as typed for the rule's own reading, `rm -rf "$DIR"` naming $DIR and
+// `cat "$ROOT/.env.local"` the file; in every other pipeline the same words
+// inside a grep pattern or a commit message are data (YM-160).
+const TARGETS = /(^|[\s|(])(rm|cat)(\s|$)/;
+
+// The index of the quote closing the one at `i`, or the text's length when
+// none does; inside double quotes a backslash escapes the next character.
+function closingQuote(text: string, i: number): number {
+  const q = text[i];
+  let j = i + 1;
+  while (j < text.length && text[j] !== q) j += q === '"' && text[j] === "\\" ? 2 : 1;
+  return j;
+}
+
+// One pipeline: its quoted spans emptied (`data`), opened as commands
+// (`command`) or left as typed (`keep`); `open` rides into the nested
+// commands.
+function quotedSpans(text: string, mode: "data" | "command" | "keep", open?: RegExp): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "\\") {
+      out += text.slice(i, i + 2);
+      i += 2;
+    } else if (c === '"' || c === "'") {
+      const j = closingQuote(text, i);
+      const inner = text.slice(i + 1, j);
+      const closed = j < text.length;
+      if (mode === "keep") out += text.slice(i, j + 1);
+      else if (mode === "command" || (c === '"' && inner.includes("$(")))
+        out += ";" + outsideQuotes(inner, open) + (closed ? ";" : "");
+      else out += closed ? c + c : c;
+      i = j + 1;
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+// The command with its quoted spans judged per pipeline: opened under a
+// RUNNER, kept as typed under a command `open` names (TARGETS for the rules
+// that read arguments), emptied everywhere else.
+function outsideQuotes(cmd: string, open?: RegExp): string {
+  let out = "";
+  let pipeline = "";
+  const flush = () => {
+    const data = quotedSpans(pipeline, "data", open);
+    out += RUNNER.test(data)
+      ? quotedSpans(pipeline, "command", open)
+      : open?.test(data)
+        ? quotedSpans(pipeline, "keep", open)
+        : data;
+    pipeline = "";
+  };
+  let i = 0;
+  while (i < cmd.length) {
+    const c = cmd[i];
+    if (c === "\\") {
+      pipeline += cmd.slice(i, i + 2);
+      i += 2;
+    } else if (c === '"' || c === "'") {
+      const j = closingQuote(cmd, i);
+      pipeline += cmd.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === ";" || c === "\n" || c === "&" || (c === "|" && cmd[i + 1] === "|")) {
+      flush();
+      const sep = c === "|" ? "||" : c;
+      out += sep;
+      i += sep.length;
+    } else {
+      pipeline += c;
+      i += 1;
+    }
+  }
+  flush();
+  return out;
+}
 
 // Long-running launches: forbidden while coding (/do, /ship). The live
 // application is /review's job.
@@ -131,7 +230,8 @@ export function judge(
   if (toolName !== "Bash") return null;
   const cmd = input.command ?? "";
 
-  if (WAIT.some((r) => r.test(cmd)))
+  const unquoted = outsideQuotes(cmd);
+  if (WAIT.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
@@ -139,8 +239,8 @@ export function judge(
     };
 
   if (mode === "note") {
-    const scrubbed = cmd.replace(/\d*>>?\s*(&\d+|\/dev\/\S+)/g, "").replace(/[=<-]>/g, "");
-    if (NOTE_WRITE.some((r) => r.test(cmd)) || />/.test(scrubbed))
+    const scrubbed = unquoted.replace(/\d*>>?\s*(&\d+|\/dev\/\S+)/g, "").replace(/[=<-]>/g, "");
+    if (NOTE_WRITE.some((r) => r.test(unquoted)) || />/.test(scrubbed))
       return {
         decision: "deny",
         reason:
@@ -148,26 +248,27 @@ export function judge(
       };
   }
 
-  if (coding && LAUNCH.some((r) => r.test(cmd)))
+  if (coding && LAUNCH.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Nothing long-running starts while coding: no dev servers, no app launches, no browsers. Only commands that finish on their own — build, lint, typecheck, unit tests. The live application is /review's job.",
     };
 
-  if (onStand && KILL.some((r) => r.test(cmd)))
+  if (onStand && KILL.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Kill only processes you started, by their saved PID: kill $PID. Blanket kills reach the engineer's own processes.",
     };
 
+  const targets = outsideQuotes(cmd, TARGETS);
   if (
     onStand &&
-    /\brm\b/.test(cmd) &&
-    HOME_PATH.test(cmd) &&
-    !DOWNLOADS.test(cmd) &&
-    !inYokemateTree(cmd, own)
+    /\brm\b/.test(targets) &&
+    HOME_PATH.test(targets) &&
+    !DOWNLOADS.test(targets) &&
+    !inYokemateTree(targets, own)
   )
     return {
       decision: "deny",
@@ -175,7 +276,7 @@ export function judge(
         "Your writable world is the task worktrees and knowledge/…/ai/. The engineer's home directory is not ours to change (~/Downloads on the engineer's word is the one exception).",
     };
 
-  if (!paneled && SHIP_LAUNCH.test(cmd))
+  if (!paneled && SHIP_LAUNCH.test(unquoted))
     return {
       decision: "ask",
       reason: "Ship merges — the one launch there is no way back from. Confirm this run is on the engineer's word.",
