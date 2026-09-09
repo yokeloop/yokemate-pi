@@ -12,7 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +22,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionContext,
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -29,10 +30,135 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+
+interface Limits {
+	maxParallelTasks: number;
+	maxConcurrency: number;
+	maxDetached: number;
+}
+
+const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
+
+const limitsByCwd = new Map<string, Limits>();
+
+function validateLimits(limits: Limits): string | undefined {
+	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
+		const value = limits[key];
+		if (!Number.isInteger(value) || value < 1) return `${key} must be an integer >= 1, got ${JSON.stringify(value)}`;
+	}
+	if (limits.maxConcurrency > limits.maxParallelTasks)
+		return `maxConcurrency (${limits.maxConcurrency}) must be <= maxParallelTasks (${limits.maxParallelTasks})`;
+	if (limits.maxDetached < limits.maxParallelTasks)
+		return `maxDetached (${limits.maxDetached}) must be >= maxParallelTasks (${limits.maxParallelTasks})`;
+	return undefined;
+}
+
+// Лимиты сцеплены друг с другом, поэтому набор из настроек либо принимается
+// целиком, либо отбрасывается целиком: половина от инженера, половина из кода
+// дала бы комбинацию, которой никто не выбирал.
+function loadLimits(cwd: string): Limits {
+	const cached = limitsByCwd.get(cwd);
+	if (cached) return cached;
+
+	let limits = DEFAULT_LIMITS;
+	const file = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
+	try {
+		if (fs.existsSync(file)) {
+			const raw = JSON.parse(fs.readFileSync(file, "utf-8"))?.subagent;
+			if (raw && typeof raw === "object") {
+				// Умолчание подгоняется под названное соседнее поле: инженер,
+				// написавший один только maxParallelTasks, назвал число, а не
+				// повод отказать себе умолчанием из кода.
+				const maxParallelTasks = raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks;
+				const candidate: Limits = {
+					maxParallelTasks,
+					maxConcurrency: raw.maxConcurrency ?? Math.min(DEFAULT_LIMITS.maxConcurrency, maxParallelTasks),
+					maxDetached: raw.maxDetached ?? Math.max(DEFAULT_LIMITS.maxDetached, maxParallelTasks),
+				};
+				const problem = validateLimits(candidate);
+				if (problem) console.error(`[subagent] ignoring subagent limits in ${file}: ${problem}`);
+				else limits = candidate;
+			}
+		}
+	} catch (e) {
+		console.error(`[subagent] could not read subagent limits in ${file}: ${(e as Error)?.message || String(e)}`);
+	}
+
+	limitsByCwd.set(cwd, limits);
+	return limits;
+}
+
+// Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
+// нет, и убить их некому, кроме конца сессии.
+const detached = new Set<ChildProcess>();
+// Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
+// тул-коллов одного хода исполняется в один тик — по одному лишь размеру
+// реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
+// в execute, и снимается со счёта своим settle.
+let activeUnits = 0;
+// Уборка на session_shutdown видит только уже поднятых детей. Очередь батча
+// (задачи сверх maxConcurrency) и следующий шаг цепочки поднимаются позже — в
+// те миллисекунды, что pi ещё дочитывает ввод, — и осиротели бы. Флаг
+// закрывает очередь; turn_start снимает его, если сессия вернулась.
+let shuttingDown = false;
+
+// Батч закрывает расширение: сколько поднято и сколько осело, знает только
+// оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
+type Batch = { total: number; settled: number; outcomes: { agent: string; failed: boolean }[] };
+const batches = new Map<string, Batch>();
+
+// Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
+// кто сейчас работает, видно только отсюда — строкой над редактором.
+const runningAgents = new Map<ChildProcess, { name: string; startedAt: number }>();
+let widgetTimer: NodeJS.Timeout | undefined;
+// ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
+// пришёл в execute текущего вызова или в turn_start, а не захваченному.
+let latestCtx: ExtensionContext | undefined;
+
+function formatElapsed(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+// Протухший ctx (смена сессии, /clear, форк, reload) бросает из setWidget так
+// же, как из sendMessage: висящий виджет — плата, упавшая сессия — нет.
+function renderRunningWidget(): void {
+	if (!latestCtx) return;
+	try {
+		if (runningAgents.size === 0) {
+			latestCtx.ui.setWidget("subagent-running", undefined);
+			return;
+		}
+		const now = Date.now();
+		const parts = Array.from(runningAgents.values()).map((a) => `${a.name} ${formatElapsed(now - a.startedAt)}`);
+		latestCtx.ui.setWidget("subagent-running", [`⋯ ${parts.join(" · ")}`]);
+	} catch (e) {
+		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
+	}
+}
+
+function stopWidgetTimer(): void {
+	if (!widgetTimer) return;
+	clearInterval(widgetTimer);
+	widgetTimer = undefined;
+}
+
+function trackRunning(proc: ChildProcess, name: string): void {
+	runningAgents.set(proc, { name, startedAt: Date.now() });
+	if (!widgetTimer) {
+		widgetTimer = setInterval(renderRunningWidget, 1000);
+		widgetTimer.unref();
+	}
+	renderRunningWidget();
+}
+
+function untrackRunning(proc: ChildProcess | undefined): void {
+	if (proc) runningAgents.delete(proc);
+	if (runningAgents.size === 0) stopWidgetTimer();
+	renderRunningWidget();
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -279,6 +405,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	onSpawn?: (proc: ChildProcess) => void,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -350,6 +477,7 @@ async function runSingleAgent(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			onSpawn?.(proc);
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -471,6 +599,60 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_shutdown", () => {
+		for (const proc of detached) {
+			try {
+				proc.kill("SIGTERM");
+			} catch {
+				/* ignore */
+			}
+		}
+		shuttingDown = true;
+		detached.clear();
+		batches.clear();
+		runningAgents.clear();
+		stopWidgetTimer();
+		renderRunningWidget();
+	});
+
+	pi.on("turn_start", (_event, ctx) => {
+		shuttingDown = false;
+		latestCtx = ctx;
+		renderRunningWidget();
+	});
+
+	// Отчёт приходит из отложенного колбэка: ловить бросок отсюда некому, и
+	// протухший ctx уронил бы весь процесс pi вместе с самим отчётом.
+	const sendReport = (content: string): void => {
+		try {
+			pi.sendMessage(
+				{ customType: "subagent-report", content, display: true },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch (e) {
+			console.error(`[subagent] report lost: ${(e as Error)?.message || String(e)}\n${content}`);
+		}
+	};
+
+	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
+		sendReport(`[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`);
+	};
+
+	const openBatch = (batchId: string, total: number): void => {
+		batches.set(batchId, { total, settled: 0, outcomes: [] });
+	};
+
+	const settleBatch = (batchId: string, agentName: string, failed: boolean): void => {
+		const batch = batches.get(batchId);
+		if (!batch) return;
+		batch.settled += 1;
+		batch.outcomes.push({ agent: agentName, failed });
+		if (batch.settled < batch.total) return;
+		batches.delete(batchId);
+		const outcomes = batch.outcomes.map((o) => `${o.agent} ${o.failed ? "failed" : "✓"}`).join(" · ");
+		sendReport(`[subagent batch complete] ${batch.settled}/${batch.total} · ${outcomes}`);
+	};
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -481,8 +663,10 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
 			const agentScope: AgentScope = params.agentScope ?? "project";
+			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -504,6 +688,67 @@ export default function (pi: ExtensionAPI) {
 					projectAgentsDir: discovery.projectAgentsDir,
 					results,
 				});
+
+			// Один ребёнок, отвязанный: тул-колл уже вернулся, поэтому исход
+			// доходит только сообщением, и своим на каждого агента.
+			const runDetachedAgent = async (
+				mode: "single" | "parallel",
+				agentName: string,
+				task: string,
+				taskCwd: string | undefined,
+				formatOutput: (result: SingleResult) => string,
+			): Promise<void> => {
+				if (shuttingDown) {
+					activeUnits -= 1;
+					console.error(`[subagent] ${agentName} dropped from the queue at shutdown, it never ran`);
+					return;
+				}
+				let child: ChildProcess | undefined;
+				// Убитый сигналом ребёнок закрывается с code === null, а
+				// runSingleAgent превращает его в exitCode 0 — без этого флага
+				// снятый руками процесс отчитался бы как успех.
+				let killedBySignal = false;
+				const settle = (failed: boolean, text: string) => {
+					activeUnits -= 1;
+					if (child) detached.delete(child);
+					untrackRunning(child);
+					reportDetached(agentName, failed || killedBySignal, text);
+					settleBatch(toolCallId, agentName, failed || killedBySignal);
+				};
+				let failed: boolean;
+				let text: string;
+				try {
+					const result = await runSingleAgent(
+						ctx.cwd,
+						dispatchDefaults,
+						agents,
+						agentName,
+						task,
+						taskCwd,
+						undefined, // step
+						undefined, // signal: тул-колл уже вернулся, отменять нечем
+						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+						makeDetails(mode),
+						(proc) => {
+							child = proc;
+							detached.add(proc);
+							trackRunning(proc, agentName);
+							proc.once("close", (_code, signalName) => {
+								if (signalName) killedBySignal = true;
+								detached.delete(proc);
+							});
+						},
+					);
+					failed = isFailedResult(result);
+					text = formatOutput(result);
+				} catch (e) {
+					failed = true;
+					text = (e as Error)?.message || String(e);
+				}
+				// Один вызов settle на все исходы: из try он мог бы уйти в свой
+				// же catch и отчитаться дважды.
+				settle(failed, text);
+			};
 
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
@@ -549,168 +794,164 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				const steps = params.chain;
+				if (activeUnits + 1 > limits.maxDetached) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
+							},
+						],
+						details: makeDetails("chain")([]),
+						isError: true,
+					};
+				}
+
+				activeUnits += 1;
+				openBatch(toolCallId, 1);
+
+				// Цепочка — одна единица: каждый шаг питается {previous}
+				// предыдущего, промежуточный вывод сам по себе не результат.
+				// Отсюда один отчёт, в конце, и одна запись в батче.
+				const runChain = async (): Promise<void> => {
+					let previousOutput = "";
+					let lastAgent = steps[steps.length - 1].agent;
+					const settle = (failed: boolean, agentName: string, text: string) => {
+						activeUnits -= 1;
+						reportDetached(failed ? "chain" : agentName, failed, text);
+						settleBatch(toolCallId, agentName, failed);
+					};
+
+					for (let i = 0; i < steps.length; i++) {
+						if (shuttingDown) {
+							activeUnits -= 1;
+							console.error(
+								`[subagent] chain dropped at shutdown before step ${i + 1} (${steps[i].agent}), it never ran`,
+							);
+							return;
+						}
+						const step = steps[i];
+						lastAgent = step.agent;
+						let killedBySignal = false;
+						let result: SingleResult;
+						try {
+							result = await runSingleAgent(
+								ctx.cwd,
+								dispatchDefaults,
+								agents,
+								step.agent,
+								step.task.replace(/\{previous\}/g, previousOutput),
+								step.cwd,
+								i + 1,
+								undefined, // signal: тул-колл уже вернулся, отменять нечем
+								undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+								makeDetails("chain"),
+								(proc) => {
+									detached.add(proc);
+									trackRunning(proc, step.agent);
+									proc.once("close", (_code, signalName) => {
+										if (signalName) killedBySignal = true;
+										detached.delete(proc);
+										untrackRunning(proc);
+									});
+								},
+							);
+						} catch (e) {
+							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${(e as Error)?.message || String(e)}`);
+							return;
+						}
+						if (isFailedResult(result) || killedBySignal) {
+							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${getResultOutput(result)}`);
+							return;
+						}
+						previousOutput = getFinalOutput(result.messages);
+					}
+					settle(false, lastAgent, previousOutput);
+				};
+				void runChain().catch((e) => console.error(`[subagent] chain failed: ${(e as Error)?.message || String(e)}`));
+
+				const names = steps.map((step) => step.agent).join(" → ");
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Detached: chain of ${steps.length} steps running (${names}). Its report will arrive as a separate message.`,
+						},
+					],
+					details: makeDetails("chain")([]),
+				};
+			}
+
+			if (params.tasks && params.tasks.length > 0) {
+				const tasks = params.tasks;
+				if (tasks.length > limits.maxParallelTasks)
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
 					};
 
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				if (activeUnits + tasks.length > limits.maxDetached) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
+							},
+						],
+						details: makeDetails("parallel")([]),
+						isError: true,
 					};
 				}
 
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
+				activeUnits += tasks.length;
+				openBatch(toolCallId, tasks.length);
+				void mapWithConcurrencyLimit(tasks, limits.maxConcurrency, (t) =>
+					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
+				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
+				const names = tasks.map((t) => t.agent).join(", ");
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text: `Detached: ${tasks.length} agents running (${names}). Their reports will arrive as separate messages prefixed "[subagent <name>]" — do not call subagent again for these tasks.`,
 						},
 					],
-					details: makeDetails("parallel")(results),
+					details: makeDetails("parallel")([]),
 				};
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
+				if (activeUnits + 1 > limits.maxDetached) {
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
+						content: [
+							{
+								type: "text",
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
+							},
+						],
+						details: makeDetails("single")([]),
 						isError: true,
 					};
 				}
+				const agentName = params.agent;
+				activeUnits += 1;
+				openBatch(toolCallId, 1);
+				void runDetachedAgent("single", agentName, params.task, params.cwd, getResultOutput);
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
+					content: [
+						{
+							type: "text",
+							text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
+						},
+					],
+					details: makeDetails("single")([]),
 				};
 			}
 
