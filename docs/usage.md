@@ -36,6 +36,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--fig
 ## Прочее
 
 - `pnpm pr-link ACME-342 <url>…` — ссылка на PR комментарием в тикет.
+- `pnpm say [--to <pane>] "<текст>"` — отправка сообщения в inbox панели (обратный адрес по `HERDR_PANE_ID`).
 - `pnpm drop ACME-342` — явное снятие тикета с очереди; ворктри, ветки, PR и папка задачи не трогаются. PR смержен руками мимо /ship → `pnpm drop <KEY>` + `rm -rf work/<KEY>`.
 - `pnpm stage ACME-342 <stage> [путь-к-плану] [--force]` — ремонт из главного чата, только с `--force`; легальные переходы делают свои команды (`plan`, `spawn`, `record-report`, `accept`). Вкладки закрывает `pnpm close-mode <ship|do> ACME-342` по уведомлению.
 - `/journal` — запись в `home/journal/YYYY-MM.md`: только реальные итоги и решения с их «почему», по одной записи на проект.
