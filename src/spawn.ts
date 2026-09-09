@@ -97,6 +97,21 @@ mkdirSync(folder, { recursive: true });
 // work/<TICKET>/.pi/extensions, which holds nothing — so all three are wired
 // here. The paths are absolute: the tab has no relative path to the engine.
 mkdirSync(join(folder, ".pi"), { recursive: true });
+
+// The subagent limits are the engineer's, and the tab is where they matter:
+// its own settings file is written from scratch, so the block is carried over
+// from the root one. No block in the root — none in the tab either.
+let subagentSettings: unknown;
+try {
+  const rootSettings = JSON.parse(readFileSync(join(ROOT, ".pi", "settings.json"), "utf8"));
+  if (rootSettings?.subagent !== undefined) subagentSettings = rootSettings.subagent;
+} catch (e) {
+  // No settings file is the ordinary case. A file that is there and broken is
+  // not: silence would drop the engineer's limits exactly where they matter.
+  if ((e as NodeJS.ErrnoException)?.code !== "ENOENT")
+    console.error(`spawn: root .pi/settings.json unreadable, the tab gets no subagent block: ${(e as Error)?.message || String(e)}`);
+}
+
 writeFileSync(
   join(folder, ".pi", "settings.json"),
   JSON.stringify(
@@ -106,6 +121,7 @@ writeFileSync(
         join(ROOT, "src", "bus.ts"),
         join(ROOT, ".pi", "extensions", "subagent", "index.ts"),
       ],
+      ...(subagentSettings !== undefined ? { subagent: subagentSettings } : {}),
     },
     null,
     2,
