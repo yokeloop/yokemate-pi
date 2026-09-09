@@ -104,8 +104,11 @@ let subagentSettings: unknown;
 try {
   const rootSettings = JSON.parse(readFileSync(join(ROOT, ".pi", "settings.json"), "utf8"));
   if (rootSettings?.subagent !== undefined) subagentSettings = rootSettings.subagent;
-} catch {
-  /* no root settings, or unreadable — the tab runs the extension's defaults */
+} catch (e) {
+  // No settings file is the ordinary case. A file that is there and broken is
+  // not: silence would drop the engineer's limits exactly where they matter.
+  if ((e as NodeJS.ErrnoException)?.code !== "ENOENT")
+    console.error(`spawn: root .pi/settings.json unreadable, the tab gets no subagent block: ${(e as Error)?.message || String(e)}`);
 }
 
 writeFileSync(

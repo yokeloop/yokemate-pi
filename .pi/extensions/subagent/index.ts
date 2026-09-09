@@ -98,6 +98,11 @@ const detached = new Set<ChildProcess>();
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
 // в execute, и снимается со счёта своим settle.
 let activeUnits = 0;
+// Уборка на session_shutdown видит только уже поднятых детей. Очередь батча
+// (задачи сверх maxConcurrency) и следующий шаг цепочки поднимаются позже — в
+// те миллисекунды, что pi ещё дочитывает ввод, — и осиротели бы. Флаг
+// закрывает очередь; turn_start снимает его, если сессия вернулась.
+let shuttingDown = false;
 
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
@@ -602,6 +607,7 @@ export default function (pi: ExtensionAPI) {
 				/* ignore */
 			}
 		}
+		shuttingDown = true;
 		detached.clear();
 		batches.clear();
 		runningAgents.clear();
@@ -610,6 +616,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
+		shuttingDown = false;
 		latestCtx = ctx;
 		renderRunningWidget();
 	});
@@ -691,6 +698,10 @@ export default function (pi: ExtensionAPI) {
 				taskCwd: string | undefined,
 				formatOutput: (result: SingleResult) => string,
 			): Promise<void> => {
+				if (shuttingDown) {
+					activeUnits -= 1;
+					return;
+				}
 				let child: ChildProcess | undefined;
 				// Убитый сигналом ребёнок закрывается с code === null, а
 				// runSingleAgent превращает его в exitCode 0 — без этого флага
@@ -812,6 +823,10 @@ export default function (pi: ExtensionAPI) {
 					};
 
 					for (let i = 0; i < steps.length; i++) {
+						if (shuttingDown) {
+							activeUnits -= 1;
+							return;
+						}
 						const step = steps[i];
 						lastAgent = step.agent;
 						let killedBySignal = false;
