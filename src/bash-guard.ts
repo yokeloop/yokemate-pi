@@ -47,8 +47,17 @@ const WAIT = [
 // A `$(…)` inside double quotes runs wherever it stands. Pipelines are cut at
 // `;`, `&`, `||` and newlines outside quotes, and the whole pipeline decides,
 // so `echo '<wait>' | sh` counts. A backslash keeps its next character, an
-// unclosed quote runs to the end. The other rules read the command as typed.
+// unclosed quote runs to the end. Every rule that reads the command text
+// reads it this way (YM-160); the one exception is the shape of a commit
+// message, which is the quoted span itself.
 const RUNNER = /(^|[\s|(])(ssh|sh|bash|zsh|dash|ksh|fish|eval|su|docker|podman|kubectl|nsenter|chroot)(\s|$)/;
+
+// Commands whose quoted arguments are what a rule judges — rm's paths
+// (home-rm), cat's file (env-dump): in a pipeline they lead, the quotes stay
+// as typed for the rule's own reading, `rm -rf "$DIR"` naming $DIR and
+// `cat "$ROOT/.env.local"` the file; in every other pipeline the same words
+// inside a grep pattern or a commit message are data (YM-160).
+const TARGETS = /(^|[\s|(])(rm|cat)(\s|$)/;
 
 // The index of the quote closing the one at `i`, or the text's length when
 // none does; inside double quotes a backslash escapes the next character.
@@ -59,9 +68,10 @@ function closingQuote(text: string, i: number): number {
   return j;
 }
 
-// One pipeline: its quoted spans emptied (`data`) or opened as commands
-// (`command`).
-function quotedSpans(text: string, mode: "data" | "command"): string {
+// One pipeline: its quoted spans emptied (`data`), opened as commands
+// (`command`) or left as typed (`keep`); `open` rides into the nested
+// commands.
+function quotedSpans(text: string, mode: "data" | "command" | "keep", open?: RegExp): string {
   let out = "";
   let i = 0;
   while (i < text.length) {
@@ -73,8 +83,9 @@ function quotedSpans(text: string, mode: "data" | "command"): string {
       const j = closingQuote(text, i);
       const inner = text.slice(i + 1, j);
       const closed = j < text.length;
-      if (mode === "command" || (c === '"' && inner.includes("$(")))
-        out += ";" + outsideQuotes(inner) + (closed ? ";" : "");
+      if (mode === "keep") out += text.slice(i, j + 1);
+      else if (mode === "command" || (c === '"' && inner.includes("$(")))
+        out += ";" + outsideQuotes(inner, open) + (closed ? ";" : "");
       else out += closed ? c + c : c;
       i = j + 1;
     } else {
@@ -85,12 +96,19 @@ function quotedSpans(text: string, mode: "data" | "command"): string {
   return out;
 }
 
-function outsideQuotes(cmd: string): string {
+// The command with its quoted spans judged per pipeline: opened under a
+// RUNNER, kept as typed under a command `open` names (TARGETS for the rules
+// that read arguments), emptied everywhere else.
+function outsideQuotes(cmd: string, open?: RegExp): string {
   let out = "";
   let pipeline = "";
   const flush = () => {
-    const data = quotedSpans(pipeline, "data");
-    out += RUNNER.test(data) ? quotedSpans(pipeline, "command") : data;
+    const data = quotedSpans(pipeline, "data", open);
+    out += RUNNER.test(data)
+      ? quotedSpans(pipeline, "command", open)
+      : open?.test(data)
+        ? quotedSpans(pipeline, "keep", open)
+        : data;
     pipeline = "";
   };
   let i = 0;
