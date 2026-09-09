@@ -94,6 +94,11 @@ const detached = new Set<ChildProcess>();
 // в execute, и снимается со счёта своим settle.
 let activeUnits = 0;
 
+// Батч закрывает расширение: сколько поднято и сколько осело, знает только
+// оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
+type Batch = { total: number; settled: number; outcomes: { agent: string; failed: boolean }[] };
+const batches = new Map<string, Batch>();
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -542,17 +547,33 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		detached.clear();
+		batches.clear();
 	});
 
-	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
+	const sendReport = (content: string): void => {
 		pi.sendMessage(
-			{
-				customType: "subagent-report",
-				content: `[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`,
-				display: true,
-			},
+			{ customType: "subagent-report", content, display: true },
 			{ deliverAs: "followUp", triggerTurn: true },
 		);
+	};
+
+	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
+		sendReport(`[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`);
+	};
+
+	const openBatch = (batchId: string, total: number): void => {
+		batches.set(batchId, { total, settled: 0, outcomes: [] });
+	};
+
+	const settleBatch = (batchId: string, agentName: string, failed: boolean): void => {
+		const batch = batches.get(batchId);
+		if (!batch) return;
+		batch.settled += 1;
+		batch.outcomes.push({ agent: agentName, failed });
+		if (batch.settled < batch.total) return;
+		batches.delete(batchId);
+		const outcomes = batch.outcomes.map((o) => `${o.agent} ${o.failed ? "failed" : "✓"}`).join(" · ");
+		sendReport(`[subagent batch complete] ${batch.settled}/${batch.total} · ${outcomes}`);
 	};
 
 	pi.registerTool({
@@ -565,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "project";
 			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {
@@ -785,6 +806,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				activeUnits += 1;
+				openBatch(toolCallId, 1);
 				const agentName = params.agent;
 				let child: ChildProcess | undefined;
 				// Убитый сигналом ребёнок закрывается с code === null, а
@@ -795,6 +817,7 @@ export default function (pi: ExtensionAPI) {
 					activeUnits -= 1;
 					if (child) detached.delete(child);
 					reportDetached(agentName, failed || killedBySignal, text);
+					settleBatch(toolCallId, agentName, failed || killedBySignal);
 				};
 				void runSingleAgent(
 					ctx.cwd,
