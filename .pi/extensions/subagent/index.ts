@@ -703,6 +703,8 @@ export default function (pi: ExtensionAPI) {
 					reportDetached(agentName, failed || killedBySignal, text);
 					settleBatch(toolCallId, agentName, failed || killedBySignal);
 				};
+				let failed: boolean;
+				let text: string;
 				try {
 					const result = await runSingleAgent(
 						ctx.cwd,
@@ -725,10 +727,15 @@ export default function (pi: ExtensionAPI) {
 							});
 						},
 					);
-					settle(isFailedResult(result), formatOutput(result));
+					failed = isFailedResult(result);
+					text = formatOutput(result);
 				} catch (e) {
-					settle(true, (e as Error)?.message || String(e));
+					failed = true;
+					text = (e as Error)?.message || String(e);
 				}
+				// Один вызов settle на все исходы: из try он мог бы уйти в свой
+				// же catch и отчитаться дважды.
+				settle(failed, text);
 			};
 
 			if (modeCount !== 1) {
