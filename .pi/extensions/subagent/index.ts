@@ -496,6 +496,17 @@ export default function (pi: ExtensionAPI) {
 		detached.clear();
 	});
 
+	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
+		pi.sendMessage(
+			{
+				customType: "subagent-report",
+				content: `[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`,
+				display: true,
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+	};
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -721,6 +732,56 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
+				if (params.detach) {
+					if (detached.size >= MAX_DETACHED) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Too many detached agents already running (${detached.size}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
+								},
+							],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					const agentName = params.agent;
+					let child: ChildProcess | undefined;
+					const settle = (failed: boolean, text: string) => {
+						if (child) detached.delete(child);
+						reportDetached(agentName, failed, text);
+					};
+					void runSingleAgent(
+						ctx.cwd,
+						dispatchDefaults,
+						agents,
+						agentName,
+						params.task,
+						params.cwd,
+						undefined, // step
+						undefined, // signal: тул-колл уже вернулся, отменять нечем — см. шаг 3
+						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+						makeDetails("single"),
+						(proc) => {
+							child = proc;
+							detached.add(proc);
+							proc.once("close", () => detached.delete(proc));
+						},
+					).then(
+						(result) => settle(isFailedResult(result), getResultOutput(result)),
+						(e) => settle(true, (e as Error)?.message || String(e)),
+					);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
+							},
+						],
+						details: makeDetails("single")([]),
+					};
+				}
+
 				const result = await runSingleAgent(
 					ctx.cwd,
 					dispatchDefaults,
