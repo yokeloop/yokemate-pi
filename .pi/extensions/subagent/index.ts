@@ -35,13 +35,14 @@ const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_DETACHED = 4;
 
-// Отвязанные (detach) дети живут дольше своего тул-колла: AbortSignal тула
-// у них уже нет, и убить их некому, кроме конца сессии.
+// Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
+// нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
-// реестра все они прошли бы потолок. Слот занимается сразу, синхронно.
-let pendingDetached = 0;
+// реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
+// в execute, и снимается со счёта своим settle.
+let activeUnits = 0;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -479,13 +480,6 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
-	detach: Type.Optional(
-		Type.Boolean({
-			description:
-				`Return immediately instead of waiting: the agent's report arrives later as a separate chat message. Single mode only, at most ${MAX_DETACHED} at a time. Default: false.`,
-			default: false,
-		}),
-	),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -518,7 +512,6 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			`Agents come from the nearest ${CONFIG_DIR_NAME}/agents — the yokemate root in the main chat, work/<TICKET>/${CONFIG_DIR_NAME}/agents in the task tab.`,
-			'Pass detach: true in single mode to get the tool result at once — the agent\'s report then arrives as a separate message prefixed "[subagent <name>]".',
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -556,14 +549,6 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
-				};
-			}
-
-			if (params.detach && !hasSingle) {
-				return {
-					content: [{ type: "text", text: "detach is supported only in single mode (agent + task)." }],
-					details: makeDetails(hasChain ? "chain" : "parallel")([]),
-					isError: true,
 				};
 			}
 
@@ -736,98 +721,61 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				if (params.detach) {
-					if (detached.size + pendingDetached >= MAX_DETACHED) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Too many detached agents already running (${detached.size + pendingDetached}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
-								},
-							],
-							details: makeDetails("single")([]),
-							isError: true,
-						};
-					}
-					pendingDetached++;
-					let reserved = true;
-					// Бронь живёт только до попадания ребёнка в реестр, иначе он
-					// считался бы дважды; пути без spawn снимают её в settle.
-					const release = () => {
-						if (!reserved) return;
-						reserved = false;
-						pendingDetached--;
-					};
-					const agentName = params.agent;
-					let child: ChildProcess | undefined;
-					// Убитый сигналом ребёнок закрывается с code === null, а
-					// runSingleAgent превращает его в exitCode 0 — без этого флага
-					// снятый руками процесс отчитался бы как успех.
-					let killedBySignal = false;
-					const settle = (failed: boolean, text: string) => {
-						release();
-						if (child) detached.delete(child);
-						reportDetached(agentName, failed || killedBySignal, text);
-					};
-					void runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						agentName,
-						params.task,
-						params.cwd,
-						undefined, // step
-						undefined, // signal: тул-колл уже вернулся, отменять нечем — см. шаг 3
-						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-						makeDetails("single"),
-						(proc) => {
-							child = proc;
-							detached.add(proc);
-							release();
-							proc.once("close", (_code, signalName) => {
-								if (signalName) killedBySignal = true;
-								detached.delete(proc);
-							});
-						},
-					).then(
-						(result) => settle(isFailedResult(result), getResultOutput(result)),
-						(e) => settle(true, (e as Error)?.message || String(e)),
-					);
+				if (activeUnits + 1 > MAX_DETACHED) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
+								text: `Too many detached agents already running (${activeUnits}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
 							},
 						],
 						details: makeDetails("single")([]),
-					};
-				}
-
-				const result = await runSingleAgent(
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
-					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
 						isError: true,
 					};
 				}
+				activeUnits += 1;
+				const agentName = params.agent;
+				let child: ChildProcess | undefined;
+				// Убитый сигналом ребёнок закрывается с code === null, а
+				// runSingleAgent превращает его в exitCode 0 — без этого флага
+				// снятый руками процесс отчитался бы как успех.
+				let killedBySignal = false;
+				const settle = (failed: boolean, text: string) => {
+					activeUnits -= 1;
+					if (child) detached.delete(child);
+					reportDetached(agentName, failed || killedBySignal, text);
+				};
+				void runSingleAgent(
+					ctx.cwd,
+					dispatchDefaults,
+					agents,
+					agentName,
+					params.task,
+					params.cwd,
+					undefined, // step
+					undefined, // signal: тул-колл уже вернулся, отменять нечем
+					undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+					makeDetails("single"),
+					(proc) => {
+						child = proc;
+						detached.add(proc);
+						proc.once("close", (_code, signalName) => {
+							if (signalName) killedBySignal = true;
+							detached.delete(proc);
+						});
+					},
+				).then(
+					(result) => settle(isFailedResult(result), getResultOutput(result)),
+					(e) => settle(true, (e as Error)?.message || String(e)),
+				);
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
+					content: [
+						{
+							type: "text",
+							text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
+						},
+					],
+					details: makeDetails("single")([]),
 				};
 			}
 
