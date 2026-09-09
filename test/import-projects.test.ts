@@ -34,7 +34,12 @@ function writeManifestFile(root: string, entries: object[]) {
   writeFileSync(join(root, "home", "projects.json"), JSON.stringify(entries, null, 2) + "\n");
 }
 
-function entryFor(remote: string, org: string, repo: string) {
+function entryFor(
+  remote: string,
+  org: string,
+  repo: string,
+  mode_models?: Record<string, string>,
+) {
   return {
     org,
     repo,
@@ -45,6 +50,7 @@ function entryFor(remote: string, org: string, repo: string) {
     figma_mcp: null,
     figma_url: null,
     subsystem: null,
+    ...(mode_models ? { mode_models } : {}),
   };
 }
 
@@ -59,7 +65,7 @@ test("an empty db gets clones and passports from the manifest", () => {
   const root = makeRoot();
   try {
     const src = makeSourceRepo(root, "alpha");
-    writeManifestFile(root, [entryFor(src, "aaa", "alpha")]);
+    writeManifestFile(root, [entryFor(src, "aaa", "alpha", { review: "luna" })]);
     const db = openDb(join(root, "yokemate.db"));
 
     importProjects(db, root, join(root, "home"));
@@ -67,12 +73,21 @@ test("an empty db gets clones and passports from the manifest", () => {
     const clonePath = join(root, "projects", "aaa", "alpha");
     assert.ok(existsSync(join(clonePath, "README.md")), "clone must exist");
     const row = db
-      .prepare("SELECT path, tracker, tracker_key, model FROM project WHERE org = ? AND repo = ?")
-      .get("aaa", "alpha") as unknown as { path: string; tracker: string; tracker_key: string; model: string };
+      .prepare(
+        "SELECT path, tracker, tracker_key, model, mode_models FROM project WHERE org = ? AND repo = ?",
+      )
+      .get("aaa", "alpha") as unknown as {
+        path: string;
+        tracker: string;
+        tracker_key: string;
+        model: string;
+        mode_models: string | null;
+      };
     assert.equal(row.path, clonePath);
     assert.equal(row.tracker, "yokeloop");
     assert.equal(row.tracker_key, "YM");
     assert.equal(row.model, "opus");
+    assert.deepEqual(JSON.parse(row.mode_models!), { review: "luna" });
     db.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -153,6 +168,26 @@ test("--only naming an absent entry fails loudly", () => {
     writeManifestFile(root, [entryFor("/nowhere", "aaa", "alpha")]);
     const db = openDb(join(root, "yokemate.db"));
     assert.throws(() => importProjects(db, root, join(root, "home"), "zzz/nope"), /zzz\/nope/);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a manifest entry without mode_models imports as no overrides", () => {
+  const root = makeRoot();
+  try {
+    const src = makeSourceRepo(root, "alpha");
+    writeManifestFile(root, [entryFor(src, "aaa", "alpha")]);
+    const db = openDb(join(root, "yokemate.db"));
+
+    importProjects(db, root, join(root, "home"));
+
+    const row = db
+      .prepare("SELECT model, mode_models FROM project WHERE org = ? AND repo = ?")
+      .get("aaa", "alpha") as unknown as { model: string; mode_models: string | null };
+    assert.equal(row.model, "opus");
+    assert.equal(row.mode_models, null, "an entry written before the field means no overrides");
     db.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
