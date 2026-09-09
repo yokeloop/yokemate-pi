@@ -113,15 +113,21 @@ function formatElapsed(ms: number): string {
 	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
+// Протухший ctx (смена сессии, /clear, форк, reload) бросает из setWidget так
+// же, как из sendMessage: висящий виджет — плата, упавшая сессия — нет.
 function renderRunningWidget(): void {
 	if (!latestCtx) return;
-	if (runningAgents.size === 0) {
-		latestCtx.ui.setWidget("subagent-running", undefined);
-		return;
+	try {
+		if (runningAgents.size === 0) {
+			latestCtx.ui.setWidget("subagent-running", undefined);
+			return;
+		}
+		const now = Date.now();
+		const parts = Array.from(runningAgents.values()).map((a) => `${a.name} ${formatElapsed(now - a.startedAt)}`);
+		latestCtx.ui.setWidget("subagent-running", [`⋯ ${parts.join(" · ")}`]);
+	} catch (e) {
+		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
 	}
-	const now = Date.now();
-	const parts = Array.from(runningAgents.values()).map((a) => `${a.name} ${formatElapsed(now - a.startedAt)}`);
-	latestCtx.ui.setWidget("subagent-running", [`⋯ ${parts.join(" · ")}`]);
 }
 
 function stopWidgetTimer(): void {
@@ -604,11 +610,17 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
+	// Отчёт приходит из отложенного колбэка: ловить бросок отсюда некому, и
+	// протухший ctx уронил бы весь процесс pi вместе с самим отчётом.
 	const sendReport = (content: string): void => {
-		pi.sendMessage(
-			{ customType: "subagent-report", content, display: true },
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
+		try {
+			pi.sendMessage(
+				{ customType: "subagent-report", content, display: true },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch (e) {
+			console.error(`[subagent] report lost: ${(e as Error)?.message || String(e)}\n${content}`);
+		}
 	};
 
 	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
