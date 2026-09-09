@@ -62,8 +62,8 @@ export function startAgent(
   for (let i = 1; ; i++) {
     try {
       run([
-        "agent", "start", agentName, "--kind", "claude", "--pane", paneId, "--",
-        "--name", displayName, "--dangerously-skip-permissions", ...extraAgentArgs,
+        "agent", "start", agentName, "--kind", "pi", "--pane", paneId, "--",
+        "-n", displayName, "-a", ...extraAgentArgs,
       ]);
       return;
     } catch (e) {

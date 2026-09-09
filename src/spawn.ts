@@ -1,5 +1,5 @@
 // Launch a task tab: herdr tab in work/<TICKET>/ running an interactive
-// claude session named after the ticket. The tab does the work and records its
+// pi session named after the ticket. The tab does the work and records its
 // own result (`pnpm record-report`) when the PRs are open; this script makes
 // the one move that belongs to the launcher — stage → running.
 //
@@ -170,9 +170,10 @@ const pane = created.result.root_pane.pane_id;
 // From here on the tab exists: anything that throws has to take it back down
 // by the id herdr just gave us, or the workspace fills up with empty tabs.
 try {
-  // The tab works unattended: nobody sits at its permission dialogs. Yolo mode;
-  // the blast radius is the task worktrees — the engineer's clones are never
-  // switched — and the PreToolUse guard above fences the rest.
+  // The tab works unattended: pi asks for no permission dialogs, and `-a`
+  // only trusts the project-local files of the tab's own root. The blast
+  // radius is the task worktrees — the engineer's clones are never switched —
+  // and the guard above fences the rest.
   startAgent(agentName, pane, ticket, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
   herdr(["agent", "prompt", agentName, prompt]);
 } catch (e) {

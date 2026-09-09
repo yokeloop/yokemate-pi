@@ -200,33 +200,12 @@ test("note pane bash blacklist cuts writes and passes reads", () => {
   assert.equal(bash("do", "git commit -m x"), null);
 });
 
-test("browser MCP and settings edits are fenced by mode", () => {
-  assert.equal(judge("review", "mcp__claude-in-chrome__computer", {})?.decision, "deny");
-  assert.equal(judge("do", "mcp__claude-in-chrome__navigate", {})?.decision, "deny");
-  assert.equal(judge(undefined, "mcp__claude-in-chrome__computer", {}), null);
-  assert.equal(judge("plan", "mcp__claude-in-chrome__computer", {}), null);
-
+test("settings edits are fenced by mode", () => {
   // Only the session's own configs are fenced: the instance root's settings
   // and the ticket's task-folder settings. A settings.json committed inside a
   // repository worktree is ordinary work; another ticket's pane is not ours.
   const root = "/home/x/yokemate";
   const own = { root, dataRoot: `${root}/home`, ticket: "ACME-1" };
-  assert.equal(
-    judge("do", "Edit", { file_path: `${root}/.claude/settings.json` }, own)?.decision,
-    "deny",
-  );
-  assert.equal(
-    judge("do", "Edit", { file_path: `${root}/.claude/settings.local.json` }, own)?.decision,
-    "deny",
-  );
-  assert.equal(
-    judge("review", "Edit", { file_path: `${root}/work/ACME-1/.claude/settings.json` }, own)?.decision,
-    "deny",
-  );
-  assert.equal(
-    judge("do", "Write", { file_path: `${root}/work/ACME-1/.claude/settings.local.json` }, own)?.decision,
-    "deny",
-  );
   assert.equal(
     judge("do", "Edit", { file_path: `${root}/.pi/settings.json` }, own)?.decision,
     "deny",
@@ -244,20 +223,20 @@ test("browser MCP and settings edits are fenced by mode", () => {
     "deny",
   );
   assert.equal(
-    judge("do", "Edit", { file_path: `${root}/work/ACME-1/repo/.claude/settings.json` }, own),
+    judge("do", "Edit", { file_path: `${root}/work/ACME-1/repo/.pi/settings.json` }, own),
     null,
   );
   assert.equal(
-    judge("do", "Edit", { file_path: `${root}/work/ACME-2/.claude/settings.json` }, own),
+    judge("do", "Edit", { file_path: `${root}/work/ACME-2/.pi/settings.json` }, own),
     null,
   );
   assert.equal(
-    judge("review", "Edit", { file_path: `${root}/.claude/settings.json` }, { root, dataRoot: `${root}/home` })
+    judge("review", "Edit", { file_path: `${root}/.pi/settings.json` }, { root, dataRoot: `${root}/home` })
       ?.decision,
     "deny",
   );
   assert.equal(
-    judge(undefined, "Edit", { file_path: `${root}/.claude/settings.json` }, own),
+    judge(undefined, "Edit", { file_path: `${root}/.pi/settings.json` }, own),
     null,
   );
   assert.equal(judge("do", "Write", { file_path: `${root}/work/ACME-1/src/index.ts` }, own), null);

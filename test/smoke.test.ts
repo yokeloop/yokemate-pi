@@ -16,6 +16,7 @@ import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
 import { closeTab, findOpenTab, findRunningAgent, startAgent } from "../src/herdr.ts";
 import { stopVerdict } from "../src/report-guard.ts";
+import { THINKING_LEVELS, checkModel } from "../src/pi-model.ts";
 
 function memDb() {
   return openDb(":memory:");
@@ -281,9 +282,9 @@ test("project passport migrates to figma_url and subsystem", () => {
   assert.equal(row.figma_url, null);
 });
 
-// 9a. The model column lands on passports that predate it, filled once: the
-// orchestrator's own project on fable, every client project on opus. A fresh
-// database refuses a passport without a model outright.
+// 9a. The model column lands on passports that predate it, filled once with a
+// single pi pattern — the passports say nothing that would tell them apart. A
+// fresh database refuses a passport without a model outright.
 test("project passport migrates to model with one-time backfill", () => {
   const dir = fs.mkdtempSync(join(tmpdir(), "yokemate-model-"));
   const path = join(dir, "old.db");
@@ -304,8 +305,8 @@ test("project passport migrates to model with one-time backfill", () => {
     (db.prepare("SELECT repo, model FROM project").all() as unknown as
       { repo: string; model: string }[]).map((r) => [r.repo, r.model]),
   );
-  assert.equal(models["yokemate"], "fable");
-  assert.equal(models["lk-subscription"], "opus");
+  assert.equal(models["yokemate"], "openai-codex/gpt-5.6-terra");
+  assert.equal(models["lk-subscription"], "openai-codex/gpt-5.6-terra");
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 
@@ -617,7 +618,7 @@ test("teammates are linked into the task folder, relinked on relaunch", () => {
   const { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readlinkSync, rmSync } = fs;
   const tmp = mkdtempSync(join(tmpdir(), "yokemate-"));
   const src = join(tmp, "agents");
-  const dst = join(tmp, "work", "ACME-342", ".claude", "agents");
+  const dst = join(tmp, "work", "ACME-342", ".pi", "agents");
   mkdirSync(src, { recursive: true });
   writeFileSync(join(src, "task-executor.md"), "x");
   writeFileSync(join(src, "notes.txt"), "not an agent");
@@ -647,16 +648,16 @@ test("the agent launch waits for the pane's shell, and only for that", () => {
   }, 20, 0);
   assert.equal(calls.length, 4);
   assert.deepEqual(calls[0], [
-    "agent", "start", "acme-342-review", "--kind", "claude", "--pane", "w4:pC", "--",
-    "--name", "ACME-342 review", "--dangerously-skip-permissions",
+    "agent", "start", "acme-342-review", "--kind", "pi", "--pane", "w4:pC", "--",
+    "-n", "ACME-342 review", "-a",
   ]);
 
   // The engineer's model choice rides along as extra agent args.
   const withModel: string[][] = [];
-  startAgent("acme-342-worklog", "w4:pD", "ACME-342 worklog", ["--model", "opus"], (args) => {
+  startAgent("acme-342-worklog", "w4:pD", "ACME-342 worklog", ["--model", "openai-codex/gpt-5.6-terra"], (args) => {
     withModel.push(args);
   }, 20, 0);
-  assert.deepEqual(withModel[0].slice(-2), ["--model", "opus"]);
+  assert.deepEqual(withModel[0].slice(-2), ["--model", "openai-codex/gpt-5.6-terra"]);
 
   let once = 0;
   assert.throws(
@@ -809,4 +810,57 @@ test("outcome lines append to the month journal", () => {
   assert.equal(content.split("\n").filter(Boolean).length, 2);
   assert.match(content, /ACME-1 принято\n$/);
   fs.rmSync(root, { recursive: true, force: true });
+});
+// 23. A model pattern is judged against pi's catalogue, and the judging is
+// pure: `pi --list-models` exits 0 on a miss too and matches fuzzily, so the
+// verdict comes from an exact `provider/id` (or bare `id`) in the parsed table.
+// A known thinking level is cut off before the call — it breaks the search —
+// but any other tail after a colon may belong to the id and goes along.
+test("a model pattern is checked against the pi catalogue, suffix apart", () => {
+  const TABLE =
+    "provider      model          context  max-out  thinking  images\n" +
+    "openai-codex  gpt-5.6-luna   272K     128K     yes       yes   \n" +
+    "openai-codex  gpt-5.6-terra  272K     128K     yes       yes   \n";
+  const NONE = 'No models matching "opus"\n';
+
+  const asked: string[] = [];
+  const table = (p: string) => { asked.push(p); return TABLE; };
+
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", table), { ok: true });
+  assert.deepEqual(checkModel("gpt-5.6-terra", table), { ok: true });
+
+  asked.length = 0;
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra:high", table), { ok: true });
+  assert.deepEqual(asked, ["openai-codex/gpt-5.6-terra"]);
+
+  const missing = checkModel("opus", () => NONE);
+  assert.equal(missing.ok, false);
+  assert.match(missing.ok ? "" : missing.reason, /"opus"/);
+
+  // A fuzzy hit is not an exact one: the table answers, the pattern still fails
+  // and the rows it did bring back are named as the nearest.
+  const fuzzy = checkModel("openai-codex/gpt-5.6", table);
+  assert.equal(fuzzy.ok, false);
+  assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-luna/);
+  assert.match(fuzzy.ok ? "" : fuzzy.reason, /openai-codex\/gpt-5\.6-terra/);
+
+  const level = checkModel("gpt-5.6-terra:ultra", table);
+  assert.equal(level.ok, false);
+  for (const l of THINKING_LEVELS) assert.match(level.ok ? "" : level.reason, new RegExp(l));
+
+  // A colon is not proof of a suffix: pi's own catalogue carries `gpt-oss:120b`.
+  // An unknown tail asks the catalogue for the whole pattern, and only a miss
+  // there is called a bad level.
+  const withColon =
+    "provider  model         context  max-out  thinking  images\n" +
+    "litellm   gpt-oss:120b  128K     32K      yes       no    \n";
+  asked.length = 0;
+  const colon = (p: string) => { asked.push(p); return withColon; };
+  assert.deepEqual(checkModel("litellm/gpt-oss:120b", colon), { ok: true });
+  assert.deepEqual(asked, ["litellm/gpt-oss:120b"]);
+  assert.deepEqual(checkModel("gpt-oss:120b", colon), { ok: true });
+
+  // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
+  // passports before the first pi session exists.
+  assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", () => null), { ok: true, skipped: true });
 });

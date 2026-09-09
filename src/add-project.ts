@@ -4,9 +4,9 @@
 // Everything else is derived. No interactivity (R6.3) — flags only.
 //
 // Usage:
-//   pnpm add-project <path-to-clone> --tracker acme:ACME --model opus
+//   pnpm add-project <path-to-clone> --tracker acme:ACME --model openai-codex/gpt-5.6-terra
 //     [--figma figma-acme] [--figma-file <url>] [--subsystem "Страница подписки"]
-//   pnpm add-project <path-to-clone> --tracker github:DEMO --model opus
+//   pnpm add-project <path-to-clone> --tracker github:DEMO --model openai-codex/gpt-5.6-terra
 //
 // `--model` is required: the model every launch for this project's tickets
 // runs on (YM-84).
@@ -16,6 +16,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
+import { assertModel } from "./pi-model.ts";
 import { writeManifest } from "./manifest.ts";
 import { validGithubPrefix } from "./github.ts";
 import { trackers } from "./trackers.ts";
@@ -52,7 +53,11 @@ const [trackerName, trackerKey] = (trackerArg ?? "").split(":");
 if (!trackerName || !trackerKey)
   fail("--tracker is required as <name:KEY>, e.g. --tracker acme:ACME");
 if (!model)
-  fail("--model is required — the model every launch for this project runs on, e.g. --model opus");
+  fail(
+    "--model is required — the model every launch for this project runs on, " +
+      "e.g. --model openai-codex/gpt-5.6-terra",
+  );
+assertModel(model);
 const github = trackerName === "github";
 if (github && !validGithubPrefix(trackerKey))
   fail(`--tracker github:${trackerKey} — префикс uppercase, буквы и цифры, e.g. --tracker github:DEMO`);

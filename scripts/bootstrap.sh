@@ -89,13 +89,22 @@ else
   apt_install gh
 fi
 
-say "claude code"
-if command -v claude >/dev/null 2>&1 || [ -x "$HOME/.local/bin/claude" ]; then
-  skip "claude"
+say "pi"
+if command -v pi >/dev/null 2>&1 || [ -x "$HOME/.local/share/pi-node/current/bin/pi" ]; then
+  skip "pi $(pi --version 2>/dev/null || true)"
 else
-  curl -fsSL https://claude.ai/install.sh | bash
+  curl -fsSL https://pi.dev/install.sh | sh
 fi
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/share/pi-node/current/bin:$HOME/.local/bin:$PATH"
+
+say "pi-mcp-adapter"
+if ! command -v pi >/dev/null 2>&1; then
+  echo "   pi not on PATH — extension install skipped (open a new shell and re-run)"
+elif pi list 2>/dev/null | grep -q 'npm:pi-mcp-adapter'; then
+  skip "pi-mcp-adapter"
+else
+  pi install npm:pi-mcp-adapter
+fi
 
 say "herdr"
 if command -v herdr >/dev/null 2>&1; then
@@ -106,19 +115,6 @@ else
   else
     echo "   WARNING: herdr install failed — /do tabs will not run on this machine; the rest continues" >&2
   fi
-fi
-
-say "\$HOME/.claude/settings.json (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)"
-settings="$HOME/.claude/settings.json"
-if [ ! -f "$settings" ]; then
-  mkdir -p "$HOME/.claude"
-  printf '{"env":{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1"}}\n' > "$settings"
-elif [ "$(jq -r '.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS // empty' "$settings")" = "1" ]; then
-  skip "settings.json"
-else
-  tmp="$(mktemp)"
-  jq '.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1"' "$settings" > "$tmp"
-  mv "$tmp" "$settings"
 fi
 
 say "yokemate clone at $YOKEMATE_DIR"
@@ -146,36 +142,47 @@ if [ -d "$home_dir/.git" ]; then
   mkdir -p "$home_dir/journal" "$home_dir/knowledge" "$home_dir/notes"
 fi
 
-say "user-level MCP (youtrack trackers)"
+# The secret is a file read back by `!cat`, not bearerTokenEnv: the panes do
+# not inherit .env.local, so an environment variable would have to be exported
+# from a shell profile. The merge is written with `cat > `, never `mv` — the
+# engineer's ~/.pi/agent/mcp.json is a symlink into dotfiles and `mv` would
+# replace it with a plain file. Foreign entries are left alone.
+say "user-level MCP (youtrack trackers) → \$HOME/.pi/agent/mcp.json"
 env_local="$YOKEMATE_DIR/.env.local"
+mcp="$HOME/.pi/agent/mcp.json"
+secrets="$HOME/.config/pi/mcp-secrets"
 if [ ! -f "$env_local" ]; then
   echo "   .env.local not found — MCP registration skipped (re-run after placing it)"
-elif ! command -v claude >/dev/null 2>&1; then
-  echo "   claude not on PATH — MCP registration skipped (open a new shell and re-run)"
 else
   set -a
   # shellcheck source=/dev/null
   . "$env_local"
   set +a
-  register_mcp() {
-    name="$1" url="$2" token="$3"
-    if [ -z "$url" ] || [ -z "$token" ]; then
-      echo "   $name: variables missing in .env.local — skipped"
-      return
-    fi
-    if claude mcp get "$name" >/dev/null 2>&1; then
-      skip "$name"
-    else
-      claude mcp add --scope user --transport http "$name" "$url/mcp" \
-        --header "Authorization: Bearer $token"
-    fi
-  }
+  mkdir -p "$HOME/.pi/agent" "$secrets"
+  chmod 700 "$secrets"
+  [ -f "$mcp" ] || printf '{"mcpServers":{}}\n' > "$mcp"
   while IFS='=' read -r key _ || [ -n "$key" ]; do
     case "$key" in YT_*_URL) ;; *) continue ;; esac
     base="${key%_URL}"
     name="youtrack-$(printf '%s' "${base#YT_}" | tr 'A-Z_' 'a-z-')"
     eval "url=\${$key:-}; token=\${${base}_TOKEN:-}"
-    register_mcp "$name" "$url" "$token"
+    if [ -z "$url" ] || [ -z "$token" ]; then
+      echo "   $name: variables missing in .env.local — skipped"
+      continue
+    fi
+    printf '%s' "$token" > "$secrets/$name.token"
+    chmod 600 "$secrets/$name.token"
+    reader="!cat \"\$HOME/.config/pi/mcp-secrets/$name.token\""
+    if [ "$(jq -r --arg n "$name" '.mcpServers[$n].url // empty' "$mcp")" = "$url/mcp" ] &&
+       [ "$(jq -r --arg n "$name" '.mcpServers[$n].bearerToken // empty' "$mcp")" = "$reader" ]; then
+      skip "$name"
+      continue
+    fi
+    tmp="$(mktemp)"
+    jq --arg n "$name" --arg u "$url/mcp" --arg t "$reader" \
+      '.mcpServers[$n] = {url: $u, auth: "bearer", bearerToken: $t}' "$mcp" > "$tmp"
+    cat "$tmp" > "$mcp"
+    rm -f "$tmp"
   done < "$env_local"
 fi
 
