@@ -13,6 +13,6 @@ pnpm add-project <клон> --tracker acme:ACME --model openai-codex/gpt-5.6-ter
 
 ## Документы
 
-- [`CLAUDE.md`](./CLAUDE.md) — правила и команды оркестратора; их читают агенты.
+- [`AGENTS.md`](./AGENTS.md) — правила и команды оркестратора; их читают агенты.
 - [`docs/usage.md`](./docs/usage.md) — инструкция инженера: от подключения проекта до приёмки.
 - `home/knowledge/<org>/<project>/` — глоссарии, ADR и артефакты задач; `home/journal/` — журнал пула.
