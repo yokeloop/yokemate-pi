@@ -239,8 +239,8 @@ export function judge(
     };
 
   if (mode === "note") {
-    const scrubbed = cmd.replace(/\d*>>?\s*(&\d+|\/dev\/\S+)/g, "").replace(/[=<-]>/g, "");
-    if (NOTE_WRITE.some((r) => r.test(cmd)) || />/.test(scrubbed))
+    const scrubbed = unquoted.replace(/\d*>>?\s*(&\d+|\/dev\/\S+)/g, "").replace(/[=<-]>/g, "");
+    if (NOTE_WRITE.some((r) => r.test(unquoted)) || />/.test(scrubbed))
       return {
         decision: "deny",
         reason:
@@ -248,26 +248,27 @@ export function judge(
       };
   }
 
-  if (coding && LAUNCH.some((r) => r.test(cmd)))
+  if (coding && LAUNCH.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Nothing long-running starts while coding: no dev servers, no app launches, no browsers. Only commands that finish on their own — build, lint, typecheck, unit tests. The live application is /review's job.",
     };
 
-  if (onStand && KILL.some((r) => r.test(cmd)))
+  if (onStand && KILL.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Kill only processes you started, by their saved PID: kill $PID. Blanket kills reach the engineer's own processes.",
     };
 
+  const targets = outsideQuotes(cmd, TARGETS);
   if (
     onStand &&
-    /\brm\b/.test(cmd) &&
-    HOME_PATH.test(cmd) &&
-    !DOWNLOADS.test(cmd) &&
-    !inYokemateTree(cmd, own)
+    /\brm\b/.test(targets) &&
+    HOME_PATH.test(targets) &&
+    !DOWNLOADS.test(targets) &&
+    !inYokemateTree(targets, own)
   )
     return {
       decision: "deny",
@@ -275,7 +276,7 @@ export function judge(
         "Your writable world is the task worktrees and knowledge/…/ai/. The engineer's home directory is not ours to change (~/Downloads on the engineer's word is the one exception).",
     };
 
-  if (!paneled && SHIP_LAUNCH.test(cmd))
+  if (!paneled && SHIP_LAUNCH.test(unquoted))
     return {
       decision: "ask",
       reason: "Ship merges — the one launch there is no way back from. Confirm this run is on the engineer's word.",
