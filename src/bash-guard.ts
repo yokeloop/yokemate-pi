@@ -32,7 +32,7 @@ const WAIT = [
   /\buntil\s+[^;\n]{0,200};\s*do\b/,
   /\bwhile\s+(true|:)\s*;\s*do\b/,
   /\binotifywait\b/,
-  /\btail\b[^\n|]*\s-[a-zA-Z]*f\b/,
+  /\btail\b[^\n|;&]*\s-[a-zA-Z]*f\b/,
   /(^|[;&|]\s*)watch\s/,
 ];
 
