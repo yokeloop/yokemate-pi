@@ -22,6 +22,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionContext,
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -98,6 +99,51 @@ let activeUnits = 0;
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
 type Batch = { total: number; settled: number; outcomes: { agent: string; failed: boolean }[] };
 const batches = new Map<string, Batch>();
+
+// Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
+// кто сейчас работает, видно только отсюда — строкой над редактором.
+const runningAgents = new Map<ChildProcess, { name: string; startedAt: number }>();
+let widgetTimer: NodeJS.Timeout | undefined;
+// ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
+// пришёл в execute текущего вызова или в turn_start, а не захваченному.
+let latestCtx: ExtensionContext | undefined;
+
+function formatElapsed(ms: number): string {
+	const total = Math.max(0, Math.floor(ms / 1000));
+	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function renderRunningWidget(): void {
+	if (!latestCtx) return;
+	if (runningAgents.size === 0) {
+		latestCtx.ui.setWidget("subagent-running", undefined);
+		return;
+	}
+	const now = Date.now();
+	const parts = Array.from(runningAgents.values()).map((a) => `${a.name} ${formatElapsed(now - a.startedAt)}`);
+	latestCtx.ui.setWidget("subagent-running", [`⋯ ${parts.join(" · ")}`]);
+}
+
+function stopWidgetTimer(): void {
+	if (!widgetTimer) return;
+	clearInterval(widgetTimer);
+	widgetTimer = undefined;
+}
+
+function trackRunning(proc: ChildProcess, name: string): void {
+	runningAgents.set(proc, { name, startedAt: Date.now() });
+	if (!widgetTimer) {
+		widgetTimer = setInterval(renderRunningWidget, 1000);
+		widgetTimer.unref();
+	}
+	renderRunningWidget();
+}
+
+function untrackRunning(proc: ChildProcess | undefined): void {
+	if (proc) runningAgents.delete(proc);
+	if (runningAgents.size === 0) stopWidgetTimer();
+	renderRunningWidget();
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -548,6 +594,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		detached.clear();
 		batches.clear();
+		runningAgents.clear();
+		stopWidgetTimer();
+		renderRunningWidget();
+	});
+
+	pi.on("turn_start", (_event, ctx) => {
+		latestCtx = ctx;
+		renderRunningWidget();
 	});
 
 	const sendReport = (content: string): void => {
@@ -587,6 +641,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			latestCtx = ctx;
 			const agentScope: AgentScope = params.agentScope ?? "project";
 			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {
@@ -628,6 +683,7 @@ export default function (pi: ExtensionAPI) {
 				const settle = (failed: boolean, text: string) => {
 					activeUnits -= 1;
 					if (child) detached.delete(child);
+					untrackRunning(child);
 					reportDetached(agentName, failed || killedBySignal, text);
 					settleBatch(toolCallId, agentName, failed || killedBySignal);
 				};
@@ -646,6 +702,7 @@ export default function (pi: ExtensionAPI) {
 						(proc) => {
 							child = proc;
 							detached.add(proc);
+							trackRunning(proc, agentName);
 							proc.once("close", (_code, signalName) => {
 								if (signalName) killedBySignal = true;
 								detached.delete(proc);
@@ -750,9 +807,11 @@ export default function (pi: ExtensionAPI) {
 								makeDetails("chain"),
 								(proc) => {
 									detached.add(proc);
+									trackRunning(proc, step.agent);
 									proc.once("close", (_code, signalName) => {
 										if (signalName) killedBySignal = true;
 										detached.delete(proc);
+										untrackRunning(proc);
 									});
 								},
 							);
