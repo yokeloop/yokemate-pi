@@ -33,6 +33,11 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const MAX_DETACHED = 4;
+
+// Отвязанные (detach) дети живут дольше своего тул-колла: AbortSignal тула
+// у них уже нет, и убить их некому, кроме конца сессии.
+const detached = new Set<ChildProcess>();
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -480,6 +485,17 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_shutdown", () => {
+		for (const proc of detached) {
+			try {
+				proc.kill("SIGTERM");
+			} catch {
+				/* ignore */
+			}
+		}
+		detached.clear();
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
