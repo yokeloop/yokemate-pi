@@ -5,11 +5,14 @@
 //
 // Usage:
 //   pnpm add-project <path-to-clone> --tracker acme:ACME --model openai-codex/gpt-5.6-terra
-//     [--figma figma-acme] [--figma-file <url>] [--subsystem "Страница подписки"]
+//     [--model review=openai-codex/gpt-5.6-luna] [--figma figma-acme]
+//     [--figma-file <url>] [--subsystem "Страница подписки"]
 //   pnpm add-project <path-to-clone> --tracker github:DEMO --model openai-codex/gpt-5.6-terra
 //
 // `--model` is required: the model every launch for this project's tickets
-// runs on (YM-84).
+// runs on (YM-84). It repeats as `--model <mode>=<pattern>` to name the model
+// of one panel mode — plan, review, do, ship, worklog, note — and that
+// override beats the project default for that mode alone (YM-159).
 
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync } from "node:fs";
@@ -17,6 +20,7 @@ import { join, resolve } from "node:path";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { assertModel } from "./pi-model.ts";
+import { parseModelToken, serializeModeModels, type ModeModels } from "./project-model.ts";
 import { writeManifest } from "./manifest.ts";
 import { validGithubPrefix } from "./github.ts";
 import { trackers } from "./trackers.ts";
@@ -31,33 +35,59 @@ const argv = process.argv.slice(2).filter((a) => a !== "--");
 const pos: string[] = [];
 let trackerArg: string | undefined;
 let model: string | undefined;
+const modeModels: ModeModels = {};
 let figma: string | null = null;
 let figmaUrl: string | null = null;
 let subsystem: string | null = null;
 for (let i = 0; i < argv.length; i++) {
   if (argv[i] === "--tracker") trackerArg = argv[++i];
-  else if (argv[i] === "--model") model = argv[++i];
-  else if (argv[i] === "--figma") figma = argv[++i];
+  else if (argv[i] === "--model") {
+    const token = argv[++i] ?? fail("--model needs a value");
+    // `fail` возвращает never, поэтому IIFE даёт типизированный результат
+    // без «used before assigned».
+    const parsed = (() => {
+      try {
+        return parseModelToken(token);
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    })();
+    if (parsed.mode === null) {
+      if (model !== undefined)
+        fail(
+          `--model given twice as the project default (${model}, ${parsed.model}) — ` +
+            `a per-mode value is written as <mode>=<pattern>`,
+        );
+      model = parsed.model;
+    } else modeModels[parsed.mode] = parsed.model;
+  } else if (argv[i] === "--figma") figma = argv[++i];
   else if (argv[i] === "--figma-file") figmaUrl = argv[++i];
   else if (argv[i] === "--subsystem") subsystem = argv[++i];
   else if (!argv[i].startsWith("--")) pos.push(argv[i]);
   else
     fail(
-      `unknown flag ${argv[i]} — known: --tracker <name:KEY>, --model <m>, --figma <mcp-name>, ` +
-        `--figma-file <url>, --subsystem <value>`,
+      `unknown flag ${argv[i]} — known: --tracker <name:KEY>, --model <m>|<mode>=<m> (repeatable), ` +
+        `--figma <mcp-name>, --figma-file <url>, --subsystem <value>`,
     );
 }
 
-const clonePath = pos[0] ?? fail("usage: add-project <path-to-clone> --tracker <name:KEY> --model <m> [--figma <mcp>]");
+const clonePath =
+  pos[0] ??
+  fail(
+    "usage: add-project <path-to-clone> --tracker <name:KEY> --model <m> " +
+      "[--model <mode>=<m> …] [--figma <mcp>]",
+  );
 const [trackerName, trackerKey] = (trackerArg ?? "").split(":");
 if (!trackerName || !trackerKey)
   fail("--tracker is required as <name:KEY>, e.g. --tracker acme:ACME");
 if (!model)
   fail(
     "--model is required — the model every launch for this project runs on, " +
-      "e.g. --model openai-codex/gpt-5.6-terra",
+      "e.g. --model openai-codex/gpt-5.6-terra" +
+      "; a per-mode override rides on a second --model, e.g. --model review=openai-codex/gpt-5.6-luna",
   );
 assertModel(model);
+for (const m of Object.values(modeModels)) assertModel(m);
 const github = trackerName === "github";
 if (github && !validGithubPrefix(trackerKey))
   fail(`--tracker github:${trackerKey} — префикс uppercase, буквы и цифры, e.g. --tracker github:DEMO`);
@@ -116,8 +146,8 @@ if (github) {
   if (taken) fail(`prefix ${trackerKey} is already taken by ${taken.org}/${taken.repo}`);
 }
 db.prepare(
-  `INSERT INTO project (org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `INSERT INTO project (org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem, mode_models)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
    ON CONFLICT (org, repo) DO UPDATE
      SET path = excluded.path,
          tracker = excluded.tracker,
@@ -125,8 +155,20 @@ db.prepare(
          model = excluded.model,
          figma_mcp = excluded.figma_mcp,
          figma_url = excluded.figma_url,
-         subsystem = excluded.subsystem`,
-).run(org, repo, resolve(clonePath), trackerName, trackerKey, model, figma, figmaUrl, subsystem);
+         subsystem = excluded.subsystem,
+         mode_models = excluded.mode_models`,
+).run(
+  org,
+  repo,
+  resolve(clonePath),
+  trackerName,
+  trackerKey,
+  model,
+  figma,
+  figmaUrl,
+  subsystem,
+  serializeModeModels(modeModels),
+);
 writeManifest(db, dataRoot(ROOT));
 
 // Knowledge moves in once, at connection time (R5.8): whatever the clone's
@@ -152,6 +194,9 @@ console.log(
     (subsystem ? ` · ${subsystemField}: ${subsystem}` : "") +
     (figma ? ` · ${figma}` : "") +
     (figmaUrl ? ` · design file` : "") +
+    (Object.keys(modeModels).length
+      ? ` · ${Object.entries(modeModels).map(([k, v]) => `${k}=${v}`).join(", ")}`
+      : "") +
     imported +
     " · projects.json updated",
 );

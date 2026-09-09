@@ -2,11 +2,14 @@
 // engineer's own git — the portable half of the project table. The machine-local path stays out; the
 // remote goes in, so import-projects on another machine can re-clone. Written
 // by add-project/set-model after every passport change, read by
-// import-projects.
+// import-projects. The per-mode model map rides along as an optional object
+// field, so a manifest written before it reads without complaint (YM-159).
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { MODES } from "./mode-guard.ts";
+import { parseModeModels, type ModeModels } from "./project-model.ts";
 
 export interface ManifestEntry {
   org: string;
@@ -18,6 +21,7 @@ export interface ManifestEntry {
   figma_mcp: string | null;
   figma_url: string | null;
   subsystem: string | null;
+  mode_models: ModeModels | null;
 }
 
 const REQUIRED = ["org", "repo", "remote", "tracker", "tracker_key", "model"] as const;
@@ -33,10 +37,14 @@ function manifestPath(root: string): string {
 export function writeManifest(db: DatabaseSync, root: string): number {
   const rows = db
     .prepare(
-      `SELECT org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem
+      `SELECT org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem,
+              mode_models
        FROM project ORDER BY org, repo`,
     )
-    .all() as unknown as (ManifestEntry & { path: string })[];
+    .all() as unknown as (Omit<ManifestEntry, "remote" | "mode_models"> & {
+      path: string;
+      mode_models: string | null;
+    })[];
 
   let prior = new Map<string, ManifestEntry>();
   try {
@@ -72,6 +80,10 @@ export function writeManifest(db: DatabaseSync, root: string): number {
       figma_mcp: row.figma_mcp,
       figma_url: row.figma_url,
       subsystem: row.subsystem,
+      mode_models: (() => {
+        const map = parseModeModels(row.mode_models);
+        return Object.keys(map).length === 0 ? null : map;
+      })(),
     });
   }
 
@@ -98,6 +110,25 @@ export function readManifest(root: string): ManifestEntry[] {
         throw new Error(
           `projects.json: entry ${entry.org ?? "?"}/${entry.repo ?? "?"} is missing "${field}"`,
         );
+    }
+    // The map is optional, but a hand-edited one must not lose overrides in
+    // silence: what is there is checked, what is absent is no overrides.
+    const mm = entry.mode_models;
+    if (mm !== undefined && mm !== null) {
+      const who = `${entry.org ?? "?"}/${entry.repo ?? "?"}`;
+      if (typeof mm !== "object" || Array.isArray(mm))
+        throw new Error(
+          `projects.json: entry ${who}: "mode_models" must be an object of "<mode>": "<model>" pairs`,
+        );
+      for (const [k, v] of Object.entries(mm)) {
+        if (!(MODES as readonly string[]).includes(k))
+          throw new Error(
+            `projects.json: entry ${who}: unknown mode "${k}" in mode_models — ` +
+              `the panel modes are: ${MODES.join(", ")}`,
+          );
+        if (typeof v !== "string" || v === "")
+          throw new Error(`projects.json: entry ${who}: mode_models.${k} must be a model pattern`);
+      }
     }
   }
   return parsed as ManifestEntry[];

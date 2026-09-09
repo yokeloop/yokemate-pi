@@ -7,7 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openDb, ownerFor } from "../src/db.ts";
-import { modelForOrg, modelForTicket } from "../src/project-model.ts";
+import {
+  modelForOrg,
+  modelForTicket,
+  parseModeModels,
+  parseModelToken,
+  rowModel,
+  serializeModeModels,
+} from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
 import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
@@ -320,28 +327,107 @@ test("project passport migrates to model with one-time backfill", () => {
   );
 });
 
+// 9c. The per-mode column lands on passports that predate it, and an old
+// passport still answers — with its project default, on every mode.
+test("the per-mode model column lands on an existing passport table", () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), "yokemate-mode-models-"));
+  const path = join(dir, "old.db");
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE project (
+    id INTEGER PRIMARY KEY, org TEXT NOT NULL, repo TEXT NOT NULL, path TEXT NOT NULL,
+    tracker TEXT NOT NULL, tracker_key TEXT NOT NULL, model TEXT NOT NULL, figma_mcp TEXT,
+    figma_url TEXT, subsystem TEXT, UNIQUE (org, repo))`);
+  old.prepare(
+    "INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('yokeloop','yokemate','/p','yokeloop','YM','fable')",
+  ).run();
+  const before = new Set(
+    (old.prepare("PRAGMA table_info(project)").all() as unknown as { name: string }[]).map((c) => c.name),
+  );
+  assert.equal(before.has("mode_models"), false);
+  old.close();
+
+  const db = openDb(path);
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info(project)").all() as unknown as { name: string }[]).map((c) => c.name),
+  );
+  assert.equal(cols.has("mode_models"), true);
+  const row = db
+    .prepare("SELECT model, mode_models FROM project WHERE repo = 'yokemate'")
+    .get() as unknown as { model: string; mode_models: string | null };
+  assert.equal(row.model, "fable");
+  assert.equal(row.mode_models, null);
+  assert.equal(rowModel(row, "review"), "fable");
+  assert.equal(modelForTicket(db, "YM-84", "review"), "fable");
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// 9d. The map survives the round trip column → map → column canonically, and
+// one parser reads the `<mode>=<model>` token for add-project and set-model
+// alike, so both refuse an unknown mode in the same words.
+test("a per-mode model round-trips through the column and its command token", () => {
+  assert.equal(serializeModeModels({}), null);
+
+  const map = { review: "luna", ship: "terra" } as const;
+  assert.deepEqual(parseModeModels(serializeModeModels(map)), map);
+  // Insertion order must not reach the column: two writes of one map are one string.
+  assert.equal(
+    serializeModeModels({ ship: "terra", review: "luna" }),
+    serializeModeModels({ review: "luna", ship: "terra" }),
+  );
+
+  assert.deepEqual(parseModelToken("review=x"), { mode: "review", model: "x" });
+  assert.deepEqual(parseModelToken("x"), { mode: null, model: "x" });
+  assert.throws(() => parseModelToken("foo=x"), /plan, review, do, ship, worklog, note/);
+  assert.throws(() => parseModelToken("review="), /has no model/);
+
+  // A hand-edited row never kills the launch: what is unreadable resolves to
+  // the project default instead.
+  assert.deepEqual(parseModeModels('{"review":"x","nope":"y"}'), { review: "x" });
+  assert.deepEqual(parseModeModels("не json"), {});
+  assert.deepEqual(parseModeModels('["review"]'), {});
+  assert.deepEqual(parseModeModels(null), {});
+});
+
 // 9b. Every launch's model resolves through the passports: one distinct value
 // per tracker key (or org for worklog) answers, anything else refuses loudly —
-// no default ever fills the gap.
+// no default ever fills the gap. The value is resolved per passport row before
+// the rows are deduplicated: the mode's override is what has to agree, not the
+// column it was read from.
 test("model resolves per tracker key and org, refusing gaps and disagreement", () => {
   const db = memDb();
   const ins = db.prepare(
-    "INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES (?, ?, '/p', ?, ?, ?)",
+    "INSERT INTO project (org, repo, path, tracker, tracker_key, model, mode_models) VALUES (?, ?, '/p', ?, ?, ?, ?)",
   );
-  ins.run("yokeloop", "yokemate", "yokeloop", "YM", "fable");
-  ins.run("acme", "lk-subscription", "acme", "ACME", "opus");
-  ins.run("acme", "acme-crm", "acme", "ACME", "opus");
-  ins.run("acme-eu", "repo-a", "acme-eu", "AEU", "opus");
-  ins.run("acme-eu", "repo-b", "acme-eu", "AEU", "sonnet");
+  ins.run("yokeloop", "yokemate", "yokeloop", "YM", "fable", null);
+  ins.run("acme", "lk-subscription", "acme", "ACME", "opus", '{"review":"luna"}');
+  ins.run("acme", "acme-crm", "acme", "ACME", "opus", '{"review":"luna"}');
+  ins.run("acme-eu", "repo-a", "acme-eu", "AEU", "opus", null);
+  ins.run("acme-eu", "repo-b", "acme-eu", "AEU", "sonnet", null);
+  // One key, two defaults that disagree, one plan override they share.
+  ins.run("dis", "repo-a", "dis", "DIS", "opus", '{"plan":"astra"}');
+  ins.run("dis", "repo-b", "dis", "DIS", "sonnet", '{"plan":"astra"}');
+  // One key, one default they share, two ship overrides that disagree.
+  ins.run("shp", "repo-a", "shp", "SHP", "opus", '{"ship":"astra"}');
+  ins.run("shp", "repo-b", "shp", "SHP", "opus", '{"ship":"luna"}');
 
-  assert.equal(modelForTicket(db, "YM-84"), "fable");
-  assert.equal(modelForTicket(db, "ACME-347"), "opus");
-  assert.throws(() => modelForTicket(db, "AEU-1"), /AEU/);
-  assert.throws(() => modelForTicket(db, "NOPE-1"), /NOPE/);
+  assert.equal(modelForTicket(db, "YM-84", "do"), "fable");
+  assert.equal(modelForTicket(db, "ACME-347", "do"), "opus");
+  assert.equal(modelForTicket(db, "ACME-347", "review"), "luna");
+  assert.throws(() => modelForTicket(db, "AEU-1", "do"), /AEU/);
+  assert.throws(() => modelForTicket(db, "NOPE-1", "do"), /NOPE/);
 
-  assert.equal(modelForOrg(db, "acme"), "opus");
-  assert.throws(() => modelForOrg(db, "acme-eu"), /acme-eu/);
-  assert.throws(() => modelForOrg(db, "ghost"), /ghost/);
+  // The override answers where the defaults would have refused …
+  assert.equal(modelForTicket(db, "DIS-1", "plan"), "astra");
+  assert.throws(() => modelForTicket(db, "DIS-1", "do"), /disagree on the do model/);
+  // … and refuses where the defaults would have agreed.
+  assert.equal(modelForTicket(db, "SHP-1", "do"), "opus");
+  assert.throws(() => modelForTicket(db, "SHP-1", "ship"), /disagree on the ship model/);
+
+  assert.equal(modelForOrg(db, "acme", "worklog"), "opus");
+  assert.equal(modelForOrg(db, "acme", "review"), "luna");
+  assert.throws(() => modelForOrg(db, "acme-eu", "worklog"), /acme-eu/);
+  assert.throws(() => modelForOrg(db, "ghost", "worklog"), /ghost/);
 });
 
 // 10. Subsystem groups a tracker key's repositories in `on-me`, single or multi

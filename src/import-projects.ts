@@ -14,6 +14,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { readManifest, type ManifestEntry } from "./manifest.ts";
+import { serializeModeModels } from "./project-model.ts";
 
 export type ImportDecision = "skip" | "clone" | "upsert";
 
@@ -26,8 +27,9 @@ export function decideImport(hasPassport: boolean, cloneExists: boolean): Import
 
 function upsertPassport(db: DatabaseSync, e: ManifestEntry, path: string): void {
   db.prepare(
-    `INSERT INTO project (org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO project (org, repo, path, tracker, tracker_key, model, figma_mcp, figma_url, subsystem,
+                          mode_models)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (org, repo) DO UPDATE
        SET path = excluded.path,
            tracker = excluded.tracker,
@@ -35,8 +37,20 @@ function upsertPassport(db: DatabaseSync, e: ManifestEntry, path: string): void 
            model = excluded.model,
            figma_mcp = excluded.figma_mcp,
            figma_url = excluded.figma_url,
-           subsystem = excluded.subsystem`,
-  ).run(e.org, e.repo, path, e.tracker, e.tracker_key, e.model, e.figma_mcp, e.figma_url, e.subsystem);
+           subsystem = excluded.subsystem,
+           mode_models = excluded.mode_models`,
+  ).run(
+    e.org,
+    e.repo,
+    path,
+    e.tracker,
+    e.tracker_key,
+    e.model,
+    e.figma_mcp,
+    e.figma_url,
+    e.subsystem,
+    serializeModeModels(e.mode_models ?? {}),
+  );
 }
 
 export function importProjects(
