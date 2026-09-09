@@ -611,6 +611,53 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
+			// Один ребёнок, отвязанный: тул-колл уже вернулся, поэтому исход
+			// доходит только сообщением, и своим на каждого агента.
+			const runDetachedAgent = async (
+				mode: "single" | "parallel",
+				agentName: string,
+				task: string,
+				taskCwd: string | undefined,
+				formatOutput: (result: SingleResult) => string,
+			): Promise<void> => {
+				let child: ChildProcess | undefined;
+				// Убитый сигналом ребёнок закрывается с code === null, а
+				// runSingleAgent превращает его в exitCode 0 — без этого флага
+				// снятый руками процесс отчитался бы как успех.
+				let killedBySignal = false;
+				const settle = (failed: boolean, text: string) => {
+					activeUnits -= 1;
+					if (child) detached.delete(child);
+					reportDetached(agentName, failed || killedBySignal, text);
+					settleBatch(toolCallId, agentName, failed || killedBySignal);
+				};
+				try {
+					const result = await runSingleAgent(
+						ctx.cwd,
+						dispatchDefaults,
+						agents,
+						agentName,
+						task,
+						taskCwd,
+						undefined, // step
+						undefined, // signal: тул-колл уже вернулся, отменять нечем
+						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+						makeDetails(mode),
+						(proc) => {
+							child = proc;
+							detached.add(proc);
+							proc.once("close", (_code, signalName) => {
+								if (signalName) killedBySignal = true;
+								detached.delete(proc);
+							});
+						},
+					);
+					settle(isFailedResult(result), formatOutput(result));
+				} catch (e) {
+					settle(true, (e as Error)?.message || String(e));
+				}
+			};
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
@@ -709,86 +756,46 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > limits.maxParallelTasks)
+				const tasks = params.tasks;
+				if (tasks.length > limits.maxParallelTasks)
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${limits.maxParallelTasks}.`,
+								text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
 					};
 
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				if (activeUnits + tasks.length > limits.maxDetached) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
+							},
+						],
+						details: makeDetails("parallel")([]),
+						isError: true,
 					};
 				}
 
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
+				activeUnits += tasks.length;
+				openBatch(toolCallId, tasks.length);
+				void mapWithConcurrencyLimit(tasks, limits.maxConcurrency, (t) =>
+					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
+				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
 
-				const results = await mapWithConcurrencyLimit(params.tasks, limits.maxConcurrency, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
+				const names = tasks.map((t) => t.agent).join(", ");
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text: `Detached: ${tasks.length} agents running (${names}). Their reports will arrive as separate messages prefixed "[subagent <name>]" — do not call subagent again for these tasks.`,
 						},
 					],
-					details: makeDetails("parallel")(results),
+					details: makeDetails("parallel")([]),
 				};
 			}
 
@@ -805,43 +812,10 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
+				const agentName = params.agent;
 				activeUnits += 1;
 				openBatch(toolCallId, 1);
-				const agentName = params.agent;
-				let child: ChildProcess | undefined;
-				// Убитый сигналом ребёнок закрывается с code === null, а
-				// runSingleAgent превращает его в exitCode 0 — без этого флага
-				// снятый руками процесс отчитался бы как успех.
-				let killedBySignal = false;
-				const settle = (failed: boolean, text: string) => {
-					activeUnits -= 1;
-					if (child) detached.delete(child);
-					reportDetached(agentName, failed || killedBySignal, text);
-					settleBatch(toolCallId, agentName, failed || killedBySignal);
-				};
-				void runSingleAgent(
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
-					agentName,
-					params.task,
-					params.cwd,
-					undefined, // step
-					undefined, // signal: тул-колл уже вернулся, отменять нечем
-					undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-					makeDetails("single"),
-					(proc) => {
-						child = proc;
-						detached.add(proc);
-						proc.once("close", (_code, signalName) => {
-							if (signalName) killedBySignal = true;
-							detached.delete(proc);
-						});
-					},
-				).then(
-					(result) => settle(isFailedResult(result), getResultOutput(result)),
-					(e) => settle(true, (e as Error)?.message || String(e)),
-				);
+				void runDetachedAgent("single", agentName, params.task, params.cwd, getResultOutput);
 				return {
 					content: [
 						{
