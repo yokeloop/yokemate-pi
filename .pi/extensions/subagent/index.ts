@@ -700,6 +700,7 @@ export default function (pi: ExtensionAPI) {
 			): Promise<void> => {
 				if (shuttingDown) {
 					activeUnits -= 1;
+					console.error(`[subagent] ${agentName} dropped from the queue at shutdown, it never ran`);
 					return;
 				}
 				let child: ChildProcess | undefined;
@@ -825,6 +826,9 @@ export default function (pi: ExtensionAPI) {
 					for (let i = 0; i < steps.length; i++) {
 						if (shuttingDown) {
 							activeUnits -= 1;
+							console.error(
+								`[subagent] chain dropped at shutdown before step ${i + 1} (${steps[i].agent}), it never ran`,
+							);
 							return;
 						}
 						const step = steps[i];
