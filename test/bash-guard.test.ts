@@ -31,7 +31,7 @@ test("a wait inside quotes is a search, a wait outside them is a wait", () => {
     'grep -n "tail -f" test/bash-guard.test.ts',
     "grep -rn 'tail -f' src",
     'grep -rn "while true; do" src',
-    "rg 'inotifywait' .claude/skills",
+    "rg 'inotifywait' .pi/skills",
     'git log --grep="sleep 300" --oneline',
     'echo "it\'s done"; grep -n "tail -f" x',
   ]) {
@@ -48,8 +48,8 @@ test("a wait inside quotes is a search, a wait outside them is a wait", () => {
     "grep 'x' log; tail -f log",
     'grep -n "tail -f" x; tail -f x',
   ]) {
-    assert.equal(bash(undefined, cmd)?.rule, "wait", cmd);
-    assert.equal(bash("do", cmd)?.rule, "wait", cmd);
+    assert.equal(bash(undefined, cmd)?.decision, "deny", cmd);
+    assert.equal(bash("do", cmd)?.decision, "deny", cmd);
   }
 });
 
@@ -70,8 +70,8 @@ test("a quoted wait under a shell, ssh or a container is a wait", () => {
     "echo 'sleep 300' | sh",
     'echo "$(tail -f x)"',
   ]) {
-    assert.equal(bash(undefined, cmd)?.rule, "wait", cmd);
-    assert.equal(bash("review", cmd)?.rule, "wait", cmd);
+    assert.equal(bash(undefined, cmd)?.decision, "deny", cmd);
+    assert.equal(bash("review", cmd)?.decision, "deny", cmd);
   }
   for (const cmd of [
     "ssh host 'journalctl -u app --since today' | tail -100",
