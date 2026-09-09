@@ -150,6 +150,115 @@ test("blanket kills and home writes are denied on tabs and stands", () => {
   assert.equal(bash("do", "rm -rf /home/user/yokemate/work/ACME-1/tmp")?.decision, "deny");
 });
 
+// The kill rule reads the command outside its quotes the way the wait rules
+// do (YM-160): the word in a grep pattern or an echo is data, the word under
+// ssh or a shell runs.
+test("a quoted kill is data under an ordinary command and a kill under ssh or a shell", () => {
+  for (const cmd of [
+    'echo "после kill -9"; ls',
+    'ls | grep "kill -9"',
+    'git log --grep="kill -9"',
+    'grep -n "pkill" src/bash-guard.ts',
+    "rg 'killall' test",
+  ]) {
+    assert.equal(bash("do", cmd), null, cmd);
+    assert.equal(bash("review", cmd), null, cmd);
+  }
+  for (const cmd of [
+    "kill -9 1234",
+    "kill -KILL 1234",
+    "kill -s 9 1234",
+    "pkill node",
+    "killall node",
+    "sudo kill -9 1234",
+    "echo 1234 | xargs kill -9",
+    "ssh host 'pkill -9 node'",
+    'bash -c "killall node"',
+    "docker exec app sh -c 'kill -9 1'",
+  ]) {
+    assert.equal(bash("do", cmd)?.decision, "deny", cmd);
+    assert.equal(bash("review", cmd)?.decision, "deny", cmd);
+  }
+});
+
+// A wait ends where its pipeline does: the rule's own class stops at `;` and
+// `&`, so a tail that finished before the next command is not a wait (YM-160).
+test("a wait is read to the end of its pipeline, not to the end of the line", () => {
+  for (const cmd of ["tail -n 5 app.log; grep -f patterns file", "tail -n 5 app.log && ls -f"]) {
+    assert.equal(bash("do", cmd), null, cmd);
+    assert.equal(bash("review", cmd), null, cmd);
+  }
+  for (const cmd of ["tail -f app.log", "ssh host 'tail -f /var/log/app.log'"]) {
+    assert.equal(bash("do", cmd)?.decision, "deny", cmd);
+    assert.equal(bash("review", cmd)?.decision, "deny", cmd);
+  }
+});
+
+// The launch rule reads the command outside its quotes too (YM-160): a launch
+// named in a commit message or a grep pattern is data, one under a runner runs.
+test("a quoted launch is data, a launch under a runner is a launch", () => {
+  for (const cmd of [
+    'git commit -m "ACME-1 docs: pnpm dev запрещён"',
+    'grep -rn "pnpm start" src',
+    'echo "pnpm dev"',
+  ]) {
+    assert.equal(bash("do", cmd), null, cmd);
+    assert.equal(bash("ship", cmd), null, cmd);
+  }
+  for (const cmd of ["pnpm dev", "ssh host 'pnpm dev'", "bash -c 'pnpm dev'"]) {
+    assert.equal(bash("do", cmd)?.decision, "deny", cmd);
+    assert.equal(bash("ship", cmd)?.decision, "deny", cmd);
+  }
+});
+
+// The /note blacklist and its redirect check read the command outside its
+// quotes (YM-160): a writing verb inside a search pattern is data, the same
+// verb under ssh or a shell writes.
+test("note-write: a quoted write is data, a write under a runner is a write", () => {
+  for (const cmd of ['grep -rn "git commit" src/', 'rg "rm -rf" docs', 'echo "pnpm spawn ACME-1"']) {
+    assert.equal(bash("note", cmd), null, cmd);
+  }
+  for (const cmd of ["git commit -m 'x'", "rm -rf notes/x", "ssh host 'rm -rf /x'", "pnpm spawn ACME-1"]) {
+    assert.equal(bash("note", cmd)?.decision, "deny", cmd);
+  }
+});
+
+// rm is the rule whose quoted argument is its target: under an rm pipeline the
+// quotes stay as typed, so `rm -rf "$HOME/Documents"` names $HOME and a path
+// with a space stays one path; in any other pipeline the same words are data
+// (YM-160).
+test("the home rule reads rm's targets with their quotes and everything else as data", () => {
+  const own = { root: "/home/x/yokemate", dataRoot: "/home/x/yokemate/home", home: "/home/x" };
+  const stand = (cmd: string) => judge("do", "Bash", { command: cmd }, own);
+  for (const cmd of [
+    'rm -rf work/ACME-1; echo "/home/eng/Documents"',
+    'grep -rn "rm -rf ~/" src',
+    'git commit -m "ACME-1 fix: rm -rf ~/Documents больше не срабатывает"',
+    "rm -rf ~/Downloads/old-build",
+  ]) {
+    assert.equal(stand(cmd), null, cmd);
+  }
+  for (const cmd of [
+    'rm -rf "$HOME/Documents"',
+    'rm -rf "/home/x/My Docs"',
+    "ssh host 'rm -rf /home/x/y'",
+    "rm -rf ~/.config/demo-app/logs",
+  ]) {
+    assert.equal(stand(cmd)?.decision, "deny", cmd);
+  }
+});
+
+// The ship question reads the command outside its quotes as well (YM-160):
+// reading or quoting the launch is ordinary work, only a launch asks.
+test("a quoted ship launch is data, an actual ship launch asks", () => {
+  for (const cmd of ['grep -n "pnpm ship" src/mode-tab.ts', 'echo "pnpm ship ACME-1"']) {
+    assert.equal(bash(undefined, cmd), null, cmd);
+  }
+  for (const cmd of ["pnpm ship ACME-1", "pnpm split ship ACME-1"]) {
+    assert.equal(bash(undefined, cmd)?.decision, "ask", cmd);
+  }
+});
+
 test("only ship launches ask in the main chat", () => {
   for (const cmd of [
     "pnpm spawn ACME-1",
