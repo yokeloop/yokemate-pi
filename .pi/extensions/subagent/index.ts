@@ -38,6 +38,10 @@ const MAX_DETACHED = 4;
 // Отвязанные (detach) дети живут дольше своего тул-колла: AbortSignal тула
 // у них уже нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
+// Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
+// тул-коллов одного хода исполняется в один тик — по одному лишь размеру
+// реестра все они прошли бы потолок. Слот занимается сразу, синхронно.
+let pendingDetached = 0;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -478,7 +482,7 @@ const SubagentParams = Type.Object({
 	detach: Type.Optional(
 		Type.Boolean({
 			description:
-				"Return immediately instead of waiting: the agent's report arrives later as a separate chat message. Single mode only. Default: false.",
+				`Return immediately instead of waiting: the agent's report arrives later as a separate chat message. Single mode only, at most ${MAX_DETACHED} at a time. Default: false.`,
 			default: false,
 		}),
 	),
@@ -733,18 +737,27 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.agent && params.task) {
 				if (params.detach) {
-					if (detached.size >= MAX_DETACHED) {
+					if (detached.size + pendingDetached >= MAX_DETACHED) {
 						return {
 							content: [
 								{
 									type: "text",
-									text: `Too many detached agents already running (${detached.size}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
+									text: `Too many detached agents already running (${detached.size + pendingDetached}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
 								},
 							],
 							details: makeDetails("single")([]),
 							isError: true,
 						};
 					}
+					pendingDetached++;
+					let reserved = true;
+					// Бронь живёт только до попадания ребёнка в реестр, иначе он
+					// считался бы дважды; пути без spawn снимают её в settle.
+					const release = () => {
+						if (!reserved) return;
+						reserved = false;
+						pendingDetached--;
+					};
 					const agentName = params.agent;
 					let child: ChildProcess | undefined;
 					// Убитый сигналом ребёнок закрывается с code === null, а
@@ -752,6 +765,7 @@ export default function (pi: ExtensionAPI) {
 					// снятый руками процесс отчитался бы как успех.
 					let killedBySignal = false;
 					const settle = (failed: boolean, text: string) => {
+						release();
 						if (child) detached.delete(child);
 						reportDetached(agentName, failed || killedBySignal, text);
 					};
@@ -769,6 +783,7 @@ export default function (pi: ExtensionAPI) {
 						(proc) => {
 							child = proc;
 							detached.add(proc);
+							release();
 							proc.once("close", (_code, signalName) => {
 								if (signalName) killedBySignal = true;
 								detached.delete(proc);
