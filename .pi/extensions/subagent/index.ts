@@ -68,10 +68,14 @@ function loadLimits(cwd: string): Limits {
 		if (fs.existsSync(file)) {
 			const raw = JSON.parse(fs.readFileSync(file, "utf-8"))?.subagent;
 			if (raw && typeof raw === "object") {
+				// Умолчание подгоняется под названное соседнее поле: инженер,
+				// написавший один только maxParallelTasks, назвал число, а не
+				// повод отказать себе умолчанием из кода.
+				const maxParallelTasks = raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks;
 				const candidate: Limits = {
-					maxParallelTasks: raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks,
-					maxConcurrency: raw.maxConcurrency ?? DEFAULT_LIMITS.maxConcurrency,
-					maxDetached: raw.maxDetached ?? DEFAULT_LIMITS.maxDetached,
+					maxParallelTasks,
+					maxConcurrency: raw.maxConcurrency ?? Math.min(DEFAULT_LIMITS.maxConcurrency, maxParallelTasks),
+					maxDetached: raw.maxDetached ?? Math.max(DEFAULT_LIMITS.maxDetached, maxParallelTasks),
 				};
 				const problem = validateLimits(candidate);
 				if (problem) console.error(`[subagent] ignoring subagent limits in ${file}: ${problem}`);
