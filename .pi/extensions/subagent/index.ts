@@ -29,11 +29,61 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const MAX_DETACHED = 4;
+
+interface Limits {
+	maxParallelTasks: number;
+	maxConcurrency: number;
+	maxDetached: number;
+}
+
+const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
+
+const limitsByCwd = new Map<string, Limits>();
+
+function validateLimits(limits: Limits): string | undefined {
+	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
+		const value = limits[key];
+		if (!Number.isInteger(value) || value < 1) return `${key} must be an integer >= 1, got ${JSON.stringify(value)}`;
+	}
+	if (limits.maxConcurrency > limits.maxParallelTasks)
+		return `maxConcurrency (${limits.maxConcurrency}) must be <= maxParallelTasks (${limits.maxParallelTasks})`;
+	if (limits.maxDetached < limits.maxParallelTasks)
+		return `maxDetached (${limits.maxDetached}) must be >= maxParallelTasks (${limits.maxParallelTasks})`;
+	return undefined;
+}
+
+// Лимиты сцеплены друг с другом, поэтому набор из настроек либо принимается
+// целиком, либо отбрасывается целиком: половина от инженера, половина из кода
+// дала бы комбинацию, которой никто не выбирал.
+function loadLimits(cwd: string): Limits {
+	const cached = limitsByCwd.get(cwd);
+	if (cached) return cached;
+
+	let limits = DEFAULT_LIMITS;
+	const file = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
+	try {
+		if (fs.existsSync(file)) {
+			const raw = JSON.parse(fs.readFileSync(file, "utf-8"))?.subagent;
+			if (raw && typeof raw === "object") {
+				const candidate: Limits = {
+					maxParallelTasks: raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks,
+					maxConcurrency: raw.maxConcurrency ?? DEFAULT_LIMITS.maxConcurrency,
+					maxDetached: raw.maxDetached ?? DEFAULT_LIMITS.maxDetached,
+				};
+				const problem = validateLimits(candidate);
+				if (problem) console.error(`[subagent] ignoring subagent limits in ${file}: ${problem}`);
+				else limits = candidate;
+			}
+		}
+	} catch (e) {
+		console.error(`[subagent] could not read subagent limits in ${file}: ${(e as Error)?.message || String(e)}`);
+	}
+
+	limitsByCwd.set(cwd, limits);
+	return limits;
+}
 
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
@@ -517,6 +567,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "project";
+			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -637,12 +688,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				if (params.tasks.length > limits.maxParallelTasks)
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								text: `Too many parallel tasks (${params.tasks.length}). Max is ${limits.maxParallelTasks}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
@@ -677,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+				const results = await mapWithConcurrencyLimit(params.tasks, limits.maxConcurrency, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						dispatchDefaults,
@@ -721,12 +772,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				if (activeUnits + 1 > MAX_DETACHED) {
+				if (activeUnits + 1 > limits.maxDetached) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${MAX_DETACHED}). Wait for their reports before detaching another.`,
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
 							},
 						],
 						details: makeDetails("single")([]),
