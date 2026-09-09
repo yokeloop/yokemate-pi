@@ -586,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "project";
 			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {
@@ -702,56 +702,83 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
+				const steps = params.chain;
+				if (activeUnits + 1 > limits.maxDetached) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
+							},
+						],
+						details: makeDetails("chain")([]),
+						isError: true,
+					};
 				}
+
+				activeUnits += 1;
+				openBatch(toolCallId, 1);
+
+				// Цепочка — одна единица: каждый шаг питается {previous}
+				// предыдущего, промежуточный вывод сам по себе не результат.
+				// Отсюда один отчёт, в конце, и одна запись в батче.
+				const runChain = async (): Promise<void> => {
+					let previousOutput = "";
+					let lastAgent = steps[steps.length - 1].agent;
+					const settle = (failed: boolean, agentName: string, text: string) => {
+						activeUnits -= 1;
+						reportDetached(failed ? "chain" : agentName, failed, text);
+						settleBatch(toolCallId, agentName, failed);
+					};
+
+					for (let i = 0; i < steps.length; i++) {
+						const step = steps[i];
+						lastAgent = step.agent;
+						let killedBySignal = false;
+						let result: SingleResult;
+						try {
+							result = await runSingleAgent(
+								ctx.cwd,
+								dispatchDefaults,
+								agents,
+								step.agent,
+								step.task.replace(/\{previous\}/g, previousOutput),
+								step.cwd,
+								i + 1,
+								undefined, // signal: тул-колл уже вернулся, отменять нечем
+								undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
+								makeDetails("chain"),
+								(proc) => {
+									detached.add(proc);
+									proc.once("close", (_code, signalName) => {
+										if (signalName) killedBySignal = true;
+										detached.delete(proc);
+									});
+								},
+							);
+						} catch (e) {
+							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${(e as Error)?.message || String(e)}`);
+							return;
+						}
+						if (isFailedResult(result) || killedBySignal) {
+							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${getResultOutput(result)}`);
+							return;
+						}
+						previousOutput = getFinalOutput(result.messages);
+					}
+					settle(false, lastAgent, previousOutput);
+				};
+				void runChain().catch((e) => console.error(`[subagent] chain failed: ${(e as Error)?.message || String(e)}`));
+
+				const names = steps.map((step) => step.agent).join(" → ");
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
+					content: [
+						{
+							type: "text",
+							text: `Detached: chain of ${steps.length} steps running (${names}). Its report will arrive as a separate message.`,
+						},
+					],
+					details: makeDetails("chain")([]),
 				};
 			}
 
