@@ -468,6 +468,13 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	detach: Type.Optional(
+		Type.Boolean({
+			description:
+				"Return immediately instead of waiting: the agent's report arrives later as a separate chat message. Single mode only. Default: false.",
+			default: false,
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -478,6 +485,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			`Agents come from the nearest ${CONFIG_DIR_NAME}/agents — the yokemate root in the main chat, work/<TICKET>/${CONFIG_DIR_NAME}/agents in the task tab.`,
+			'Pass detach: true in single mode to get the tool result at once — the agent\'s report then arrives as a separate message prefixed "[subagent <name>]".',
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -515,6 +523,14 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			if (params.detach && !hasSingle) {
+				return {
+					content: [{ type: "text", text: "detach is supported only in single mode (agent + task)." }],
+					details: makeDetails(hasChain ? "chain" : "parallel")([]),
+					isError: true,
 				};
 			}
 
