@@ -210,6 +210,11 @@ if [ ! -d "$YOKEMATE_DIR/home/.git" ]; then
        then re-run ./scripts/bootstrap.sh")
 fi
 
+if [ -d "$YOKEMATE_DIR/home/.git" ] && [ ! -f "$YOKEMATE_DIR/home/pool.json" ]; then
+  manual+=("home/pool.json: /plan on a problem and /note take their model from it —
+       create it as {\"plan\": \"<pattern>\", \"note\": \"<pattern>\"}")
+fi
+
 gh auth status >/dev/null 2>&1 || manual+=("gh auth login")
 
 github_ssh_ok || manual+=("ssh key: generate it and register on the git hostings")

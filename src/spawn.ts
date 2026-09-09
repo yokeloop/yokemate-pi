@@ -51,10 +51,11 @@ for (let i = 1; i < argv.length; i++) {
 const db = openDb(join(ROOT, "yokemate.db"));
 
 // The launch never inherits the machine's default: the engineer's --model
-// wins, else the ticket's passports answer (YM-84).
+// wins, else the ticket's passports answer (YM-84) — by the mode `do`, the
+// one this tab is stamped with and the only mode it ever runs (YM-159).
 if (!model) {
   try {
-    model = modelForTicket(db, ticket);
+    model = modelForTicket(db, ticket, "do");
   } catch (e) {
     model = fail((e as Error).message);
   }
@@ -219,4 +220,4 @@ const moved = applyMove(
 );
 if (!moved.ok) fail(`${ticket}: the tab is up, but the stage write was refused — ${moved.refuse}`);
 
-console.log(`${ticket} → tab ${pane}, agent "${agentName}", stage running`);
+console.log(`${ticket} → tab ${pane}, agent "${agentName}", model ${model}, stage running`);

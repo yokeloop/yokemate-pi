@@ -48,6 +48,9 @@ export function openDb(path: string): DatabaseSync {
       model        TEXT NOT NULL,             -- openai-codex/gpt-5.6-terra | … — the pi model
                                               -- pattern every launch for this project's
                                               -- tickets runs on
+      mode_models  TEXT,                      -- {"review":"openai-codex/gpt-5.6-luna", …} —
+                                              -- модель на мод панели поверх model; NULL, когда
+                                              -- переопределений нет. Мод, а не work.stage (YM-159)
       figma_mcp    TEXT,                      -- figma-acme-eu | figma-acme | NULL
       figma_url    TEXT,                      -- the repo's own design file; NULL when there is none
       subsystem    TEXT,                      -- tracker enum value that scopes this repo; NULL when
@@ -87,7 +90,7 @@ export function openDb(path: string): DatabaseSync {
       (c) => c.name,
     ),
   );
-  for (const col of ["figma_url", "subsystem"]) {
+  for (const col of ["figma_url", "subsystem", "mode_models"]) {
     if (!have.has(col)) db.exec(`ALTER TABLE project ADD COLUMN ${col} TEXT`);
   }
   if (!have.has("model")) {

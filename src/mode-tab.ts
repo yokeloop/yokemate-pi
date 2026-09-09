@@ -17,9 +17,11 @@
 // skill, no worker — and its `run` verdict does the same inline work.
 //
 // Every mode takes a free-text note after the ticket and passes it verbatim
-// into the mode's prompt. The model comes from the project's passport; an
-// explicit `--model <m>` — the engineer's words, translated by the main chat —
-// overrides it. No launch inherits the machine's default (YM-84).
+// into the mode's prompt. The model comes from the project's passport, by the
+// mode of the panel being raised; an explicit `--model <m>` — the engineer's
+// words, translated by the main chat — overrides it. A launch with no ticket
+// has no passport to ask and takes its model from home/pool.json (YM-159). No
+// launch inherits the machine's default (YM-84).
 //
 // Usage:
 //   pnpm review ACME-342 [--model <m>] [note]
@@ -33,6 +35,7 @@ import { findPlan } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
+import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note"] as const;
@@ -43,11 +46,6 @@ export type Mode = (typeof MODES)[number];
  *  like one. A note launch takes a topic — never a key. */
 export const TICKETLESS: readonly string[] = ["plan", "note"];
 const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
-
-/** The model for a problem-input /plan: the passports answer by key, and a
- *  problem has no key yet — the standing default rides here (YM-84, the role
- *  the retired SPEC_MODEL played). */
-export const PLAN_MODEL = "openai-codex/gpt-6-astra";
 
 /** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
 export type Surface = "tab" | "split";
@@ -194,18 +192,23 @@ if (import.meta.filename === process.argv[1]) {
     }
   }
   // The launch never inherits the machine's default: the engineer's --model
-  // wins, else the passports answer — by org for worklog, by key prefix for
-  // every keyed mode. A problem-input plan has no key for them to answer by.
+  // wins, else the passports answer by mode — by org for worklog, by key
+  // prefix for every keyed mode. A launch with no key at all (a problem-input
+  // plan, a note) has no passport to ask: home/pool.json answers, and a gap
+  // there is a refusal, not a literal (YM-159).
   if (!model) {
-    if (!ticket) {
-      model = PLAN_MODEL;
-    } else {
-      const db = openDb(join(ROOT, "yokemate.db"));
-      try {
-        model = mode === "worklog" ? modelForOrg(db, ticket) : modelForTicket(db, ticket.split("+")[0]);
-      } catch (e) {
-        model = fail((e as Error).message);
+    try {
+      if (!ticket) {
+        model = poolModel(dataRoot(ROOT), mode);
+      } else {
+        const db = openDb(join(ROOT, "yokemate.db"));
+        model =
+          mode === "worklog"
+            ? modelForOrg(db, ticket, mode)
+            : modelForTicket(db, ticket.split("+")[0], mode);
       }
+    } catch (e) {
+      model = fail((e as Error).message);
     }
   }
 
@@ -286,5 +289,7 @@ if (import.meta.filename === process.argv[1]) {
     fail(`${label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
   }
 
-  console.log(`${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", /${mode} in ${cwd}`);
+  console.log(
+    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}`,
+  );
 }
