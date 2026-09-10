@@ -26,7 +26,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, TruncatedText } from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
@@ -132,6 +132,28 @@ function taskExcerpt(task: string): string {
 	return task.replace(/\s+/g, " ").trim().slice(0, TASK_EXCERPT_BUDGET).trimEnd();
 }
 
+// Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
+// срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
+// из двоих виден один). Тогда тот же список встаёт столбцом, по ребёнку на строку.
+// Выбор делается в render — то есть по фактической ширине и в том же кадре, в
+// который пришёл ресайз, а не по ширине на момент постановки виджета.
+class RunningAgentsWidget implements Component {
+	private readonly parts: string[];
+
+	constructor(parts: string[]) {
+		this.parts = parts;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const row = `⋯ ${this.parts.join(" · ")}`;
+		// paddingX = 1 с обеих сторон: ряд влезает, пока строка не длиннее width - 2.
+		if (visibleWidth(row) + 2 <= width) return new TruncatedText(row, 1, 0).render(width);
+		return this.parts.flatMap((part) => new TruncatedText(`⋯ ${part}`, 1, 0).render(width));
+	}
+}
+
 // Протухший ctx (смена сессии, /clear, форк, reload) бросает из setWidget так
 // же, как из sendMessage: висящий виджет — плата, упавшая сессия — нет.
 function renderRunningWidget(): void {
@@ -147,10 +169,7 @@ function renderRunningWidget(): void {
 				? `${a.name} ${formatElapsed(now - a.startedAt)} ${a.task}`
 				: `${a.name} ${formatElapsed(now - a.startedAt)}`,
 		);
-		// Массив строк редактор заворачивает по словам: на узком терминале виджет
-		// разъезжается на несколько строк и прыгает при ресайзе. Компонент режет
-		// сам, по фактической ширине и в том же кадре, в который пришёл ресайз.
-		latestCtx.ui.setWidget("subagent-running", () => new TruncatedText(`⋯ ${parts.join(" · ")}`, 1, 0));
+		latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
 	} catch (e) {
 		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
 	}
