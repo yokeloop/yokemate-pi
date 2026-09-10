@@ -26,7 +26,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
@@ -111,7 +111,7 @@ const batches = new Map<string, Batch>();
 
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
-const runningAgents = new Map<ChildProcess, { name: string; startedAt: number }>();
+const runningAgents = new Map<ChildProcess, { name: string; task: string; startedAt: number }>();
 let widgetTimer: NodeJS.Timeout | undefined;
 // ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
 // пришёл в execute текущего вызова или в turn_start, а не захваченному.
@@ -120,6 +120,38 @@ let latestCtx: ExtensionContext | undefined;
 function formatElapsed(ms: number): string {
 	const total = Math.max(0, Math.floor(ms / 1000));
 	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+const TASK_EXCERPT_BUDGET = 24;
+
+// Задача сабагента — это его промт целиком: многострочный, на тысячи знаков, а
+// в цепочке ещё и с подставленным отчётом предыдущего шага. В строке виджета от
+// него нужен только опознавательный кусок начала, и без переводов строк: первая
+// строка промта бывает служебной и у двух детей одинаковой.
+function taskExcerpt(task: string): string {
+	return task.replace(/\s+/g, " ").trim().slice(0, TASK_EXCERPT_BUDGET).trimEnd();
+}
+
+// Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
+// срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
+// из двоих виден один). Тогда тот же список встаёт столбцом, по ребёнку на строку.
+// Выбор делается в render — то есть по фактической ширине и в том же кадре, в
+// который пришёл ресайз, а не по ширине на момент постановки виджета.
+class RunningAgentsWidget implements Component {
+	private readonly parts: string[];
+
+	constructor(parts: string[]) {
+		this.parts = parts;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const row = `⋯ ${this.parts.join(" · ")}`;
+		// paddingX = 1 с обеих сторон: ряд влезает, пока строка не длиннее width - 2.
+		if (visibleWidth(row) + 2 <= width) return new TruncatedText(row, 1, 0).render(width);
+		return this.parts.flatMap((part) => new TruncatedText(`⋯ ${part}`, 1, 0).render(width));
+	}
 }
 
 // Протухший ctx (смена сессии, /clear, форк, reload) бросает из setWidget так
@@ -132,8 +164,12 @@ function renderRunningWidget(): void {
 			return;
 		}
 		const now = Date.now();
-		const parts = Array.from(runningAgents.values()).map((a) => `${a.name} ${formatElapsed(now - a.startedAt)}`);
-		latestCtx.ui.setWidget("subagent-running", [`⋯ ${parts.join(" · ")}`]);
+		const parts = Array.from(runningAgents.values()).map((a) =>
+			a.task
+				? `${a.name} ${formatElapsed(now - a.startedAt)} ${a.task}`
+				: `${a.name} ${formatElapsed(now - a.startedAt)}`,
+		);
+		latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
 	} catch (e) {
 		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
 	}
@@ -145,8 +181,8 @@ function stopWidgetTimer(): void {
 	widgetTimer = undefined;
 }
 
-function trackRunning(proc: ChildProcess, name: string): void {
-	runningAgents.set(proc, { name, startedAt: Date.now() });
+function trackRunning(proc: ChildProcess, name: string, task: string): void {
+	runningAgents.set(proc, { name, task: taskExcerpt(task), startedAt: Date.now() });
 	if (!widgetTimer) {
 		widgetTimer = setInterval(renderRunningWidget, 1000);
 		widgetTimer.unref();
@@ -732,7 +768,7 @@ export default function (pi: ExtensionAPI) {
 						(proc) => {
 							child = proc;
 							detached.add(proc);
-							trackRunning(proc, agentName);
+							trackRunning(proc, agentName, task);
 							proc.once("close", (_code, signalName) => {
 								if (signalName) killedBySignal = true;
 								detached.delete(proc);
@@ -833,6 +869,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						const step = steps[i];
 						lastAgent = step.agent;
+						const stepTask = step.task.replace(/\{previous\}/g, previousOutput);
 						let killedBySignal = false;
 						let result: SingleResult;
 						try {
@@ -841,7 +878,7 @@ export default function (pi: ExtensionAPI) {
 								dispatchDefaults,
 								agents,
 								step.agent,
-								step.task.replace(/\{previous\}/g, previousOutput),
+								stepTask,
 								step.cwd,
 								i + 1,
 								undefined, // signal: тул-колл уже вернулся, отменять нечем
@@ -849,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 								makeDetails("chain"),
 								(proc) => {
 									detached.add(proc);
-									trackRunning(proc, step.agent);
+									trackRunning(proc, step.agent, stepTask);
 									proc.once("close", (_code, signalName) => {
 										if (signalName) killedBySignal = true;
 										detached.delete(proc);
