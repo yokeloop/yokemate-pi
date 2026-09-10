@@ -51,10 +51,11 @@ for (let i = 1; i < argv.length; i++) {
 const db = openDb(join(ROOT, "yokemate.db"));
 
 // The launch never inherits the machine's default: the engineer's --model
-// wins, else the ticket's passports answer (YM-84).
+// wins, else the ticket's passports answer (YM-84) — by the mode `do`, the
+// one this tab is stamped with and the only mode it ever runs (YM-159).
 if (!model) {
   try {
-    model = modelForTicket(db, ticket);
+    model = modelForTicket(db, ticket, "do");
   } catch (e) {
     model = fail((e as Error).message);
   }
@@ -96,6 +97,21 @@ mkdirSync(folder, { recursive: true });
 // work/<TICKET>/.pi/extensions, which holds nothing — so all three are wired
 // here. The paths are absolute: the tab has no relative path to the engine.
 mkdirSync(join(folder, ".pi"), { recursive: true });
+
+// The subagent limits are the engineer's, and the tab is where they matter:
+// its own settings file is written from scratch, so the block is carried over
+// from the root one. No block in the root — none in the tab either.
+let subagentSettings: unknown;
+try {
+  const rootSettings = JSON.parse(readFileSync(join(ROOT, ".pi", "settings.json"), "utf8"));
+  if (rootSettings?.subagent !== undefined) subagentSettings = rootSettings.subagent;
+} catch (e) {
+  // No settings file is the ordinary case. A file that is there and broken is
+  // not: silence would drop the engineer's limits exactly where they matter.
+  if ((e as NodeJS.ErrnoException)?.code !== "ENOENT")
+    console.error(`spawn: root .pi/settings.json unreadable, the tab gets no subagent block: ${(e as Error)?.message || String(e)}`);
+}
+
 writeFileSync(
   join(folder, ".pi", "settings.json"),
   JSON.stringify(
@@ -105,6 +121,7 @@ writeFileSync(
         join(ROOT, "src", "bus.ts"),
         join(ROOT, ".pi", "extensions", "subagent", "index.ts"),
       ],
+      ...(subagentSettings !== undefined ? { subagent: subagentSettings } : {}),
     },
     null,
     2,
@@ -203,4 +220,4 @@ const moved = applyMove(
 );
 if (!moved.ok) fail(`${ticket}: the tab is up, but the stage write was refused — ${moved.refuse}`);
 
-console.log(`${ticket} → tab ${pane}, agent "${agentName}", stage running`);
+console.log(`${ticket} → tab ${pane}, agent "${agentName}", model ${model}, stage running`);

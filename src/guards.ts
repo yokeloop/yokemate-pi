@@ -40,6 +40,22 @@ export function guardCall(
   return null;
 }
 
+/**
+ * Что забор делает с вердиктом, зная вердикт предыдущего отстоя: `null` —
+ * ничего; иначе доставить, и с триггером только когда вердикт сменился.
+ * Повтор без триггера и делает цикл конечным: нет триггера — нет рана, нет
+ * рана — нет следующего agent_settled. Сообщение при этом всё равно попадает
+ * в транскрипт и в контекст модели, так что обязанность «таб не заканчивается,
+ * не записав отчёт» остаётся видимой на каждом отстое.
+ */
+export function stopDelivery(
+  last: string | null,
+  reason: string | null,
+): { content: string; triggerTurn: boolean } | null {
+  if (!reason) return null;
+  return { content: reason, triggerTurn: reason !== last };
+}
+
 export default function guards(pi: ExtensionAPI) {
   // Raw read-only handle, not openDb: a guard runs no DDL. Closed on the way
   // out — report-guard.ts leaves that to the process exit, an extension lives on.
@@ -85,17 +101,27 @@ export default function guards(pi: ExtensionAPI) {
   // follow with a retry, a compaction or a queued continuation, while
   // agent_settled arrives when nothing more will run and the session idles —
   // so triggerTurn raises a new turn, which is what a blocking Stop was.
+  //
+  // Вердикт предыдущего отстоя. Переменная замыкания: она живёт ровно столько,
+  // сколько сессия процесса (фабрика расширения зовётся один раз на загрузку),
+  // и это ровно нужный срок — перезапущенный таб обязан получить толчок
+  // заново. Тот же приём этажом ниже держит digestPending. Ни файла, ни
+  // строки в БД: забор остаётся read-only.
+  let lastVerdict: string | null = null;
+
   pi.on("agent_settled", () => {
     let reason: string | null = null;
     try {
       reason = stopVerdict(process.env, readStage);
     } catch {
-      return;
+      return; // не смогли прочитать стадию — память не трогаем, см. шапку файла
     }
-    if (!reason) return;
+    const delivery = stopDelivery(lastVerdict, reason);
+    lastVerdict = reason;
+    if (!delivery) return;
     pi.sendMessage(
-      { customType: "yokemate-stop-guard", content: reason, display: true },
-      { deliverAs: "followUp", triggerTurn: true },
+      { customType: "yokemate-stop-guard", content: delivery.content, display: true },
+      { deliverAs: "followUp", triggerTurn: delivery.triggerTurn },
     );
   });
 
