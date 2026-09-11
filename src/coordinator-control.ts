@@ -43,11 +43,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   }
   const origins = new Map<string, ControlOrigin>();
   const replies = new Map<string, ControlReply>();
-  const acceptedByRequest = new Map<string, string>();
+  const requestOrigins = new Map<string, string>();
+  const requestRuns = new Map<string, string>();
+  const runOrigins = new Map<string, string>();
   const bindOrigin = (origin: ControlOrigin): string => {
     if (!origin.sessionId || !origin.pid || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
     if (!isLiveProcess(origin.pid) || !descendantOf(origin.pid, identity.pid)) throw new Error("origin is not a live child of the coordinator parent");
-    if (origin.sessionId !== identity.sessionId && origin.parentPane !== undefined) throw new Error("panel origin is not registered with this parent");
+    if (origin.sessionId !== identity.sessionId) throw new Error("origin session is not registered with this parent");
     const id = randomUUID();
     origins.set(id, { ...origin });
     return id;
@@ -72,8 +74,14 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         }
         const origin = envelope.originId ? origins.get(envelope.originId) : undefined;
         if (!origin) { reply({ requestId: envelope.requestId, state: "refused", reason: "unknown origin binding" }); continue; }
-        if (envelope.operation === "status") { reply(parent.status(envelope.targetRequestId ?? envelope.requestId, origin)); continue; }
+        if (envelope.operation === "status") {
+          const target = envelope.targetRequestId ?? envelope.requestId;
+          if (requestOrigins.get(target) !== envelope.originId) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator request" }); continue; }
+          reply(parent.status(requestRuns.get(target) ?? target, origin));
+          continue;
+        }
         if (envelope.operation === "cancel" && envelope.runId) {
+          if (runOrigins.get(envelope.runId) !== envelope.originId) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator run" }); continue; }
           try { await parent.cancel(envelope.runId, origin); reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId }); }
           catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
           continue;
@@ -84,7 +92,9 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         reply({ requestId: envelope.requestId, state: "received" });
         try {
           const accepted = await parent.launch(envelope.request, origin);
-          acceptedByRequest.set(envelope.requestId, accepted.runId);
+          requestOrigins.set(envelope.requestId, envelope.originId);
+          requestRuns.set(envelope.requestId, accepted.runId);
+          runOrigins.set(accepted.runId, envelope.originId);
           reply({ requestId: envelope.requestId, state: "accepted", ...accepted });
         } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
       }

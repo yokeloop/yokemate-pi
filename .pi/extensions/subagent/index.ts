@@ -663,6 +663,7 @@ export default function (pi: ExtensionAPI) {
 	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
+	let uiTail: Promise<void> = Promise.resolve();
 	let ownedReadyRunId: string | undefined;
 	pi.on("input", (event, ctx) => {
 		const text = event.text.trim();
@@ -687,19 +688,37 @@ export default function (pi: ExtensionAPI) {
 		const admission = checks.checkAdmission(coordinators.active().length);
 		if (admission) throw new Error(admission);
 		const run = coordinators.reserve(request, origin, origin.sessionId ?? "main", prepared.model, prepared.cwd, prepared.parts.map((part) => part.repo));
+		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
 		try {
 			coordinators.setPrepared(run.identity.runId, prepared);
-			if (request.mode === "do") markDoRunning(root, prepared, { ...origin, YOKEMATE_MODE: "do", YOKEMATE_TICKET: request.tickets[0], YOKEMATE_ROLE: "coordinator" });
-			const rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
+			if (request.mode === "do") markDoRunning(root, prepared, origin);
+			rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (result?.details?.kind !== "yokemate-coordinator-outcome" || !result.details.outcome) return;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
 				const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
-				if (!verification.ok) return;
+				if (!verification.ok) {
+					void rpc?.request({ type: "prompt", message: `coordinator_finish was not verified: ${verification.reason ?? "missing facts"}. Continue the pipeline or finish blocked.`, streamingBehavior: "followUp" }).catch(() => {});
+					return;
+				}
+				rpc?.acceptTerminal();
 				coordinators.finalize(run.identity.runId, proposal.outcome, proposal.reason);
 				pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
 				void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId);
+			}, onUiRequest: (event, reply) => {
+				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string };
+				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
+				uiTail = uiTail.then(async () => {
+					const id = request.id!;
+					try {
+						if (!ctx.hasUI) { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
+						const ui = ctx.ui as any;
+						if (request.method === "confirm") reply({ type: "extension_ui_response", id, confirmed: Boolean(await ui.confirm(request.title ?? "Coordinator", request.message ?? "")) });
+						else if (request.method === "select") { const value = await ui.select(request.title ?? "Coordinator", request.options ?? []); reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
+						else { const value = request.method === "editor" ? await ui.editor(request.title ?? "Coordinator") : await ui.input(request.title ?? "Coordinator", request.placeholder); reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
+					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
+				}).catch(() => {});
 			}, onBlocked: (reason) => {
 				const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
@@ -713,7 +732,7 @@ export default function (pi: ExtensionAPI) {
 			const work = await rpc.request({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
-		} catch (error) { coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); rpcByRun.delete(run.identity.runId); throw error; }
+		} catch (error) { await rpc?.stop(); coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); rpcByRun.delete(run.identity.runId); throw error; }
 	};
 	pi.on("session_start", (_event, ctx) => {
 		latestCtx = ctx;

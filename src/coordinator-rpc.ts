@@ -7,7 +7,7 @@ import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { RuntimeIdentity } from "./coordinator-runtime.ts";
 
 export interface RpcEvent { type: string; id?: string; [key: string]: unknown }
-export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; ready: Promise<void>; stop(): Promise<void>; events: RpcEvent[] }
+export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; acceptTerminal(): void; ready: Promise<void>; stop(): Promise<void>; events: RpcEvent[] }
 export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
 
 function cap(text: string): string { return Buffer.byteLength(text) <= 50 * 1024 ? text : Buffer.from(text).subarray(0, 50 * 1024).toString(); }
@@ -81,8 +81,6 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
         else { stateAck = true; maybeReady(); }
       }
     }
-    const details = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string } } | undefined)?.details : undefined;
-    if (details?.kind === "yokemate-coordinator-outcome") terminal = true;
     const messageDetails = (event.message as { details?: { runId?: string; ok?: boolean } } | undefined)?.details;
     if (event.type === "message_end" && messageDetails?.runId === identity.runId) {
       if (messageDetails.ok) { readyMessage = true; maybeReady(); }
@@ -104,5 +102,5 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     const kill = setTimeout(() => { try { process.kill(-process.pid!, "SIGKILL"); } catch {} }, 10_000);
     process.once("close", () => { clearTimeout(term); clearTimeout(kill); resolve(); });
   });
-  return { process, send, request, ready, stop, events };
+  return { process, send, request, acceptTerminal: () => { terminal = true; }, ready, stop, events };
 }
