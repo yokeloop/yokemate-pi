@@ -37,6 +37,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
+import { requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note"] as const;
 export type Mode = (typeof MODES)[number];
@@ -95,6 +96,7 @@ export function resolveLaunch(
   parentPane?: string,
   stand?: StandFacts,
 ): Launch {
+  if (mode === "ship") throw new Error("ship runs in the background coordinator, not a tab");
   if (mode === "review" && stand && !stand.folder) {
     if (!stand.plan)
       throw new Error(
@@ -169,6 +171,23 @@ if (import.meta.filename === process.argv[1]) {
   } else {
     ticket = argv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
     tail = argv.slice(2);
+  }
+
+  if (mode === "ship") {
+    let shipModel: string | undefined;
+    const modelIndex = tail.indexOf("--model");
+    if (modelIndex >= 0) {
+      shipModel = tail[modelIndex + 1] ?? fail("--model needs a value");
+      tail.splice(modelIndex, 2);
+    }
+    const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required to route ship to its live coordinator parent");
+    try {
+      const parent = resolveCoordinatorParent(ROOT);
+      const reply = await requestCoordinator(ROOT, { mode: "ship", tickets: ticket.split("+"), model: shipModel, note: tail.join(" ") || undefined }, { sessionId, pid: process.pid, cwd: ROOT, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
+      if (reply.state !== "accepted" || !reply.runId) fail(reply.reason ?? "ship coordinator launch was not accepted");
+      console.log(`${ticket} → background run ${reply.runId}`);
+      process.exit(0);
+    } catch (error) { fail((error as Error).message); }
   }
 
   if (process.env.HERDR_ENV !== "1")
