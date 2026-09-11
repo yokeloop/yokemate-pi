@@ -144,6 +144,7 @@ export function resolveResearchLaunch(root: string, argv: string[], id = crypto.
       `YOKEMATE_RESEARCH_PROJECT=${context.project ? `${context.project.org}/${context.project.repo}` : ""}`,
       `YOKEMATE_RESEARCH_PROJECT_PATH=${context.project?.path ?? ""}`,
       `YOKEMATE_RESEARCH_TRACKER_KEY=${context.project?.tracker_key ?? ""}`,
+      `YOKEMATE_RESEARCH_TRACKER=${context.project?.tracker ?? ""}`,
       `YOKEMATE_RESEARCH_ROOT=${resolve(root)}`,
     ],
   };

@@ -123,6 +123,8 @@ export function researchChildLaunch(identity: ResearchIdentity, cwd: string, rea
       YOKEMATE_RESEARCH_ROOT: identity.root,
       YOKEMATE_RESEARCH_PROJECT: identity.project ?? "",
       YOKEMATE_RESEARCH_PROJECT_PATH: identity.projectPath ?? "",
+      YOKEMATE_RESEARCH_TRACKER_KEY: process.env.YOKEMATE_RESEARCH_TRACKER_KEY ?? "",
+      YOKEMATE_RESEARCH_TRACKER: process.env.YOKEMATE_RESEARCH_TRACKER ?? "",
       YOKEMATE_RESEARCH_ROLE: "child",
       YOKEMATE_PARENT_PANE: identity.parentPane ?? "",
     },
