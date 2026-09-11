@@ -19,6 +19,8 @@ import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
 import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
 import { decide } from "../src/mode-guard.ts";
+import { parseShipArgs } from "../src/ship-args.ts";
+import { resolveGuardPolicy } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
 import { closeTab, findOpenTab, findRunningAgent, startAgent } from "../src/herdr.ts";
@@ -597,6 +599,123 @@ test("note splits at the root with the topic in the worker prompt", () => {
   assert.deepEqual(note.env, ["YOKEMATE_MODE=note"]);
 
   assert.equal(freeAgentName("note", ["note"]), "note-2");
+});
+
+test("ship argument parser preserves launcher semantics", () => {
+  assert.deepEqual(parseShipArgs(["YM-199", "YM-198", "YM-197"]), {
+    ticket: "YM-199+YM-198+YM-197",
+    tail: [],
+  });
+  assert.deepEqual(parseShipArgs(["YM-199", "note", "YM-198", "--model", "terra", "later"]), {
+    ticket: "YM-199+YM-198",
+    tail: ["note", "--model", "terra", "later"],
+  });
+  assert.deepEqual(parseShipArgs(["YM-199", "--model", "terra", "YM-198"]), {
+    ticket: "YM-199",
+    tail: ["--model", "terra", "YM-198"],
+  });
+  assert.deepEqual(parseShipArgs(["YM-199", "YM-199"]), { ticket: "YM-199+YM-199", tail: [] });
+  assert.deepEqual(parseShipArgs(["note", "--model", "terra"]), {
+    ticket: "",
+    tail: ["note", "--model", "terra"],
+  });
+  assert.deepEqual(parseShipArgs(["YM-199+YM-198"], true), {
+    ticket: "YM-199+YM-198",
+    tail: [],
+  });
+  assert.deepEqual(parseShipArgs(["YM-199+YM-198"]), {
+    ticket: "",
+    tail: ["YM-199+YM-198"],
+  });
+
+  const parsed = parseShipArgs(["YM-199", "note", "YM-198", "--model", "terra"]);
+  const launch = resolveLaunch("/root", "ship", parsed.ticket, parsed.tail.filter((word) => word !== "--model" && word !== "terra").join(" "));
+  assert.ok(launch.env.includes("YOKEMATE_TICKET=YM-199+YM-198"));
+  assert.equal(launch.prompt, "/skill:ship-worker YM-199+YM-198 note");
+});
+
+test("ship prompt preserves single and batch arguments through where", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({
+    cwd: root,
+    agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts", "ship.md")],
+    includeDefaults: false,
+  });
+  const runWhere = (args: string[], env: Record<string, string>) =>
+    spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "ship", ...args],
+      { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
+    );
+
+  for (const keys of [["YM-197"], ["YM-199", "YM-198", "YM-197"]]) {
+    const stamp = keys.join("+");
+    const expanded = promptTemplates.expandPromptTemplate(`/ship ${keys.join(" ")}`, templates);
+    const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
+    const launch = expanded.match(/pnpm ship(?: [^`\n]*)?/)?.[0];
+    assert.ok(where);
+    assert.ok(launch);
+    const whereArgs = where.split(/\s+/).slice(3);
+    const main = runWhere(whereArgs, {});
+    assert.equal(main.status, 0, main.stderr);
+    assert.equal(main.stdout.trim(), "launch");
+    assert.deepEqual(whereArgs, keys);
+    assert.deepEqual(launch.split(/\s+/).slice(2), keys);
+
+    const own = runWhere(whereArgs, { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
+    assert.equal(own.status, 0, own.stderr);
+    assert.equal(own.stdout.trim(), "run");
+    for (const env of [
+      { YOKEMATE_MODE: "review", YOKEMATE_TICKET: stamp },
+      { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: keys.length === 1 ? "YM-198" : keys.slice(0, -1).join("+") },
+      ...(keys.length === 1 ? [] : [{ YOKEMATE_MODE: "ship", YOKEMATE_TICKET: [...keys].reverse().join("+") }]),
+    ]) {
+      const refused = runWhere(whereArgs, env);
+      assert.equal(refused.status, 1);
+      assert.match(refused.stdout, /^refuse: /);
+    }
+    const worker = runWhere([stamp], { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
+    assert.equal(worker.status, 0, worker.stderr);
+    assert.equal(worker.stdout.trim(), "run");
+  }
+
+  const withTail = promptTemplates.expandPromptTemplate("/ship YM-199 note YM-198 --model terra YM-197", templates);
+  const withTailWhere = withTail.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
+  const withTailLaunch = withTail.match(/pnpm ship(?: [^`\n]*)?/)?.[0];
+  assert.ok(withTailWhere);
+  assert.ok(withTailLaunch);
+  assert.deepEqual(withTailLaunch.split(/\s+/).slice(2), ["YM-199", "note", "YM-198", "--model", "terra", "YM-197"]);
+  const ownTail = runWhere(withTailWhere.split(/\s+/).slice(3), {
+    YOKEMATE_MODE: "ship",
+    YOKEMATE_TICKET: "YM-199+YM-198",
+  });
+  assert.equal(ownTail.status, 0, ownTail.stderr);
+  assert.equal(ownTail.stdout.trim(), "run");
+
+  const empty = promptTemplates.expandPromptTemplate("/ship", templates);
+  const where = empty.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
+  assert.ok(where);
+  const result = runWhere(where.split(/\s+/).slice(3), {});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /usage: where/);
+  const withoutKeys = runWhere(["note", "--model", "terra"], {});
+  assert.equal(withoutKeys.status, 1);
+  assert.match(withoutKeys.stderr, /usage: where/);
+
+  const policyOff = resolveGuardPolicy({ yolo: false, guards: { modeOwnership: false } });
+  assert.deepEqual(
+    decide({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-199" }, "ship", "YM-199", policyOff),
+    { kind: "launch" },
+  );
+  assert.deepEqual(
+    decide({ YOKEMATE_MODE: "ship", YOKEMATE_TICKET: "YM-199" }, "ship", "YM-199", policyOff),
+    { kind: "run" },
+  );
 });
 
 test("spawn and mode-tab refuse without a pane id, before any effect", async () => {

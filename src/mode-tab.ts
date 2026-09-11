@@ -41,6 +41,7 @@ import { modelForOrg, modelForTicket } from "./project-model.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
+import { parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
@@ -188,19 +189,11 @@ if (import.meta.filename === process.argv[1]) {
   // A ticketless mode eats its first word as a key only when it looks like
   // one — anything else is already the note (a problem statement for plan).
   const ticketless = TICKETLESS.includes(mode);
-  // Ship takes one or several keys: every word before --model (or the end)
-  // matching the key shape joins the list; the pane carries them as one
-  // `+`-joined string, and everything else stays the note.
   let ticket: string;
   let tail: string[];
   if (mode === "ship") {
-    const words = normalizedArgv.slice(1);
-    const stop = words.indexOf("--model");
-    const head = stop === -1 ? words : words.slice(0, stop);
-    const keys = head.filter((w) => TICKET_KEY.test(w));
-    if (keys.length === 0) fail(`usage: ship <KEY> [<KEY> …] [--model <m>] [note]`);
-    ticket = keys.join("+");
-    tail = [...head.filter((w) => !TICKET_KEY.test(w)), ...(stop === -1 ? [] : words.slice(stop))];
+    ({ ticket, tail } = parseShipArgs(normalizedArgv.slice(1)));
+    if (!ticket) fail(`usage: ship <KEY> [<KEY> …] [--model <m>] [note]`);
   } else if (ticketless) {
     ticket = TICKET_KEY.test(normalizedArgv[1] ?? "") ? normalizedArgv[1] : "";
     tail = normalizedArgv.slice(ticket ? 2 : 1);

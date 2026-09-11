@@ -5,10 +5,10 @@ argument-hint: "<KEY> [<KEY> …] [note]"
 
 # /ship — launcher
 
-You raise the ship tab and stop. The work runs there as `ship-worker`, prompted at the tab's creation — the engineer never types it, and nothing in this file describes the work. One command runs before anything else, with the keys out of `$@` joined by `+` in the order the engineer typed them:
+You raise the ship tab and stop. The work runs there as `ship-worker`, prompted at the tab's creation — the engineer never types it, and nothing in this file describes the work. One command runs before anything else with the original arguments; the where CLI normalizes the keys:
 
 ```
-pnpm where ship
+pnpm where ship $@
 ```
 
 - **`launch`** — this is the main chat. Raise the tab and stop:
