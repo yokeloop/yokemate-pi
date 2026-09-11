@@ -56,7 +56,8 @@ function partsForPlan(root: string, ticket: string, plan: string): PreparedPart[
 function settings(root: string, folder: string): void {
   mkdirSync(join(folder, ".pi"), { recursive: true });
   let subagent: unknown;
-  try { subagent = JSON.parse(readFileSync(join(root, ".pi", "settings.json"), "utf8"))?.subagent; } catch {}
+  try { subagent = JSON.parse(readFileSync(join(root, ".pi", "settings.json"), "utf8"))?.subagent; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   writeFileSync(join(folder, ".pi", "settings.json"), JSON.stringify({ extensions: [join(root, "src", "guards.ts"), join(root, "src", "bus.ts"), join(root, ".pi", "extensions", "subagent", "index.ts")], ...(subagent === undefined ? {} : { subagent }) }, null, 2));
   linkTeammates(join(root, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 }

@@ -54,9 +54,11 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   ensureDir(directory, uid);
   if (existsSync(sock)) {
     const sidecar = `${sock}.json`;
-    let owner: { pid?: number; starttime?: string } | undefined;
-    try { owner = JSON.parse(readFileSync(sidecar, "utf8")); } catch {}
-    if (owner?.pid && typeof owner.starttime === "string" && processMatches(owner.pid, owner.starttime)) throw new Error(`coordinator endpoint is owned by live pid ${owner.pid}`);
+    let owner: { pid?: number; starttime?: string };
+    try { owner = JSON.parse(readFileSync(sidecar, "utf8")); }
+    catch { throw new Error("coordinator endpoint ownership cannot be verified"); }
+    if (!owner.pid || typeof owner.starttime !== "string") throw new Error("coordinator endpoint ownership cannot be verified");
+    if (processMatches(owner.pid, owner.starttime)) throw new Error(`coordinator endpoint is owned by live pid ${owner.pid}`);
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }

@@ -137,6 +137,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = () => new Promise<void>((resolve) => {
     captureOwned();
+    if (liveOwned().length === 0) return resolve();
     const grace = options.stopGraceMs ?? 5000;
     let settled = false;
     const finish = () => { if (!settled) { settled = true; resolve(); } };
