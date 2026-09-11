@@ -82,14 +82,12 @@ if (!existsSync(planAbs)) fail(`plan not found: ${planAbs}`);
 // in one line, not leave an empty tab behind. The write itself happens after
 // the agent is up — where the decision completes.
 const env = process.env as MoveEnv;
-{
-  const cur =
-    ((db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
-      | { stage: string }
-      | undefined)?.stage as From | undefined) ?? "absent";
-  const v = checkMove("spawn", env, ticket, cur, { allowFresh: Boolean(planArg), policy });
-  if (!v.ok) fail(v.refuse);
-}
+const expected =
+  ((db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
+    | { stage: string }
+    | undefined)?.stage as From | undefined) ?? "absent";
+const preflight = checkMove("spawn", env, ticket, expected, { allowFresh: Boolean(planArg), policy });
+if (!preflight.ok) fail(preflight.refuse);
 
 // Task folder. Worktrees inside it are created by the /do skill, not here.
 const folder = join(ROOT, "work", ticket);
@@ -135,7 +133,7 @@ const label = runId ? `${ticket} [${runId}]` : ticket;
 const agents = (
   herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
 ).result.agents;
-const running = findRunningAgent(agents, legacyAgentName);
+const running = findRunningAgent(agents, legacyAgentName, true);
 if (policy.guards.duplicateDo && running)
   fail(`${ticket} already runs in pane ${running} — go to it, or close it and launch again`);
 
@@ -211,7 +209,7 @@ const moved = applyMove(
       `UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?`,
     ).run(folder, planAbs, ticket);
   },
-  { allowFresh: Boolean(planArg), policy },
+  { allowFresh: Boolean(planArg), policy, expected },
 );
 if (!moved.ok) fail(`${ticket}: the tab is up, but the stage write was refused — ${moved.refuse}`);
 

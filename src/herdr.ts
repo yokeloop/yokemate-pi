@@ -43,8 +43,9 @@ export function findOpenTabs(
 export function findRunningAgent(
   agents: { name?: string; pane_id: string }[],
   agentName: string,
+  includeRuns = false,
 ): string | undefined {
-  return agents.find((a) => a.name === agentName)?.pane_id;
+  return agents.find((a) => a.name === agentName || (includeRuns && a.name?.startsWith(`${agentName.slice(0, 23)}-`)))?.pane_id;
 }
 
 /**

@@ -29,10 +29,10 @@ export function guardCall(
 ): { name: string; input: { command?: string; file_path?: string } } | null {
   if (toolName === "bash")
     return { name: "Bash", input: { command: input.command as string | undefined } };
-  if (toolName === "write" || toolName === "edit") {
+  if (toolName === "write" || toolName === "edit" || toolName === "notebook_edit") {
     const p = input.path;
     return {
-      name: toolName === "write" ? "Write" : "Edit",
+      name: toolName === "write" ? "Write" : toolName === "edit" ? "Edit" : "NotebookEdit",
       input: { file_path: typeof p === "string" ? resolve(cwd, p) : undefined },
     };
   }
@@ -112,6 +112,7 @@ export default function guards(pi: ExtensionAPI) {
   let lastVerdict: string | null = null;
 
   pi.on("agent_settled", () => {
+    if (process.env.YOKEMATE_ROLE === "executor") return;
     let reason: string | null = null;
     try {
       reason = stopVerdict(process.env, readStage);
@@ -145,7 +146,7 @@ export default function guards(pi: ExtensionAPI) {
   // arriving from a pane in the meantime would reach the model but never the
   // transcript. The first turn waits for the pull instead, below.
   pi.on("session_start", (event, ctx) => {
-    if (process.env.YOKEMATE_MODE) return;
+    if (process.env.YOKEMATE_ROLE === "executor" || process.env.YOKEMATE_MODE) return;
     if (event.reason !== "startup") return;
     digestPending = true;
     // ctx.ui is a getter that throws once the session is replaced or reloaded,

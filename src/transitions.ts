@@ -89,7 +89,7 @@ export function checkMove(
     const seats = Object.keys(rule.stamped);
     return { ok: false, refuse: `${via} is not ${mode}'s move — it belongs to ${seats.length ? seats.join("/") : "the main chat alone"}` };
   }
-  if (mode && policy.guards.transitionTicket && seat && !seat.ticketless && env.YOKEMATE_TICKET !== ticket)
+  if (mode && policy.guards.transitionTicket && !seat?.ticketless && env.YOKEMATE_TICKET !== ticket)
     return { ok: false, refuse: `this pane is stamped ${env.YOKEMATE_TICKET ?? "nothing"}, not ${ticket} — a mode moves only its own ticket` };
   const base = seat?.from ?? rule.unstamped;
   const from = opts.allowFresh ? [...new Set<From>([...base, "absent", "new"])] : base;
