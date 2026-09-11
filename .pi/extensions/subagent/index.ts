@@ -513,7 +513,7 @@ async function runSingleAgent(
 			const child = research
 				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
 				: undefined;
-			const env = {
+			const env: NodeJS.ProcessEnv = {
 				...process.env,
 				YOKEMATE_ROLE: "executor",
 				YOKEMATE_RUN_ID: randomUUID(),
