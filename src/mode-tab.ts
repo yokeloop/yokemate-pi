@@ -257,7 +257,7 @@ if (import.meta.filename === process.argv[1]) {
     agentName = freeAgentName(agentName, agents.map((a) => a.name ?? ""));
     label = agentName;
   } else {
-    const running = findRunningAgent(agents, launch.agentName, true);
+    const running = findRunningAgent(agents, launch.agentName, { mode, ticket, cwd });
     if (duplicateGuard && running)
       fail(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
   }

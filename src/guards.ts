@@ -30,7 +30,7 @@ export function guardCall(
   if (toolName === "bash")
     return { name: "Bash", input: { command: input.command as string | undefined } };
   if (toolName === "write" || toolName === "edit" || toolName === "notebook_edit") {
-    const p = input.path;
+    const p = input.path ?? input.notebook_path;
     return {
       name: toolName === "write" ? "Write" : toolName === "edit" ? "Edit" : "NotebookEdit",
       input: { file_path: typeof p === "string" ? resolve(cwd, p) : undefined },

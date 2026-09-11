@@ -133,7 +133,7 @@ const label = runId ? `${ticket} [${runId}]` : ticket;
 const agents = (
   herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
 ).result.agents;
-const running = findRunningAgent(agents, legacyAgentName, true);
+const running = findRunningAgent(agents, legacyAgentName, { mode: "do", ticket, cwd: folder });
 if (policy.guards.duplicateDo && running)
   fail(`${ticket} already runs in pane ${running} — go to it, or close it and launch again`);
 
@@ -211,6 +211,9 @@ const moved = applyMove(
   },
   { allowFresh: Boolean(planArg), policy, expected },
 );
-if (!moved.ok) fail(`${ticket}: the tab is up, but the stage write was refused — ${moved.refuse}`);
+if (!moved.ok) {
+  try { herdr(["tab", "close", created.result.tab.tab_id]); } catch {}
+  fail(`${ticket}: the tab was closed because the stage write was refused — ${moved.refuse}`);
+}
 
 console.log(`${ticket} → tab ${pane}, agent "${agentName}", model ${model}, stage running${runId ? `, run ${runId}` : ""}`);

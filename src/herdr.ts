@@ -4,6 +4,9 @@
 // one file.
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { sidecarPath, socketDir, type Sidecar } from "./inbox.ts";
 
 /** One herdr command, its JSON answer parsed. Output is captured, never
  * inherited: herdr's errors belong in the thrown error, not in the chat. */
@@ -43,9 +46,22 @@ export function findOpenTabs(
 export function findRunningAgent(
   agents: { name?: string; pane_id: string }[],
   agentName: string,
-  includeRuns = false,
+  expected?: { mode: string; ticket: string; cwd: string },
 ): string | undefined {
-  return agents.find((a) => a.name === agentName || (includeRuns && a.name?.startsWith(`${agentName.slice(0, 23)}-`)))?.pane_id;
+  const legacy = agents.find((a) => a.name === agentName);
+  if (legacy) return legacy.pane_id;
+  if (!expected) return undefined;
+  const dir = socketDir(process.env, process.getuid!());
+  const prefix = `${agentName.slice(0, 23)}-`;
+  for (const agent of agents) {
+    if (!agent.name?.startsWith(prefix)) continue;
+    try {
+      const sidecar = JSON.parse(readFileSync(sidecarPath(dir, agent.pane_id), "utf8")) as Sidecar;
+      if (sidecar.mode === expected.mode && sidecar.ticket === expected.ticket && resolve(sidecar.cwd) === resolve(expected.cwd))
+        return agent.pane_id;
+    } catch {}
+  }
+  return undefined;
 }
 
 /**
