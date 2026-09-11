@@ -30,6 +30,7 @@ import {
 import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
@@ -468,7 +469,9 @@ async function runSingleAgent(
 	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
 		args.push("--thinking", dispatchDefaults.thinkingLevel);
 	}
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	const research = researchIdentity();
+	if (!research && agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (research) args.push("--no-extensions", "--no-tools", "-e", path.join(research.root, "src", "research.ts"));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -507,11 +510,19 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
-			const env = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: randomUUID() };
-			if (process.env.YOKEMATE_RUN_ID) env.YOKEMATE_PARENT_RUN_ID = process.env.YOKEMATE_RUN_ID;
+			const child = research
+				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
+				: undefined;
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
+				YOKEMATE_ROLE: "executor",
+				YOKEMATE_RUN_ID: randomUUID(),
+				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
+				...(child?.env ?? {}),
+			};
 			delete env.HERDR_PANE_ID;
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
+				cwd: child?.cwd ?? cwd ?? defaultCwd,
 				env,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],

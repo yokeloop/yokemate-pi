@@ -38,15 +38,17 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
+import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
+import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
 
-export const MODES = ["plan", "review", "ship", "worklog", "note"] as const;
+export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
 
 /** The modes that may run before a ticket exists — everything else is keyed by
  *  one. A plan launch takes a key or a problem statement; only the key looks
  *  like one. A note launch takes a topic — never a key. */
-export const TICKETLESS: readonly string[] = ["plan", "note"];
+export const TICKETLESS: readonly string[] = ["plan", "note", "research"];
 const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 
 /** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
@@ -146,9 +148,43 @@ if (import.meta.filename === process.argv[1]) {
     process.exit(1);
   };
 
-  const argv = process.argv.slice(2).filter((a) => a !== "--");
+  const argv = process.argv.slice(2);
   const mode = argv[0] as Mode;
   if (!MODES.includes(mode)) fail(`usage: <${MODES.join("|")}> <TICKET> [--model <m>] [rest…]`);
+
+  if (mode === "research") {
+    if (process.env.HERDR_ENV !== "1")
+      fail("not inside a herdr session — open the main chat in herdr first");
+    const parentPane = process.env.HERDR_PANE_ID ||
+      fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
+    const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
+    let launch;
+    try {
+      launch = resolveResearchLaunch(ROOT, argv.slice(1));
+      const checked = checkModel(launch.model, piList);
+      if (!checked.ok) fail(checked.reason);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+    const agents = (herdr(["agent", "list"]) as { result: { agents: { name?: string }[] } }).result.agents;
+    if (findRunningAgent(agents as { name?: string; pane_id: string }[], launch.agentName))
+      fail(`${launch.label} already runs`);
+    const { tab, root_pane } = (herdr([
+      "tab", "create", "--workspace", parentWorkspace, "--cwd", ROOT, "--label", launch.label,
+      ...[...launch.env, `YOKEMATE_PARENT_PANE=${parentPane}`].flatMap((e) => ["--env", e]),
+    ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
+    try {
+      startAgent(launch.agentName, root_pane.pane_id, launch.label, researchAgentArgs(ROOT, launch.model));
+      herdr(["agent", "prompt", launch.agentName, launch.prompt]);
+    } catch (e) {
+      try { herdr(["tab", "close", tab.tab_id]); } catch {}
+      fail(`${launch.label}: ${(e as Error).message.split("\n")[0]}`);
+    }
+    console.log(`/research → tab ${tab.tab_id}, pane ${root_pane.pane_id}, agent "${launch.agentName}", model ${launch.model}, ${launch.project ? `${launch.project.org}/${launch.project.repo}` : launch.topic}`);
+    process.exit(0);
+  }
+
+  const normalizedArgv = argv.filter((a) => a !== "--");
   // A ticketless mode eats its first word as a key only when it looks like
   // one — anything else is already the note (a problem statement for plan).
   const ticketless = TICKETLESS.includes(mode);
@@ -158,7 +194,7 @@ if (import.meta.filename === process.argv[1]) {
   let ticket: string;
   let tail: string[];
   if (mode === "ship") {
-    const words = argv.slice(1);
+    const words = normalizedArgv.slice(1);
     const stop = words.indexOf("--model");
     const head = stop === -1 ? words : words.slice(0, stop);
     const keys = head.filter((w) => TICKET_KEY.test(w));
@@ -166,11 +202,11 @@ if (import.meta.filename === process.argv[1]) {
     ticket = keys.join("+");
     tail = [...head.filter((w) => !TICKET_KEY.test(w)), ...(stop === -1 ? [] : words.slice(stop))];
   } else if (ticketless) {
-    ticket = TICKET_KEY.test(argv[1] ?? "") ? argv[1] : "";
-    tail = argv.slice(ticket ? 2 : 1);
+    ticket = TICKET_KEY.test(normalizedArgv[1] ?? "") ? normalizedArgv[1] : "";
+    tail = normalizedArgv.slice(ticket ? 2 : 1);
   } else {
-    ticket = argv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
-    tail = argv.slice(2);
+    ticket = normalizedArgv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
+    tail = normalizedArgv.slice(2);
   }
 
   const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();

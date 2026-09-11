@@ -18,6 +18,7 @@ import { dataRoot as dataRootOf } from "./data-root.ts";
 import { GuardPolicyError, formatGuardPolicy, readGuardPolicy, resolveGuardPolicy } from "./guard-policy.ts";
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
+import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -78,6 +79,14 @@ export default function guards(pi: ExtensionAPI) {
   // throw from a tool_call handler kills the tool — the opposite of the policy
   // in the header.
   pi.on("tool_call", async (event, ctx) => {
+    if (process.env.YOKEMATE_RESEARCH_ID) {
+      try {
+        const v = classifyResearchCall(researchIdentity(process.env, String((ctx as unknown as { sessionId?: string }).sessionId ?? "runtime")), event.toolName);
+        if (!v.ok) return { block: true, reason: v.reason };
+      } catch (e) {
+        return { block: true, reason: `research guard failure: ${(e as Error).message}` };
+      }
+    }
     try {
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
