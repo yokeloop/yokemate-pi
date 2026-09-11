@@ -36,6 +36,8 @@ import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
+import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
+import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -466,14 +468,16 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
 	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
 		args.push("--thinking", dispatchDefaults.thinkingLevel);
 	}
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	const research = researchIdentity();
+	if (!research && agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (research) args.push("--no-extensions", "--no-tools", "-e", path.join(research.root, "src", "research.ts"));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -517,16 +521,24 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
-			const env = { ...process.env };
+			const child = research
+				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
+				: undefined;
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
+				YOKEMATE_ROLE: "executor",
+				YOKEMATE_RUN_ID: randomUUID(),
+				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
+				...(child?.env ?? {}),
+			};
 			if (coordinatorChild) {
-				env.YOKEMATE_PARENT_RUN_ID = env.YOKEMATE_RUN_ID;
+				env.YOKEMATE_PARENT_RUN_ID = process.env.YOKEMATE_RUN_ID;
 				env.YOKEMATE_RUN_ID = randomUUID();
-				env.YOKEMATE_ROLE = "executor";
 			}
 			delete env.HERDR_PANE_ID;
 			delete env.YOKEMATE_PARENT_PANE;
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
+				cwd: child?.cwd ?? cwd ?? defaultCwd,
 				env,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
@@ -701,41 +713,44 @@ export default function (pi: ExtensionAPI) {
 		activeUnits += 1;
 		let run: CoordinatorRun | undefined;
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+		let reportBlocked: ((reason: string) => void) | undefined;
 		const finishCalls = new Set<string>();
 		try {
 			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
-			coordinatorUnits.add(run.identity.runId);
+			if (!run) throw new Error("coordinator reservation failed");
+			const ownedRun = run;
+			coordinatorUnits.add(ownedRun.identity.runId);
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
-			run.identity.model = prepared.model;
-			run.identity.cwd = prepared.cwd;
-			run.identity.project = prepared.parts.map((part) => part.repo);
-			coordinators.setPrepared(run.identity.runId, prepared);
+			ownedRun.identity.model = prepared.model;
+			ownedRun.identity.cwd = prepared.cwd;
+			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
+			coordinators.setPrepared(ownedRun.identity.runId, prepared);
 			let terminalReported = false;
 			let nudgeSent = false;
-			const reportBlocked = (reason: string) => {
+			reportBlocked = (reason: string) => {
 				if (terminalReported) return;
 				terminalReported = true;
-				uiAbortByRun.get(run.identity.runId)?.abort();
-				uiAbortByRun.delete(run.identity.runId);
-				const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
-				releaseCoordinatorUnit(run.identity.runId);
+				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
+				uiAbortByRun.delete(ownedRun.identity.runId);
+				const blocked = coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
+				releaseCoordinatorUnit(ownedRun.identity.runId);
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
-				rpcByRun.delete(run.identity.runId);
+				rpcByRun.delete(ownedRun.identity.runId);
 			};
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
-			rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
+			rpc = startCoordinatorRpc(prepared, ownedRun.identity, { onEvent: (event) => {
 				if (event.type === "agent_start") { nudgeSent = false; return; }
 				if (event.type === "agent_settled" && !terminalReported) {
-					if (nudgeSent) { reportBlocked("coordinator stopped without outcome"); return; }
+					if (nudgeSent) { reportBlocked?.("coordinator stopped without outcome"); return; }
 					nudgeSent = true;
-					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked((error as Error).message));
+					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked?.((error as Error).message));
 					return;
 				}
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
-				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== run.identity.runId || !result.details.outcome || terminalReported) return;
+				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
 				terminalReported = true;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
 				const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
@@ -745,21 +760,21 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				rpc?.acceptTerminal();
-				uiAbortByRun.get(run.identity.runId)?.abort();
-				uiAbortByRun.delete(run.identity.runId);
-				coordinators.finalize(run.identity.runId, proposal.outcome, proposal.reason);
-				releaseCoordinatorUnit(run.identity.runId);
-				pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
-				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
-				void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId);
+				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
+				uiAbortByRun.delete(ownedRun.identity.runId);
+				coordinators.finalize(ownedRun.identity.runId, proposal.outcome, proposal.reason);
+				releaseCoordinatorUnit(ownedRun.identity.runId);
+				pi.appendEntry("yokemate-coordinator-run", { identity: ownedRun.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
+				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${ownedRun.identity.mode} ${ownedRun.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: ownedRun.identity.runId, mode: ownedRun.identity.mode, tickets: ownedRun.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+				void rpcByRun.get(ownedRun.identity.runId)?.stop(); rpcByRun.delete(ownedRun.identity.runId);
 			}, onUiRequest: (event, reply) => {
 				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
 				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
-				const controller = uiAbortByRun.get(run.identity.runId) ?? new AbortController();
-				uiAbortByRun.set(run.identity.runId, controller);
+				const controller = uiAbortByRun.get(ownedRun.identity.runId) ?? new AbortController();
+				uiAbortByRun.set(ownedRun.identity.runId, controller);
 				uiTail = uiTail.then(async () => {
 					const id = request.id!;
-					const live = () => !controller.signal.aborted && !["done", "blocked"].includes(coordinators.get(run.identity.runId)?.state ?? "blocked");
+					const live = () => !controller.signal.aborted && !["done", "blocked"].includes(coordinators.get(ownedRun.identity.runId)?.state ?? "blocked");
 					try {
 						if (!ctx.hasUI || !live()) { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
 						const options = { signal: controller.signal };
@@ -776,18 +791,18 @@ export default function (pi: ExtensionAPI) {
 					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
 				}).catch(() => {});
 			}, onBlocked: reportBlocked });
-			rpcByRun.set(run.identity.runId, rpc);
+			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
-			coordinators.attachProcess(run.identity.runId, rpc.process);
-			const work = await rpc.request({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
+			coordinators.attachProcess(ownedRun.identity.runId, rpc.process);
+			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
-			return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
+			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
 			if (run) {
 				uiAbortByRun.get(run.identity.runId)?.abort();
 				uiAbortByRun.delete(run.identity.runId);
 				await rpc?.stop();
-				reportBlocked((error as Error).message);
+				reportBlocked?.((error as Error).message);
 			} else activeUnits -= 1;
 			throw error;
 		}
@@ -900,7 +915,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coordinator finish",
 		description: "Finish this owned background coordinator with a verified outcome.",
 		parameters: Type.Object({ outcome: StringEnum(["done", "blocked"] as const), summary: Type.String(), reason: Type.Optional(Type.String()), passedTickets: Type.Optional(Type.Array(Type.String())) }),
-		async execute(_id, params) {
+		async execute(_id, params): Promise<any> {
 			const runId = process.env.YOKEMATE_RUN_ID;
 			if (!runId || process.env.YOKEMATE_ROLE !== "coordinator" || ownedReadyRunId !== runId)
 				return { content: [{ type: "text", text: "coordinator_finish is available only to its owned RPC coordinator" }], isError: true };
@@ -937,7 +952,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
@@ -963,7 +978,13 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			const agentScope: AgentScope = params.agentScope ?? "project";
-			const limits = loadLimits(ctx.cwd);
+			let policy;
+			try {
+				policy = readGuardPolicy(ENGINE_ROOT);
+			} catch (e) {
+				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
+			}
+			const limits = readSubagentLimits(ENGINE_ROOT);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -1062,6 +1083,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (
 				(agentScope === "project" || agentScope === "both") &&
+				policy.guards.projectAgentConfirmation &&
 				confirmProjectAgents &&
 				ctx.hasUI &&
 				!ctx.isProjectTrusted()
@@ -1092,14 +1114,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain && params.chain.length > 0) {
 				const steps = params.chain;
-				if (activeUnits + 1 > limits.maxDetached) {
+				const admission = subagentAdmission(policy, limits, "chain", 1, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("chain")([]),
 						isError: true,
 					};
@@ -1183,25 +1201,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.tasks && params.tasks.length > 0) {
 				const tasks = params.tasks;
-				if (tasks.length > limits.maxParallelTasks)
+				const admission = subagentAdmission(policy, limits, "parallel", tasks.length, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				if (activeUnits + tasks.length > limits.maxDetached) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("parallel")([]),
 						isError: true,
 					};
@@ -1209,7 +1212,7 @@ export default function (pi: ExtensionAPI) {
 
 				activeUnits += tasks.length;
 				openBatch(toolCallId, tasks.length);
-				void mapWithConcurrencyLimit(tasks, limits.maxConcurrency, (t) =>
+				void mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), (t) =>
 					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
 				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
 
@@ -1226,14 +1229,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				if (activeUnits + 1 > limits.maxDetached) {
+				const admission = subagentAdmission(policy, limits, "single", 1, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("single")([]),
 						isError: true,
 					};

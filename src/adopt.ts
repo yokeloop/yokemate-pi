@@ -189,7 +189,7 @@ export function adopt(
     db.prepare("DELETE FROM part WHERE work_id = ?").run(work.id);
     const ins = db.prepare("INSERT INTO part (work_id, repo, role, branch, pr) VALUES (?, ?, ?, ?, ?)");
     for (const p of parts) ins.run(work.id, p.repo, p.role, key, p.pr);
-  });
+  }, { expected: current });
   if (!out.ok) throw new Error(out.refuse);
   return { repeat: out.repeat, planPath, parts };
 }

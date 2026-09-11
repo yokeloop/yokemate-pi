@@ -12,10 +12,12 @@
 // Usage: pnpm where <mode> <TICKET>   → prints `launch`, `run`, or `refuse: …`
 //        pnpm where plan [KEY]        → /plan can run before a ticket exists
 
-export const MODES = ["plan", "review", "do", "ship", "worklog", "note"] as const;
+import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+
+export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
 
 /** Modes that run before a ticket exists, so their pane may carry no ticket. */
-export const TICKETLESS: readonly Mode[] = ["plan", "note"];
+export const TICKETLESS: readonly Mode[] = ["plan", "note", "research"];
 export type Mode = (typeof MODES)[number];
 
 export type Decision =
@@ -34,11 +36,12 @@ export interface ModeEnv {
  * of another ticket or another mode: doing the work there would write one
  * ticket's plan while wearing another ticket's name.
  */
-export function decide(env: ModeEnv, mode: Mode, ticket?: string): Decision {
+export function decide(env: ModeEnv, mode: Mode, ticket?: string, policy: GuardPolicy = readGuardPolicy()): Decision {
   const here = env.YOKEMATE_MODE;
   if (!here) return { kind: "launch" };
   // A ticketless mode matches on the mode alone — both sides carry no key.
   if (here === mode && (env.YOKEMATE_TICKET ?? "") === (ticket ?? "")) return { kind: "run" };
+  if (!policy.guards.modeOwnership) return { kind: "launch" };
   const asked = ticket ? `${mode} ${ticket}` : mode;
   return {
     kind: "refuse",

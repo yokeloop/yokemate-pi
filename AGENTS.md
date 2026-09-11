@@ -17,7 +17,7 @@ Orchestrator chat for development work across multiple organizations and reposit
 - The answer names the same subject as the question. If you do not know it, say «не знаю» — not the neighboring answer you do know.
 - Repeating your own frame after the engineer rejected it is the most expensive failure there is. Second rejection: drop your version entirely, build from their words, and say what breaks — do not defend.
 - «Готово» names the entry you checked it through. A behavior has more than one entry — the command and what the engineer types. Fixing one and closing the question is the failure that cost the most turns.
-- A mode starts only on the engineer's typed command in this turn; the guard confirms only a ship launch — the one irreversible run, it merges.
+- A mode starts only on the engineer's typed command in this turn, except that an already delegated plan-flow with effective `workflowApproval=false` may launch its ready worker after recording the plan; an explicit «стоп» or «только план» still wins. The guard confirms only a ship launch — the one irreversible run, it merges.
 
 ## Layout
 
@@ -37,7 +37,7 @@ Orchestrator chat for development work across multiple organizations and reposit
 
 ## Orchestrator commands
 
-The engineer types `/plan`, `/split plan`, `/do`, `/review`, `/ship`, `/journal`, `/worklog`, `/note`, `/warmup` and nothing else. These commands are how you carry that out — your tools, not the engineer's; do not answer with one.
+The engineer types `/plan`, `/split plan`, `/do`, `/review`, `/ship`, `/journal`, `/worklog`, `/note`, `/research`, `/warmup` and nothing else. These commands are how you carry that out — your tools, not the engineer's; do not answer with one.
 
 A stage move is made by the mode where the result was born — the /plan flow, the background do coordinator and the review pane run the state commands themselves; each command checks the caller's stamp, the legal move, the current stage (compare-and-set) and repeat-safety (`src/transitions.ts`). The unstamped main chat is the repair entry; `--force` lives on `stage` alone. A do or ship coordinator reports one verified terminal outcome through its parent runtime; there is no tab to close. /review, /worklog, /note and the /plan splits end in a conversation with the engineer and are the engineer's to close.
 
@@ -50,6 +50,7 @@ A stage move is made by the mode where the result was born — the /plan flow, t
 - `pnpm plan <TICKET> <plan-path>` — record a ready plan, stage → planned; the /plan flow runs it itself
 - `pnpm spawn <TICKET> [--plan <path>] [--model <m>]` — route a do background coordinator through the live parent runtime; stage → running only after preparation and reservation. The plan comes from the ticket's row; `--plan` only overrides it
 - `pnpm review <TICKET> [note]` · `pnpm ship <KEY> [<KEY> …] [note]` · `pnpm worklog <org> [note]` — ship routes a background coordinator; review and worklog use a split of the main chat's pane. The note reaches the worker verbatim. When the engineer names a model in their command («запусти на gpt-6-astra»), translate it into `--model <m>` — spawn takes the flag too; without the flag the model comes from the project's passport by the mode of the launched worker, and the flag overrides it
+- `pnpm research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>` — ticketless TAB research; it reads a selected passport or free topic without queue/stage/worktree effects, and it stays open until the engineer closes it. Every clone edit needs one fresh TUI consent for its exact target and final diff; `-a`/YOLO does not bypass it.
 - `pnpm note [тема] [--model <m>]` — read-only split beside the chat: a conversation about the pool or a project with the guard holding every write; the outcome is a note in `home/notes/` saved via `pnpm note-save` on the engineer's word, a secret gist on their word too; the engineer closes the pane. Без тикета паспорта спрашивать не о чем — модель приходит из `home/pool.json`
 - `pnpm split plan [KEY|проблема] [--model <m>] [note]` — the explicit split: the same /plan in a split of the main chat's pane, for parallel plannings on a big screen; the panes are conversational — the engineer closes them. По проблеме, без ключа, модель приходит из `home/pool.json`
 - `pnpm close-mode <ship|do> <TICKET>` — compatibility response: background coordinators have no tab to close

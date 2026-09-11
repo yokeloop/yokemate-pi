@@ -9,6 +9,7 @@
 // and pass through, and the review pane sits at the yokemate root besides.
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
 
 export interface GuardEnv {
   YOKEMATE_MODE?: string;
@@ -20,8 +21,9 @@ export interface GuardEnv {
 export function stopVerdict(
   env: GuardEnv,
   readStage: (ticket: string) => string | undefined,
+  policy: GuardPolicy = readGuardPolicy(),
 ): string | null {
-  if (env.YOKEMATE_ROLE === "coordinator" || env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
+  if (env.YOKEMATE_ROLE === "coordinator" || !policy.guards.doCompletion || env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
   const stage = readStage(env.YOKEMATE_TICKET);
   if (stage === "review" || stage === "accepted") return null;
   return (

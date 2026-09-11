@@ -30,6 +30,7 @@
 //   pnpm split plan [ACME-342|проблема] [--model <m>] [note]
 
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { findPlan } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
@@ -38,14 +39,17 @@ import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
 import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
+import { checkModel, piList } from "./pi-model.ts";
+import { readGuardPolicy } from "./guard-policy.ts";
 
-export const MODES = ["plan", "review", "ship", "worklog", "note"] as const;
+export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
 
 /** The modes that may run before a ticket exists — everything else is keyed by
  *  one. A plan launch takes a key or a problem statement; only the key looks
  *  like one. A note launch takes a topic — never a key. */
-export const TICKETLESS: readonly string[] = ["plan", "note"];
+export const TICKETLESS: readonly string[] = ["plan", "note", "research"];
 const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 
 /** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
@@ -146,9 +150,44 @@ if (import.meta.filename === process.argv[1]) {
     process.exit(1);
   };
 
-  const argv = process.argv.slice(2).filter((a) => a !== "--");
+  const argv = process.argv.slice(2);
   const mode = argv[0] as Mode;
   if (!MODES.includes(mode)) fail(`usage: <${MODES.join("|")}> <TICKET> [--model <m>] [rest…]`);
+
+  if (mode === "research") {
+    if (process.env.HERDR_ENV !== "1")
+      fail("not inside a herdr session — open the main chat in herdr first");
+    const parentPane = process.env.HERDR_PANE_ID ||
+      fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
+    const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
+    let launch: ReturnType<typeof resolveResearchLaunch> | undefined;
+    try {
+      launch = resolveResearchLaunch(ROOT, argv.slice(1));
+      const checked = checkModel(launch.model, piList);
+      if (!checked.ok) fail(checked.reason);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+    const research = launch ?? fail("research launch was not resolved");
+    const agents = (herdr(["agent", "list"]) as { result: { agents: { name?: string }[] } }).result.agents;
+    if (findRunningAgent(agents as { name?: string; pane_id: string }[], research.agentName))
+      fail(`${research.label} already runs`);
+    const { tab, root_pane } = (herdr([
+      "tab", "create", "--workspace", parentWorkspace, "--cwd", ROOT, "--label", research.label,
+      ...[...research.env, `YOKEMATE_PARENT_PANE=${parentPane}`].flatMap((e) => ["--env", e]),
+    ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
+    try {
+      startAgent(research.agentName, root_pane.pane_id, research.label, researchAgentArgs(ROOT, research.model));
+      herdr(["agent", "prompt", research.agentName, research.prompt]);
+    } catch (e) {
+      try { herdr(["tab", "close", tab.tab_id]); } catch {}
+      fail(`${research.label}: ${(e as Error).message.split("\n")[0]}`);
+    }
+    console.log(`/research → tab ${tab.tab_id}, pane ${root_pane.pane_id}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
+    process.exit(0);
+  }
+
+  const normalizedArgv = argv.filter((a) => a !== "--");
   // A ticketless mode eats its first word as a key only when it looks like
   // one — anything else is already the note (a problem statement for plan).
   const ticketless = TICKETLESS.includes(mode);
@@ -158,7 +197,7 @@ if (import.meta.filename === process.argv[1]) {
   let ticket: string;
   let tail: string[];
   if (mode === "ship") {
-    const words = argv.slice(1);
+    const words = normalizedArgv.slice(1);
     const stop = words.indexOf("--model");
     const head = stop === -1 ? words : words.slice(0, stop);
     const keys = head.filter((w) => TICKET_KEY.test(w));
@@ -166,13 +205,14 @@ if (import.meta.filename === process.argv[1]) {
     ticket = keys.join("+");
     tail = [...head.filter((w) => !TICKET_KEY.test(w)), ...(stop === -1 ? [] : words.slice(stop))];
   } else if (ticketless) {
-    ticket = TICKET_KEY.test(argv[1] ?? "") ? argv[1] : "";
-    tail = argv.slice(ticket ? 2 : 1);
+    ticket = TICKET_KEY.test(normalizedArgv[1] ?? "") ? normalizedArgv[1] : "";
+    tail = normalizedArgv.slice(ticket ? 2 : 1);
   } else {
-    ticket = argv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
-    tail = argv.slice(2);
+    ticket = normalizedArgv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
+    tail = normalizedArgv.slice(2);
   }
 
+  const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
   if (mode === "ship") {
     let shipModel: string | undefined;
     const modelIndex = tail.indexOf("--model");
@@ -189,7 +229,6 @@ if (import.meta.filename === process.argv[1]) {
       process.exit(0);
     } catch (error) { fail((error as Error).message); }
   }
-
   if (process.env.HERDR_ENV !== "1")
     fail("not inside a herdr session — open the main chat in herdr first");
 
@@ -253,9 +292,13 @@ if (import.meta.filename === process.argv[1]) {
   } catch (e) {
     launch = fail((e as Error).message);
   }
-  const { cwd, prompt, env, surface } = launch;
-  let agentName = launch.agentName;
-  let label = launch.label;
+  const { cwd, surface } = launch;
+  const duplicateGuard = policy.guards.duplicateMode;
+  const runId = ticket && !duplicateGuard ? randomUUID().replace(/-/g, "").slice(0, 8) : undefined;
+  const prompt = launch.prompt + (runId ? ` Run ID: ${runId}. Include it in your final report.` : "");
+  const env = [...launch.env, "YOKEMATE_ROLE=coordinator", ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : [])];
+  let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;
+  let label = runId ? `${launch.label} [${runId}]` : launch.label;
 
   const agents = (
     herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
@@ -269,8 +312,8 @@ if (import.meta.filename === process.argv[1]) {
     agentName = freeAgentName(agentName, agents.map((a) => a.name ?? ""));
     label = agentName;
   } else {
-    const running = findRunningAgent(agents, agentName);
-    if (running)
+    const running = findRunningAgent(agents, launch.agentName, { mode, ticket, cwd });
+    if (duplicateGuard && running)
       fail(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
   }
 
@@ -309,6 +352,6 @@ if (import.meta.filename === process.argv[1]) {
   }
 
   console.log(
-    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}`,
+    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
   );
 }

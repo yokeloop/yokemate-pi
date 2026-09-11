@@ -9,7 +9,7 @@ pnpm on-me                                        # тикеты на мне, п
 pnpm add-project <клон> --tracker acme:ACME --model openai-codex/gpt-5.6-terra   # подключить репозиторий
 ```
 
-Дальше в главном чате: `/plan ACME-347` → `/do` → `/review` → `pnpm accept`.
+Дальше в главном чате: `/plan ACME-347` → `/do` → `/review` → `pnpm accept`. Для исследования без тикета есть `/research <project/topic>` — отдельная вкладка.
 
 ## Документы
 

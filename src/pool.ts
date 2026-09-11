@@ -24,7 +24,7 @@ export function readPool(dataRoot: string): Partial<Record<Mode, string>> {
   } catch {
     throw new Error(
       `no pool.json in ${dataRoot} — a launch without a ticket takes its model from there: ` +
-        `create it as {"plan": "<pattern>", "note": "<pattern>"}, or pass --model in the command`,
+        `create it as {"plan": "<pattern>", "note": "<pattern>", "research": "<pattern>"}, or pass --model in the command`,
     );
   }
   let parsed: unknown;

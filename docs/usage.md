@@ -29,13 +29,19 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 
 ## Повторный запуск, подтверждения, модель
 
-Второй запуск режима по тому же тикету не поднимает дубль — coordinator parent называет существующий run. Retained `pnpm spawn` и `pnpm ship` обращаются к живому parent runtime через owner-only socket и отказывают без точной session binding. Через твоё подтверждение проходит только `/ship` — он мержит; do, review, worklog и split запускаются без диалога. Подтверждение и typed `/ship` проверяет backend, а страж (`src/bash-guard.ts`) режет циклы ожидания и запуск приложений на этапе кода.
+Второй запуск режима по тому же тикету не поднимает дубль — coordinator parent называет существующий run. Retained `pnpm spawn` и `pnpm ship` обращаются к живому parent runtime через owner-only socket и отказывают без точной session binding. Через твоё подтверждение проходит только `/ship` — он мержит; do, review, worklog и split запускаются без диалога. Подтверждение и typed `/ship` проверяет backend, а страж (`src/bash-guard.ts`) режет циклы ожидания и запуск приложений на этапе кода. Отдельный research code consent для точной правки не зависит от этого правила и от YOLO.
 
 Приоритет один и в этом порядке: `--model` в команде → переопределение мода в паспорте → умолчание проекта в паспорте → `home/pool.json` для запусков без тикета. Модель запуска называешь в приписке: `/do ACME-231 запусти на gpt-6-astra, задача сложная` — оркестратор передаст её background coordinator; флаг перекрывает паспорт и ничего не меняет в конфиге. Без флага паспорт отвечает по моду: `plan, review, do, ship, worklog, note`. Инлайн-`/plan` идёт на модели самого главного чата.
 
 `pnpm set-model <KEY> [<модель>] [<мод>=<модель> …]` меняет у всех паспортов ключа разом что названо — умолчание проекта, отдельные моды или всё сразу — и не теряет остального. Снять переопределение мода можно только повторным `add-project` без этого токена: его upsert перезаписывает карту целиком.
 
 У запуска без тикета (`/plan <проблема>`, `/note <тема>`) ключа нет, спросить паспорта не о чем — модель приходит из `home/pool.json`, плоской карты `{"plan": "<паттерн>", "note": "<паттерн>"}` рядом с `projects.json`. Файла или нужного мода там нет — панель не поднимается, отказ называет путь и форму; литерала модели в коде не осталось нигде.
+
+## Исследование без тикета
+
+`/research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <тема>` поднимает независимую вкладку TAB и не меняет очередь, стадии, планы или ворктри. Без `--project` первый токен сопоставляется с паспортом; `--topic` оставляет его частью свободной темы. Для проекта модель берётся в порядке `--model`, research override паспорта, default паспорта; свободная тема берёт `pool.research` из `home/pool.json`.
+
+Вкладка читает клон и разрешённые web/tracker источники, сохраняет артефакты в `home/knowledge/<org>/<repo>/research/` (свободная тема — в `home/notes/`) и отправляет отчёт главному чату, но не закрывается сама. Создание issue происходит только по просьбе. Каждая конкретная правка clone требует отдельного TUI consent с полным target и diff даже с `-a`/YOLO; согласие не разрешает shell, commit, push или другую правку. Bounded shell/MCP/script допускают только перечисленные операции чтения и создания issue; это контроль harness, не OS sandbox.
 
 ## Прочее
 
@@ -50,3 +56,23 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 - Канарейка `[k7x2]` — каждый ответ любой сессии этого корня (главный чат, паны, вкладки /do) начинается с литерального маркера `[k7x2]`; правило стоит в хвосте AGENTS.md.
   Маркер пропал или исказился хотя бы на символ — контекст сессии деградировал, перезапусти её.
   Никакой автоматики за маркером нет — это визуальный сигнал, реакция на него твоя.
+
+## Guard policy
+
+Единственный источник policy — `<engine-root>/.pi/settings.json`; он перечитывается перед каждым guarded action, CLI-переходом и dispatch subagent. Все поля необязательны:
+
+```json
+{
+  "guardPolicy": {
+    "yolo": false,
+    "workflowApproval": true,
+    "guards": {}
+  }
+}
+```
+
+Реестр keys: `settingsWrite`, `noteFileWrite`, `wait`, `noteShellWrite`, `codingLaunch`, `massKill`, `homeDelete`, `shipConfirmation`, `doCompletion`, `modeOwnership`, `transitionCaller`, `transitionTicket`, `transitionSource`, `spawnCaller`, `stageCaller`, `stageForce`, `duplicateDo`, `duplicateMode`, `reportTarget`, `projectAgentConfirmation`, `parallelTaskLimit`, `parallelConcurrencyLimit`, `detachedLimit`.
+
+`yolo: true` выключает optional action guards и `workflowApproval`; явный `guards.<id>: true` сильнее preset. Например, `{ "guardPolicy": { "guards": { "wait": false } } }` выключает только wait; `{ "guardPolicy": { "yolo": true, "guards": { "settingsWrite": true, "shipConfirmation": true } } }` возвращает эти два ограничения. Удаление overrides и `yolo: false` возвращают legacy defaults. Повреждённая policy явно блокирует action с путём и причиной; guards — эвристические ограничения, не sandbox.
+
+`workflowApproval: false` снимает промежуточные текстовые паузы только внутри уже делегированной задачи. Scope, quality gates, готовый PR с `record-report`, корректные данные и введённый инженером `/ship` остаются обязательными. `shipConfirmation: false` снимает только второй UI-вопрос, не создаёт полномочие на merge. Разрешённые дубли получают run ID; отчёт передаёт его родителю, а `pnpm close-mode do|ship <KEY> --run <id>` закрывает ровно этот run.

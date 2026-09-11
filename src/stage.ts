@@ -19,6 +19,7 @@ import { openDb, STAGES, type Stage } from "./db.ts";
 import { logMove } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type From, type MoveEnv } from "./transitions.ts";
+import { readGuardPolicy } from "./guard-policy.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const DATA = dataRoot(ROOT);
@@ -38,6 +39,7 @@ const planAbs = rest[2] ? resolve(rest[2]) : undefined;
 if (planAbs && !existsSync(planAbs)) fail(`plan not found: ${planAbs}`);
 
 const env = process.env as MoveEnv;
+const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
 const db = openDb(join(ROOT, "yokemate.db"));
 
 // A move without a path leaves the recorded plan alone: not every stage comes
@@ -76,13 +78,20 @@ if (stage === "scouted") {
 } else {
   // Repair path: unstamped and explicit, loud in the output, silent in the
   // journal — the journal records results, not fixes.
-  if (env.YOKEMATE_MODE)
+  if (policy.guards.stageCaller && env.YOKEMATE_MODE)
     fail(`${stage} is the main chat's repair — a mode records its result through its own command`);
-  if (!force) fail(`moving to ${stage} by hand is a repair — add --force`);
-  const prev =
-    (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
-      | { stage: string }
-      | undefined)?.stage ?? "absent";
-  write(prev as From);
-  console.log(`${ticket}: forced ${prev} → ${stage}` + (planAbs ? `, plan: ${planAbs}` : ""));
+  if (policy.guards.stageForce && !force) fail(`moving to ${stage} by hand is a repair — add --force`);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const prev =
+      (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
+        | { stage: string }
+        | undefined)?.stage ?? "absent";
+    write(prev as From);
+    db.exec("COMMIT");
+    console.log(`${ticket}: forced ${prev} → ${stage}` + (planAbs ? `, plan: ${planAbs}` : ""));
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw e;
+  }
 }
