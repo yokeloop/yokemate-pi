@@ -34,7 +34,8 @@ import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type
 import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks } from "../../../src/coordinator-runtime.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
-import { bindCoordinatorControl, type ControlOrigin } from "../../../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, type ControlOrigin } from "../../../src/coordinator-control.ts";
+import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -664,6 +665,7 @@ export default function (pi: ExtensionAPI) {
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
 	let uiTail: Promise<void> = Promise.resolve();
+	const uiAbortByRun = new Map<string, AbortController>();
 	let ownedReadyRunId: string | undefined;
 	pi.on("input", (event, ctx) => {
 		const text = event.text.trim();
@@ -704,6 +706,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				rpc?.acceptTerminal();
+				uiAbortByRun.get(run.identity.runId)?.abort();
+				uiAbortByRun.delete(run.identity.runId);
 				coordinators.finalize(run.identity.runId, proposal.outcome, proposal.reason);
 				pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
@@ -711,17 +715,29 @@ export default function (pi: ExtensionAPI) {
 			}, onUiRequest: (event, reply) => {
 				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
 				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
+				const controller = uiAbortByRun.get(run.identity.runId) ?? new AbortController();
+				uiAbortByRun.set(run.identity.runId, controller);
 				uiTail = uiTail.then(async () => {
 					const id = request.id!;
+					const live = () => !controller.signal.aborted && !["done", "blocked"].includes(coordinators.get(run.identity.runId)?.state ?? "blocked");
 					try {
-						if (!ctx.hasUI || coordinators.get(run.identity.runId)?.state === "done" || coordinators.get(run.identity.runId)?.state === "blocked") { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
-						const ui = ctx.ui as any;
-						if (request.method === "confirm") reply({ type: "extension_ui_response", id, confirmed: Boolean(await ui.confirm(request.title ?? "Coordinator", request.message ?? "")) });
-						else if (request.method === "select") { const value = await ui.select(request.title ?? "Coordinator", request.options ?? []); reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
-						else { const value = request.method === "editor" ? await ui.editor(request.title ?? "Coordinator", request.prefill) : await ui.input(request.title ?? "Coordinator", request.placeholder); if (coordinators.get(run.identity.runId)?.state === "done" || coordinators.get(run.identity.runId)?.state === "blocked") reply({ type: "extension_ui_response", id, cancelled: true }); else reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
+						if (!ctx.hasUI || !live()) { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
+						const options = { signal: controller.signal };
+						const value = request.method === "confirm"
+							? await ctx.ui.confirm(request.title ?? "Coordinator", request.message ?? "", options)
+							: request.method === "select"
+								? await ctx.ui.select(request.title ?? "Coordinator", request.options ?? [], options)
+								: request.method === "input"
+									? await ctx.ui.input(request.title ?? "Coordinator", request.placeholder, options)
+									: await showCoordinatorEditor(ctx, request.title ?? "Coordinator", request.prefill, controller.signal);
+						if (!live() || value === undefined || value === false) reply({ type: "extension_ui_response", id, cancelled: true });
+						else if (request.method === "confirm") reply({ type: "extension_ui_response", id, confirmed: true });
+						else reply({ type: "extension_ui_response", id, value });
 					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
 				}).catch(() => {});
 			}, onBlocked: (reason) => {
+				uiAbortByRun.get(run.identity.runId)?.abort();
+				uiAbortByRun.delete(run.identity.runId);
 				const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
@@ -734,7 +750,7 @@ export default function (pi: ExtensionAPI) {
 			const work = await rpc.request({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
-		} catch (error) { await rpc?.stop(); coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); rpcByRun.delete(run.identity.runId); throw error; }
+		} catch (error) { uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); await rpc?.stop(); coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); rpcByRun.delete(run.identity.runId); throw error; }
 	};
 	pi.on("session_start", (_event, ctx) => {
 		latestCtx = ctx;
@@ -758,7 +774,7 @@ export default function (pi: ExtensionAPI) {
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
 				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
-			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, cwd: ctx.cwd });
+			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
 	pi.registerCommand("yokemate-coordinator-ready", {
@@ -781,6 +797,8 @@ export default function (pi: ExtensionAPI) {
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
+		for (const controller of uiAbortByRun.values()) controller.abort();
+		uiAbortByRun.clear();
 		for (const rpc of rpcByRun.values()) void rpc.stop();
 		rpcByRun.clear();
 		for (const proc of detached) {
@@ -877,7 +895,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = coordinators.cancel(params.cancelRun); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {

@@ -9,15 +9,16 @@ import type { RuntimeIdentity } from "./coordinator-runtime.ts";
 export interface RpcEvent { type: string; id?: string; [key: string]: unknown }
 export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; acceptTerminal(): void; ready: Promise<void>; stop(): Promise<void>; events: RpcEvent[] }
 export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
+export interface CoordinatorRpcOptions { invocation?: { command: string; args: string[] }; readyTimeoutMs?: number; stopGraceMs?: number }
 
 function cap(text: string): string { return Buffer.byteLength(text) <= 50 * 1024 ? text : Buffer.from(text).subarray(0, 50 * 1024).toString(); }
 function piInvocation(args: string[]): { command: string; args: string[] } { const script = process.argv[1]; return script && !script.startsWith("/$bunfs/") ? { command: process.execPath, args: [script, ...args] } : { command: "pi", args }; }
 
-export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: RuntimeIdentity, callbacks: RpcCallbacks = {}): CoordinatorRpc {
+export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: RuntimeIdentity, callbacks: RpcCallbacks = {}, options: CoordinatorRpcOptions = {}): CoordinatorRpc {
   const dir = mkdtempSync(join(tmpdir(), "yokemate-coordinator-"));
   const definition = join(dir, "definition.md");
   writeFileSync(definition, `Coordinator identity: ${JSON.stringify(identity)}\nUse /skill:${prepared.mode}-worker. Finish only through coordinator_finish.`, { mode: 0o600 });
-  const invocation = piInvocation(["--mode", "rpc", "--no-session", "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition]);
+  const invocation = options.invocation ?? piInvocation(["--mode", "rpc", "--no-session", "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition]);
   const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
@@ -36,7 +37,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   let readyResolve!: () => void;
   let readyReject!: (error: Error) => void;
   const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
-  const readyTimer = setTimeout(() => fail("coordinator RPC ready timeout"), 30_000);
+  const readyTimer = setTimeout(() => fail("coordinator RPC ready timeout"), options.readyTimeoutMs ?? 30_000);
   const fail = (reason: string) => {
     if (blocked) return;
     blocked = true;
@@ -98,8 +99,9 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const stop = () => new Promise<void>((resolve) => {
     if (closed) return resolve();
     try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
-    const term = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGTERM"); } catch {} }, 5000);
-    const kill = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGKILL"); } catch {} }, 10_000);
+    const grace = options.stopGraceMs ?? 5000;
+    const term = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGTERM"); } catch {} }, grace);
+    const kill = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGKILL"); } catch {} }, grace * 2);
     child.once("close", () => { clearTimeout(term); clearTimeout(kill); resolve(); });
   });
   return { process: child, send, request, acceptTerminal: () => { terminal = true; }, ready, stop, events };

@@ -5,11 +5,20 @@ import { join, resolve } from "node:path";
 import { ensureDir, socketDir } from "./inbox.ts";
 import type { CoordinatorRequest } from "./coordinator-launch.ts";
 
-export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
+export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
 export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "status" | "cancel"; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; runId?: string; targetRequestId?: string }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; originId?: string; identity?: unknown }
 export interface ParentControl { launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId: string; identity: unknown }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
-export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; cwd: string }
+export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
+
+export function processStarttime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+  } catch { return undefined; }
+}
+
+function processMatches(pid: number, starttime: string): boolean { return isLiveProcess(pid) && processStarttime(pid) === starttime; }
 
 export function coordinatorSocketPath(root: string, env: NodeJS.ProcessEnv = process.env, uid = process.getuid!()): string {
   return join(socketDir(env, uid), "coordinators", `${createHash("sha256").update(resolve(root)).digest("hex")}.sock`);
@@ -19,11 +28,21 @@ function isLiveProcess(pid: number): boolean {
   try { return statSync(`/proc/${pid}`).isDirectory(); } catch { return false; }
 }
 
-function descendantOf(pid: number, ancestor: number): boolean {
+function parentPid(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[1]);
+  } catch { return undefined; }
+}
+
+function descendantOf(pid: number, starttime: string, ancestor: number, ancestorStarttime: string): boolean {
+  if (!processMatches(pid, starttime) || !processMatches(ancestor, ancestorStarttime)) return false;
   let current = pid;
   for (let remaining = 0; remaining < 32 && current > 1; remaining += 1) {
-    if (current === ancestor) return true;
-    try { current = Number(readFileSync(`/proc/${current}/stat`, "utf8").split(") ")[1]?.split(" ")[1]); } catch { return false; }
+    if (current === ancestor) return processMatches(current, ancestorStarttime);
+    const parent = parentPid(current);
+    if (!parent) return false;
+    current = parent;
   }
   return false;
 }
@@ -35,26 +54,31 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   ensureDir(directory, uid);
   if (existsSync(sock)) {
     const sidecar = `${sock}.json`;
-    let owner: { pid?: number } | undefined;
+    let owner: { pid?: number; starttime?: string } | undefined;
     try { owner = JSON.parse(readFileSync(sidecar, "utf8")); } catch {}
-    if (owner?.pid && isLiveProcess(owner.pid)) throw new Error(`coordinator endpoint is owned by live pid ${owner.pid}`);
+    if (owner?.pid && typeof owner.starttime === "string" && processMatches(owner.pid, owner.starttime)) throw new Error(`coordinator endpoint is owned by live pid ${owner.pid}`);
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
   const origins = new Map<string, ControlOrigin>();
+  const paneParents = new Map<string, string | undefined>();
+  if (identity.pane) paneParents.set(identity.pane, undefined);
   const replies = new Map<string, ControlReply>();
   const requestOrigins = new Map<string, string>();
   const requestRuns = new Map<string, string>();
   const runOrigins = new Map<string, string>();
   const bindOrigin = (origin: ControlOrigin): string => {
-    if (!origin.sessionId || !origin.pid || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
-    if (!isLiveProcess(origin.pid) || !descendantOf(origin.pid, identity.pid)) throw new Error("origin is not a live child of the coordinator parent");
-    if (origin.sessionId !== identity.sessionId) {
-      if (!origin.pane || !origin.parentPane) throw new Error("origin session is not registered with this parent");
+    if (!origin.sessionId || !origin.pid || !origin.starttime || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
+    if (!descendantOf(origin.pid, origin.starttime, identity.pid, identity.starttime)) throw new Error("origin is not a live child of the coordinator parent");
+    if (origin.pane) {
+      if (origin.parentPane === origin.pane) throw new Error("origin pane cannot parent itself");
       let panel: { pid?: number; cwd?: string } | undefined;
       try { panel = JSON.parse(readFileSync(join(socketDir(env, uid), `${origin.pane}.json`), "utf8")); } catch {}
       if (panel?.pid !== origin.pid || resolve(panel.cwd ?? "") !== canonicalRoot) throw new Error("panel origin is not registered with this parent");
-    }
+      const parentKnown = origin.parentPane === identity.pane || (origin.parentPane !== undefined && paneParents.has(origin.parentPane));
+      if (origin.sessionId !== identity.sessionId && (!origin.parentPane || !parentKnown)) throw new Error("origin pane chain is not registered with this parent");
+      paneParents.set(origin.pane, origin.parentPane);
+    } else if (origin.sessionId !== identity.sessionId) throw new Error("origin session is not registered with this parent");
     const id = randomUUID();
     origins.set(id, { ...origin });
     return id;
@@ -108,7 +132,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   });
   server.on("close", () => { rmSync(sock, { force: true }); rmSync(`${sock}.json`, { force: true }); });
   server.listen(sock);
-  writeFileSync(`${sock}.json`, JSON.stringify({ root: canonicalRoot, pid: identity.pid, sessionId: identity.sessionId, runtimeId: identity.runtimeId, cwd: identity.cwd }), { mode: 0o600 });
+  writeFileSync(`${sock}.json`, JSON.stringify({ root: canonicalRoot, pid: identity.pid, starttime: identity.starttime, sessionId: identity.sessionId, runtimeId: identity.runtimeId, cwd: identity.cwd, pane: identity.pane }), { mode: 0o600 });
   return server;
 }
 
@@ -134,7 +158,7 @@ export function resolveCoordinatorParent(root: string, env: NodeJS.ProcessEnv = 
   let parsed: ParentIdentity;
   try { parsed = JSON.parse(readFileSync(sidecar, "utf8")) as ParentIdentity; }
   catch { throw new Error("no live coordinator parent for this yokemate root"); }
-  if (resolve(parsed.root) !== resolve(root) || !isLiveProcess(parsed.pid)) throw new Error("coordinator parent is stale");
+  if (resolve(parsed.root) !== resolve(root) || !parsed.starttime || !processMatches(parsed.pid, parsed.starttime)) throw new Error("coordinator parent is stale");
   return parsed;
 }
 
