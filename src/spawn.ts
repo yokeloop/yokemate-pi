@@ -12,6 +12,7 @@
 //   pnpm spawn ACME-347 --model <m>              # overrides the passport's model
 
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { openDb } from "./db.ts";
 import { modelForTicket } from "./project-model.ts";
@@ -19,6 +20,7 @@ import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
+import { readGuardPolicy } from "./guard-policy.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -27,8 +29,11 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+const policy = (() => {
+  try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); }
+})();
 if (process.env.HERDR_ENV !== "1") fail("not inside a herdr session — open the main chat in herdr first");
-if (process.env.YOKEMATE_MODE)
+if (policy.guards.spawnCaller && process.env.YOKEMATE_MODE)
   fail(`spawn runs in the main chat only — this pane is stamped ${process.env.YOKEMATE_MODE}`);
 
 // The pane this command runs in — the chat that asked for the tab. The tab
@@ -82,7 +87,7 @@ const env = process.env as MoveEnv;
     ((db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
       | { stage: string }
       | undefined)?.stage as From | undefined) ?? "absent";
-  const v = checkMove("spawn", env, ticket, cur, { allowFresh: Boolean(planArg) });
+  const v = checkMove("spawn", env, ticket, cur, { allowFresh: Boolean(planArg), policy });
   if (!v.ok) fail(v.refuse);
 }
 
@@ -98,20 +103,6 @@ mkdirSync(folder, { recursive: true });
 // here. The paths are absolute: the tab has no relative path to the engine.
 mkdirSync(join(folder, ".pi"), { recursive: true });
 
-// The subagent limits are the engineer's, and the tab is where they matter:
-// its own settings file is written from scratch, so the block is carried over
-// from the root one. No block in the root — none in the tab either.
-let subagentSettings: unknown;
-try {
-  const rootSettings = JSON.parse(readFileSync(join(ROOT, ".pi", "settings.json"), "utf8"));
-  if (rootSettings?.subagent !== undefined) subagentSettings = rootSettings.subagent;
-} catch (e) {
-  // No settings file is the ordinary case. A file that is there and broken is
-  // not: silence would drop the engineer's limits exactly where they matter.
-  if ((e as NodeJS.ErrnoException)?.code !== "ENOENT")
-    console.error(`spawn: root .pi/settings.json unreadable, the tab gets no subagent block: ${(e as Error)?.message || String(e)}`);
-}
-
 writeFileSync(
   join(folder, ".pi", "settings.json"),
   JSON.stringify(
@@ -121,7 +112,6 @@ writeFileSync(
         join(ROOT, "src", "bus.ts"),
         join(ROOT, ".pi", "extensions", "subagent", "index.ts"),
       ],
-      ...(subagentSettings !== undefined ? { subagent: subagentSettings } : {}),
     },
     null,
     2,
@@ -135,15 +125,18 @@ linkTeammates(join(ROOT, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 // Tab in herdr, agent named after the ticket (lowercase per herdr's rules).
 // The env stamp is how /do inside the tab knows it is inside the tab and not
 // in the main chat, where the same skill only raises this tab (R4.21).
-const agentName = ticket.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+const legacyAgentName = ticket.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+const runId = policy.guards.duplicateDo ? undefined : randomUUID().replace(/-/g, "").slice(0, 8);
+const agentName = runId ? `${legacyAgentName.slice(0, 23)}-${runId}` : legacyAgentName;
+const label = runId ? `${ticket} [${runId}]` : ticket;
 
 // A second launch of a ticket already running is a forgotten tab, not a wish
 // for two: the agent's name is the one string that holds across surfaces.
 const agents = (
   herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
 ).result.agents;
-const running = findRunningAgent(agents, agentName);
-if (running)
+const running = findRunningAgent(agents, legacyAgentName);
+if (policy.guards.duplicateDo && running)
   fail(`${ticket} already runs in pane ${running} — go to it, or close it and launch again`);
 
 // Passports for the repositories the plan mentions: clone path (worktrees fork
@@ -173,12 +166,14 @@ const prompt =
   (passportLines ? `Project passports (worktrees fork from these clones):\n${passportLines}\n` : "") +
   `When the PRs are open and green, run \`pnpm record-report ${ticket} --part ` +
   `<org/repo>:<role>:<branch>:<pr-url>\` from the task folder root yourself, then send the ` +
-  `report with \`send_message\` — the message is a courtesy, the stage is already recorded.`;
+  `report with \`send_message\` — the message is a courtesy, the stage is already recorded.` +
+  (runId ? ` This run ID is ${runId}; include it in the final report.` : "");
 
 const created = herdr([
-  "tab", "create", "--workspace", parentWorkspace, "--cwd", folder, "--label", ticket,
+  "tab", "create", "--workspace", parentWorkspace, "--cwd", folder, "--label", label,
   "--env", `YOKEMATE_MODE=do`, "--env", `YOKEMATE_TICKET=${ticket}`,
-  "--env", `YOKEMATE_PARENT_PANE=${parentPane}`,
+  "--env", `YOKEMATE_PARENT_PANE=${parentPane}`, "--env", `YOKEMATE_ROLE=coordinator`,
+  ...(runId ? ["--env", `YOKEMATE_RUN_ID=${runId}`] : []),
 ]) as {
   result: { tab: { tab_id: string }; root_pane: { pane_id: string } };
 };
@@ -216,8 +211,8 @@ const moved = applyMove(
       `UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?`,
     ).run(folder, planAbs, ticket);
   },
-  { allowFresh: Boolean(planArg) },
+  { allowFresh: Boolean(planArg), policy },
 );
 if (!moved.ok) fail(`${ticket}: the tab is up, but the stage write was refused — ${moved.refuse}`);
 
-console.log(`${ticket} → tab ${pane}, agent "${agentName}", model ${model}, stage running`);
+console.log(`${ticket} → tab ${pane}, agent "${agentName}", model ${model}, stage running${runId ? `, run ${runId}` : ""}`);

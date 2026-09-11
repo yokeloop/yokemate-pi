@@ -1,4 +1,7 @@
 {
+  "guardPolicy": {
+    "yolo": false
+  },
   "extensions": [
     "../src/guards.ts",
     "../src/bus.ts"

@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readGuardPolicy } from "./guard-policy.ts";
 import {
   allowTarget,
   bindInbox,
@@ -21,7 +22,7 @@ export default function bus(pi: ExtensionAPI) {
     pi.sendMessage(
       {
         customType: "yokemate-report",
-        content: `[${r.mode}${r.ticket ? " " + r.ticket : ""} ${r.from}] ${r.text}`,
+        content: `[${r.mode}${r.ticket ? " " + r.ticket : ""}${r.runId ? ` ${r.runId}` : ""} ${r.from}] ${r.text}`,
         display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
@@ -85,7 +86,12 @@ export default function bus(pi: ExtensionAPI) {
     const to = (event.input as { to?: string }).to;
     const dir = socketDir(process.env, process.getuid!());
     const mains = scanMains(dir, ownPane(process.env), ROOT).map((c) => c.pane);
-    const v = allowTarget(process.env, to, mains);
+    let v;
+    try {
+      v = allowTarget(process.env, to, mains, readGuardPolicy(ROOT));
+    } catch (e) {
+      return { block: true, reason: (e as Error).message };
+    }
     if (!v.ok) return { block: true, reason: v.reason };
   });
 }

@@ -15,6 +15,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
+import { GuardPolicyError, formatGuardPolicy, readGuardPolicy, resolveGuardPolicy } from "./guard-policy.ts";
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 
@@ -92,7 +93,8 @@ export default function guards(pi: ExtensionAPI) {
       // a dialog to ask in, it does not go.
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;
       return ok ? undefined : { block: true, reason: v.reason };
-    } catch {
+    } catch (e) {
+      if (e instanceof GuardPolicyError) return { block: true, reason: e.message };
       return undefined;
     }
   });
@@ -113,9 +115,13 @@ export default function guards(pi: ExtensionAPI) {
     let reason: string | null = null;
     try {
       reason = stopVerdict(process.env, readStage);
-    } catch {
-      return; // не смогли прочитать стадию — память не трогаем, см. шапку файла
+    } catch (e) {
+      if (e instanceof GuardPolicyError) {
+        reason = stopVerdict(process.env, readStage, resolveGuardPolicy(undefined));
+        pi.sendMessage({ customType: "yokemate-guard-policy", content: e.message, display: true }, { deliverAs: "followUp", triggerTurn: false });
+      } else return;
     }
+    if (!reason) lastVerdict = null;
     const delivery = stopDelivery(lastVerdict, reason);
     lastVerdict = reason;
     if (!delivery) return;
@@ -173,10 +179,17 @@ export default function guards(pi: ExtensionAPI) {
   // The result's message lands in the turn's messages — pi's counterpart of
   // Claude's additionalContext on SessionStart.
   pi.on("before_agent_start", async () => {
-    if (!digestPending) return undefined;
+    let policyContext: string;
+    try {
+      policyContext = formatGuardPolicy(readGuardPolicy(ROOT));
+    } catch (e) {
+      policyContext = `Guard policy error: ${(e as Error).message}. Optional action guards fail closed; immutable boundaries remain mandatory.`;
+    }
+    if (!digestPending) return { systemPrompt: policyContext };
     digestPending = false;
     await pulled;
     return {
+      systemPrompt: policyContext,
       message: {
         customType: "yokemate-warmup",
         content: `Warmup — состояние пула на старте сессии\n\n${buildDigest(ROOT, dataRootOf(ROOT))}`,

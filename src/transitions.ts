@@ -12,6 +12,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import type { Stage } from "./db.ts";
+import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
 
 export type Via = "stage" | "plan" | "spawn" | "record-report" | "accept" | "accept-rework" | "adopt";
 
@@ -78,30 +79,21 @@ export function checkMove(
   env: MoveEnv,
   ticket: string,
   current: From,
-  opts: { allowFresh?: boolean } = {},
+  opts: { allowFresh?: boolean; policy?: GuardPolicy } = {},
 ): Verdict {
   const rule = RULES[via];
+  const policy = opts.policy ?? readGuardPolicy();
   const mode = env.YOKEMATE_MODE;
-  if (mode) {
-    const seat = rule.stamped[mode];
-    if (!seat) {
-      const seats = Object.keys(rule.stamped);
-      return {
-        ok: false,
-        refuse: `${via} is not ${mode}'s move — it belongs to ${seats.length ? seats.join("/") : "the main chat alone"}`,
-      };
-    }
-    if (!seat.ticketless && env.YOKEMATE_TICKET !== ticket)
-      return {
-        ok: false,
-        refuse: `this pane is stamped ${env.YOKEMATE_TICKET ?? "nothing"}, not ${ticket} — a mode moves only its own ticket`,
-      };
-    if (!seat.from.includes(current))
-      return { ok: false, refuse: `${ticket} is at ${current}; ${via} moves from ${seat.from.join("/")}` };
-    return { ok: true, repeat: current === rule.to };
+  const seat = mode ? rule.stamped[mode] : undefined;
+  if (mode && policy.guards.transitionCaller && !seat) {
+    const seats = Object.keys(rule.stamped);
+    return { ok: false, refuse: `${via} is not ${mode}'s move — it belongs to ${seats.length ? seats.join("/") : "the main chat alone"}` };
   }
-  const from = opts.allowFresh ? [...new Set<From>([...rule.unstamped, "absent", "new"])] : rule.unstamped;
-  if (!from.includes(current))
+  if (mode && policy.guards.transitionTicket && seat && !seat.ticketless && env.YOKEMATE_TICKET !== ticket)
+    return { ok: false, refuse: `this pane is stamped ${env.YOKEMATE_TICKET ?? "nothing"}, not ${ticket} — a mode moves only its own ticket` };
+  const base = seat?.from ?? rule.unstamped;
+  const from = opts.allowFresh ? [...new Set<From>([...base, "absent", "new"])] : base;
+  if (policy.guards.transitionSource && !from.includes(current))
     return { ok: false, refuse: `${ticket} is at ${current}; ${via} moves from ${from.join("/")}` };
   return { ok: true, repeat: current === rule.to };
 }
@@ -119,7 +111,7 @@ export function applyMove(
   env: MoveEnv,
   ticket: string,
   write: (prev: From) => void,
-  opts: { allowFresh?: boolean } = {},
+  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {},
 ): MoveOutcome {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -127,6 +119,10 @@ export function applyMove(
       | { stage: Stage }
       | undefined;
     const prev: From = row?.stage ?? "absent";
+    if (opts.expected !== undefined && prev !== opts.expected) {
+      db.exec("ROLLBACK");
+      return { ok: false, refuse: `${ticket} changed from expected ${opts.expected} to ${prev}` };
+    }
     const v = checkMove(via, env, ticket, prev, opts);
     if (!v.ok) {
       db.exec("ROLLBACK");
