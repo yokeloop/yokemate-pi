@@ -121,7 +121,7 @@ export function resolveLaunch(
       ...(ticket ? [`YOKEMATE_TICKET=${ticket}`] : []),
       ...(parentPane ? [`YOKEMATE_PARENT_PANE=${parentPane}`] : []),
     ],
-    surface: mode === "ship" ? "tab" : "split",
+    surface: "split",
     model,
   };
 }

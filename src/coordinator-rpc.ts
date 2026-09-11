@@ -21,7 +21,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
-  const process = spawn(invocation.command, invocation.args, { cwd: prepared.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+  const child = spawn(invocation.command, invocation.args, { cwd: prepared.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
   const events: RpcEvent[] = [];
   const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   let stderr = "";
@@ -47,8 +47,8 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     callbacks.onBlocked?.(reason);
   };
   const send = (command: Record<string, unknown>) => {
-    if (closed || !process.stdin?.writable) throw new Error("coordinator RPC is not running");
-    process.stdin.write(JSON.stringify(command) + "\n");
+    if (closed || !child.stdin?.writable) throw new Error("coordinator RPC is not running");
+    child.stdin.write(JSON.stringify(command) + "\n");
   };
   const request = (command: Record<string, unknown>) => new Promise<RpcEvent>((resolve, reject) => {
     const id = typeof command.id === "string" ? command.id : `${identity.runId}:${Math.random().toString(36).slice(2)}`;
@@ -90,17 +90,17 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     callbacks.onEvent?.(event);
   };
   const decoder = new StringDecoder("utf8");
-  process.stdout.on("data", (chunk: Buffer) => { buffer += decoder.write(chunk); for (;;) { const newline = buffer.indexOf("\n"); if (newline < 0) break; const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); emit(line.endsWith("\r") ? line.slice(0, -1) : line); } });
-  process.stderr.on("data", (chunk: Buffer) => { stderr = cap(stderr + chunk.toString("utf8")); });
-  process.on("close", () => { closed = true; clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); rmSync(dir, { recursive: true, force: true }); });
-  process.on("error", (error) => fail(error.message));
+  child.stdout.on("data", (chunk: Buffer) => { buffer += decoder.write(chunk); for (;;) { const newline = buffer.indexOf("\n"); if (newline < 0) break; const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); emit(line.endsWith("\r") ? line.slice(0, -1) : line); } });
+  child.stderr.on("data", (chunk: Buffer) => { stderr = cap(stderr + chunk.toString("utf8")); });
+  child.on("close", () => { closed = true; clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); rmSync(dir, { recursive: true, force: true }); });
+  child.on("error", (error) => fail(error.message));
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = () => new Promise<void>((resolve) => {
     if (closed) return resolve();
     try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
-    const term = setTimeout(() => { try { process.kill(-process.pid!, "SIGTERM"); } catch {} }, 5000);
-    const kill = setTimeout(() => { try { process.kill(-process.pid!, "SIGKILL"); } catch {} }, 10_000);
-    process.once("close", () => { clearTimeout(term); clearTimeout(kill); resolve(); });
+    const term = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGTERM"); } catch {} }, 5000);
+    const kill = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGKILL"); } catch {} }, 10_000);
+    child.once("close", () => { clearTimeout(term); clearTimeout(kill); resolve(); });
   });
-  return { process, send, request, acceptTerminal: () => { terminal = true; }, ready, stop, events };
+  return { process: child, send, request, acceptTerminal: () => { terminal = true; }, ready, stop, events };
 }

@@ -97,9 +97,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         reply({ requestId: envelope.requestId, state: "received" });
         try {
           const accepted = await parent.launch(envelope.request, origin);
-          requestOrigins.set(envelope.requestId, envelope.originId);
+          const originId = envelope.originId!;
+          requestOrigins.set(envelope.requestId, originId);
           requestRuns.set(envelope.requestId, accepted.runId);
-          runOrigins.set(accepted.runId, envelope.originId);
+          runOrigins.set(accepted.runId, originId);
           reply({ requestId: envelope.requestId, state: "accepted", ...accepted });
         } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
       }
