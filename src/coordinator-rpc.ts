@@ -1,7 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { RuntimeIdentity } from "./coordinator-runtime.ts";
@@ -15,9 +14,8 @@ function cap(text: string): string { return Buffer.byteLength(text) <= 50 * 1024
 function piInvocation(args: string[]): { command: string; args: string[] } { const script = process.argv[1]; return script && !script.startsWith("/$bunfs/") ? { command: process.execPath, args: [script, ...args] } : { command: "pi", args }; }
 
 export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: RuntimeIdentity, callbacks: RpcCallbacks = {}, options: CoordinatorRpcOptions = {}): CoordinatorRpc {
-  const dir = mkdtempSync(join(tmpdir(), "yokemate-coordinator-"));
-  const definition = join(dir, "definition.md");
-  writeFileSync(definition, `Coordinator identity: ${JSON.stringify(identity)}\nUse /skill:${prepared.mode}-worker. Finish only through coordinator_finish.`, { mode: 0o600 });
+  const definition = join(prepared.resourcesPath, ".pi", "agents", `${prepared.mode}-coordinator.md`);
+  if (!existsSync(definition)) throw new Error(`coordinator definition is missing: ${definition}`);
   const invocation = options.invocation ?? piInvocation(["--mode", "rpc", "--no-session", "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition]);
   const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
   delete env.HERDR_PANE_ID;
@@ -93,7 +91,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const decoder = new StringDecoder("utf8");
   child.stdout.on("data", (chunk: Buffer) => { buffer += decoder.write(chunk); for (;;) { const newline = buffer.indexOf("\n"); if (newline < 0) break; const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); emit(line.endsWith("\r") ? line.slice(0, -1) : line); } });
   child.stderr.on("data", (chunk: Buffer) => { stderr = cap(stderr + chunk.toString("utf8")); });
-  child.on("close", () => { closed = true; clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); rmSync(dir, { recursive: true, force: true }); });
+  child.on("close", () => { closed = true; clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); });
   child.on("error", (error) => fail(error.message));
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = () => new Promise<void>((resolve) => {
