@@ -56,3 +56,23 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 - Канарейка `[k7x2]` — каждый ответ любой сессии этого корня (главный чат, паны, вкладки /do) начинается с литерального маркера `[k7x2]`; правило стоит в хвосте AGENTS.md.
   Маркер пропал или исказился хотя бы на символ — контекст сессии деградировал, перезапусти её.
   Никакой автоматики за маркером нет — это визуальный сигнал, реакция на него твоя.
+
+## Guard policy
+
+Единственный источник policy — `<engine-root>/.pi/settings.json`; он перечитывается перед каждым guarded action, CLI-переходом и dispatch subagent. Все поля необязательны:
+
+```json
+{
+  "guardPolicy": {
+    "yolo": false,
+    "workflowApproval": true,
+    "guards": {}
+  }
+}
+```
+
+Реестр keys: `settingsWrite`, `noteFileWrite`, `wait`, `noteShellWrite`, `codingLaunch`, `massKill`, `homeDelete`, `shipConfirmation`, `doCompletion`, `modeOwnership`, `transitionCaller`, `transitionTicket`, `transitionSource`, `spawnCaller`, `stageCaller`, `stageForce`, `duplicateDo`, `duplicateMode`, `reportTarget`, `projectAgentConfirmation`, `parallelTaskLimit`, `parallelConcurrencyLimit`, `detachedLimit`.
+
+`yolo: true` выключает optional action guards и `workflowApproval`; явный `guards.<id>: true` сильнее preset. Например, `{ "guardPolicy": { "guards": { "wait": false } } }` выключает только wait; `{ "guardPolicy": { "yolo": true, "guards": { "settingsWrite": true, "shipConfirmation": true } } }` возвращает эти два ограничения. Удаление overrides и `yolo: false` возвращают legacy defaults. Повреждённая policy явно блокирует action с путём и причиной; guards — эвристические ограничения, не sandbox.
+
+`workflowApproval: false` снимает промежуточные текстовые паузы только внутри уже делегированной задачи. Scope, quality gates, готовый PR с `record-report`, корректные данные и введённый инженером `/ship` остаются обязательными. `shipConfirmation: false` снимает только второй UI-вопрос, не создаёт полномочие на merge. Разрешённые дубли получают run ID; отчёт передаёт его родителю, а `pnpm close-mode do|ship <KEY> --run <id>` закрывает ровно этот run.

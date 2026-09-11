@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import * as net from "node:net";
 import { join, resolve } from "node:path";
+import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
 
 export const TIMEOUT_MS = 2000;
 export const ROOT = resolve(new URL("..", import.meta.url).pathname);
@@ -18,6 +19,7 @@ export interface InboxEnv {
   YOKEMATE_PARENT_PANE?: string;
   YOKEMATE_MODE?: string;
   YOKEMATE_TICKET?: string;
+  YOKEMATE_RUN_ID?: string;
   XDG_RUNTIME_DIR?: string;
 }
 
@@ -65,6 +67,7 @@ export interface Report {
   mode: string;
   ticket: string | null;
   text: string;
+  runId?: string;
 }
 
 export type Delivery = { ok: true } | { ok: false; reason: string };
@@ -236,8 +239,9 @@ export function allowTarget(
   env: InboxEnv,
   to: string | undefined,
   mains: string[],
+  policy: GuardPolicy = readGuardPolicy(),
 ): { ok: true } | { ok: false; reason: string } {
-  if (!env.YOKEMATE_MODE) return { ok: true };
+  if (!policy.guards.reportTarget || !env.YOKEMATE_MODE) return { ok: true };
   if (!to) return { ok: true };
   if (to === parentPane(env) || mains.includes(to)) return { ok: true };
   return {
@@ -262,6 +266,7 @@ export async function sendReport(
     mode: env.YOKEMATE_MODE ?? "main",
     ticket: env.YOKEMATE_TICKET ?? null,
     text,
+    ...(env.YOKEMATE_RUN_ID ? { runId: env.YOKEMATE_RUN_ID } : {}),
   };
 
   const sweepIfDead = (pane: string, reason: string): void => {

@@ -13,6 +13,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -30,6 +31,7 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
+import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -460,7 +462,7 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
@@ -511,7 +513,13 @@ async function runSingleAgent(
 			const child = research
 				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
 				: undefined;
-			const env = { ...process.env, ...(child?.env ?? {}) };
+			const env = {
+				...process.env,
+				YOKEMATE_ROLE: "executor",
+				YOKEMATE_RUN_ID: randomUUID(),
+				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
+				...(child?.env ?? {}),
+			};
 			delete env.HERDR_PANE_ID;
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: child?.cwd ?? cwd ?? defaultCwd,
@@ -708,7 +716,13 @@ export default function (pi: ExtensionAPI) {
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const agentScope: AgentScope = params.agentScope ?? "project";
-			const limits = loadLimits(ctx.cwd);
+			let policy;
+			try {
+				policy = readGuardPolicy(ENGINE_ROOT);
+			} catch (e) {
+				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
+			}
+			const limits = readSubagentLimits(ENGINE_ROOT);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -807,6 +821,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (
 				(agentScope === "project" || agentScope === "both") &&
+				policy.guards.projectAgentConfirmation &&
 				confirmProjectAgents &&
 				ctx.hasUI &&
 				!ctx.isProjectTrusted()
@@ -837,14 +852,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain && params.chain.length > 0) {
 				const steps = params.chain;
-				if (activeUnits + 1 > limits.maxDetached) {
+				const admission = subagentAdmission(policy, limits, "chain", 1, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("chain")([]),
 						isError: true,
 					};
@@ -928,25 +939,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.tasks && params.tasks.length > 0) {
 				const tasks = params.tasks;
-				if (tasks.length > limits.maxParallelTasks)
+				const admission = subagentAdmission(policy, limits, "parallel", tasks.length, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${tasks.length}). Max is ${limits.maxParallelTasks}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				if (activeUnits + tasks.length > limits.maxDetached) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("parallel")([]),
 						isError: true,
 					};
@@ -954,7 +950,7 @@ export default function (pi: ExtensionAPI) {
 
 				activeUnits += tasks.length;
 				openBatch(toolCallId, tasks.length);
-				void mapWithConcurrencyLimit(tasks, limits.maxConcurrency, (t) =>
+				void mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), (t) =>
 					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
 				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
 
@@ -971,14 +967,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				if (activeUnits + 1 > limits.maxDetached) {
+				const admission = subagentAdmission(policy, limits, "single", 1, activeUnits);
+				if (admission) {
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many detached agents already running (${activeUnits}/${limits.maxDetached}). Wait for their reports before detaching another.`,
-							},
-						],
+						content: [{ type: "text", text: admission }],
 						details: makeDetails("single")([]),
 						isError: true,
 					};

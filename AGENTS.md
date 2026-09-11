@@ -17,7 +17,7 @@ Orchestrator chat for development work across multiple organizations and reposit
 - The answer names the same subject as the question. If you do not know it, say «не знаю» — not the neighboring answer you do know.
 - Repeating your own frame after the engineer rejected it is the most expensive failure there is. Second rejection: drop your version entirely, build from their words, and say what breaks — do not defend.
 - «Готово» names the entry you checked it through. A behavior has more than one entry — the command and what the engineer types. Fixing one and closing the question is the failure that cost the most turns.
-- A mode starts only on the engineer's typed command in this turn; the guard confirms only a ship launch — the one irreversible run, it merges.
+- A mode starts only on the engineer's typed command in this turn, except that an already delegated plan-flow with effective `workflowApproval=false` may launch its ready worker after recording the plan; an explicit «стоп» or «только план» still wins. The guard confirms only a ship launch — the one irreversible run, it merges.
 
 ## Layout
 
