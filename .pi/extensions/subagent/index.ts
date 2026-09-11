@@ -13,6 +13,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -510,7 +511,13 @@ async function runSingleAgent(
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const env = { ...process.env };
+			if (env.YOKEMATE_ROLE === "coordinator") {
+				env.YOKEMATE_PARENT_RUN_ID = env.YOKEMATE_RUN_ID;
+				env.YOKEMATE_RUN_ID = randomUUID();
+				env.YOKEMATE_ROLE = "executor";
+			}
 			delete env.HERDR_PANE_ID;
+			delete env.YOKEMATE_PARENT_PANE;
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				env,
@@ -655,11 +662,26 @@ export default function (pi: ExtensionAPI) {
 	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
 	pi.on("input", (event, ctx) => {
 		const text = event.text.trim();
-		const match = text.match(/^\/ship\s+(.+)$/);
+		const match = event.source === "interactive" ? text.match(/^\/ship\s+(.+)$/) : undefined;
 		if (match && !process.env.YOKEMATE_MODE) {
 			const tickets = match[1].split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
 			if (tickets.length) shipPermits.observeInteractiveShip(tickets, (ctx as any).sessionManager?.getSessionId?.() ?? "main");
 		} else shipPermits.invalidate();
+	});
+	pi.registerCommand("yokemate-coordinator-ready", {
+		description: "Initialize an owned coordinator RPC runtime.",
+		handler: async (args, ctx) => {
+			try {
+				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string } };
+				const identity = payload.identity;
+				if (!identity || identity.role !== "coordinator" || identity.runId !== process.env.YOKEMATE_RUN_ID || identity.cwd !== ctx.cwd || payload.prepared?.cwd !== ctx.cwd || !ctx.isProjectTrusted()) throw new Error("invalid coordinator ready identity");
+				const commands = pi.getCommands().map((command) => command.name);
+				if (!commands.includes(`skill:${process.env.YOKEMATE_MODE}-worker`)) throw new Error("worker skill unavailable");
+				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
+			} catch (error) {
+				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "blocked", display: false, details: { ok: false, reason: (error as Error).message } }, { deliverAs: "followUp", triggerTurn: false });
+			}
+		},
 	});
 	pi.on("session_shutdown", () => {
 		for (const rpc of rpcByRun.values()) void rpc.stop();
@@ -773,13 +795,14 @@ export default function (pi: ExtensionAPI) {
 						if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 					}
 					const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
-					const duplicate = checks.checkDuplicate(request.mode, coordinators.active());
+					const duplicate = checks.checkDuplicate(request.mode, coordinators.active().filter((active) => active.request.tickets.some((ticket) => request.tickets.includes(ticket))));
 					if (duplicate) throw new Error(duplicate);
 					const admission = checks.checkAdmission(coordinators.active().length);
 					if (admission) throw new Error(admission);
 					const run = coordinators.reserve(request, origin, sessionId, prepared.model, prepared.cwd, prepared.parts.map((part) => part.repo));
-					coordinators.setPrepared(run.identity.runId, prepared);
-					if (request.mode === "do") markDoRunning(root, prepared, { ...origin, YOKEMATE_MODE: "do", YOKEMATE_TICKET: request.tickets[0], YOKEMATE_ROLE: "coordinator" });
+					try {
+						coordinators.setPrepared(run.identity.runId, prepared);
+						if (request.mode === "do") markDoRunning(root, prepared, { ...origin, YOKEMATE_MODE: "do", YOKEMATE_TICKET: request.tickets[0], YOKEMATE_ROLE: "coordinator" });
 					const rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
 						const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 						if (result?.details?.kind !== "yokemate-coordinator-outcome" || !result.details.outcome) return;
@@ -791,11 +814,19 @@ export default function (pi: ExtensionAPI) {
 						pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
 						void rpcByRun.get(run.identity.runId)?.stop();
 						rpcByRun.delete(run.identity.runId);
-					}, onBlocked: (reason) => { coordinators.finalize(run.identity.runId, "blocked", reason); rpcByRun.delete(run.identity.runId); } });
+					}, onBlocked: (reason) => {
+						const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
+						const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
+						pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
+						pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+						rpcByRun.delete(run.identity.runId);
+					} });
 					rpcByRun.set(run.identity.runId, rpc);
+					await rpc.ready;
 					coordinators.attachProcess(run.identity.runId, rpc.process);
 					rpc.send({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 					return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
+					} catch (error) { coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); rpcByRun.delete(run.identity.runId); throw error; }
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			const agentScope: AgentScope = params.agentScope ?? "project";

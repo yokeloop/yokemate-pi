@@ -101,12 +101,14 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
   const parts: PreparedPart[] = [];
   for (const ticket of request.tickets) {
     const folder = join(root, "work", ticket);
-    if (existsSync(folder) && lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
+    if (!existsSync(folder)) fail(`no task folder ${folder} — /ship runs after /do`);
+    if (lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
     const plan = resolvePlan(root, ticket);
     plans[ticket] = plan;
     for (const part of partsForPlan(root, ticket, plan)) {
       const worktree = join(folder, part.repo.split("/")[1]!);
-      const gitCwd = existsSync(worktree) ? worktree : part.path;
+      if (!existsSync(worktree)) fail(`no worktree ${worktree} for ${part.repo}`);
+      const gitCwd = worktree;
       const remote = (await exec("git", ["remote", "get-url", "origin"], gitCwd)).trim();
       const base = (await exec("gh", ["pr", "view", ticket, "--json", "baseRefName,url", "--jq", '"\\(.baseRefName)\\t\\(.url)"'], gitCwd)).trim().split("\t");
       parts.push({ ...part, pr: base[1], base: base[0], path: gitCwd, figmaUrl: part.figmaUrl, figmaMcp: part.figmaMcp, remote } as PreparedPart);

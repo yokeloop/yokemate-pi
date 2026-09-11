@@ -25,7 +25,8 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
         if (!row?.pr) return { ok: false, reason: `missing recorded part ${expected.repo}` };
         const pr = gh(expected.path, ["pr", "view", row.pr, "--json", "state,headRefName,statusCheckRollup"] ) as { state: string; headRefName: string; statusCheckRollup?: { conclusion?: string | null }[] };
         if (pr.state !== "OPEN" || pr.headRefName !== ticket) return { ok: false, reason: `${expected.repo} PR is not open on ${ticket}` };
-        if ((pr.statusCheckRollup ?? []).some((check) => check.conclusion && check.conclusion !== "SUCCESS" && check.conclusion !== "SKIPPED")) return { ok: false, reason: `${expected.repo} has a red PR check` };
+        const checks = pr.statusCheckRollup ?? [];
+        if (checks.length === 0 || checks.some((check) => check.conclusion !== "SUCCESS" && check.conclusion !== "SKIPPED")) return { ok: false, reason: `${expected.repo} has pending or red PR checks` };
       }
       return { ok: true, parts: rows.map((row) => row.repo) };
     }
