@@ -1,16 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createFindTool, createGrepTool, createLsTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { resolve } from "node:path";
 import bus from "./bus.ts";
 import subagent from "../.pi/extensions/subagent/index.ts";
-import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
+import { canonicalResearchRead, classifyResearchCall, researchIdentity } from "./research-guard.ts";
 import { installResearchMcp, isResearchMcpTool } from "./research-mcp.ts";
 import { executeResearchBash, installResearchTools } from "./research-tools.ts";
 
 export default function research(pi: ExtensionAPI): void {
   let ready = false;
-  pi.on("tool_call", (event) => {
-    const verdict = classifyResearchCall(researchIdentity(), event.toolName);
-    return verdict.ok || isResearchMcpTool(event.toolName) ? undefined : { block: true, reason: verdict.reason };
+  pi.on("tool_call", (event, ctx) => {
+    const identity = researchIdentity();
+    const verdict = classifyResearchCall(identity, event.toolName);
+    if (!verdict.ok && !isResearchMcpTool(event.toolName)) return { block: true, reason: verdict.reason };
+    if (identity && ["read", "grep", "find", "ls"].includes(event.toolName)) {
+      const input = event.input as { path?: unknown };
+      const path = typeof input.path === "string" ? resolve(ctx.cwd, input.path) : ctx.cwd;
+      const readable = canonicalResearchRead(path, identity);
+      if (!readable.ok) return { block: true, reason: readable.reason };
+    }
+    return undefined;
   });
   pi.setActiveTools([]);
   pi.on("user_bash", async (event) => {

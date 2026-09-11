@@ -30,6 +30,23 @@ function within(path: string, root: string): boolean {
   return r === "" || (!r.startsWith(".." + sep) && r !== ".." && !r.includes(".." + sep));
 }
 
+export function canonicalResearchRead(target: string, identity: ResearchIdentity): ResearchVerdict {
+  const candidate = resolve(target);
+  let path: string;
+  try { path = realpathSync(candidate); } catch { return { ok: false, reason: `research read target does not exist: ${target}` }; }
+  const roots = [
+    identity.projectPath,
+    resolve(identity.root, "home", "notes"),
+    ...(identity.project ? [resolve(identity.root, "home", "knowledge", ...identity.project.split("/"))] : []),
+    resolve(identity.root, "src"),
+    resolve(identity.root, ".pi", "skills"),
+    resolve(identity.root, "docs"),
+  ].filter((root): root is string => Boolean(root)).map((root) => resolve(root));
+  if (!roots.some((root) => within(path, root))) return { ok: false, reason: "research reads are limited to the selected clone, artifacts, and engine source resources" };
+  if (path.split(sep).some((part) => part === ".git" || /^\.env(?:\.|$)/.test(part) || /(?:credential|secret|token|keyring)/i.test(part))) return { ok: false, reason: "research does not expose credential or runtime identity files" };
+  return { ok: true };
+}
+
 export function canonicalResearchTarget(target: string, root: string): string {
   const absolute = resolve(target);
   if (!within(absolute, resolve(root))) throw new Error(`target escapes its allowed root: ${target}`);

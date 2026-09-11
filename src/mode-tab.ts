@@ -38,7 +38,7 @@ import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
-import { checkModel } from "./pi-model.ts";
+import { checkModel, piList } from "./pi-model.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
@@ -159,7 +159,7 @@ if (import.meta.filename === process.argv[1]) {
     let launch;
     try {
       launch = resolveResearchLaunch(ROOT, argv.slice(1));
-      const checked = checkModel(launch.model);
+      const checked = checkModel(launch.model, piList);
       if (!checked.ok) fail(checked.reason);
     } catch (e) {
       fail((e as Error).message);
