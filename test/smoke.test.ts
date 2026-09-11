@@ -493,29 +493,18 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
   assert.equal(resolveLaunch("/root", "review", "ACME-342", "").cwd, "/root");
 
   // One agent name per mode per ticket: two modes on one ticket never collide.
-  const names = MODES.map(m => resolveLaunch("/root", m, "ACME-342", "").agentName);
-  assert.equal(new Set(names).size, MODES.length);
+  const names = MODES.filter(m => m !== "ship").map(m => resolveLaunch("/root", m, "ACME-342", "").agentName);
+  assert.equal(new Set(names).size, names.length);
 
   // The modes that talk to the engineer stand next to the chat.
   assert.equal(review.surface, "split");
   assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "split");
   assert.equal(resolveLaunch("/root", "worklog", "acme", "").cwd, "/root");
 
-  // Ship reports and is closed from the main chat, so it needs a tab of its
-  // own. It takes one or several keys as a single `+`-joined string and walks
-  // their task folders itself, so it runs at the root.
-  const ship = resolveLaunch("/root", "ship", "ACME-3+ACME-4", "");
-  assert.equal(ship.cwd, "/root");
-  assert.equal(ship.label, "ACME-3+ACME-4 ship");
-  assert.equal(ship.surface, "tab");
-  assert.equal(ship.env.includes("YOKEMATE_TICKET=ACME-3+ACME-4"), true);
-
-  assert.equal(ship.agentName, "acme-3-acme-4-ship");
-
-  const big = resolveLaunch("/root", "ship", "DEMO-31+DEMO-32+DEMO-37+DEMO-42", "");
-  assert.equal(big.agentName, "demo-31-plus3-ship");
-  assert.match(big.agentName, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.equal(big.label, "DEMO-31+DEMO-32+DEMO-37+DEMO-42 ship");
+  assert.throws(
+    () => resolveLaunch("/root", "ship", "ACME-3+ACME-4", ""),
+    /background coordinator/,
+  );
 
   // The engineer's model choice travels through the launch untouched.
   assert.equal(resolveLaunch("/root", "review", "ACME-342", "", "opus").model, "opus");
@@ -612,7 +601,7 @@ test("spawn and mode-tab refuse without a pane id, before any effect", async () 
 
   const spawn = run("src/spawn.ts", "YM-0");
   assert.equal(spawn.status, 1);
-  assert.match(spawn.stderr, /HERDR_PANE_ID/);
+  assert.match(spawn.stderr, /PI_SESSION_ID/);
   assert.equal(fs.existsSync(join(root, "work", "YM-0")), false);
 
   const review = run("src/mode-tab.ts", "review", "YM-0");
@@ -659,10 +648,10 @@ test("a mode skill knows whether to launch the pane or do the work", () => {
     assert.equal(decide(env, "review", "ACME-342").kind, "refuse");
   }
 
-  // The stamp the launch writes is the one the guard reads — same strings.
-  const { env } = resolveLaunch("/root", "ship", "ACME-342", "");
-  const stamped = Object.fromEntries(env.map((e) => e.split("=") as [string, string]));
-  assert.deepEqual(decide(stamped, "ship", "ACME-342"), { kind: "run" });
+  assert.deepEqual(
+    decide({ YOKEMATE_MODE: "ship", YOKEMATE_TICKET: "ACME-342" }, "ship", "ACME-342"),
+    { kind: "run" },
+  );
 
   // A ticketless /plan pane answers `run` on the mode alone; a keyed pane is
   // still someone else's, and so is the plan pane for a keyed mode.

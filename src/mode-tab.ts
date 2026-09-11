@@ -38,6 +38,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
+import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
@@ -99,6 +100,7 @@ export function resolveLaunch(
   parentPane?: string,
   stand?: StandFacts,
 ): Launch {
+  if (mode === "ship") throw new Error("ship runs in the background coordinator, not a tab");
   if (mode === "review" && stand && !stand.folder) {
     if (!stand.plan)
       throw new Error(
@@ -123,7 +125,7 @@ export function resolveLaunch(
       ...(ticket ? [`YOKEMATE_TICKET=${ticket}`] : []),
       ...(parentPane ? [`YOKEMATE_PARENT_PANE=${parentPane}`] : []),
     ],
-    surface: mode === "ship" ? "tab" : "split",
+    surface: "split",
     model,
   };
 }
@@ -158,7 +160,7 @@ if (import.meta.filename === process.argv[1]) {
     const parentPane = process.env.HERDR_PANE_ID ||
       fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
     const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
-    let launch;
+    let launch: ReturnType<typeof resolveResearchLaunch> | undefined;
     try {
       launch = resolveResearchLaunch(ROOT, argv.slice(1));
       const checked = checkModel(launch.model, piList);
@@ -166,21 +168,22 @@ if (import.meta.filename === process.argv[1]) {
     } catch (e) {
       fail((e as Error).message);
     }
+    const research = launch ?? fail("research launch was not resolved");
     const agents = (herdr(["agent", "list"]) as { result: { agents: { name?: string }[] } }).result.agents;
-    if (findRunningAgent(agents as { name?: string; pane_id: string }[], launch.agentName))
-      fail(`${launch.label} already runs`);
+    if (findRunningAgent(agents as { name?: string; pane_id: string }[], research.agentName))
+      fail(`${research.label} already runs`);
     const { tab, root_pane } = (herdr([
-      "tab", "create", "--workspace", parentWorkspace, "--cwd", ROOT, "--label", launch.label,
-      ...[...launch.env, `YOKEMATE_PARENT_PANE=${parentPane}`].flatMap((e) => ["--env", e]),
+      "tab", "create", "--workspace", parentWorkspace, "--cwd", ROOT, "--label", research.label,
+      ...[...research.env, `YOKEMATE_PARENT_PANE=${parentPane}`].flatMap((e) => ["--env", e]),
     ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
     try {
-      startAgent(launch.agentName, root_pane.pane_id, launch.label, researchAgentArgs(ROOT, launch.model));
-      herdr(["agent", "prompt", launch.agentName, launch.prompt]);
+      startAgent(research.agentName, root_pane.pane_id, research.label, researchAgentArgs(ROOT, research.model));
+      herdr(["agent", "prompt", research.agentName, research.prompt]);
     } catch (e) {
       try { herdr(["tab", "close", tab.tab_id]); } catch {}
-      fail(`${launch.label}: ${(e as Error).message.split("\n")[0]}`);
+      fail(`${research.label}: ${(e as Error).message.split("\n")[0]}`);
     }
-    console.log(`/research → tab ${tab.tab_id}, pane ${root_pane.pane_id}, agent "${launch.agentName}", model ${launch.model}, ${launch.project ? `${launch.project.org}/${launch.project.repo}` : launch.topic}`);
+    console.log(`/research → tab ${tab.tab_id}, pane ${root_pane.pane_id}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
     process.exit(0);
   }
 
@@ -210,6 +213,22 @@ if (import.meta.filename === process.argv[1]) {
   }
 
   const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
+  if (mode === "ship") {
+    let shipModel: string | undefined;
+    const modelIndex = tail.indexOf("--model");
+    if (modelIndex >= 0) {
+      shipModel = tail[modelIndex + 1] ?? fail("--model needs a value");
+      tail.splice(modelIndex, 2);
+    }
+    const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required to route ship to its live coordinator parent");
+    try {
+      const parent = resolveCoordinatorParent(ROOT);
+      const reply = await requestCoordinator(ROOT, { mode: "ship", tickets: ticket.split("+"), model: shipModel, note: tail.join(" ") || undefined }, { sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? fail("cannot read CLI process starttime"), cwd: ROOT, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
+      if (reply.state !== "accepted" || !reply.runId) fail(reply.reason ?? "ship coordinator launch was not accepted");
+      console.log(`${ticket} → background run ${reply.runId}`);
+      process.exit(0);
+    } catch (error) { fail((error as Error).message); }
+  }
   if (process.env.HERDR_ENV !== "1")
     fail("not inside a herdr session — open the main chat in herdr first");
 

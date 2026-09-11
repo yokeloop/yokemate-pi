@@ -41,18 +41,19 @@ function gitRead(args: string[]): boolean {
 
 const ghFields = new Set(["number,title,state,url,body", "number,title,state,url", "number,title,state,url,author"]);
 function ghBounded(args: string[], identity: ResearchIdentity): Promise<string> | null {
-  if (process.env.YOKEMATE_RESEARCH_TRACKER !== "github" || !identity.projectPath) return null;
-  const remote = originOwnerRepo(identity.projectPath);
+  const projectPath = identity.projectPath;
+  if (process.env.YOKEMATE_RESEARCH_TRACKER !== "github" || !projectPath) return null;
+  const remote = originOwnerRepo(projectPath);
   const repo = `${remote.owner}/${remote.repo}`;
   const list = args[0] === "gh" && (args[1] === "issue" || args[1] === "pr") && args[2] === "list" && args[3] === "--repo" && args[4] === repo && args[5] === "--json" && ghFields.has(args[6] ?? "") && args[7] === "--limit" && /^(?:[1-9]|[1-9]\d|100)$/.test(args[8] ?? "") && args.length === 9;
   const view = args[0] === "gh" && (args[1] === "issue" || args[1] === "pr") && args[2] === "view" && /^\d+$/.test(args[3] ?? "") && args[4] === "--repo" && args[5] === repo && args[6] === "--json" && ghFields.has(args[7] ?? "") && args.length === 8;
-  if (list || view) return execute("gh", args.slice(1), identity.projectPath);
+  if (list || view) return execute("gh", args.slice(1), projectPath);
   const create = args[0] === "gh" && args[1] === "issue" && args[2] === "create" && args[3] === "--repo" && args[4] === repo && args[5] === "--title" && args[6] && args[7] === "--body" && args[8] !== undefined && args.length === 9;
   if (!create) return null;
-  return execute("gh", args.slice(1), identity.projectPath).then(async (created) => {
+  return execute("gh", args.slice(1), projectPath).then(async (created) => {
     const url = created.trim();
     if (!/^https:\/\/github\.com\//.test(url)) throw new Error("research GitHub create did not return an issue URL");
-    await execute("gh", ["issue", "view", url, "--repo", repo, "--json", "number,title,state,url"], identity.projectPath);
+    await execute("gh", ["issue", "view", url, "--repo", repo, "--json", "number,title,state,url"], projectPath);
     return created;
   });
 }
