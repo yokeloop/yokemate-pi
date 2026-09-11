@@ -665,7 +665,6 @@ const SubagentParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
-	const checks = legacyCoordinatorChecks();
 	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
@@ -676,6 +675,7 @@ export default function (pi: ExtensionAPI) {
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
 	let ownedReadyRunId: string | undefined;
+	let finishingCoordinatorRunId: string | undefined;
 	pi.on("input", (event, ctx) => {
 		const text = event.text.trim();
 		const match = event.source === "interactive" ? text.match(/^\/ship\s+(.+)$/) : undefined;
@@ -685,6 +685,8 @@ export default function (pi: ExtensionAPI) {
 		} else shipPermits.invalidate();
 	});
 	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
+		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+		const checks = legacyCoordinatorChecks(loadLimits(root).maxDetached);
 		validateCoordinatorRequest(request);
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
@@ -692,7 +694,6 @@ export default function (pi: ExtensionAPI) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
-		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 		const duplicate = checks.checkDuplicate(request.mode, coordinators.active().filter((active) => active.request.tickets.some((ticket) => request.tickets.includes(ticket))));
 		if (duplicate) throw new Error(duplicate);
 		const admission = checks.checkAdmission(activeUnits);
@@ -709,8 +710,29 @@ export default function (pi: ExtensionAPI) {
 			run.identity.cwd = prepared.cwd;
 			run.identity.project = prepared.parts.map((part) => part.repo);
 			coordinators.setPrepared(run.identity.runId, prepared);
+			let terminalReported = false;
+			let nudgeSent = false;
+			const reportBlocked = (reason: string) => {
+				if (terminalReported) return;
+				terminalReported = true;
+				uiAbortByRun.get(run.identity.runId)?.abort();
+				uiAbortByRun.delete(run.identity.runId);
+				const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
+				releaseCoordinatorUnit(run.identity.runId);
+				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
+				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
+				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+				rpcByRun.delete(run.identity.runId);
+			};
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
+				if (event.type === "agent_start") { nudgeSent = false; return; }
+				if (event.type === "agent_settled" && !terminalReported) {
+					if (nudgeSent) { reportBlocked("coordinator stopped without outcome"); return; }
+					nudgeSent = true;
+					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked((error as Error).message));
+					return;
+				}
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== run.identity.runId || !result.details.outcome) return;
@@ -751,16 +773,7 @@ export default function (pi: ExtensionAPI) {
 						else reply({ type: "extension_ui_response", id, value });
 					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
 				}).catch(() => {});
-			}, onBlocked: (reason) => {
-				uiAbortByRun.get(run.identity.runId)?.abort();
-				uiAbortByRun.delete(run.identity.runId);
-				const blocked = coordinators.finalize(run.identity.runId, "blocked", reason);
-				releaseCoordinatorUnit(run.identity.runId);
-				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
-				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
-				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
-				rpcByRun.delete(run.identity.runId);
-			} });
+			}, onBlocked: reportBlocked });
 			rpcByRun.set(run.identity.runId, rpc);
 			await rpc.ready;
 			coordinators.attachProcess(run.identity.runId, rpc.process);
@@ -772,9 +785,7 @@ export default function (pi: ExtensionAPI) {
 				uiAbortByRun.get(run.identity.runId)?.abort();
 				uiAbortByRun.delete(run.identity.runId);
 				await rpc?.stop();
-				coordinators.finalize(run.identity.runId, "blocked", (error as Error).message);
-				releaseCoordinatorUnit(run.identity.runId);
-				rpcByRun.delete(run.identity.runId);
+				reportBlocked((error as Error).message);
 			} else activeUnits -= 1;
 			throw error;
 		}
@@ -893,18 +904,24 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "coordinator_finish is available only to its owned RPC coordinator" }], isError: true };
 			if (params.outcome === "blocked" && !params.reason)
 				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
+			if (finishingCoordinatorRunId) return { content: [{ type: "text", text: "coordinator is already finishing" }], isError: true };
+			if (batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
 			const run = coordinators.get(runId);
-			if (!run) return { content: [{ type: "text", text: "outcome proposed" }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, summary: params.summary, reason: params.reason, passedTickets: params.passedTickets } };
+			if (!run) {
+				finishingCoordinatorRunId = runId;
+				return { content: [{ type: "text", text: "outcome proposed" }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, summary: params.summary, reason: params.reason, passedTickets: params.passedTickets }, terminate: true };
+			}
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const verification = verifyCoordinatorOutcome(root, run.prepared!, params, batches.size);
 			if (!verification.ok)
 				return { content: [{ type: "text", text: verification.reason ?? "outcome cannot be verified" }], isError: true };
+			finishingCoordinatorRunId = runId;
 			coordinators.finalize(runId, params.outcome, params.reason);
 			pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: params.outcome, verification, summary: params.summary, reason: params.reason });
 			pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${params.outcome}: ${params.summary}`, display: true, details: { runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: params.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
 			void rpcByRun.get(runId)?.stop();
 			rpcByRun.delete(runId);
-			return { content: [{ type: "text", text: `${params.outcome} verified` }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, verification } };
+			return { content: [{ type: "text", text: `${params.outcome} verified` }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, verification }, terminate: true };
 		},
 	});
 
@@ -920,6 +937,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
+			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {

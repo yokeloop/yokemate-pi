@@ -71,10 +71,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     if (!origin.sessionId || !origin.pid || !origin.starttime || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
     if (origin.pane) {
       if (origin.parentPane === origin.pane) throw new Error("origin pane cannot parent itself");
-      let panel: { pid?: number; cwd?: string } | undefined;
+      let panel: { pid?: number; cwd?: string; mode?: string; ticket?: string | null } | undefined;
       try { panel = JSON.parse(readFileSync(join(socketDir(env, uid), `${origin.pane}.json`), "utf8")); } catch {}
       const paneStarttime = panel?.pid ? processStarttime(panel.pid) : undefined;
-      if (!panel?.pid || !paneStarttime || !descendantOf(origin.pid, origin.starttime, panel.pid, paneStarttime) || resolve(panel.cwd ?? "") !== canonicalRoot) throw new Error("panel origin is not registered with this parent");
+      if (!panel?.pid || !paneStarttime || !descendantOf(origin.pid, origin.starttime, panel.pid, paneStarttime) || resolve(panel.cwd ?? "") !== canonicalRoot || panel.mode !== origin.mode || (panel.ticket ?? undefined) !== origin.ticket) throw new Error("panel origin is not registered with this parent");
       const parentKnown = origin.parentPane === identity.pane || (origin.parentPane !== undefined && paneParents.has(origin.parentPane));
       if (origin.sessionId !== identity.sessionId && (!origin.parentPane || !parentKnown)) throw new Error("origin pane chain is not registered with this parent");
       paneParents.set(origin.pane, origin.parentPane);
