@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { RuntimeIdentity } from "./coordinator-runtime.ts";
@@ -11,6 +11,18 @@ export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reas
 export interface CoordinatorRpcOptions { invocation?: { command: string; args: string[] }; readyTimeoutMs?: number; stopGraceMs?: number }
 
 function cap(text: string): string { return Buffer.byteLength(text) <= 50 * 1024 ? text : Buffer.from(text).subarray(0, 50 * 1024).toString(); }
+function processStarttime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+  } catch { return undefined; }
+}
+function processParent(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[1]);
+  } catch { return undefined; }
+}
 function piInvocation(args: string[]): { command: string; args: string[] } { const script = process.argv[1]; return script && !script.startsWith("/$bunfs/") ? { command: process.execPath, args: [script, ...args] } : { command: "pi", args }; }
 
 export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: RuntimeIdentity, callbacks: RpcCallbacks = {}, options: CoordinatorRpcOptions = {}): CoordinatorRpc {
@@ -21,6 +33,35 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
   const child = spawn(invocation.command, invocation.args, { cwd: prepared.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+  const owned = new Map<number, string>();
+  const captureOwned = () => {
+    if (child.pid) {
+      const starttime = processStarttime(child.pid);
+      if (starttime) owned.set(child.pid, starttime);
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      let pids: string[] = [];
+      try { pids = readdirSync("/proc"); } catch { return; }
+      for (const name of pids) {
+        const pid = Number(name);
+        if (!Number.isInteger(pid) || owned.has(pid)) continue;
+        const parent = processParent(pid);
+        const starttime = processStarttime(pid);
+        if (parent !== undefined && starttime && owned.has(parent)) { owned.set(pid, starttime); changed = true; }
+      }
+    }
+  };
+  const liveOwned = () => {
+    captureOwned();
+    return [...owned].filter(([pid, starttime]) => processStarttime(pid) === starttime);
+  };
+  const signalOwned = (signal: NodeJS.Signals) => {
+    for (const [pid, starttime] of liveOwned()) {
+      try { globalThis.process.kill(pid, signal); } catch {}
+    }
+  };
   const events: RpcEvent[] = [];
   const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   let stderr = "";
@@ -95,12 +136,20 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   child.on("error", (error) => fail(error.message));
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = () => new Promise<void>((resolve) => {
-    if (closed) return resolve();
-    try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
+    captureOwned();
     const grace = options.stopGraceMs ?? 5000;
-    const term = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGTERM"); } catch {} }, grace);
-    const kill = setTimeout(() => { try { globalThis.process.kill(-child.pid!, "SIGKILL"); } catch {} }, grace * 2);
-    child.once("close", () => { clearTimeout(term); clearTimeout(kill); resolve(); });
+    let settled = false;
+    const finish = () => { if (!settled) { settled = true; resolve(); } };
+    try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
+    const waitForOwnedExit = (deadline: number) => {
+      if (liveOwned().length === 0 || Date.now() >= deadline) return finish();
+      setTimeout(() => waitForOwnedExit(deadline), 10);
+    };
+    const term = setTimeout(() => signalOwned("SIGTERM"), grace);
+    const kill = setTimeout(() => { signalOwned("SIGKILL"); waitForOwnedExit(Date.now() + grace); }, grace * 2);
+    child.once("close", () => {
+      if (liveOwned().length === 0) { clearTimeout(term); clearTimeout(kill); finish(); }
+    });
   });
   return { process: child, send, request, acceptTerminal: () => { terminal = true; }, ready, stop, events };
 }

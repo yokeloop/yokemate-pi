@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 
-const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-process.on("exit", () => { try { grandchild.kill("SIGKILL"); } catch {} });
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
 let buffer = "";
 const send = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
+send({ type: "grandchild", pid: grandchild.pid });
 
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString("utf8");

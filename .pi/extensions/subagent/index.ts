@@ -693,23 +693,21 @@ export default function (pi: ExtensionAPI) {
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
 		const duplicate = checks.checkDuplicate(request.mode, coordinators.active().filter((active) => active.request.tickets.some((ticket) => request.tickets.includes(ticket))));
 		if (duplicate) throw new Error(duplicate);
 		const admission = checks.checkAdmission(activeUnits);
 		if (admission) throw new Error(admission);
 		activeUnits += 1;
-		let run: CoordinatorRun;
-		try {
-			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", prepared.model, prepared.cwd, prepared.parts.map((part) => part.repo));
-			coordinatorUnits.add(run.identity.runId);
-		} catch (error) {
-			activeUnits -= 1;
-			throw error;
-		}
+		let run: CoordinatorRun | undefined;
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
 		const finishCalls = new Set<string>();
 		try {
+			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
+			coordinatorUnits.add(run.identity.runId);
+			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
+			run.identity.model = prepared.model;
+			run.identity.cwd = prepared.cwd;
+			run.identity.project = prepared.parts.map((part) => part.repo);
 			coordinators.setPrepared(run.identity.runId, prepared);
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
@@ -769,7 +767,17 @@ export default function (pi: ExtensionAPI) {
 			const work = await rpc.request({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
-		} catch (error) { uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); await rpc?.stop(); coordinators.finalize(run.identity.runId, "blocked", (error as Error).message); releaseCoordinatorUnit(run.identity.runId); rpcByRun.delete(run.identity.runId); throw error; }
+		} catch (error) {
+			if (run) {
+				uiAbortByRun.get(run.identity.runId)?.abort();
+				uiAbortByRun.delete(run.identity.runId);
+				await rpc?.stop();
+				coordinators.finalize(run.identity.runId, "blocked", (error as Error).message);
+				releaseCoordinatorUnit(run.identity.runId);
+				rpcByRun.delete(run.identity.runId);
+			} else activeUnits -= 1;
+			throw error;
+		}
 	};
 	pi.on("session_start", (_event, ctx) => {
 		latestCtx = ctx;

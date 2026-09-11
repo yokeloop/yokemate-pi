@@ -69,7 +69,6 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const runOrigins = new Map<string, string>();
   const bindOrigin = (origin: ControlOrigin): string => {
     if (!origin.sessionId || !origin.pid || !origin.starttime || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
-    if (!descendantOf(origin.pid, origin.starttime, identity.pid, identity.starttime)) throw new Error("origin is not a live child of the coordinator parent");
     if (origin.pane) {
       if (origin.parentPane === origin.pane) throw new Error("origin pane cannot parent itself");
       let panel: { pid?: number; cwd?: string } | undefined;
@@ -79,7 +78,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       const parentKnown = origin.parentPane === identity.pane || (origin.parentPane !== undefined && paneParents.has(origin.parentPane));
       if (origin.sessionId !== identity.sessionId && (!origin.parentPane || !parentKnown)) throw new Error("origin pane chain is not registered with this parent");
       paneParents.set(origin.pane, origin.parentPane);
-    } else if (origin.sessionId !== identity.sessionId) throw new Error("origin session is not registered with this parent");
+    } else if (origin.sessionId !== identity.sessionId || !descendantOf(origin.pid, origin.starttime, identity.pid, identity.starttime)) throw new Error("origin session is not registered with this parent");
     const id = randomUUID();
     origins.set(id, { ...origin });
     return id;
