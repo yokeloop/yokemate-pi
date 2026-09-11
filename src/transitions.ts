@@ -18,6 +18,7 @@ export type Via = "stage" | "plan" | "spawn" | "record-report" | "accept" | "acc
 export interface MoveEnv {
   YOKEMATE_MODE?: string;
   YOKEMATE_TICKET?: string;
+  YOKEMATE_ROLE?: "coordinator" | "executor";
 }
 
 export type From = Stage | "absent";
@@ -46,9 +47,7 @@ const RULES: Record<Via, Rule> = {
     stamped: { plan: { from: PLAN_FROM, ticketless: true } },
     unstamped: PLAN_FROM,
   },
-  // spawn raises tabs, so it runs in the main chat alone; a fresh row (a ticket
-  // never queued) is legal only when the caller names the plan outright.
-  spawn: { to: "running", stamped: {}, unstamped: ["planned", "running"] },
+  spawn: { to: "running", stamped: { do: { from: ["planned", "running"] } }, unstamped: ["planned", "running"] },
   "record-report": {
     to: "review",
     stamped: { do: { from: ["running", "review"] } },
@@ -78,11 +77,17 @@ export function checkMove(
   env: MoveEnv,
   ticket: string,
   current: From,
-  opts: { allowFresh?: boolean } = {},
+  opts: { allowFresh?: boolean; expected?: From } = {},
 ): Verdict {
   const rule = RULES[via];
+  if (opts.expected !== undefined && current !== opts.expected)
+    return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${current} before ${via}` };
   const mode = env.YOKEMATE_MODE;
   if (mode) {
+    if (via === "spawn" && env.YOKEMATE_ROLE !== "coordinator")
+      return { ok: false, refuse: "spawn is owned by a do coordinator" };
+    if (via === "record-report" && env.YOKEMATE_ROLE === "executor")
+      return { ok: false, refuse: "record-report is owned by the coordinator" };
     const seat = rule.stamped[mode];
     if (!seat) {
       const seats = Object.keys(rule.stamped);
@@ -119,7 +124,7 @@ export function applyMove(
   env: MoveEnv,
   ticket: string,
   write: (prev: From) => void,
-  opts: { allowFresh?: boolean } = {},
+  opts: { allowFresh?: boolean; expected?: From } = {},
 ): MoveOutcome {
   db.exec("BEGIN IMMEDIATE");
   try {

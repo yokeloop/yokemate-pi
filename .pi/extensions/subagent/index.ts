@@ -29,6 +29,10 @@ import {
 import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
+import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks } from "../../../src/coordinator-runtime.ts";
+import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
+import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -622,7 +626,17 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "project",
 });
 
+const CoordinatorRequestSchema = Type.Object({
+	mode: StringEnum(["do", "ship"] as const),
+	tickets: Type.Array(Type.String()),
+	plan: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	note: Type.Optional(Type.String()),
+});
+
 const SubagentParams = Type.Object({
+	coordinator: Type.Optional(CoordinatorRequestSchema),
+	cancelRun: Type.Optional(Type.String()),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -635,7 +649,21 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	const coordinators = new CoordinatorRegistry();
+	const shipPermits = new ShipPermitStore();
+	const checks = legacyCoordinatorChecks();
+	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
+	pi.on("input", (event, ctx) => {
+		const text = event.text.trim();
+		const match = text.match(/^\/ship\s+(.+)$/);
+		if (match && !process.env.YOKEMATE_MODE) {
+			const tickets = match[1].split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
+			if (tickets.length) shipPermits.observeInteractiveShip(tickets, (ctx as any).sessionManager?.getSessionId?.() ?? "main");
+		} else shipPermits.invalidate();
+	});
 	pi.on("session_shutdown", () => {
+		for (const rpc of rpcByRun.values()) void rpc.stop();
+		rpcByRun.clear();
 		for (const proc of detached) {
 			try {
 				proc.kill("SIGTERM");
@@ -690,6 +718,32 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerTool({
+		name: "coordinator_finish",
+		label: "Coordinator finish",
+		description: "Finish this owned background coordinator with a verified outcome.",
+		parameters: Type.Object({ outcome: StringEnum(["done", "blocked"] as const), summary: Type.String(), reason: Type.Optional(Type.String()), passedTickets: Type.Optional(Type.Array(Type.String())) }),
+		async execute(_id, params) {
+			const runId = process.env.YOKEMATE_RUN_ID;
+			if (!runId || process.env.YOKEMATE_ROLE !== "coordinator")
+				return { content: [{ type: "text", text: "coordinator_finish is available only to its owned RPC coordinator" }], isError: true };
+			if (params.outcome === "blocked" && !params.reason)
+				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
+			const run = coordinators.get(runId);
+			if (!run) return { content: [{ type: "text", text: "outcome proposed" }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, summary: params.summary, reason: params.reason, passedTickets: params.passedTickets } };
+			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+			const verification = verifyCoordinatorOutcome(root, run.prepared!, params, batches.size);
+			if (!verification.ok)
+				return { content: [{ type: "text", text: verification.reason ?? "outcome cannot be verified" }], isError: true };
+			coordinators.finalize(runId, params.outcome, params.reason);
+			pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: params.outcome, verification, summary: params.summary, reason: params.reason });
+			pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${params.outcome}: ${params.summary}`, display: true, details: { runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: params.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+			void rpcByRun.get(runId)?.stop();
+			rpcByRun.delete(runId);
+			return { content: [{ type: "text", text: `${params.outcome} verified` }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, verification } };
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
@@ -701,6 +755,49 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			latestCtx = ctx;
+			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
+			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
+			if (params.cancelRun) {
+				try { const run = coordinators.cancel(params.cancelRun); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+			}
+			if (params.coordinator) {
+				const request = params.coordinator as CoordinatorRequest;
+				try {
+					validateCoordinatorRequest(request);
+					const origin = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE as "coordinator" | "executor" | undefined, sessionId, cwd: ctx.cwd };
+					const refusal = checks.checkCaller(origin, request);
+					if (refusal) throw new Error(refusal);
+					if (request.mode === "ship") {
+						if (!shipPermits.consume(request.tickets, sessionId)) throw new Error("ship requires the current interactive /ship command in the main chat");
+						if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
+					}
+					const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
+					const duplicate = checks.checkDuplicate(request.mode, coordinators.active());
+					if (duplicate) throw new Error(duplicate);
+					const admission = checks.checkAdmission(coordinators.active().length);
+					if (admission) throw new Error(admission);
+					const run = coordinators.reserve(request, origin, sessionId, prepared.model, prepared.cwd, prepared.parts.map((part) => part.repo));
+					coordinators.setPrepared(run.identity.runId, prepared);
+					if (request.mode === "do") markDoRunning(root, prepared, { ...origin, YOKEMATE_MODE: "do", YOKEMATE_TICKET: request.tickets[0], YOKEMATE_ROLE: "coordinator" });
+					const rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
+						const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
+						if (result?.details?.kind !== "yokemate-coordinator-outcome" || !result.details.outcome) return;
+						const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
+						const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
+						if (!verification.ok) return;
+						coordinators.finalize(run.identity.runId, proposal.outcome, proposal.reason);
+						pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
+						pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+						void rpcByRun.get(run.identity.runId)?.stop();
+						rpcByRun.delete(run.identity.runId);
+					}, onBlocked: (reason) => { coordinators.finalize(run.identity.runId, "blocked", reason); rpcByRun.delete(run.identity.runId); } });
+					rpcByRun.set(run.identity.runId, rpc);
+					coordinators.attachProcess(run.identity.runId, rpc.process);
+					rpc.send({ id: `${run.identity.runId}:work`, type: "prompt", message: prepared.prompt });
+					return { content: [{ type: "text", text: `accepted ${run.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: run.identity.runId, identity: run.identity } };
+				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+			}
 			const agentScope: AgentScope = params.agentScope ?? "project";
 			const limits = loadLimits(ctx.cwd);
 			const dispatchDefaults: DispatchDefaults = {

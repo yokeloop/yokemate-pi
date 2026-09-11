@@ -13,6 +13,7 @@ import { DatabaseSync } from "node:sqlite";
 export interface GuardEnv {
   YOKEMATE_MODE?: string;
   YOKEMATE_TICKET?: string;
+  YOKEMATE_ROLE?: "coordinator" | "executor";
 }
 
 /** null — let the stop through; a string — block with that reason. */
@@ -20,15 +21,13 @@ export function stopVerdict(
   env: GuardEnv,
   readStage: (ticket: string) => string | undefined,
 ): string | null {
-  if (env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
+  if (env.YOKEMATE_ROLE === "coordinator" || env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
   const stage = readStage(env.YOKEMATE_TICKET);
   if (stage === "review" || stage === "accepted") return null;
   return (
     `The ticket's stage is still ${stage ?? "unrecorded"}. When every PR is open and green, record the result ` +
     `yourself from the task folder root: pnpm record-report ${env.YOKEMATE_TICKET} ` +
-    `--part <org/repo>:<role>:<branch>:<pr-url> — one --part per repository — then send the report with ` +
-    `send_message and finish. A ticket that cannot be completed records nothing: report what is missing with ` +
-    `send_message and wait — the orchestrator closes this tab.`
+    `--part <org/repo>:<role>:<branch>:<pr-url> — one --part per repository — then finish. A ticket that cannot be completed records nothing and reports what is missing.`
   );
 }
 
