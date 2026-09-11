@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { authorizeResearchMutation, canonicalResearchTarget, classifyResearchCall, type ResearchIdentity } from "../src/research-guard.ts";
+import { authorizeResearchMutation, canonicalResearchTarget, classifyResearchCall, researchChildLaunch, type ResearchIdentity } from "../src/research-guard.ts";
 
 const identity = (path: string): ResearchIdentity => ({ root: path, id: "r", project: "acme/app", projectPath: path, sessionId: "s", role: "worker" });
 
@@ -19,5 +19,9 @@ test("research mutation needs fresh UI consent and rejects escapes", async () =>
     const target = join(root, "target"); mkdirSync(target); symlinkSync(target, join(root, "link"));
     assert.throws(() => canonicalResearchTarget(join(root, "link", "x"), root));
     assert.equal(classifyResearchCall(identity(root), "node").ok, false);
+    const child = researchChildLaunch(identity(root), root, [root]);
+    assert.equal(child.cwd, root);
+    assert.equal(child.env.YOKEMATE_RESEARCH_ROLE, "child");
+    assert.throws(() => researchChildLaunch(identity(root), "/tmp", [root]));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
