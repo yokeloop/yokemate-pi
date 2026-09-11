@@ -12,10 +12,10 @@
 // Usage: pnpm where <mode> <TICKET>   → prints `launch`, `run`, or `refuse: …`
 //        pnpm where plan [KEY]        → /plan can run before a ticket exists
 
-export const MODES = ["plan", "review", "do", "ship", "worklog", "note"] as const;
+export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
 
 /** Modes that run before a ticket exists, so their pane may carry no ticket. */
-export const TICKETLESS: readonly Mode[] = ["plan", "note"];
+export const TICKETLESS: readonly Mode[] = ["plan", "note", "research"];
 export type Mode = (typeof MODES)[number];
 
 export type Decision =
