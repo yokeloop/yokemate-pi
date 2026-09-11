@@ -46,7 +46,8 @@ if (parts.length === 0) fail("at least one --part is required: a report without 
 
 const db = openDb(join(ROOT, "yokemate.db"));
 const out = applyMove(db, "record-report", process.env as MoveEnv, ticket, () => {
-  const work = db.prepare("SELECT id FROM work WHERE ticket = ?").get(ticket) as { id: number };
+  const work = db.prepare("SELECT id FROM work WHERE ticket = ?").get(ticket) as { id: number } | undefined;
+  if (!work) throw new Error(`${ticket}: cannot record a report without a work row`);
   db.prepare("DELETE FROM part WHERE work_id = ?").run(work.id); // rework replaces
   const ins = db.prepare(
     "INSERT INTO part (work_id, repo, role, branch, pr) VALUES (?, ?, ?, ?, ?)",

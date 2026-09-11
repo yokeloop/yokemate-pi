@@ -12,6 +12,7 @@
 
 import { join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
+import { GuardPolicyError, readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -190,6 +191,7 @@ export function judge(
   toolName: string,
   input: { command?: string; file_path?: string; notebook_path?: string },
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
+  policy: GuardPolicy = readGuardPolicy(),
 ): Verdict | null {
   const coding = mode === "do" || mode === "ship";
   const paneled = mode !== undefined && mode !== "";
@@ -208,14 +210,14 @@ export function judge(
             ]
           : []),
       ];
-      if (fenced.includes(path ?? ""))
+      if (policy.guards.settingsWrite && fenced.includes(path ?? ""))
         return {
           decision: "deny",
           reason:
             "Session configuration is not edited from a task pane. If the hook or the settings are wrong, report it to the orchestrator.",
         };
     }
-    if (mode === "note" && own) {
+    if (policy.guards.noteFileWrite && mode === "note" && own) {
       const notesDir = join(own.dataRoot, "notes") + "/";
       if (!(path ?? "").startsWith(notesDir))
         return {
@@ -231,14 +233,14 @@ export function judge(
   const cmd = input.command ?? "";
 
   const unquoted = outsideQuotes(cmd);
-  if (WAIT.some((r) => r.test(unquoted)))
+  if (policy.guards.wait && WAIT.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Waiting is forbidden: a finished subagent returns its result as the tool result, and completion comes to the session on its own. Check the condition once, without sleep, and keep working.",
     };
 
-  if (mode === "note") {
+  if (policy.guards.noteShellWrite && mode === "note") {
     const scrubbed = unquoted.replace(/\d*>>?\s*(&\d+|\/dev\/\S+)/g, "").replace(/[=<-]>/g, "");
     if (NOTE_WRITE.some((r) => r.test(unquoted)) || />/.test(scrubbed))
       return {
@@ -248,14 +250,14 @@ export function judge(
       };
   }
 
-  if (coding && LAUNCH.some((r) => r.test(unquoted)))
+  if (policy.guards.codingLaunch && coding && LAUNCH.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
         "Nothing long-running starts while coding: no dev servers, no app launches, no browsers. Only commands that finish on their own — build, lint, typecheck, unit tests. The live application is /review's job.",
     };
 
-  if (onStand && KILL.some((r) => r.test(unquoted)))
+  if (policy.guards.massKill && onStand && KILL.some((r) => r.test(unquoted)))
     return {
       decision: "deny",
       reason:
@@ -264,6 +266,7 @@ export function judge(
 
   const targets = outsideQuotes(cmd, TARGETS);
   if (
+    policy.guards.homeDelete &&
     onStand &&
     /\brm\b/.test(targets) &&
     HOME_PATH.test(targets) &&
@@ -276,7 +279,7 @@ export function judge(
         "Your writable world is the task worktrees and knowledge/…/ai/. The engineer's home directory is not ours to change (~/Downloads on the engineer's word is the one exception).",
     };
 
-  if (!paneled && SHIP_LAUNCH.test(unquoted))
+  if (policy.guards.shipConfirmation && !paneled && SHIP_LAUNCH.test(unquoted))
     return {
       decision: "ask",
       reason: "Ship merges — the one launch there is no way back from. Confirm this run is on the engineer's word.",
@@ -311,8 +314,9 @@ if (import.meta.filename === process.argv[1]) {
             },
           }),
         );
-    } catch {
-      // Broken guard → allow; see the header.
+    } catch (e) {
+      if (e instanceof GuardPolicyError)
+        console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: e.message } }));
     }
     process.exit(0);
   });

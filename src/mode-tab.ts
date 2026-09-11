@@ -30,6 +30,7 @@
 //   pnpm split plan [ACME-342|проблема] [--model <m>] [note]
 
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { findPlan } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
@@ -37,6 +38,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
+import { readGuardPolicy } from "./guard-policy.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note"] as const;
 export type Mode = (typeof MODES)[number];
@@ -171,6 +173,7 @@ if (import.meta.filename === process.argv[1]) {
     tail = argv.slice(2);
   }
 
+  const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
   if (process.env.HERDR_ENV !== "1")
     fail("not inside a herdr session — open the main chat in herdr first");
 
@@ -234,9 +237,13 @@ if (import.meta.filename === process.argv[1]) {
   } catch (e) {
     launch = fail((e as Error).message);
   }
-  const { cwd, prompt, env, surface } = launch;
-  let agentName = launch.agentName;
-  let label = launch.label;
+  const { cwd, surface } = launch;
+  const duplicateGuard = policy.guards.duplicateMode;
+  const runId = ticket && !duplicateGuard ? randomUUID().replace(/-/g, "").slice(0, 8) : undefined;
+  const prompt = launch.prompt + (runId ? ` Run ID: ${runId}. Include it in your final report.` : "");
+  const env = [...launch.env, "YOKEMATE_ROLE=coordinator", ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : [])];
+  let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;
+  let label = runId ? `${launch.label} [${runId}]` : launch.label;
 
   const agents = (
     herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
@@ -250,8 +257,8 @@ if (import.meta.filename === process.argv[1]) {
     agentName = freeAgentName(agentName, agents.map((a) => a.name ?? ""));
     label = agentName;
   } else {
-    const running = findRunningAgent(agents, agentName);
-    if (running)
+    const running = findRunningAgent(agents, launch.agentName, { mode, ticket, cwd });
+    if (duplicateGuard && running)
       fail(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
   }
 
@@ -290,6 +297,6 @@ if (import.meta.filename === process.argv[1]) {
   }
 
   console.log(
-    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}`,
+    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
   );
 }
