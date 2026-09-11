@@ -20,6 +20,7 @@ export function researchIdentity(env: NodeJS.ProcessEnv = process.env, sessionId
   if (!id || !root) return null;
   const project = env.YOKEMATE_RESEARCH_PROJECT || null;
   const projectPath = env.YOKEMATE_RESEARCH_PROJECT_PATH || null;
+  if (Boolean(project) !== Boolean(projectPath)) return null;
   if (env.YOKEMATE_MODE !== "research") return { root: resolve(root), id, project, projectPath, sessionId, role: "worker" };
   return { root: resolve(root), id, project, projectPath, sessionId, role: env.YOKEMATE_RESEARCH_ROLE === "child" ? "child" : "worker", parentPane: env.YOKEMATE_PARENT_PANE };
 }
@@ -34,6 +35,7 @@ export function canonicalResearchTarget(target: string, root: string): string {
   if (!within(absolute, resolve(root))) throw new Error(`target escapes its allowed root: ${target}`);
   let lexical = resolve(root);
   for (const part of relative(resolve(root), absolute).split(sep).filter(Boolean)) {
+    if (part === ".git") throw new Error(`git metadata is not writable: ${target}`);
     lexical = resolve(lexical, part);
     if (existsSync(lexical) && lstatSync(lexical).isSymbolicLink())
       throw new Error(`symlink target is not writable: ${target}`);

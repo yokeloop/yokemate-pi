@@ -4,7 +4,7 @@ import bus from "./bus.ts";
 import subagent from "../.pi/extensions/subagent/index.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
 import { installResearchMcp } from "./research-mcp.ts";
-import { installResearchTools } from "./research-tools.ts";
+import { executeResearchBash, installResearchTools } from "./research-tools.ts";
 
 export default function research(pi: ExtensionAPI): void {
   let ready = false;
@@ -13,6 +13,13 @@ export default function research(pi: ExtensionAPI): void {
     return verdict.ok ? undefined : { block: true, reason: verdict.reason };
   });
   pi.setActiveTools([]);
+  pi.on("user_bash", async (event) => {
+    try {
+      return { result: { output: await executeResearchBash(event.command), exitCode: 0, cancelled: false, truncated: false } };
+    } catch (error) {
+      return { result: { output: (error as Error).message, exitCode: 1, cancelled: false, truncated: false } };
+    }
+  });
   bus(pi);
   subagent(pi);
   pi.on("session_start", async (_event, ctx) => {
