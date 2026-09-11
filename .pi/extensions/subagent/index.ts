@@ -689,12 +689,14 @@ export default function (pi: ExtensionAPI) {
 		if (admission) throw new Error(admission);
 		const run = coordinators.reserve(request, origin, origin.sessionId ?? "main", prepared.model, prepared.cwd, prepared.parts.map((part) => part.repo));
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+		const finishCalls = new Set<string>();
 		try {
 			coordinators.setPrepared(run.identity.runId, prepared);
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, run.identity, { onEvent: (event) => {
-				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
-				if (result?.details?.kind !== "yokemate-coordinator-outcome" || !result.details.outcome) return;
+				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
+				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
+				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== run.identity.runId || !result.details.outcome) return;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
 				const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
 				if (!verification.ok) {
@@ -707,16 +709,16 @@ export default function (pi: ExtensionAPI) {
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
 				void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId);
 			}, onUiRequest: (event, reply) => {
-				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string };
+				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
 				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
 				uiTail = uiTail.then(async () => {
 					const id = request.id!;
 					try {
-						if (!ctx.hasUI) { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
+						if (!ctx.hasUI || coordinators.get(run.identity.runId)?.state === "done" || coordinators.get(run.identity.runId)?.state === "blocked") { reply({ type: "extension_ui_response", id, cancelled: true }); return; }
 						const ui = ctx.ui as any;
 						if (request.method === "confirm") reply({ type: "extension_ui_response", id, confirmed: Boolean(await ui.confirm(request.title ?? "Coordinator", request.message ?? "")) });
 						else if (request.method === "select") { const value = await ui.select(request.title ?? "Coordinator", request.options ?? []); reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
-						else { const value = request.method === "editor" ? await ui.editor(request.title ?? "Coordinator") : await ui.input(request.title ?? "Coordinator", request.placeholder); reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
+						else { const value = request.method === "editor" ? await ui.editor(request.title ?? "Coordinator", request.prefill) : await ui.input(request.title ?? "Coordinator", request.placeholder); if (coordinators.get(run.identity.runId)?.state === "done" || coordinators.get(run.identity.runId)?.state === "blocked") reply({ type: "extension_ui_response", id, cancelled: true }); else reply(value === undefined ? { type: "extension_ui_response", id, cancelled: true } : { type: "extension_ui_response", id, value }); }
 					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
 				}).catch(() => {});
 			}, onBlocked: (reason) => {

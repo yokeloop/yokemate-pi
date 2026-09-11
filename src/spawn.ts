@@ -15,7 +15,7 @@ for (let index = 0; index < argv.length; index += 1) {
 const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required to route spawn to its live coordinator parent");
 try {
   const parent = resolveCoordinatorParent(root);
-  const reply = await requestCoordinator(root, { mode: "do", tickets: [ticket], plan, model }, { sessionId, pid: process.pid, cwd: root, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
+  const reply = await requestCoordinator(root, { mode: "do", tickets: [ticket], plan, model }, { sessionId, pid: process.pid, cwd: root, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
   if (reply.state !== "accepted" || !reply.runId) fail(reply.reason ?? "coordinator launch was not accepted");
   console.log(`${ticket} → background run ${reply.runId}`);
 } catch (error) { fail((error as Error).message); }

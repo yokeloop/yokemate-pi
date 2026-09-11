@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { dataRoot } from "./data-root.ts";
@@ -41,10 +41,8 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
     }
     for (const ticket of prepared.tickets) if (existsSync(join(root, "work", ticket))) remaining.push(ticket);
     if (remaining.length) return { ok: false, reason: `task folders remain: ${remaining.join(", ")}`, merged, remaining };
-    const now = new Date();
-    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    const journal = join(dataRoot(root), "journal", `${month}.md`);
-    const lines = existsSync(journal) ? readFileSync(journal, "utf8") : "";
+    const journalDir = join(dataRoot(root), "journal");
+    const lines = existsSync(journalDir) ? readdirSync(journalDir).filter((name) => /^\\d{4}-\\d{2}\\.md$/.test(name)).map((name) => readFileSync(join(journalDir, name), "utf8")).join("\n") : "";
     const missing = prepared.tickets.filter((ticket) => !new RegExp(`^\\- \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} ${ticket} отгружено(?:$|:)`, "m").test(lines));
     return missing.length ? { ok: false, reason: `missing shipped journal lines: ${missing.join(", ")}`, merged, remaining } : { ok: true, merged, remaining };
   } catch (error) { return { ok: false, reason: (error as Error).message }; }

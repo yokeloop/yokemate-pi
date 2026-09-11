@@ -49,7 +49,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const bindOrigin = (origin: ControlOrigin): string => {
     if (!origin.sessionId || !origin.pid || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
     if (!isLiveProcess(origin.pid) || !descendantOf(origin.pid, identity.pid)) throw new Error("origin is not a live child of the coordinator parent");
-    if (origin.sessionId !== identity.sessionId) throw new Error("origin session is not registered with this parent");
+    if (origin.sessionId !== identity.sessionId) {
+      if (!origin.pane || !origin.parentPane) throw new Error("origin session is not registered with this parent");
+      let panel: { pid?: number; cwd?: string } | undefined;
+      try { panel = JSON.parse(readFileSync(join(socketDir(env, uid), `${origin.pane}.json`), "utf8")); } catch {}
+      if (panel?.pid !== origin.pid || resolve(panel.cwd ?? "") !== canonicalRoot) throw new Error("panel origin is not registered with this parent");
+    }
     const id = randomUUID();
     origins.set(id, { ...origin });
     return id;
