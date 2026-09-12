@@ -14,6 +14,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -133,8 +134,7 @@ let shuttingDown = false;
 
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
-type Batch = { total: number; settled: number; outcomes: { agent: string; failed: boolean }[] };
-const batches = new Map<string, Batch>();
+const batches = new Set<string>();
 
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
@@ -335,6 +335,7 @@ interface UsageStats {
 }
 
 interface SingleResult {
+	envelope?: ResultEnvelope;
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
@@ -353,22 +354,17 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	batchId?: string;
+	children?: LaunchAck["children"];
 }
 
 function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
+	const last = messages.findLast((message) => message.role === "assistant");
+	return last?.role === "assistant" ? last.content.filter((part) => part.type === "text").map((part) => part.text).join("") : "";
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return result.envelope ? failedEnvelope(result.envelope) : result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -468,7 +464,8 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	onSpawn?: (proc: ChildProcess) => void,
+	onSpawn: ((proc: ChildProcess) => void) | undefined,
+	identity: ChildIdentity,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -545,13 +542,13 @@ async function runSingleAgent(
 			const env: NodeJS.ProcessEnv = {
 				...process.env,
 				YOKEMATE_ROLE: "executor",
-				YOKEMATE_RUN_ID: randomUUID(),
+				YOKEMATE_RUN_ID: identity.runId,
 				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
 				...(child?.env ?? {}),
 			};
 			if (coordinatorChild) {
 				env.YOKEMATE_PARENT_RUN_ID = process.env.YOKEMATE_RUN_ID;
-				env.YOKEMATE_RUN_ID = randomUUID();
+				env.YOKEMATE_RUN_ID = identity.runId;
 			}
 			delete env.HERDR_PANE_ID;
 			delete env.YOKEMATE_PARENT_PANE;
@@ -641,6 +638,7 @@ async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");
+		currentResult.envelope = resultEnvelope(identity, task, { processOutcome: "exited", exitCode, signal: null, stopReason: currentResult.stopReason }, getFinalOutput(currentResult.messages));
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -658,15 +656,19 @@ async function runSingleAgent(
 	}
 }
 
+const ReviewRevisionSchema = Type.Object({ baseSha: Type.String(), headSha: Type.String() });
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
+	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -684,6 +686,7 @@ const CoordinatorRequestSchema = Type.Object({
 });
 
 const SubagentParams = Type.Object({
+	review: Type.Optional(ReviewRevisionSchema),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
 	cancelRun: Type.Optional(Type.String()),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
@@ -698,6 +701,8 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	let runs: ChildRuns | undefined;
+	const sentBatches = new Set<string>();
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
 	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
@@ -904,36 +909,20 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
-	// Отчёт приходит из отложенного колбэка: ловить бросок отсюда некому, и
-	// протухший ctx уронил бы весь процесс pi вместе с самим отчётом.
-	const sendReport = (content: string): void => {
+	const sendReport = (envelope: ResultEnvelope | BatchEnvelope): void => {
+		const prefix = envelope.kind === "result" ? `[subagent ${envelope.identity.agent}${failedEnvelope(envelope) ? " failed" : ""}]` : envelope.kind === "batch" ? "[subagent batch complete]" : "[subagent chain]";
 		try {
-			pi.sendMessage(
-				{ customType: "subagent-report", content, display: true },
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		} catch (e) {
-			console.error(`[subagent] report lost: ${(e as Error)?.message || String(e)}\n${content}`);
+			pi.sendMessage({ customType: "subagent-report", content: `${prefix} ${JSON.stringify(envelope)}`, display: true, details: envelope }, { deliverAs: "followUp", triggerTurn: true });
+		} catch {
+			console.error("[subagent] report delivery failed");
 		}
 	};
-
-	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
-		sendReport(`[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`);
-	};
-
-	const openBatch = (batchId: string, total: number): void => {
-		batches.set(batchId, { total, settled: 0, outcomes: [] });
-	};
-
-	const settleBatch = (batchId: string, agentName: string, failed: boolean): void => {
-		const batch = batches.get(batchId);
-		if (!batch) return;
-		batch.settled += 1;
-		batch.outcomes.push({ agent: agentName, failed });
-		if (batch.settled < batch.total) return;
+	const settleBatch = (batchId: string): void => {
+		const batch = runs?.batch(batchId);
+		if (!batch || sentBatches.has(batchId)) return;
+		sentBatches.add(batchId);
+		sendReport(batch);
 		batches.delete(batchId);
-		const outcomes = batch.outcomes.map((o) => `${o.agent} ${o.failed ? "failed" : "✓"}`).join(" · ");
-		sendReport(`[subagent batch complete] ${batch.settled}/${batch.total} · ${outcomes}`);
 	};
 
 	pi.registerTool({
@@ -1033,66 +1022,61 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			// Один ребёнок, отвязанный: тул-колл уже вернулся, поэтому исход
-			// доходит только сообщением, и своим на каждого агента.
-			const runDetachedAgent = async (
-				mode: "single" | "parallel",
-				agentName: string,
-				task: string,
-				taskCwd: string | undefined,
-				formatOutput: (result: SingleResult) => string,
-			): Promise<void> => {
-				if (shuttingDown) {
-					activeUnits -= 1;
-					console.error(`[subagent] ${agentName} dropped from the queue at shutdown, it never ran`);
-					return;
-				}
+			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
+			if (!runs) runs = new ChildRuns(ownerRunId, sessionId);
+			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
+			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<ResultEnvelope> => {
 				let child: ChildProcess | undefined;
-				// Убитый сигналом ребёнок закрывается с code === null, а
-				// runSingleAgent превращает его в exitCode 0 — без этого флага
-				// снятый руками процесс отчитался бы как успех.
-				let killedBySignal = false;
-				let killSignal: NodeJS.Signals | null = null;
-				const settle = (failed: boolean, text: string) => {
-					activeUnits -= 1;
+				let envelope: ResultEnvelope;
+				try {
+					if (shuttingDown) return resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+					runs!.start(identity);
+					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
+						child = proc;
+						detached.add(proc);
+						trackRunning(proc, identity.agent, task);
+					}, identity);
+					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+				} catch {
+					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
+				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
-					reportDetached(agentName, failed || killedBySignal, killedBySignal ? `terminated by ${killSignal}${text ? `\n${text}` : ""}` : text);
-					settleBatch(toolCallId, agentName, failed || killedBySignal);
-				};
-				let failed: boolean;
-				let text: string;
-				try {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						agentName,
-						task,
-						taskCwd,
-						undefined, // step
-						undefined, // signal: тул-колл уже вернулся, отменять нечем
-						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-						makeDetails(mode),
-						(proc) => {
-							child = proc;
-							detached.add(proc);
-							trackRunning(proc, agentName, task);
-							proc.once("close", (_code, signalName) => {
-								if (signalName) { killedBySignal = true; killSignal = signalName; }
-								detached.delete(proc);
-							});
-						},
-					);
-					failed = isFailedResult(result);
-					text = formatOutput(result);
-				} catch (e) {
-					failed = true;
-					text = (e as Error)?.message || String(e);
 				}
-				// Один вызов settle на все исходы: из try он мог бы уйти в свой
-				// же catch и отчитаться дважды.
-				settle(failed, text);
+				return envelope;
+			};
+			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
+				const units = mode === "chain" ? 1 : tasks.length;
+				const admission = subagentAdmission(policy, limits, mode, units, activeUnits);
+				if (admission) throw new Error(admission);
+				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				activeUnits += units;
+				batches.add(toolCallId);
+				const execute = async () => {
+					try {
+						if (mode === "chain") {
+							let previous = "";
+							let failed = false;
+							for (let i = 0; i < tasks.length; i++) {
+								const identity = ack.children[i]!.identity;
+								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
+								const result = failed ? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "") : await runDetachedAgent(mode, identity, task, i + 1);
+								runs!.settle(result);
+								failed ||= failedEnvelope(result);
+								previous = result.payload;
+							}
+							sendReport(runs!.batch(toolCallId, "chain")!);
+						} else {
+							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
+								const result = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
+								if (runs!.settle(result)) sendReport(result);
+							});
+						}
+						settleBatch(toolCallId);
+					} finally { activeUnits -= units; }
+				};
+				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
+				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack } };
 			};
 
 			if (modeCount !== 1) {
@@ -1139,145 +1123,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const steps = params.chain;
-				const admission = subagentAdmission(policy, limits, "chain", 1, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("chain")([]),
-						isError: true,
-					};
-				}
-
-				activeUnits += 1;
-				openBatch(toolCallId, 1);
-
-				// Цепочка — одна единица: каждый шаг питается {previous}
-				// предыдущего, промежуточный вывод сам по себе не результат.
-				// Отсюда один отчёт, в конце, и одна запись в батче.
-				const runChain = async (): Promise<void> => {
-					let previousOutput = "";
-					let lastAgent = steps[steps.length - 1].agent;
-					const settle = (failed: boolean, agentName: string, text: string) => {
-						activeUnits -= 1;
-						reportDetached(failed ? "chain" : agentName, failed, text);
-						settleBatch(toolCallId, agentName, failed);
-					};
-
-					for (let i = 0; i < steps.length; i++) {
-						if (shuttingDown) {
-							activeUnits -= 1;
-							console.error(
-								`[subagent] chain dropped at shutdown before step ${i + 1} (${steps[i].agent}), it never ran`,
-							);
-							return;
-						}
-						const step = steps[i];
-						lastAgent = step.agent;
-						const stepTask = step.task.replace(/\{previous\}/g, previousOutput);
-						let killedBySignal = false;
-						let result: SingleResult;
-						try {
-							result = await runSingleAgent(
-								ctx.cwd,
-								dispatchDefaults,
-								agents,
-								step.agent,
-								stepTask,
-								step.cwd,
-								i + 1,
-								undefined, // signal: тул-колл уже вернулся, отменять нечем
-								undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-								makeDetails("chain"),
-								(proc) => {
-									detached.add(proc);
-									trackRunning(proc, step.agent, stepTask);
-									proc.once("close", (_code, signalName) => {
-										if (signalName) killedBySignal = true;
-										detached.delete(proc);
-										untrackRunning(proc);
-									});
-								},
-							);
-						} catch (e) {
-							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${(e as Error)?.message || String(e)}`);
-							return;
-						}
-						if (isFailedResult(result) || killedBySignal) {
-							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${getResultOutput(result)}`);
-							return;
-						}
-						previousOutput = getFinalOutput(result.messages);
-					}
-					settle(false, lastAgent, previousOutput);
-				};
-				void runChain().catch((e) => console.error(`[subagent] chain failed: ${(e as Error)?.message || String(e)}`));
-
-				const names = steps.map((step) => step.agent).join(" → ");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: chain of ${steps.length} steps running (${names}). Its report will arrive as a separate message.`,
-						},
-					],
-					details: makeDetails("chain")([]),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				const tasks = params.tasks;
-				const admission = subagentAdmission(policy, limits, "parallel", tasks.length, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("parallel")([]),
-						isError: true,
-					};
-				}
-
-				activeUnits += tasks.length;
-				openBatch(toolCallId, tasks.length);
-				void mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), (t) =>
-					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
-				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
-
-				const names = tasks.map((t) => t.agent).join(", ");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: ${tasks.length} agents running (${names}). Their reports will arrive as separate messages prefixed "[subagent <name>]" — do not call subagent again for these tasks.`,
-						},
-					],
-					details: makeDetails("parallel")([]),
-				};
-			}
-
-			if (params.agent && params.task) {
-				const admission = subagentAdmission(policy, limits, "single", 1, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("single")([]),
-						isError: true,
-					};
-				}
-				const agentName = params.agent;
-				activeUnits += 1;
-				openBatch(toolCallId, 1);
-				void runDetachedAgent("single", agentName, params.task, params.cwd, getResultOutput);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
-			}
+			if (params.chain?.length) return launch("chain", params.chain);
+			if (params.tasks?.length) return launch("parallel", params.tasks);
+			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, review: params.review }]);
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
@@ -1427,7 +1275,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter((r) => !isFailedResult(r)).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
 				if (expanded) {
@@ -1444,7 +1292,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1496,7 +1344,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
