@@ -31,8 +31,9 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
-import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
+import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
@@ -51,6 +52,23 @@ interface Limits {
 const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
 
 const limitsByCwd = new Map<string, Limits>();
+
+function openChildLog(taskRoot: string, agentName: string, runId: string | undefined): ((chunk: string) => void) | undefined {
+	try {
+		const dir = path.join(taskRoot, "logs");
+		fs.mkdirSync(dir, { recursive: true });
+		const file = path.join(dir, `${agentName}-${runId ?? "unknown"}.log`);
+		return (chunk) => {
+			try {
+				fs.appendFileSync(file, chunk);
+			} catch {
+				/* ignore */
+			}
+		};
+	} catch {
+		return undefined;
+	}
+}
 
 function validateLimits(limits: Limits): string | undefined {
 	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
@@ -468,7 +486,8 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session", "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
+	const coordinatorChild = process.env.YOKEMATE_ROLE === "coordinator";
+	const args: string[] = ["--mode", "json", "-p", ...(coordinatorChild ? ["--session-dir", path.join(process.cwd(), "sessions")] : ["--no-session"]), "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
@@ -511,7 +530,6 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		const coordinatorChild = process.env.YOKEMATE_ROLE === "coordinator";
 		if (coordinatorChild) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			args.push("--no-approve", "-e", path.join(root, "src", "guards.ts"), "-e", path.join(root, ".pi", "extensions", "subagent", "index.ts"), "--skill", path.join(root, ".pi", "skills"));
@@ -544,6 +562,8 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			onSpawn?.(proc);
+			const log = coordinatorChild ? openChildLog(process.cwd(), agentName, env.YOKEMATE_RUN_ID) : undefined;
+			log?.(`[start ${new Date().toISOString()}] pid=${proc.pid} cwd=${child?.cwd ?? cwd ?? defaultCwd} ${invocation.command} ${invocation.args.join(" ")}\n`);
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -584,6 +604,7 @@ async function runSingleAgent(
 			};
 
 			proc.stdout.on("data", (data) => {
+				log?.(data.toString());
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
@@ -591,10 +612,12 @@ async function runSingleAgent(
 			});
 
 			proc.stderr.on("data", (data) => {
+				log?.(data.toString());
 				currentResult.stderr += data.toString();
 			});
 
-			proc.on("close", (code) => {
+			proc.on("close", (code, signalName) => {
+				log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signalName}\n`);
 				if (buffer.trim()) processLine(buffer);
 				resolve(code ?? 0);
 			});
@@ -726,7 +749,7 @@ export default function (pi: ExtensionAPI) {
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
 			coordinators.setPrepared(ownedRun.identity.runId, prepared);
 			let terminalReported = false;
-			let nudgeSent = false;
+			let nudges = 0;
 			reportBlocked = (reason: string) => {
 				if (terminalReported) return;
 				terminalReported = true;
@@ -739,12 +762,15 @@ export default function (pi: ExtensionAPI) {
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
+			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
+			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
-			rpc = startCoordinatorRpc(prepared, ownedRun.identity, { onEvent: (event) => {
-				if (event.type === "agent_start") { nudgeSent = false; return; }
+			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (event.type === "agent_settled" && !terminalReported) {
-					if (nudgeSent) { reportBlocked?.("coordinator stopped without outcome"); return; }
-					nudgeSent = true;
+					const verdict = idleVerdict({ nudges, hasChildren: rpc?.hasLiveDescendants() ?? false });
+					if (verdict === "wait") return;
+					if (verdict === "blocked") { reportBlocked?.("coordinator stopped without outcome"); return; }
+					nudges += 1;
 					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked?.((error as Error).message));
 					return;
 				}
@@ -1026,11 +1052,12 @@ export default function (pi: ExtensionAPI) {
 				// runSingleAgent превращает его в exitCode 0 — без этого флага
 				// снятый руками процесс отчитался бы как успех.
 				let killedBySignal = false;
+				let killSignal: NodeJS.Signals | null = null;
 				const settle = (failed: boolean, text: string) => {
 					activeUnits -= 1;
 					if (child) detached.delete(child);
 					untrackRunning(child);
-					reportDetached(agentName, failed || killedBySignal, text);
+					reportDetached(agentName, failed || killedBySignal, killedBySignal ? `terminated by ${killSignal}${text ? `\n${text}` : ""}` : text);
 					settleBatch(toolCallId, agentName, failed || killedBySignal);
 				};
 				let failed: boolean;
@@ -1052,7 +1079,7 @@ export default function (pi: ExtensionAPI) {
 							detached.add(proc);
 							trackRunning(proc, agentName, task);
 							proc.once("close", (_code, signalName) => {
-								if (signalName) killedBySignal = true;
+								if (signalName) { killedBySignal = true; killSignal = signalName; }
 								detached.delete(proc);
 							});
 						},

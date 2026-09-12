@@ -701,6 +701,35 @@ test("ship prompt preserves single and batch arguments through where", async () 
   );
 });
 
+test("do prompt preserves its key through where", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({
+    cwd: root,
+    agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts", "do.md")],
+    includeDefaults: false,
+  });
+  const expanded = promptTemplates.expandPromptTemplate("/do YM-203", templates);
+  const where = expanded.match(/pnpm where do(?: [^`\n]*)?/)?.[0];
+  assert.match(expanded, /subagent.*coordinator/);
+  assert.ok(where);
+  const args = where.split(/\s+/).slice(3);
+  const run = (env: Record<string, string>) => spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "do", ...args],
+    { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
+  );
+  assert.equal(run({}).stdout.trim(), "launch");
+  assert.equal(run({ YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-203" }).stdout.trim(), "run");
+  const refused = run({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-203" });
+  assert.equal(refused.status, 1);
+  assert.match(refused.stdout, /^refuse: /);
+});
+
 test("spawn and mode-tab refuse without a pane id, before any effect", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");

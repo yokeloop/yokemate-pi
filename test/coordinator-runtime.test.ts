@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CoordinatorRegistry, ShipPermitStore } from "../src/coordinator-runtime.ts";
+import { CoordinatorRegistry, IDLE_NUDGE_LIMIT, ShipPermitStore, idleVerdict } from "../src/coordinator-runtime.ts";
 
 test("coordinator registry reserves ticket batches atomically and releases terminal runs", () => {
   const registry = new CoordinatorRegistry();
@@ -20,4 +20,12 @@ test("ship permit is exact, single-use and invalidated by later input", () => {
   permits.observeInteractiveShip(["ACME-3"], "main");
   permits.invalidate();
   assert.equal(permits.consume(["ACME-3"], "main"), false);
+});
+
+test("idle verdict waits on live children, nudges a bounded number of times, then blocks", () => {
+  assert.equal(idleVerdict({ nudges: 0, hasChildren: true }), "wait");
+  assert.equal(idleVerdict({ nudges: 99, hasChildren: true }), "wait");
+  assert.equal(idleVerdict({ nudges: 0, hasChildren: false }), "nudge");
+  assert.equal(idleVerdict({ nudges: IDLE_NUDGE_LIMIT - 1, hasChildren: false }), "nudge");
+  assert.equal(idleVerdict({ nudges: IDLE_NUDGE_LIMIT, hasChildren: false }), "blocked");
 });

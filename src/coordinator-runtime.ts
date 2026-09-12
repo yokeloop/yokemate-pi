@@ -6,6 +6,13 @@ export type RuntimeState = "preparing" | "starting" | "active" | "finishing" | "
 export interface CoordinatorRun { identity: RuntimeIdentity; request: CoordinatorRequest; origin: CoordinatorOrigin; state: RuntimeState; process?: { kill(signal?: NodeJS.Signals): boolean }; requestId?: string; prepared?: PreparedCoordinator; reason?: string }
 export interface CoordinatorLaunchChecks { checkCaller(origin: CoordinatorOrigin, request: CoordinatorRequest): string | undefined; checkDuplicate(mode: CoordinatorMode, activeRuns: CoordinatorRun[]): string | undefined; checkAdmission(activeUnits: number): string | undefined; needsShipConfirmation(origin: CoordinatorOrigin): boolean }
 
+export const IDLE_NUDGE_LIMIT = 3;
+export type IdleVerdict = "wait" | "nudge" | "blocked";
+export function idleVerdict(state: { nudges: number; hasChildren: boolean }, limit = IDLE_NUDGE_LIMIT): IdleVerdict {
+  if (state.hasChildren) return "wait";
+  return state.nudges < limit ? "nudge" : "blocked";
+}
+
 export const legacyCoordinatorChecks = (maxDetached = 8): CoordinatorLaunchChecks => ({
   checkCaller(origin, request) {
     if (request.mode === "do" && origin.YOKEMATE_MODE && origin.YOKEMATE_MODE !== "plan") return `spawn runs in the main chat only — this pane is stamped ${origin.YOKEMATE_MODE}`;
