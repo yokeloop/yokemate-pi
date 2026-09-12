@@ -175,3 +175,35 @@ test("an observed delivery retires its asynchronous error before a later healthy
   assert.equal(tracker.deliveryFailureReason(), undefined);
   assert.equal(tracker.settled(), "wait");
 });
+
+test("blocked teardown after unexpected exit preserves the completed parent snapshot", async () => {
+  const fs = await import("node:fs");
+  const { RunSnapshots } = await import("../src/subagent-runs.ts");
+  const root = mkdtempSync(join(tmpdir(), "ym204-closed-parent-"));
+  const folder = join(root, "home/knowledge/org/repo/ai/task");
+  fs.mkdirSync(folder, { recursive: true });
+  fs.mkdirSync(join(root, ".pi/agents"), { recursive: true });
+  fs.writeFileSync(join(root, ".pi/agents/do-coordinator.md"), "fixture");
+  const plan = join(folder, "plan.md");
+  fs.writeFileSync(plan, "plan");
+  let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+  let stopped!: () => void;
+  const complete = new Promise<void>((resolve) => { stopped = resolve; });
+  try {
+    rpc = startCoordinatorRpc({ ...prepared, cwd: root, resourcesPath: root, plan }, identity, expected, {
+      onBlocked() { void rpc?.stop().then(stopped); },
+    }, { invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture, "exit-no-descendants"] }, stopGraceMs: 20 });
+    await rpc.ready;
+    await rpc.request({ type: "prompt", message: "work" });
+    await complete;
+    await rpc.stop();
+    const file = join(folder, "reviewer-runs/run-1-run-1.json");
+    const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(snapshot.completed, true);
+    assert.equal(snapshot.exitCode, 9);
+    assert.equal(snapshot.cancellationInitiator, "unknown");
+    const snapshots = new RunSnapshots(root, plan);
+    for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, {}, true);
+    assert.equal(fs.existsSync(file), false);
+  } finally { await rpc?.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+});

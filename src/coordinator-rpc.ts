@@ -190,11 +190,12 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   child.on("error", (error) => { metadata.spawnError = errorMetadata(error); save(false); fail("coordinator RPC spawn error"); });
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = (reason = "parent_rpc_stop") => new Promise<void>((resolve) => {
-    metadata.cancellationInitiator = reason;
-    save(false);
-    try { send({ type: "prompt", message: `/yokemate-child-cancel ${Buffer.from(JSON.stringify({ runId: identity.runId, reason })).toString("base64")}` }); } catch {}
     captureOwned();
     if (liveOwned().length === 0) return resolve();
+    if (closed) metadata.descendantCancellationInitiator ??= reason;
+    else if (metadata.cancellationInitiator === "unknown") metadata.cancellationInitiator = reason;
+    save(closed);
+    try { send({ type: "prompt", message: `/yokemate-child-cancel ${Buffer.from(JSON.stringify({ runId: identity.runId, reason })).toString("base64")}` }); } catch {}
     const grace = options.stopGraceMs ?? 5000;
     let settled = false;
     const finish = () => { if (!settled) { settled = true; resolve(); } };

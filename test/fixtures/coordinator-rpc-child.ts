@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 
 const scenario = process.argv[2] ?? "ready";
-const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+const grandchild = scenario === "exit-no-descendants" ? undefined : spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
 let buffer = "";
 const send = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
-send({ type: "grandchild", pid: grandchild.pid });
+if (grandchild) send({ type: "grandchild", pid: grandchild.pid });
 
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString("utf8");
@@ -29,6 +29,7 @@ process.stdin.on("data", (chunk) => {
     } else if (command.type === "prompt") {
       send({ type: "work_prompt" });
       send({ type: "response", id: command.id, success: true });
+      if (scenario === "exit-no-descendants") process.exit(9);
       setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
     } else if (command.type === "abort") {
       process.exit(0);
