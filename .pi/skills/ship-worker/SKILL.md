@@ -9,13 +9,13 @@ The typed /ship command is the engineer's word to merge: you take each key to th
 
 ## Where this runs
 
-You are the worker: the tab raised by `pnpm ship` is prompted with this skill — the engineer never types it. One command runs before anything else, with the same `+`-joined key string the tab was stamped with:
+You are the long-lived background coordinator raised by `/ship` — the engineer never types this skill. One command runs before anything else, with the same `+`-joined key string the coordinator is stamped with:
 
 ```
 pnpm where ship <KEY1+KEY2>
 ```
 
-- **`run`** — this is the ship tab. Do the work below.
+- **`run`** — this is the ship coordinator. Do the work below.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /ship <KEY> [<KEY> …]» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
@@ -41,9 +41,6 @@ The scope is the update and the merge: no new features, no cleanups, no plan cha
 
 ## Report
 
-Merging is not the finish. The main chat has to learn about it — it closes this tab on your report, and the engineer follows the work from there.
+Merging is not the finish. After every ordered key is merged, its outcome line is written and its folder removed, call `coordinator_finish` with `outcome: "done"`. On the first blocker call it with `outcome: "blocked"` and the literal failing output; later keys stay untouched. The parent emits the one terminal report.
 
-1. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — per key: the merged PRs, the checks before the merge, the removed folder; for a key stopped on red — the literal failing output and what stands untouched; open points if any. A result of `unreachable: <reason>` → say the report in this pane and stop.
-2. Say the same line in this tab, then stop.
-
-The stage does not change — no «merged» stage exists; the accepted row has already left the queue. The launching chat closes this tab (`pnpm close-mode ship <KEY1+KEY2>` — the same `+`-joined string from your report).
+The stage does not change — no «merged» stage exists; the accepted row has already left the queue.

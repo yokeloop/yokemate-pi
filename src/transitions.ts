@@ -19,6 +19,7 @@ export type Via = "stage" | "plan" | "spawn" | "record-report" | "accept" | "acc
 export interface MoveEnv {
   YOKEMATE_MODE?: string;
   YOKEMATE_TICKET?: string;
+  YOKEMATE_ROLE?: "coordinator" | "executor";
 }
 
 export type From = Stage | "absent";
@@ -47,9 +48,7 @@ const RULES: Record<Via, Rule> = {
     stamped: { plan: { from: PLAN_FROM, ticketless: true } },
     unstamped: PLAN_FROM,
   },
-  // spawn raises tabs, so it runs in the main chat alone; a fresh row (a ticket
-  // never queued) is legal only when the caller names the plan outright.
-  spawn: { to: "running", stamped: {}, unstamped: ["planned", "running"] },
+  spawn: { to: "running", stamped: { do: { from: ["planned", "running"] } }, unstamped: ["planned", "running"] },
   "record-report": {
     to: "review",
     stamped: { do: { from: ["running", "review"] } },
@@ -79,16 +78,22 @@ export function checkMove(
   env: MoveEnv,
   ticket: string,
   current: From,
-  opts: { allowFresh?: boolean; policy?: GuardPolicy } = {},
+  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {},
 ): Verdict {
   const rule = RULES[via];
   const policy = opts.policy ?? readGuardPolicy();
+  if (opts.expected !== undefined && current !== opts.expected)
+    return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${current} before ${via}` };
   const mode = env.YOKEMATE_MODE;
   const seat = mode ? rule.stamped[mode] : undefined;
   if (mode && policy.guards.transitionCaller && !seat) {
     const seats = Object.keys(rule.stamped);
     return { ok: false, refuse: `${via} is not ${mode}'s move — it belongs to ${seats.length ? seats.join("/") : "the main chat alone"}` };
   }
+  if (mode && policy.guards.transitionCaller && via === "spawn" && env.YOKEMATE_ROLE !== "coordinator")
+    return { ok: false, refuse: "spawn is owned by a do coordinator" };
+  if (mode && policy.guards.transitionCaller && via === "record-report" && env.YOKEMATE_ROLE === "executor")
+    return { ok: false, refuse: "record-report is owned by the coordinator" };
   if (mode && policy.guards.transitionTicket && !seat?.ticketless && env.YOKEMATE_TICKET !== ticket)
     return { ok: false, refuse: `this pane is stamped ${env.YOKEMATE_TICKET ?? "nothing"}, not ${ticket} — a mode moves only its own ticket` };
   const base = seat?.from ?? rule.unstamped;
@@ -111,7 +116,7 @@ export function applyMove(
   env: MoveEnv,
   ticket: string,
   write: (prev: From) => void,
-  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {},
+  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {}
 ): MoveOutcome {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -121,7 +126,7 @@ export function applyMove(
     const prev: From = row?.stage ?? "absent";
     if (opts.expected !== undefined && prev !== opts.expected) {
       db.exec("ROLLBACK");
-      return { ok: false, refuse: `${ticket} changed from expected ${opts.expected} to ${prev}` };
+      return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${prev}` };
     }
     const v = checkMove(via, env, ticket, prev, opts);
     if (!v.ok) {

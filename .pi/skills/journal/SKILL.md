@@ -9,7 +9,7 @@ One journal for the whole pool: `<yokemate>/home/journal/YYYY-MM.md`, newest ent
 
 ## When it writes itself
 
-The main chat appends the narrative entry as part of its reaction to a mode's courtesy message — in the same turn as `pnpm close-mode do|ship <TICKET>` and as the reaction to an acceptance outcome. The material is the courtesy message itself plus the plan or report at the paths it names; the entry follows the format and rules below. The engineer types nothing for this — that is why the warmup digest at session start is always fresh.
+The main chat appends the narrative entry as part of its reaction to one terminal coordinator report or an acceptance outcome. It deduplicates coordinator reports by runId and writes verified facts; a blocked run is never described as done. The material is the report plus the plan or report at the paths it names; the entry follows the format and rules below. The engineer types nothing for this — that is why the warmup digest at session start is always fresh.
 
 Manual `/journal` stays for outcomes outside a stage move: conversations, decisions with no ticket, dead ends worth recording.
 

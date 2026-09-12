@@ -38,7 +38,11 @@ export function classifyResearchMcp(server: string | undefined, tool: string | u
     if (!exactKeys(args, firecrawl.get(tool)!)) return { ok: false, reason: "research Firecrawl call has unsupported arguments" };
     if (tool === "firecrawl_search") {
       if (typeof args.query !== "string" || (args.limit !== undefined && !count(args.limit)) || (args.sources !== undefined && !strings(args.sources)) || (args.categories !== undefined && !strings(args.categories)) || (args.includeDomains !== undefined && !strings(args.includeDomains)) || (args.excludeDomains !== undefined && !strings(args.excludeDomains))) return { ok: false, reason: "research Firecrawl search has invalid arguments" };
-    } else if (typeof args.url !== "string" || !/^https?:\/\//.test(args.url) || (args.formats !== undefined && (!strings(args.formats) || args.formats.some((v) => !["markdown", "html", "links", "summary"].includes(v)))) || (args.maxAge !== undefined && !count(args.maxAge)) || (args.onlyMainContent !== undefined && typeof args.onlyMainContent !== "boolean")) return { ok: false, reason: "research Firecrawl scrape has invalid arguments" };
+    } else {
+      const formats = args.formats;
+      const validFormats = formats === undefined || (strings(formats) && (formats as string[]).every((v) => ["markdown", "html", "links", "summary"].includes(v)));
+      if (typeof args.url !== "string" || !/^https?:\/\//.test(args.url) || !validFormats || (args.maxAge !== undefined && !count(args.maxAge)) || (args.onlyMainContent !== undefined && typeof args.onlyMainContent !== "boolean")) return { ok: false, reason: "research Firecrawl scrape has invalid arguments" };
+    }
     return { ok: true };
   }
   if (server === trackerServer() && youtrackRead.has(tool)) {

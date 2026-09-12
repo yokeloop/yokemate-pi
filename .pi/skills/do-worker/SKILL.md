@@ -1,6 +1,6 @@
 ---
 name: do-worker
-description: Internal — raised by pnpm spawn, not typed by the engineer. Execute a ticket by its plan inside the task folder — worktrees per affected repository, then a gated pipeline (implement by the plan's steps, run the project's checks, independent review, fix, re-check, format), one PR per repository, one report back to the orchestrator.
+description: Internal — raised by a long-lived background coordinator, not typed by the engineer. Execute a ticket by its plan inside the task folder through the existing gated pipeline.
 ---
 
 # /do — execute a ticket
@@ -9,13 +9,13 @@ You are the single executor of one ticket. You run in `yokemate/work/<TICKET>/`.
 
 ## Where this runs
 
-You are the worker: the tab raised by `pnpm spawn` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
+You are the long-lived background coordinator prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
 
 ```
 pnpm where do <TICKET>
 ```
 
-- **`run`** — this is the do tab. Do the work below.
+- **`run`** — this is the do coordinator. Do the work below and remain alive between detached child reports.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /do <TICKET>» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
@@ -46,7 +46,7 @@ git -C <clone-path> worktree add <cwd>/<repo> -b <TICKET>
 
 The clone is the engineer's workplace: never switch branches there, never commit there. If the branch `<TICKET>` already exists (rework round), add the worktree on the existing branch — same branch, same future PR.
 
-On a rework round the worktree may already stand from the previous run. Before the first step, `git status --porcelain` in every worktree must be empty: everything legitimate was committed by the previous run, so any dirt is the acceptance stand's leftovers (a `link:` override in package.json and the like) — `git restore --staged --worktree .` and note the fact in `progress.md`.
+On a resumed round inspect `progress.md`, `git status --porcelain` and the diff before changing anything. Preserve unfinished work. Restore only a clearly identified temporary acceptance-stand override (such as `link:` in package.json), and record that fact in `progress.md`; unknown dirt is a blocked outcome, not something to erase.
 
 ### 2. Read, then keep score
 
@@ -117,8 +117,6 @@ Before opening each PR: `git fetch origin`. The report names how far the branch 
 When every PR is open and green — `gh pr checks <url>` per part, not an assumption:
 
 1. Record the result yourself, from the task folder root (`work/<TICKET>/`, never from inside a worktree — there pnpm resolves the repository's own package.json and the script does not exist): `pnpm record-report <TICKET> --part <org/repo>:<role>:<branch>:<pr-url>` — one `--part` per repository. The stop guard reads the stage this command writes and lets the tab finish only once it is recorded.
-2. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — ticket key, outcome, PR URL per repository, behind/intersection facts from step 9, and any open point. A result of `unreachable: <reason>` → say the report in this pane and stop; the stage is already recorded either way.
+2. Call `coordinator_finish` with `outcome: "done"` and a short summary. The parent verifies the recorded parts, PR branches and checks before it emits the single terminal report.
 
-   The message is a courtesy: the launching chat closes this tab on it (`pnpm close-mode do <TICKET>`).
-
-A ticket you cannot complete — no PRs to record — records nothing: report exactly what is missing the same way and wait; the launching chat decides and closes this tab. The task folder stays either way, this tab does not.
+A ticket you cannot complete — no PRs to record — calls `coordinator_finish` with `outcome: "blocked"`, a short summary and the exact nonempty reason. The task folder stays for a later explicit retry.
