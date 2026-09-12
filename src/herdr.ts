@@ -1,29 +1,84 @@
-// The herdr calls the orchestrator makes: raise a tab or split a pane, put an
-// agent in it, find it again, close it. Every mode's surface is created here
-// (mode-tab, spawn) and closed here, so the rules about what dies when live in
-// one file.
-
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { sidecarPath, socketDir, type Sidecar } from "./inbox.ts";
 
-/** One herdr command, its JSON answer parsed. Output is captured, never
- * inherited: herdr's errors belong in the thrown error, not in the chat. */
-export function herdr(args: string[]): unknown {
-  return JSON.parse(execFileSync("herdr", args, { encoding: "utf8", stdio: "pipe" }));
+export interface HerdrCapture {
+  argv: string[];
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
 }
 
-/** Sleep on the calling thread — these launchers are synchronous throughout. */
+export interface HerdrRunOptions {
+  timeout?: number;
+  maxBuffer?: number;
+}
+
+type HerdrSpawn = (command: string, args: string[], options: Record<string, unknown>) => {
+  stdout?: string | Buffer | null;
+  stderr?: string | Buffer | null;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+};
+
+function text(value: string | Buffer | null | undefined): string {
+  return value === undefined || value === null ? "" : Buffer.isBuffer(value) ? value.toString("utf8") : value;
+}
+
+function capturedError(message: string, capture: HerdrCapture): Error & HerdrCapture {
+  const error = Object.assign(new Error(message), capture);
+  if (capture.error) error.cause = capture.error;
+  return error;
+}
+
+export function runHerdr(args: string[], options: HerdrRunOptions = {}, execute: HerdrSpawn = spawnSync): HerdrCapture {
+  const result = execute("herdr", args, { encoding: "utf8", stdio: "pipe", ...options });
+  const capture: HerdrCapture = {
+    argv: args,
+    stdout: text(result.stdout),
+    stderr: text(result.stderr),
+    status: result.status,
+    signal: result.signal,
+    error: result.error,
+  };
+  if (capture.error) throw capturedError(`herdr ${args.join(" ")} failed: ${capture.error.message}`, capture);
+  if (capture.status !== 0 || capture.signal)
+    throw capturedError(`herdr ${args.join(" ")} exited with ${capture.signal ? `signal ${capture.signal}` : `status ${capture.status}`}`, capture);
+  return capture;
+}
+
+export function herdrRaw(args: string[], options?: HerdrRunOptions, execute?: HerdrSpawn): string {
+  return runHerdr(args, options, execute).stdout;
+}
+
+export function herdr(args: string[], execute?: HerdrSpawn): unknown {
+  const capture = runHerdr(args, {}, execute);
+  try {
+    return JSON.parse(capture.stdout);
+  } catch (error) {
+    throw capturedError(`herdr ${args.join(" ")} returned malformed JSON: ${(error as Error).message}`, capture);
+  }
+}
+
+export function formatHerdrError(error: unknown): string {
+  const value = error as Error & Partial<HerdrCapture> & { cause?: unknown };
+  const parts = [value.message || String(error)];
+  if (value.cause instanceof Error && !parts.some((part) => part.includes(value.cause!.message)))
+    parts.push(`herdr capture cause: ${value.cause.message}`);
+  for (const [label, output] of [["herdr stdout", value.stdout], ["herdr stderr", value.stderr]] as const) {
+    if (output && !parts.some((part) => part.includes(output))) parts.push(`${label}:\n${output}`);
+  }
+  return parts.join("\n");
+}
+
 function pause(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/**
- * A tab is found by the label its launch gave it — the same string on both
- * sides, because herdr's tab list carries no other name. Mode tabs are labelled
- * `<TICKET> <mode>`, the task tab of /do is labelled `<TICKET>`.
- */
 export function findOpenTab(
   tabs: { label?: string; tab_id: string }[],
   label: string,
@@ -38,11 +93,6 @@ export function findOpenTabs(
   return tabs.filter((t) => t.label === label || t.label?.startsWith(`${label} [`));
 }
 
-/**
- * A mode already running is found by its agent's name — the one string that
- * holds whether the mode took a tab of its own (ship, /do) or a split of the
- * main chat's pane (review, worklog). Returns the pane it sits in.
- */
 export function findRunningAgent(
   agents: { name?: string; pane_id: string }[],
   agentName: string,
@@ -64,16 +114,6 @@ export function findRunningAgent(
   return undefined;
 }
 
-/**
- * Start the agent in a pane herdr has just created. `tab create` returns before
- * the pane's shell reaches its prompt, and `agent start` refuses such a pane
- * outright (`agent_pane_busy`) — its own `--timeout` covers only agent readiness
- * after that check. So the busy refusal is retried; anything else is a real
- * failure and is thrown at once, so the caller can take its fresh tab down.
- *
- * `extraAgentArgs` go to the agent binary after the fixed ones — the engineer's
- * model choice (`--model <m>`) travels here.
- */
 export function startAgent(
   agentName: string,
   paneId: string,
@@ -91,8 +131,6 @@ export function startAgent(
       ]);
       return;
     } catch (e) {
-      // herdr reports the refusal as JSON; which stream it lands on is its
-      // business, so the whole failure is searched, message and both streams.
       const err = e as Error & { stdout?: string; stderr?: string };
       const said = `${err.message}${err.stdout ?? ""}${err.stderr ?? ""}`;
       if (i === tries || !said.includes("agent_pane_busy")) throw e;
@@ -101,16 +139,6 @@ export function startAgent(
   }
 }
 
-/**
- * Close a tab that has finished — the orchestrator does this for /ship and
- * /do, whose tabs report and have nothing left to say. Returns the id it
- * closed, or undefined when no such tab is open: a tab the engineer already
- * closed by hand is not an error.
- *
- * /review and /worklog are not closed here — they sit in a split of the main
- * chat's pane, and both end in a conversation with the engineer, who is the
- * only one who knows it is over.
- */
 export function closeTab(
   label: string,
   runIdOrRun?: string | ((args: string[]) => unknown),
