@@ -5,6 +5,8 @@
 // the PR branches and upserts the work row straight into `review` — the same
 // row record-report would have written here. The review pane calls it itself
 // when the stand is missing; the unstamped main chat is the repair entry.
+// Adoption does not confirm the runtime — the review pane runs `pnpm ready <KEY>`
+// next; the row is in `review`, the environment is not proven until the receipt exists.
 //
 // Usage: pnpm adopt ACME-347
 
@@ -205,7 +207,7 @@ if (import.meta.filename === process.argv[1]) {
   try {
     const out = adopt(root, dataRootOf(root), key, process.env as MoveEnv);
     console.log(
-      `${key} adopted${out.repeat ? " (repeat)" : ""}: ${out.parts.length} part(s), stage review, folder work/${key}`,
+      `${key} adopted${out.repeat ? " (repeat)" : ""}: ${out.parts.length} part(s), stage review, folder work/${key} — run pnpm ready ${key} before the stand`,
     );
   } catch (e) {
     console.error(e instanceof Error ? e.message : String(e));
