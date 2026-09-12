@@ -730,6 +730,20 @@ test("do prompt preserves its key through where", async () => {
   assert.match(refused.stdout, /^refuse: /);
 });
 
+test("record-report without arguments refuses before any effect", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = join(import.meta.dirname, "..");
+  const before = fs.existsSync(join(root, "work")) ? fs.readdirSync(join(root, "work")) : null;
+  const out = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/record-report.ts"],
+    { cwd: root, env: { PATH: process.env.PATH ?? "" }, encoding: "utf8" },
+  );
+  assert.equal(out.status, 1);
+  assert.match(out.stderr, /usage: record-report/);
+  assert.deepEqual(fs.existsSync(join(root, "work")) ? fs.readdirSync(join(root, "work")) : null, before);
+});
+
 test("spawn and mode-tab refuse without a pane id, before any effect", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");

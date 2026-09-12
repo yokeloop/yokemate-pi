@@ -13,6 +13,8 @@
     "import-projects": "node --experimental-strip-types --no-warnings src/import-projects.ts",
     "spawn": "node --experimental-strip-types --no-warnings src/spawn.ts",
     "record-report": "node --experimental-strip-types --no-warnings src/record-report.ts",
+    "ready": "node --experimental-strip-types --no-warnings src/ready.ts",
+    "gate": "node --experimental-strip-types --no-warnings src/gate.ts",
     "adopt": "node --experimental-strip-types --no-warnings src/adopt.ts",
     "accept": "node --experimental-strip-types --no-warnings src/accept.ts",
     "drop": "node --experimental-strip-types --no-warnings src/drop.ts",
