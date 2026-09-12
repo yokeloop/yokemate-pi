@@ -1,0 +1,407 @@
+diff --git a/consent-manager.ts b/consent-manager.ts
+index 2e44e18..daa2c42 100644
+--- a/consent-manager.ts
++++ b/consent-manager.ts
+@@ -4,11 +4,13 @@ import { logger } from "./logger.ts";
+ export type ToolConsentMode = "never" | "once-per-server" | "always";
+-
++
+ export class ConsentManager {
++  private mode: ToolConsentMode;
+   private approvedServers = new Set<string>();
+   private deniedServers = new Set<string>();
+   private log = logger.child({ component: "ConsentManager" });
+-
++
+-  constructor(private mode: ToolConsentMode = "once-per-server") {
++  constructor(mode: ToolConsentMode = "once-per-server") {
++    this.mode = mode;
+     this.log.debug("Initialized", { mode });
+   }
+-
++
+diff --git a/lifecycle.ts b/lifecycle.ts
+index 46a18e6..4ee34d6 100644
+--- a/lifecycle.ts
++++ b/lifecycle.ts
+@@ -8,6 +8,8 @@ export type ReconnectCallback = (serverName: string) => void;
+ export type ReconnectFailureCallback = (serverName: string, error: unknown) => void;
+-
++
+ export class McpLifecycleManager {
++  private readonly manager: McpServerManager;
++  private readonly hasPendingAuthForServer: typeof hasPendingAuth;
+   private keepAliveServers = new Map<string, ServerDefinition>();
+   private allServers = new Map<string, ServerDefinition>();
+   private serverSettings = new Map<string, { idleTimeout?: number }>();
+@@ -23,9 +25,12 @@ export class McpLifecycleManager {
+   private removeHealthAbortListener: (() => void) | undefined;
+-
++
+   constructor(
+-    private readonly manager: McpServerManager,
+-    private readonly hasPendingAuthForServer = hasPendingAuth,
+-  ) {}
++    manager: McpServerManager,
++    hasPendingAuthForServer = hasPendingAuth,
++  ) {
++    this.manager = manager;
++    this.hasPendingAuthForServer = hasPendingAuthForServer;
++  }
+-
++
+   setReconnectCallback(callback: ReconnectCallback): void {
+     this.onReconnect = callback;
+diff --git a/logger.ts b/logger.ts
+index b1ff9b8..559c5b4 100644
+--- a/logger.ts
++++ b/logger.ts
+@@ -123,10 +123,15 @@ class Logger {
+ }
+-
++
+ class ChildLogger {
++  private parent: Logger;
++  private context: LogContext;
+   constructor(
+-    private parent: Logger,
+-    private context: LogContext
+-  ) {}
++    parent: Logger,
++    context: LogContext
++  ) {
++    this.parent = parent;
++    this.context = context;
++  }
+-
++
+   debug(message: string, context?: LogContext): void {
+     this.parent.debug(message, { ...this.context, ...context });
+diff --git a/mcp-auth.ts b/mcp-auth.ts
+index a46b985..1ce5541 100644
+--- a/mcp-auth.ts
++++ b/mcp-auth.ts
+@@ -75,14 +75,16 @@ export interface AuthStorageOptions {
+ }
+-
++
+ export class OAuthCredentialStoreError extends Error {
++  readonly operation: 'read' | 'write' | 'remove';
+   readonly code = 'OAUTH_CREDENTIAL_STORE_UNAVAILABLE';
+-
++
+   constructor(
+     message: string,
+-    readonly operation: 'read' | 'write' | 'remove',
++    operation: 'read' | 'write' | 'remove',
+     cause: unknown,
+   ) {
+     super(message, { cause });
++    this.operation = operation;
+     this.name = 'OAuthCredentialStoreError';
+   }
+ }
+diff --git a/mcp-oauth-provider.ts b/mcp-oauth-provider.ts
+index 3e2e546..73368e9 100644
+--- a/mcp-oauth-provider.ts
++++ b/mcp-oauth-provider.ts
+@@ -121,6 +121,12 @@ export interface McpOAuthCallbacks {
+  * Implements the OAuthClientProvider interface from the MCP SDK.
+  */
+ export class McpOAuthProvider implements OAuthClientProvider {
++  private serverName: string;
++  private serverUrl: string;
++  private config: McpOAuthConfig;
++  private callbacks: McpOAuthCallbacks;
++  private storageOptions: AuthStorageOptions;
++  private runtimeSignal?: AbortSignal;
+   private readonly redirectUrlSnapshot: string | undefined
+   private active = true
+   private flowClientInfo: StoredClientInfo | undefined
+@@ -130,14 +136,20 @@ export class McpOAuthProvider implements OAuthClientProvider {
+   private flowState: string | undefined
+-
++
+   constructor(
+-    private serverName: string,
+-    private serverUrl: string,
+-    private config: McpOAuthConfig,
+-    private callbacks: McpOAuthCallbacks,
+-    private storageOptions: AuthStorageOptions = {},
+-    private runtimeSignal?: AbortSignal,
++    serverName: string,
++    serverUrl: string,
++    config: McpOAuthConfig,
++    callbacks: McpOAuthCallbacks,
++    storageOptions: AuthStorageOptions = {},
++    runtimeSignal?: AbortSignal,
+     initialState?: string,
+   ) {
++    this.serverName = serverName;
++    this.serverUrl = serverUrl;
++    this.config = config;
++    this.callbacks = callbacks;
++    this.storageOptions = storageOptions;
++    this.runtimeSignal = runtimeSignal;
+     this.flowState = initialState
+     this.redirectUrlSnapshot = config.grantType === "client_credentials"
+       ? undefined
+diff --git a/mcp-panel.ts b/mcp-panel.ts
+index 7b2a0f1..7127114 100644
+--- a/mcp-panel.ts
++++ b/mcp-panel.ts
+@@ -146,6 +146,8 @@ interface VisibleItem {
+ }
+-
++
+ class McpPanel {
++  private callbacks: McpPanelCallbacks;
++  private done: (result: McpPanelResult) => void;
+   private noticeLines: string[];
+   private prefix: ToolPrefix;
+   private servers: ServerState[] = [];
+@@ -173,11 +175,13 @@ class McpPanel {
+     config: McpConfig,
+     cache: MetadataCache | null,
+     provenance: Map<string, ServerProvenance>,
+-    private callbacks: McpPanelCallbacks,
++    callbacks: McpPanelCallbacks,
+     tui: { requestRender(): void },
+-    private done: (result: McpPanelResult) => void,
++    done: (result: McpPanelResult) => void,
+     options: { noticeLines?: string[]; authOnly?: boolean; keybindings?: PanelKeybindings } = {},
+   ) {
++    this.callbacks = callbacks;
++    this.done = done;
+     this.tui = tui;
+     this.noticeLines = options.noticeLines ?? [];
+     this.authOnly = options.authOnly === true;
+diff --git a/mcp-setup-panel.ts b/mcp-setup-panel.ts
+index b288643..1c11f39 100644
+--- a/mcp-setup-panel.ts
++++ b/mcp-setup-panel.ts
+@@ -91,6 +91,10 @@ interface Action {
+ }
+-
++
+ export class McpSetupPanel {
++  private discovery: McpDiscoverySummary;
++  private callbacks: SetupPanelCallbacks;
++  private options: SetupPanelOptions;
++  private done: () => void;
+   private screen: Screen;
+   private actionCursor = 0;
+   private importCursor = 0;
+@@ -105,12 +109,16 @@ export class McpSetupPanel {
+   private static readonly INACTIVITY_MS = 60_000;
+-
++
+   constructor(
+-    private discovery: McpDiscoverySummary,
+-    private callbacks: SetupPanelCallbacks,
+-    private options: SetupPanelOptions,
++    discovery: McpDiscoverySummary,
++    callbacks: SetupPanelCallbacks,
++    options: SetupPanelOptions,
+     tui: { requestRender(): void },
+-    private done: () => void,
++    done: () => void,
+   ) {
++    this.discovery = discovery;
++    this.callbacks = callbacks;
++    this.options = options;
++    this.done = done;
+     this.tui = tui;
+     this.keys = createPanelKeys(options.keybindings);
+     this.screen = options.mode;
+diff --git a/mcp-trace.ts b/mcp-trace.ts
+index 041f0e6..02ad263 100644
+--- a/mcp-trace.ts
++++ b/mcp-trace.ts
+@@ -120,6 +120,7 @@ export function createMcpTraceEvent(
+ }
+-
++
+ export class McpTraceWriter {
++  private readonly options: McpTraceWriterOptions;
+   private readonly maxBytes: number;
+   private readonly maxEvents: number;
+   private readonly append: NonNullable<McpTraceWriterOptions["appendFile"]>;
+@@ -132,7 +133,8 @@ export class McpTraceWriter {
+   private initializationFailed = false;
+   private readonly fileReady: Promise<void>;
+-
++
+-  constructor(private readonly options: McpTraceWriterOptions) {
++  constructor(options: McpTraceWriterOptions) {
++    this.options = options;
+     this.maxBytes = boundedPositiveInteger(options.maxBytes, DEFAULT_MCP_TRACE_MAX_BYTES);
+     this.maxEvents = boundedPositiveInteger(options.maxEvents, DEFAULT_MCP_TRACE_MAX_EVENTS);
+     this.append = options.appendFile ?? (async (path, data, appendOptions) => {
+diff --git a/sampling-handler.ts b/sampling-handler.ts
+index 40421c7..10a1bdd 100644
+--- a/sampling-handler.ts
++++ b/sampling-handler.ts
+@@ -1,4 +1,5 @@
+-import { complete, type Api, type AssistantMessage, type Message, type Model, type TextContent } from "@earendil-works/pi-ai";
++import type { Api, AssistantMessage, Message, Model, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
++import { complete } from "@earendil-works/pi-ai/compat";
+ import { truncateAtWord } from "./utils.ts";
+ import { throwIfAborted } from "./abort.ts";
+ import type { ExtensionUIContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+@@ -126,7 +127,7 @@ async function resolveSamplingModel(
+ ): Promise<{
+   model: Model<Api>;
+   apiKey?: string;
+-  headers?: Record<string, string>;
++  headers?: ProviderHeaders;
+ }> {
+   const candidates: Model<Api>[] = [];
+   const availableModels = options.modelRegistry.getAvailable();
+diff --git a/server-manager.ts b/server-manager.ts
+index 80b0c38..cdbc7e8 100644
+--- a/server-manager.ts
++++ b/server-manager.ts
+@@ -134,6 +134,7 @@ type UiStreamListener = (serverName: string, notification: ServerStreamResultPat
+ type MetadataListChangedListener = (serverName: string, reason: string) => void;
+-
++
+ export class McpServerManager {
++  private readonly defaultCwd?: string;
+   private connections = new Map<string, ServerConnection>();
+   private connectPromises = new Map<string, Promise<ServerConnection>>();
+   private reconnectPromises = new Map<string, Promise<ServerConnection>>();
+@@ -154,7 +155,9 @@ export class McpServerManager {
+   private stopped = false;
+-
++
+   /** Default cwd for stdio servers without an explicit config `cwd`. */
+-  constructor(private readonly defaultCwd?: string) {}
++  constructor(defaultCwd?: string) {
++    this.defaultCwd = defaultCwd;
++  }
+-
++
+   setSamplingConfig(config: ServerSamplingConfig | undefined): void {
+     this.samplingConfig = config;
+diff --git a/session-recovery.ts b/session-recovery.ts
+index 22760fd..fa207ee 100644
+--- a/session-recovery.ts
++++ b/session-recovery.ts
+@@ -64,8 +64,12 @@ function hasSessionId(connection: ServerConnection): boolean {
+ }
+-
++
+ export class SessionRecoveryAuthRequiredError extends Error {
+-  constructor(readonly serverName: string, readonly authMessage?: string) {
++  readonly serverName: string;
++  readonly authMessage?: string;
++  constructor(serverName: string, authMessage?: string) {
+     super(authMessage ?? `MCP server "${serverName}" requires OAuth authentication after reconnect.`);
++    this.serverName = serverName;
++    this.authMessage = authMessage;
+     this.name = "SessionRecoveryAuthRequiredError";
+   }
+ }
+diff --git a/tool-result-renderer.ts b/tool-result-renderer.ts
+index b1086d6..04a2e3b 100644
+--- a/tool-result-renderer.ts
++++ b/tool-result-renderer.ts
+@@ -38,18 +38,30 @@ const DEFAULT_MAX_COLLAPSED_CHARS = 8000;
+ const COLLAPSED_RENDER_CHAR_SLACK = 8;
+-
++
+ class CollapsibleText implements Component {
++  private readonly text: string;
++  private readonly expanded: boolean;
++  private readonly maxCollapsedLines: number;
++  private readonly ellipsis: string;
++  private readonly expandHint: string;
++  private readonly preTruncated: boolean;
+   private readonly fullText: Text;
+   private readonly footerText: Text;
+   private collapsedText: { charBudget: number; fullyIncluded: boolean; text: Text } | null = null;
+-
++
+   constructor(
+-    private readonly text: string,
+-    private readonly expanded: boolean,
+-    private readonly maxCollapsedLines: number,
+-    private readonly ellipsis: string,
+-    private readonly expandHint: string,
+-    private readonly preTruncated = false,
++    text: string,
++    expanded: boolean,
++    maxCollapsedLines: number,
++    ellipsis: string,
++    expandHint: string,
++    preTruncated = false,
+   ) {
++    this.text = text;
++    this.expanded = expanded;
++    this.maxCollapsedLines = maxCollapsedLines;
++    this.ellipsis = ellipsis;
++    this.expandHint = expandHint;
++    this.preTruncated = preTruncated;
+     this.fullText = new Text(text, 0, 0);
+     this.footerText = new Text(`${ellipsis}\n${expandHint}`, 0, 0);
+   }
+diff --git a/ui-resource-handler.ts b/ui-resource-handler.ts
+index da96ea5..5d74f43 100644
+--- a/ui-resource-handler.ts
++++ b/ui-resource-handler.ts
+@@ -21,9 +21,14 @@ interface ReadUiResourceOptions {
+ }
+-
++
+ export class UiResourceHandler {
++  private manager: McpServerManager;
++  private config: McpConfig | undefined;
+   private log = logger.child({ component: "UiResourceHandler" });
+-
++
+-  constructor(private manager: McpServerManager, private config: McpConfig | undefined = undefined) {}
++  constructor(manager: McpServerManager, config: McpConfig | undefined = undefined) {
++    this.manager = manager;
++    this.config = config;
++  }
+-
++
+   async readUiResource(serverName: string, uri: string, options: ReadUiResourceOptions = {}): Promise<UiResourceContent> {
+     const log = this.log.child({ server: serverName, uri });
+diff --git a/unix-socket-transport.ts b/unix-socket-transport.ts
+index f6b4577..c784768 100644
+--- a/unix-socket-transport.ts
++++ b/unix-socket-transport.ts
+@@ -5,6 +5,7 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/client";
+-
++
+ /** MCP JSONL transport for an explicitly configured Unix-domain socket. */
+ export class UnixSocketClientTransport implements Transport {
++  private readonly socketPath: string;
+   private socket: Socket | undefined;
+   private readonly readBuffer = new ReadBuffer();
+-
++
+@@ -12,7 +13,9 @@ export class UnixSocketClientTransport implements Transport {
+   onerror?: (error: Error) => void;
+   onmessage?: (message: JSONRPCMessage) => void;
+-
++
+-  constructor(private readonly socketPath: string) {}
++  constructor(socketPath: string) {
++    this.socketPath = socketPath;
++  }
+-
++
+   async start(): Promise<void> {
+     if (this.socket) {
+@@ -30,7 +33,7 @@ export class UnixSocketClientTransport implements Transport {
+       });
+       socket.on("data", chunk => {
+         try {
+-          this.readBuffer.append(chunk);
++          this.readBuffer.append(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+           while (true) {
+             const message = this.readBuffer.readMessage();
+             if (message === null) break;
