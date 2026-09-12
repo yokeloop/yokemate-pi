@@ -105,6 +105,7 @@ function loadLimits(cwd: string): Limits {
 // нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
 const cancellationByProcess = new Map<ChildProcess, (initiator: string) => void>();
+const childCompletions = new Map<ChildProcess, Promise<void>>();
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -533,6 +534,12 @@ async function runSingleAgent(
 				emitUpdate();
 			}
 		});
+		const refreshObservation = () => {
+			diagnostic.metadata.stream = observation.metadata();
+			diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
+			diagnostic.metadata.sessionId = observation.sessionId;
+			diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
+		};
 		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
@@ -546,7 +553,12 @@ async function runSingleAgent(
 			diagnostic.metadata.pid = proc.pid;
 			diagnostic.metadata.starttime = proc.pid ? processStarttime(proc.pid) : undefined;
 			diagnostic.metadata.spawnAt = new Date().toISOString();
-			cancellationByProcess.set(proc, (initiator) => { cancelled = true; diagnostic.metadata.cancellationInitiator = initiator; diagnostic.save(false); });
+			cancellationByProcess.set(proc, (initiator) => {
+				cancelled = true;
+				if (diagnostic.metadata.cancellationInitiator === "unknown") diagnostic.metadata.cancellationInitiator = initiator;
+				refreshObservation();
+				diagnostic.save(false);
+			});
 			diagnostic.save(false);
 			onSpawn?.(proc);
 			const abort = () => {
@@ -570,10 +582,7 @@ async function runSingleAgent(
 		});
 		currentResult.exitCode = terminal.exitCode;
 		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
-		diagnostic.metadata.stream = observation.metadata();
-		diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") };
-		diagnostic.metadata.sessionId = observation.sessionId;
-		diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
+		refreshObservation();
 		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
 		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), verdict: currentResult.envelope.reviewVerdict };
 		diagnostic.save(true);
@@ -869,24 +878,26 @@ export default function (pi: ExtensionAPI) {
 			for (const mark of cancellationByProcess.values()) mark(payload.reason);
 		},
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
-		for (const rpc of rpcByRun.values()) void rpc.stop("parent_session_shutdown");
+		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
-		for (const proc of detached) {
+		await Promise.all([...detached].map(async (proc) => {
+			const completion = childCompletions.get(proc);
 			cancellationByProcess.get(proc)?.("session_shutdown");
+			const timer = setTimeout(() => { if (cancellationByProcess.has(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 5000);
 			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* ignore */
-			}
-		}
-		shuttingDown = true;
+				try { proc.kill("SIGTERM"); } catch {}
+				await completion;
+			} finally { clearTimeout(timer); }
+		}));
+		await Promise.all(coordinatorStops);
 		detached.clear();
 		batches.clear();
 		runningAgents.clear();
@@ -909,7 +920,8 @@ export default function (pi: ExtensionAPI) {
 		const { delivery } = registerDelivery(envelope);
 		if (delivery.state !== "pending") return;
 		emitChildState();
-		try {
+		if (shuttingDown) delivery.state = "delivery_unknown";
+		else try {
 			pi.sendMessage({ customType: "subagent-report", content: reportContent(envelope, delivery), display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } }, { deliverAs: "followUp", triggerTurn: true });
 			if (delivery.state === "pending") delivery.state = "enqueued";
 		} catch { delivery.state = "delivery_failed"; }
@@ -1046,6 +1058,7 @@ export default function (pi: ExtensionAPI) {
 			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
+				let completeChild: (() => void) | undefined;
 				let envelope: ResultEnvelope;
 				let output = "";
 				try {
@@ -1054,6 +1067,7 @@ export default function (pi: ExtensionAPI) {
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
 						child = proc;
+						childCompletions.set(proc, new Promise<void>((resolve) => { completeChild = resolve; }));
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
 					}, identity, diagnostics.get(identity.runId)!);
@@ -1066,6 +1080,8 @@ export default function (pi: ExtensionAPI) {
 				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
+					if (child) childCompletions.delete(child);
+					completeChild?.();
 				}
 				return { envelope, output };
 			};

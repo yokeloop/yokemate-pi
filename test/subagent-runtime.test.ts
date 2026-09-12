@@ -138,7 +138,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 
 test("real Pi single, parallel, chain and terminal fault variants retain primary outcomes", { timeout: 90000 }, async () => {
   const cases = [
-    ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
+    ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
     ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
     ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
   ] as const;
@@ -163,6 +163,8 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
     Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
     const sockets = new Set<Socket>();
     const loaded: any[] = [];
+    let working!: () => void;
+    const childWorking = new Promise<void>((resolve) => { working = resolve; });
     const server = createServer((socket) => {
       sockets.add(socket);
       socket.once("close", () => sockets.delete(socket));
@@ -172,7 +174,8 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
         if (!buffer.includes("\n")) return;
         const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
         if (event.phase === "loaded") loaded.push(event);
-        if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
+        if (scenario === "parent_cancel" && event.phase === "child-working") working();
+        else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
         else socket.end("release\n");
       });
     });
@@ -196,9 +199,26 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
             if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
           }
         } },
-        { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: 50 });
+        { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
       await rpc.ready;
       await rpc.request({ type: "prompt", message: "work" });
+      if (scenario === "parent_cancel") {
+        await childWorking;
+        rpc.acceptTerminal();
+        await rpc.stop("parent_control_cancel");
+        const fs = await import("node:fs");
+        const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
+        const child = snapshots.find((snapshot) => snapshot.identity?.agent === "task-reviewer");
+        assert.equal(child.completed, true);
+        assert.equal(child.terminal.processOutcome, "cancelled");
+        assert.equal(child.cancellationInitiator, "parent_control_cancel");
+        assert.equal(child.stream.phase, "thinking");
+        assert.ok(child.stream.stdoutBytes > 0);
+        assert.ok(child.sessionId);
+        assert.equal(child.effective.model, "unknown");
+        assert.ok(child.closeAt);
+        continue;
+      }
       await Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]);
       if (scenario.startsWith("delivery_")) {
         assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
