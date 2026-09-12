@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve, sep } from "node:path";
-import { parseAffected } from "./adopt.ts";
+import { findPlan, parseAffected } from "./adopt.ts";
+import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 
 export interface ReadyPart { repo: string; worktree: string }
@@ -117,23 +118,17 @@ export function ready(root: string, ticket: string, parts: ReadyPart[], deps: Pa
   return { ok: true, receipt };
 }
 
-if (import.meta.filename === process.argv[1]) {
-  const ticket = process.argv.slice(2).filter((a) => a !== "--")[0];
-  if (!ticket) {
-    console.error("usage: ready <TICKET>");
-    process.exit(1);
-  }
-  const root = resolve(new URL("..", import.meta.url).pathname);
+export function readyTicket(root: string, ticket: string, deps: Partial<ReadyDeps> = {}): ({ ok: true; receipt: ReadyReceipt } | { ok: false; reason: string; output: string }) & { parts?: ReadyPart[] } {
+  const refuse = (reason: string) => ({ ok: false as const, reason, output: "" });
   const dbPath = join(root, "yokemate.db");
   const db = existsSync(dbPath) ? openDb(dbPath) : null;
   const work = db?.prepare("SELECT stage, plan FROM work WHERE ticket = ?").get(ticket) as { stage: string; plan: string | null } | undefined;
-  if (!db || !work || (work.stage !== "running" && work.stage !== "review")) {
-    console.error(`ready: ${ticket} is ${work?.stage ?? "unrecorded"} — spawn or adopt first`);
-    process.exit(1);
-  }
+  if (work && work.stage !== "running" && work.stage !== "review") return refuse(`${ticket} is ${work.stage} — spawn or adopt first`);
+  if (!db || (!work && !existsSync(join(root, "work", ticket)))) return refuse(`${ticket} is unrecorded — spawn or adopt first`);
   try {
-    if (!work.plan || !existsSync(work.plan)) throw new Error(`${ticket}: the work row names no readable plan`);
-    const parts: ReadyPart[] = parseAffected(readFileSync(work.plan, "utf8")).map((planned) => {
+    const plan = work?.plan ?? findPlan(dataRoot(root), ticket);
+    if (!plan || !existsSync(plan)) return refuse(`${ticket}: no readable plan`);
+    const parts: ReadyPart[] = parseAffected(readFileSync(plan, "utf8")).map((planned) => {
       const [org, repo] = planned.repo.includes("/") ? planned.repo.split("/", 2) : [null, planned.repo];
       const rows = (org
         ? db.prepare("SELECT org, repo, path FROM project WHERE org = ? AND repo = ?").all(org, repo)
@@ -141,19 +136,27 @@ if (import.meta.filename === process.argv[1]) {
       if (rows.length !== 1) throw new Error(`${ticket}: ${planned.repo} has ${rows.length} passports`);
       return { repo: `${rows[0]!.org}/${rows[0]!.repo}`, worktree: join(root, "work", ticket, rows[0]!.repo) };
     });
-    const out = ready(root, ticket, parts);
-    if (!out.ok) {
-      console.error(`ready: ${out.reason}`);
-      if (out.output) console.error(out.output);
-      process.exit(1);
-    }
-    for (const part of parts) {
-      const entry = out.receipt.parts[part.repo]!;
-      const tools = Object.entries(entry.bins).map(([bin, path]) => `, ${bin} → ${path}`).join("");
-      console.log(`${part.repo} ready: ${entry.command} exit ${entry.exit}${tools}, head ${entry.head.slice(0, 7)}`);
-    }
+    return { ...ready(root, ticket, parts, deps), parts };
   } catch (e) {
-    console.error(`ready: ${e instanceof Error ? e.message : String(e)}`);
+    return refuse(e instanceof Error ? e.message : String(e));
+  }
+}
+
+if (import.meta.filename === process.argv[1]) {
+  const ticket = process.argv.slice(2).filter((a) => a !== "--")[0];
+  if (!ticket) {
+    console.error("usage: ready <TICKET>");
     process.exit(1);
+  }
+  const out = readyTicket(resolve(new URL("..", import.meta.url).pathname), ticket);
+  if (!out.ok) {
+    console.error(`ready: ${out.reason}`);
+    if (out.output) console.error(out.output);
+    process.exit(1);
+  }
+  for (const part of out.parts ?? []) {
+    const entry = out.receipt.parts[part.repo]!;
+    const tools = Object.entries(entry.bins).map(([bin, path]) => `, ${bin} → ${path}`).join("");
+    console.log(`${part.repo} ready: ${entry.command} exit ${entry.exit}${tools}, head ${entry.head.slice(0, 7)}`);
   }
 }

@@ -5,8 +5,10 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { ready, recipeFor, type ReadyReceipt } from "../src/ready.ts";
-import { git, stand } from "./fixtures/gate-stand.ts";
+import { gate } from "../src/gate.ts";
+import { openDb } from "../src/db.ts";
+import { ready, readyTicket, recipeFor, type ReadyReceipt } from "../src/ready.ts";
+import { git, green, notify, stand, withShim, writePr } from "./fixtures/gate-stand.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -142,4 +144,42 @@ test("pnpm ready refuses an unrecorded ticket before any install", () => {
     assert.equal(usage.status, 1);
     assert.match(usage.stderr, /usage: ready/);
   } finally { rmSync(shim, { recursive: true, force: true }); }
+});
+
+test("after accept the ticket is made ready from its plan and the gate follows the moved head", async () => {
+  const s = stand();
+  try {
+    const first = readyTicket(s.root, s.ticket, { run: ownEnvironment });
+    assert.ok(first.ok);
+    writeFileSync(join(s.worktree, "merged.txt"), "from the base\n");
+    git(s.worktree, "add", "merged.txt");
+    git(s.worktree, "commit", "-m", "update from base");
+    const head = git(s.worktree, "rev-parse", "HEAD");
+    await withShim(s, () => {
+      writePr(s, s.ticket, [green("checks"), green("pi-loader-smoke"), notify]);
+      const stale = gate(s.root, s.ticket);
+      assert.match(stale.ok ? "" : stale.reason, /ready receipt is for/);
+      const second = readyTicket(s.root, s.ticket, { run: ownEnvironment });
+      assert.ok(second.ok);
+      assert.equal(second.receipt.parts["org/repo"]!.head, head);
+      assert.deepEqual(gate(s.root, s.ticket), { ok: true, heads: { "org/repo": head } });
+    });
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
+});
+
+test("a recorded ticket outside running and review is refused before any install", () => {
+  const s = stand();
+  try {
+    openDb(join(s.root, "yokemate.db")).prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-9','u','planned')").run();
+    let calls = 0;
+    const out = readyTicket(s.root, s.ticket, { run: () => { calls++; return { exit: 0, output: "" }; } });
+    assert.equal(out.ok, false);
+    assert.equal(out.ok ? "" : out.reason, "YM-9 is planned — spawn or adopt first");
+    assert.equal(calls, 0);
+    rmSync(join(s.root, "work", "YM-9"), { recursive: true, force: true });
+    openDb(join(s.root, "yokemate.db")).prepare("DELETE FROM work").run();
+    const unrecorded = readyTicket(s.root, s.ticket, { run: () => { calls++; return { exit: 0, output: "" }; } });
+    assert.equal(unrecorded.ok ? "" : unrecorded.reason, "YM-9 is unrecorded — spawn or adopt first");
+    assert.equal(calls, 0);
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
 });
