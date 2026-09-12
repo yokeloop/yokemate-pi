@@ -67,6 +67,7 @@ export default function (pi: ExtensionAPI) {
           await barrier(scenario ? "child-working" : text.includes("review-B") ? "B-working" : "A-working", { pid: process.pid });
           message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           childTurns++;
+          if (scenario === "parallel_max" || scenario === "chain_max") message.content = [{ type: "text", text: JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: '"'.repeat(24000), fix: "fixture" }] }) }];
           if (scenario === "chain_long") message.content = [{ type: "text", text: text.includes("step-1") ? "x".repeat(60 * 1024) + "UNTRUNCATED-TAIL" : text.includes("UNTRUNCATED-TAIL") ? "tail received" : "tail missing" }];
           if (scenario === "missing" || (scenario === "old_final" && childTurns > 1)) message.content = [{ type: "thinking", thinking: "private thinking" }];
           if (scenario === "invalid" || (scenario === "chain" && text.includes("step-2"))) message.content = [{ type: "text", text: "{}" }];
@@ -97,10 +98,10 @@ export default function (pi: ExtensionAPI) {
           if (!calledA) {
             calledA = true;
             call("batch-A", "review-A");
-            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long") {
+            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max") {
               const block = message.content[0] as any;
               const single = block.arguments;
-              block.arguments = { [scenario === "parallel" ? "tasks" : "chain"]: Array.from({ length: scenario === "chain" ? 3 : 2 }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
+              block.arguments = { [scenario === "parallel" || scenario === "parallel_max" ? "tasks" : "chain"]: Array.from({ length: scenario === "parallel_max" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" ? 3 : 2 }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
             }
           }
           else if (!scenario && !calledB && text.includes("[subagent task-reviewer]")) { calledB = true; call("batch-B", "review-B"); }

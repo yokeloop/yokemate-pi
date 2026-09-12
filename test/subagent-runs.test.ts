@@ -134,3 +134,29 @@ test("metadata snapshots are private, bounded, retain active runs and survive wr
     assert.equal(limit.write("owner", "oversize", { tooLarge: "x".repeat(PAYLOAD_LIMIT) }, true), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("aggregate framing budgets account for escaped content and details without changing settled envelopes", async () => {
+  const { boundBatchResult, deliveryFor, reportContent, JsonlObservation } = await import("../src/subagent-runs.ts");
+  for (const character of ["x", '"']) {
+    const runs = new ChildRuns("owner", "session");
+    const ack = runs.admit("maximum", Array.from({ length: 8 }, () => task), cwd);
+    const payload = JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: character.repeat(character === "x" ? 48000 : 24000), fix: "fixture" }] });
+    assert.ok(Buffer.byteLength(payload) < PAYLOAD_LIMIT);
+    const results = ack.children.map(({ identity }) => boundBatchResult(resultEnvelope(identity, task.task, clean, payload), ack.children.map((child) => child.identity)));
+    assert.ok(results.every((result) => result.payloadOutcome === (character === "x" ? "valid" : "output_limit")));
+    for (const result of results) assert.equal(runs.settle(result), true);
+    const envelope = runs.batch("maximum")!;
+    assert.deepEqual(envelope.results, results);
+    const delivery = deliveryFor(envelope);
+    const record = JSON.stringify({ type: "message_end", message: { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } } });
+    assert.ok(Buffer.byteLength(record) < 1024 * 1024);
+    const observation = new JsonlObservation();
+    observation.write(Buffer.from(record + "\n"));
+    observation.end();
+    assert.equal(observation.protocolError, false);
+  }
+  const runs = new ChildRuns("owner", "session");
+  assert.throws(() => runs.admit("oversized-identities", Array.from({ length: 2000 }, () => ({ agent: "worker", task: "task" })), cwd), /batch identity exceeds JSONL transport budget/);
+  assert.equal(runs.children.size, 0);
+  assert.equal(runs.batches.size, 0);
+});

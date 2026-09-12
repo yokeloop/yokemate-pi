@@ -32,6 +32,7 @@ export interface ResultEnvelope {
   stopReason?: string;
   payloadOutcome: PayloadOutcome;
   payload: string;
+  outputLimit?: "batch_transport";
   reviewVerdict: "approved" | "changes_required" | null;
 }
 export interface BatchEnvelope {
@@ -99,6 +100,7 @@ export class ChildRuns {
   admit(batchId: string, tasks: ChildTask[], cwd: string): LaunchAck {
     if (this.batches.has(batchId)) throw new Error("duplicate subagent batch admission");
     const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd));
+    batchPayloadQuota(identities);
     this.batches.set(batchId, identities);
     for (const identity of identities) this.children.set(identity.runId, { identity, state: "queued" });
     return { version: 1, kind: "ack", terminal: false, batchId, children: identities.map((identity) => ({ identity, state: "queued" })) };
@@ -424,4 +426,37 @@ export class OwnedChildState {
     this.lastNudgeProgress = this.progress;
     return "nudge";
   }
+}
+
+function emptyBatchResult(identity: ChildIdentity): ResultEnvelope {
+  return resultEnvelope(identity, "", { processOutcome: "not_started", exitCode: null, signal: null }, "");
+}
+function resultWireCost(result: ResultEnvelope): number {
+  const json = JSON.stringify(result);
+  return Buffer.byteLength(json) + Buffer.byteLength(JSON.stringify(json));
+}
+function batchPayloadQuota(identities: ChildIdentity[]): number {
+  const first = identities[0]!;
+  const envelope: BatchEnvelope = { version: 1, kind: "batch", ownerRunId: first.ownerRunId, ownerSessionId: first.ownerSessionId, batchId: first.batchId, results: identities.map(emptyBatchResult) };
+  const delivery = deliveryFor(envelope);
+  const message = { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), display: true, timestamp: Date.now(), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } };
+  const overhead = Buffer.byteLength(JSON.stringify({ type: "message_end", message }));
+  const quota = Math.floor((RECORD_LIMIT - overhead - 4096 - identities.length * 256) / identities.length);
+  if (quota < 0) throw new Error("subagent batch identity exceeds JSONL transport budget");
+  return quota;
+}
+export function boundBatchResult(result: ResultEnvelope, identities: ChildIdentity[]): ResultEnvelope {
+  const budget = resultWireCost(emptyBatchResult(result.identity)) + batchPayloadQuota(identities);
+  if (resultWireCost(result) <= budget) return result;
+  if (result.identity.agent === "task-reviewer") return { ...result, payloadOutcome: "output_limit", payload: "", reviewVerdict: null, outputLimit: "batch_transport" };
+  const characters = Array.from(result.payload);
+  let low = 0;
+  let high = characters.length;
+  const limited = (end: number) => ({ ...result, payload: characters.slice(0, end).join("") + "\n[Output truncated: batch transport budget]" });
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (resultWireCost(limited(middle)) <= budget) low = middle;
+    else high = middle - 1;
+  }
+  return limited(low);
 }

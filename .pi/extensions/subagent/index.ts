@@ -14,7 +14,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1072,7 +1072,10 @@ export default function (pi: ExtensionAPI) {
 						trackRunning(proc, identity.agent, task);
 					}, identity, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
-					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
+					const diagnostic = diagnostics.get(identity.runId)!;
+					diagnostic.metadata.payload = { ...(diagnostic.metadata.payload as Record<string, unknown>), outcome: envelope.payloadOutcome, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
+					diagnostic.save(true);
 				} catch (error) {
 					const diagnostic = diagnostics.get(identity.runId);
 					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }

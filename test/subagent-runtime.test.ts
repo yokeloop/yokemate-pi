@@ -138,7 +138,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 
 test("real Pi single, parallel, chain and terminal fault variants retain primary outcomes", { timeout: 90000 }, async () => {
   const cases = [
-    ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
+    ["parallel_max", "output_limit"], ["chain_max", "output_limit"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
     ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
     ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
   ] as const;
@@ -198,7 +198,7 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
             const state = (event.entry as any).data;
             if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
           }
-        } },
+        }, onBlocked(reason) { failureReason = reason; complete(); } },
         { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
       await rpc.ready;
       await rpc.request({ type: "prompt", message: "work" });
@@ -230,6 +230,7 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
         rpc.acceptTerminal();
         continue;
       }
+      assert.equal(failureReason, undefined, scenario);
       assert.ok(batch, scenario);
       const results = batch.results;
       assert.equal(results[scenario === "chain" ? 1 : 0].payloadOutcome, outcome, scenario);
@@ -239,6 +240,8 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
         assert.equal(results[2].processOutcome, "not_started");
         assert.notEqual(results[1].actualTaskHash, results[1].identity.taskHash);
       }
+      if (scenario === "parallel_max") { assert.equal(results.length, 8); assert.ok(results.every((result: any) => result.payloadOutcome === "output_limit")); }
+      if (scenario === "chain_max") { assert.equal(results.length, 20); assert.ok(results.slice(1).every((result: any) => result.processOutcome === "not_started")); }
       if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
       if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
       if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
