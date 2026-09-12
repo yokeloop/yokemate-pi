@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveResearchContext, resolveResearchLaunch } from "../src/research-launch.ts";
+import { researchAgentArgs, resolveResearchContext, resolveResearchLaunch } from "../src/research-launch.ts";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "research-launch-"));
@@ -17,6 +17,19 @@ function fixture() {
   db.close();
   return { root, clone };
 }
+
+test("research launch keeps the closed extension argv and typed diagnostics template", () => {
+  const root = join(import.meta.dirname, "..");
+  const args = researchAgentArgs(root, "model");
+  assert.deepEqual(args, ["--model", "model", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")]);
+  assert.equal(args.includes("--no-tools"), false);
+  assert.equal(args.includes("--tools"), false);
+  assert.equal(args.filter((arg) => arg === "-e").length, 1);
+  const prompt = readFileSync(join(root, ".pi", "prompts", "research.md"), "utf8");
+  assert.match(prompt, /On success, return its one output line unchanged/);
+  assert.match(prompt, /On failure, return the full relevant multiline CLI diagnostics unchanged/);
+  assert.match(prompt, /pnpm research \$@/);
+});
 
 test("research resolves canonical project aliases and topic without a ticket", () => {
   const { root } = fixture();
