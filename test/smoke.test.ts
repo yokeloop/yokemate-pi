@@ -618,9 +618,8 @@ test("ship argument parser preserves launcher semantics", () => {
   });
 
   const parsed = parseShipArgs(["YM-199", "note", "YM-198", "--model", "terra"]);
-  const launch = resolveLaunch("/root", "ship", parsed.ticket, parsed.tail.filter((word) => word !== "--model" && word !== "terra").join(" "));
-  assert.ok(launch.env.includes("YOKEMATE_TICKET=YM-199+YM-198"));
-  assert.equal(launch.prompt, "/skill:ship-worker YM-199+YM-198 note");
+  assert.equal(parsed.ticket, "YM-199+YM-198");
+  assert.deepEqual(parsed.tail, ["note", "--model", "terra"]);
 });
 
 test("ship prompt preserves single and batch arguments through where", async () => {
@@ -646,15 +645,13 @@ test("ship prompt preserves single and batch arguments through where", async () 
     const stamp = keys.join("+");
     const expanded = promptTemplates.expandPromptTemplate(`/ship ${keys.join(" ")}`, templates);
     const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
-    const launch = expanded.match(/pnpm ship(?: [^`\n]*)?/)?.[0];
+    assert.match(expanded, /subagent.*coordinator/);
     assert.ok(where);
-    assert.ok(launch);
     const whereArgs = where.split(/\s+/).slice(3);
     const main = runWhere(whereArgs, {});
     assert.equal(main.status, 0, main.stderr);
     assert.equal(main.stdout.trim(), "launch");
     assert.deepEqual(whereArgs, keys);
-    assert.deepEqual(launch.split(/\s+/).slice(2), keys);
 
     const own = runWhere(whereArgs, { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
     assert.equal(own.status, 0, own.stderr);
@@ -675,10 +672,7 @@ test("ship prompt preserves single and batch arguments through where", async () 
 
   const withTail = promptTemplates.expandPromptTemplate("/ship YM-199 note YM-198 --model terra YM-197", templates);
   const withTailWhere = withTail.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
-  const withTailLaunch = withTail.match(/pnpm ship(?: [^`\n]*)?/)?.[0];
   assert.ok(withTailWhere);
-  assert.ok(withTailLaunch);
-  assert.deepEqual(withTailLaunch.split(/\s+/).slice(2), ["YM-199", "note", "YM-198", "--model", "terra", "YM-197"]);
   const ownTail = runWhere(withTailWhere.split(/\s+/).slice(3), {
     YOKEMATE_MODE: "ship",
     YOKEMATE_TICKET: "YM-199+YM-198",
