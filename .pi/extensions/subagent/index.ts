@@ -1044,11 +1044,12 @@ export default function (pi: ExtensionAPI) {
 			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
 			if (!runs) runs = new ChildRuns(ownerRunId, sessionId);
 			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
-			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<ResultEnvelope> => {
+			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
 				let envelope: ResultEnvelope;
+				let output = "";
 				try {
-					if (shuttingDown) return resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
 					runs!.start(identity);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
@@ -1056,6 +1057,7 @@ export default function (pi: ExtensionAPI) {
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
 					}, identity, diagnostics.get(identity.runId)!);
+					output = getFinalOutput(result.messages);
 					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 				} catch (error) {
 					const diagnostic = diagnostics.get(identity.runId);
@@ -1065,7 +1067,7 @@ export default function (pi: ExtensionAPI) {
 					if (child) detached.delete(child);
 					untrackRunning(child);
 				}
-				return envelope;
+				return { envelope, output };
 			};
 			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
 				const units = mode === "chain" ? 1 : tasks.length;
@@ -1089,15 +1091,15 @@ export default function (pi: ExtensionAPI) {
 							for (let i = 0; i < tasks.length; i++) {
 								const identity = ack.children[i]!.identity;
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
-								const result = failed ? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "") : await runDetachedAgent(mode, identity, task, i + 1);
+								const { envelope: result, output } = failed ? { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output: "" } : await runDetachedAgent(mode, identity, task, i + 1);
 								settleResult(result, false);
 								failed ||= failedEnvelope(result);
-								previous = result.payload;
+								previous = output;
 							}
 							sendReport(runs!.batch(toolCallId, "chain")!);
 						} else {
 							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
-								const result = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
+								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
 								settleResult(result, true);
 							});
 						}

@@ -138,7 +138,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 
 test("real Pi single, parallel, chain and terminal fault variants retain primary outcomes", { timeout: 90000 }, async () => {
   const cases = [
-    ["parallel", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
+    ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
     ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
     ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
   ] as const;
@@ -154,6 +154,7 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
     writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
+    writeFileSync(join(cwd, ".pi/agents/worker.md"), "---\nname: worker\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn the requested output.\n");
     writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
     writeFileSync(join(folder, "plan.md"), "fixture plan");
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
@@ -218,6 +219,7 @@ test("real Pi single, parallel, chain and terminal fault variants retain primary
         assert.equal(results[2].processOutcome, "not_started");
         assert.notEqual(results[1].actualTaskHash, results[1].identity.taskHash);
       }
+      if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
       if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
       if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
       if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
