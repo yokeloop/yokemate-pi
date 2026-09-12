@@ -13,8 +13,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -54,22 +54,6 @@ const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDeta
 
 const limitsByCwd = new Map<string, Limits>();
 
-function openChildLog(taskRoot: string, agentName: string, runId: string | undefined): ((chunk: string) => void) | undefined {
-	try {
-		const dir = path.join(taskRoot, "logs");
-		fs.mkdirSync(dir, { recursive: true });
-		const file = path.join(dir, `${agentName}-${runId ?? "unknown"}.log`);
-		return (chunk) => {
-			try {
-				fs.appendFileSync(file, chunk);
-			} catch {
-				/* ignore */
-			}
-		};
-	} catch {
-		return undefined;
-	}
-}
 
 function validateLimits(limits: Limits): string | undefined {
 	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
@@ -121,6 +105,7 @@ function loadLimits(cwd: string): Limits {
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
+const cancellationByProcess = new Map<ChildProcess, (initiator: string) => void>();
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -339,7 +324,7 @@ interface SingleResult {
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
-	exitCode: number;
+	exitCode: number | null;
 	messages: Message[];
 	stderr: string;
 	usage: UsageStats;
@@ -466,6 +451,7 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onSpawn: ((proc: ChildProcess) => void) | undefined,
 	identity: ChildIdentity,
+	diagnostic: { metadata: Record<string, unknown>; save(completed: boolean): void },
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -532,113 +518,76 @@ async function runSingleAgent(
 			args.push("--no-approve", "-e", path.join(root, "src", "guards.ts"), "-e", path.join(root, ".pi", "extensions", "subagent", "index.ts"), "--skill", path.join(root, ".pi", "skills"));
 		}
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const child = research
-				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
-				: undefined;
-			const env: NodeJS.ProcessEnv = {
-				...process.env,
-				YOKEMATE_ROLE: "executor",
-				YOKEMATE_RUN_ID: identity.runId,
-				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
-				...(child?.env ?? {}),
-			};
-			if (coordinatorChild) {
-				env.YOKEMATE_PARENT_RUN_ID = process.env.YOKEMATE_RUN_ID;
-				env.YOKEMATE_RUN_ID = identity.runId;
-			}
-			delete env.HERDR_PANE_ID;
-			delete env.YOKEMATE_PARENT_PANE;
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: child?.cwd ?? cwd ?? defaultCwd,
-				env,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			onSpawn?.(proc);
-			const log = coordinatorChild ? openChildLog(process.cwd(), agentName, env.YOKEMATE_RUN_ID) : undefined;
-			log?.(`[start ${new Date().toISOString()}] pid=${proc.pid} cwd=${child?.cwd ?? cwd ?? defaultCwd} ${invocation.command} ${invocation.args.join(" ")}\n`);
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+		diagnostic.metadata.launch = fileProvenance(getPiInvocation(args).args[0] ?? process.execPath);
+		diagnostic.metadata.appendedPromptHash = sha256(agent.systemPrompt);
+		diagnostic.metadata.agentDefinition = fileProvenance(agent.filePath);
+		diagnostic.metadata.requested = { model, thinking: inheritsDispatchConfig ? dispatchDefaults.thinkingLevel : "unknown" };
+		let stderrBytes = 0;
+		const stderrHash = createHash("sha256");
+		const observation = new JsonlObservation((event) => {
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				const msg = event.message as Message;
+				currentResult.messages = [msg];
+				if (msg.role === "assistant") {
+					currentResult.stopReason = msg.stopReason;
+					currentResult.model = msg.model;
+					currentResult.usage.turns++;
+					if (msg.usage) {
+						currentResult.usage.input += msg.usage.input || 0;
+						currentResult.usage.output += msg.usage.output || 0;
+						currentResult.usage.cacheRead += msg.usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += msg.usage.cacheWrite || 0;
+						currentResult.usage.cost += msg.usage.cost?.total || 0;
+						currentResult.usage.contextTokens = msg.usage.totalTokens || 0;
 					}
-					emitUpdate();
 				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				log?.(data.toString());
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				log?.(data.toString());
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code, signalName) => {
-				log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signalName}\n`);
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
+				emitUpdate();
 			}
 		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
-		currentResult.envelope = resultEnvelope(identity, task, { processOutcome: "exited", exitCode, signal: null, stopReason: currentResult.stopReason }, getFinalOutput(currentResult.messages));
+		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
+			const invocation = getPiInvocation(args);
+			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
+			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, ...(child?.env ?? {}) };
+			delete env.HERDR_PANE_ID;
+			delete env.YOKEMATE_PARENT_PANE;
+			let spawnError: Error | undefined;
+			let cancelled = false;
+			let killTimer: NodeJS.Timeout | undefined;
+			const proc = spawn(invocation.command, invocation.args, { cwd: child?.cwd ?? identity.cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			diagnostic.metadata.pid = proc.pid;
+			diagnostic.metadata.starttime = proc.pid ? processStarttime(proc.pid) : undefined;
+			diagnostic.metadata.spawnAt = new Date().toISOString();
+			cancellationByProcess.set(proc, (initiator) => { cancelled = true; diagnostic.metadata.cancellationInitiator = initiator; diagnostic.save(false); });
+			diagnostic.save(false);
+			onSpawn?.(proc);
+			const abort = () => {
+				cancellationByProcess.get(proc)?.("tool_abort_signal");
+				proc.kill("SIGTERM");
+				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
+			};
+			proc.stdout.on("data", (data: Buffer) => observation.write(data));
+			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
+			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
+			proc.once("close", (exitCode, signalName) => {
+				clearTimeout(killTimer);
+				signal?.removeEventListener("abort", abort);
+				observation.end();
+				cancellationByProcess.delete(proc);
+				diagnostic.metadata.closeAt = new Date().toISOString();
+				resolve({ exitCode, signal: signalName, processOutcome: cancelled ? "cancelled" : spawnError ? "spawn_error" : signalName ? "signaled" : "exited" });
+			});
+			if (signal?.aborted) abort();
+			else signal?.addEventListener("abort", abort, { once: true });
+		});
+		currentResult.exitCode = terminal.exitCode;
+		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
+		diagnostic.metadata.stream = observation.metadata();
+		diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") };
+		diagnostic.metadata.sessionId = observation.sessionId;
+		diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
+		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
+		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.save(true);
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -702,7 +651,34 @@ const SubagentParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	let runs: ChildRuns | undefined;
+	let snapshots: RunSnapshots | undefined;
+	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
 	const sentBatches = new Set<string>();
+	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
+	let childSequence = 0;
+	const emitChildState = () => {
+		if (!runs) return;
+		pi.appendEntry("yokemate-child-state", { version: 1, ownerRunId: runs.ownerRunId, ownerSessionId: runs.ownerSessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", sequence: ++childSequence, children: runs.active(), deliveries: [...deliveries.values()].map(({ delivery }) => ({ ...delivery })) });
+	};
+	pi.on("context", (event) => {
+		let changed = false;
+		for (const message of event.messages) {
+			if (message.role !== "custom" || message.customType !== "subagent-report") continue;
+			for (const { delivery, envelope } of deliveries.values()) {
+				if (delivery.state === "observed" || message.content !== reportContent(envelope, delivery)) continue;
+				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
+				if (details?.deliveryId !== delivery.deliveryId || details.envelopeHash !== delivery.envelopeHash) continue;
+				delivery.state = "observed";
+				for (const runId of delivery.runIds) {
+					const diagnostic = diagnostics.get(runId);
+					if (diagnostic) { diagnostic.metadata.delivery = { id: delivery.deliveryId, state: delivery.state, observedAt: new Date().toISOString() }; diagnostic.save(true); }
+				}
+				changed = true;
+			}
+		}
+		if (changed) emitChildState();
+	});
+	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
 	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
@@ -754,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
 			coordinators.setPrepared(ownedRun.identity.runId, prepared);
 			let terminalReported = false;
-			let nudges = 0;
+
 			reportBlocked = (reason: string) => {
 				if (terminalReported) return;
 				terminalReported = true;
@@ -762,7 +738,7 @@ export default function (pi: ExtensionAPI) {
 				uiAbortByRun.delete(ownedRun.identity.runId);
 				const blocked = coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
 				releaseCoordinatorUnit(ownedRun.identity.runId);
-				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
+				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.busyCount() ?? 1);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
 				rpcByRun.delete(ownedRun.identity.runId);
@@ -772,10 +748,9 @@ export default function (pi: ExtensionAPI) {
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (event.type === "agent_settled" && !terminalReported) {
-					const verdict = idleVerdict({ nudges, hasChildren: rpc?.hasLiveDescendants() ?? false });
+					const verdict = rpc?.childState.settled() ?? "wait";
 					if (verdict === "wait") return;
 					if (verdict === "blocked") { reportBlocked?.("coordinator stopped without outcome"); return; }
-					nudges += 1;
 					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked?.((error as Error).message));
 					return;
 				}
@@ -784,7 +759,8 @@ export default function (pi: ExtensionAPI) {
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
 				terminalReported = true;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
-				const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
+				if (!rpc?.childState.canFinish(proposal.outcome, proposal.reason)) { terminalReported = false; return; }
+				const verification = verifyCoordinatorOutcome(root, prepared, proposal, rpc.childState.canFinish(proposal.outcome, proposal.reason) ? 0 : rpc.childState.busyCount());
 				if (!verification.ok) {
 					terminalReported = false;
 					void rpc?.request({ type: "prompt", message: `coordinator_finish was not verified: ${verification.reason ?? "missing facts"}. Continue the pipeline or finish blocked.`, streamingBehavior: "followUp" }).catch(() => {});
@@ -859,7 +835,7 @@ export default function (pi: ExtensionAPI) {
 					const run = coordinators.get(runId);
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
+				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); await rpcByRun.get(run.identity.runId)?.stop("parent_control_cancel"); rpcByRun.delete(run.identity.runId); },
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -867,16 +843,29 @@ export default function (pi: ExtensionAPI) {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
 			try {
-				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string } };
+				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string } };
 				const identity = payload.identity;
 				if (!identity || identity.role !== "coordinator" || identity.runId !== process.env.YOKEMATE_RUN_ID || identity.cwd !== ctx.cwd || payload.prepared?.cwd !== ctx.cwd || !ctx.isProjectTrusted()) throw new Error("invalid coordinator ready identity");
 				const commands = pi.getCommands().map((command) => command.name);
 				if (!commands.includes(`skill:${process.env.YOKEMATE_MODE}-worker`)) throw new Error("worker skill unavailable");
+				if (payload.prepared?.plan) {
+					try { snapshots = new RunSnapshots(ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
+				}
+				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
+				emitChildState();
 				ownedReadyRunId = identity.runId;
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
 			} catch (error) {
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "blocked", display: false, details: { ok: false, reason: (error as Error).message } }, { deliverAs: "followUp", triggerTurn: false });
 			}
+		},
+	});
+	pi.registerCommand("yokemate-child-cancel", {
+		description: "Record an owned parent cancellation before teardown.",
+		handler: async (args) => {
+			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
+			if (payload.runId !== ownedReadyRunId || !["parent_rpc_stop", "parent_control_cancel", "parent_cancel_run", "parent_session_shutdown"].includes(payload.reason)) throw new Error("invalid owned child cancellation");
+			for (const mark of cancellationByProcess.values()) mark(payload.reason);
 		},
 	});
 	pi.on("session_shutdown", () => {
@@ -886,9 +875,10 @@ export default function (pi: ExtensionAPI) {
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
-		for (const rpc of rpcByRun.values()) void rpc.stop();
+		for (const rpc of rpcByRun.values()) void rpc.stop("parent_session_shutdown");
 		rpcByRun.clear();
 		for (const proc of detached) {
+			cancellationByProcess.get(proc)?.("session_shutdown");
 			try {
 				proc.kill("SIGTERM");
 			} catch {
@@ -909,13 +899,20 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
-	const sendReport = (envelope: ResultEnvelope | BatchEnvelope): void => {
-		const prefix = envelope.kind === "result" ? `[subagent ${envelope.identity.agent}${failedEnvelope(envelope) ? " failed" : ""}]` : envelope.kind === "batch" ? "[subagent batch complete]" : "[subagent chain]";
+	const registerDelivery = (envelope: ReportEnvelope) => {
+		const delivery = deliveryFor(envelope);
+		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope });
+		return deliveries.get(delivery.deliveryId)!;
+	};
+	const sendReport = (envelope: ReportEnvelope): void => {
+		const { delivery } = registerDelivery(envelope);
+		if (delivery.state !== "pending") return;
+		emitChildState();
 		try {
-			pi.sendMessage({ customType: "subagent-report", content: `${prefix} ${JSON.stringify(envelope)}`, display: true, details: envelope }, { deliverAs: "followUp", triggerTurn: true });
-		} catch {
-			console.error("[subagent] report delivery failed");
-		}
+			pi.sendMessage({ customType: "subagent-report", content: reportContent(envelope, delivery), display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } }, { deliverAs: "followUp", triggerTurn: true });
+			if (delivery.state === "pending") delivery.state = "enqueued";
+		} catch { delivery.state = "delivery_failed"; }
+		emitChildState();
 	};
 	const settleBatch = (batchId: string): void => {
 		const batch = runs?.batch(batchId);
@@ -923,6 +920,16 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.add(batchId);
 		sendReport(batch);
 		batches.delete(batchId);
+	};
+	const settleResult = (result: ResultEnvelope, report: boolean) => {
+		if (!runs?.settle(result)) return;
+		if (report) registerDelivery(result);
+		const batch = runs.batch(result.identity.batchId);
+		if (batch) {
+			registerDelivery(batch);
+			if (!report) registerDelivery({ ...batch, kind: "chain" });
+		}
+		if (report) sendReport(result);
 	};
 
 	pi.registerTool({
@@ -937,7 +944,9 @@ export default function (pi: ExtensionAPI) {
 			if (params.outcome === "blocked" && !params.reason)
 				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
 			if (finishingCoordinatorRunId) return { content: [{ type: "text", text: "coordinator is already finishing" }], isError: true };
-			if (batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
+			if (runs?.active().length || batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
+			const pending = [...deliveries.values()].map(({ delivery }) => delivery).filter((delivery) => delivery.state !== "observed");
+			if (pending.length && !(params.outcome === "blocked" && pending.some((delivery) => delivery.state === "delivery_failed" || delivery.state === "delivery_unknown") && pending.every((delivery) => params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
 			const run = coordinators.get(runId);
 			if (!run) {
 				finishingCoordinatorRunId = runId;
@@ -973,7 +982,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); void rpcByRun.get(run.identity.runId)?.stop("parent_cancel_run"); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {
@@ -1031,11 +1040,12 @@ export default function (pi: ExtensionAPI) {
 				try {
 					if (shuttingDown) return resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 					runs!.start(identity);
+					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
 						child = proc;
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
-					}, identity);
+					}, identity, diagnostics.get(identity.runId)!);
 					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 				} catch {
 					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
@@ -1050,8 +1060,15 @@ export default function (pi: ExtensionAPI) {
 				const admission = subagentAdmission(policy, limits, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				for (const { identity } of ack.children) {
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date().toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", delivery: "pending" };
+					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
+					diagnostics.set(identity.runId, diagnostic);
+					diagnostic.save(false);
+				}
 				activeUnits += units;
 				batches.add(toolCallId);
+				emitChildState();
 				const execute = async () => {
 					try {
 						if (mode === "chain") {
@@ -1061,7 +1078,7 @@ export default function (pi: ExtensionAPI) {
 								const identity = ack.children[i]!.identity;
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
 								const result = failed ? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "") : await runDetachedAgent(mode, identity, task, i + 1);
-								runs!.settle(result);
+								settleResult(result, false);
 								failed ||= failedEnvelope(result);
 								previous = result.payload;
 							}
@@ -1069,7 +1086,7 @@ export default function (pi: ExtensionAPI) {
 						} else {
 							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
 								const result = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
-								if (runs!.settle(result)) sendReport(result);
+								settleResult(result, true);
 							});
 						}
 						settleBatch(toolCallId);

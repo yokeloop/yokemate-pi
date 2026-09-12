@@ -59,3 +59,78 @@ test("review verdict is separate from process and payload failures, and oversize
   assert.equal(reviewerVerdict(JSON.stringify({ status: "approved", findings: [finding] })), null);
   assert.equal(reviewerVerdict(JSON.stringify({ status: "changes_required", findings: [finding] })), "changes_required");
 });
+
+test("JSONL observation preserves split UTF-8 and the last assistant only", async () => {
+  const { JsonlObservation } = await import("../src/subagent-runs.ts");
+  const observed = new JsonlObservation();
+  const line = (message: unknown) => Buffer.from(JSON.stringify({ type: "message_end", message }) + "\r\n");
+  const bytes = line({ role: "assistant", content: [{ type: "text", text: "é日" }, { type: "text", text: "🙂" }], stopReason: "stop", provider: "fixture", model: "model" });
+  for (const byte of bytes) observed.write(Buffer.from([byte]));
+  assert.equal(observed.finalText, "é日🙂");
+  observed.write(line({ role: "assistant", content: [{ type: "thinking", thinking: "private" }], stopReason: "toolUse" }));
+  observed.end();
+  assert.equal(observed.finalText, "");
+  assert.equal(observed.stopReason, "toolUse");
+  assert.equal(observed.protocolError, false);
+  assert.doesNotMatch(JSON.stringify(observed.metadata()), /private/);
+});
+
+test("JSONL framing reports malformed, unfinished and overflow records without retaining secrets", async () => {
+  const { JsonlObservation } = await import("../src/subagent-runs.ts");
+  for (const bytes of [Buffer.from('{bad-private}\n'), Buffer.from('{"unfinished":"private"}'), Buffer.from('x'.repeat(1024 * 1024 + 1) + '\n')]) {
+    const observed = new JsonlObservation();
+    observed.write(bytes);
+    observed.end();
+    assert.equal(observed.protocolError, true);
+    assert.ok(observed.metadata().parserErrors > 0);
+    assert.doesNotMatch(JSON.stringify(observed.metadata()), /bad-private|unfinished|x{100}/);
+  }
+});
+
+test("tool and retry remain incomplete until their actual end events", async () => {
+  const { JsonlObservation } = await import("../src/subagent-runs.ts");
+  const observed = new JsonlObservation();
+  const event = (value: unknown) => observed.write(Buffer.from(JSON.stringify(value) + "\n"));
+  event({ type: "tool_execution_start", toolCallId: "one", args: { secret: "private" } });
+  assert.equal(observed.incomplete, true);
+  event({ type: "tool_execution_end", toolCallId: "one" });
+  event({ type: "auto_retry_start", errorMessage: "private" });
+  assert.equal(observed.incomplete, true);
+  event({ type: "auto_retry_end", success: true });
+  assert.equal(observed.incomplete, false);
+  assert.doesNotMatch(JSON.stringify(observed.metadata()), /private/);
+});
+
+test("metadata snapshots are private, bounded, retain active runs and survive write/rename/prune faults", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { RunSnapshots, errorMetadata } = await import("../src/subagent-runs.ts");
+  const root = fs.mkdtempSync(path.join(tmpdir(), "ym204-snapshots-"));
+  const folder = path.join(root, "home/knowledge/org/repo/ai/task");
+  fs.mkdirSync(folder, { recursive: true });
+  const plan = path.join(folder, "plan.md");
+  fs.writeFileSync(plan, "plan");
+  const dir = path.join(folder, "reviewer-runs");
+  try {
+    const snapshots = new RunSnapshots(root, plan);
+    assert.equal(snapshots.write("owner", "active", { error: errorMetadata(new Error("private credentials")) }, false), true);
+    for (let i = 0; i < 24; i++) assert.equal(snapshots.write("owner", `run-${i}`, {}, true), true);
+    assert.equal(fs.readdirSync(dir).length, 21);
+    const active = fs.readFileSync(path.join(dir, "owner-active.json"), "utf8");
+    assert.doesNotMatch(active, /private credentials/);
+    assert.equal(fs.statSync(path.join(dir, "owner-active.json")).mode & 0o777, 0o600);
+    for (const method of ["writeFileSync", "renameSync", "unlinkSync"] as const) {
+      const writer = new RunSnapshots(root, plan);
+      assert.equal(writer.write("owner", `fill-${method}`, {}, true), true);
+      const original = fs[method];
+      (fs as any)[method] = () => { throw new Error("injected private failure"); };
+      try { assert.equal(writer.write("owner", `fault-${method}`, {}, true), false); }
+      finally { (fs as any)[method] = original; }
+    }
+    assert.equal(fs.existsSync(path.join(dir, "owner-active.json")), true);
+    assert.throws(() => new RunSnapshots(root, path.join(root, "plan.md")), /invalid reviewer/);
+    const limit = new RunSnapshots(root, plan);
+    assert.equal(limit.write("owner", "oversize", { tooLarge: "x".repeat(PAYLOAD_LIMIT) }, true), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
