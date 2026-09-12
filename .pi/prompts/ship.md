@@ -5,7 +5,7 @@ argument-hint: "<KEY> [<KEY> …] [note]"
 
 # /ship — launcher
 
-Run `pnpm where ship $1` first, with the ordered keys joined by `+`.
+Run `pnpm where ship $@` first with the original arguments; the where CLI normalizes the ordered keys.
 
 - **launch** — call `subagent` with `coordinator: { mode: "ship", tickets: [ordered engineer keys], note }`; include an engineer-named model unchanged. Reply with its ACK and return to the chat.
 - **run** — say this coordinator already runs these keys and stop.

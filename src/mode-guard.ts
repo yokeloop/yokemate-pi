@@ -10,9 +10,11 @@
 // are in the environment of everything inside it. The main chat has neither.
 //
 // Usage: pnpm where <mode> <TICKET>   → prints `launch`, `run`, or `refuse: …`
+//        pnpm where ship <KEY> [<KEY> …]|<KEY1+KEY2>
 //        pnpm where plan [KEY]        → /plan can run before a ticket exists
 
 import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
 
@@ -54,7 +56,7 @@ export function decide(env: ModeEnv, mode: Mode, ticket?: string, policy: GuardP
 if (import.meta.filename === process.argv[1]) {
   const argv = process.argv.slice(2).filter((a) => a !== "--");
   const mode = argv[0] as Mode;
-  const ticket = argv[1];
+  const ticket = mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
   if (!MODES.includes(mode) || (!ticket && !TICKETLESS.includes(mode))) {
     console.error(`usage: where <${MODES.join("|")}> <TICKET>`);
     process.exit(1);
