@@ -151,5 +151,5 @@ export function resolveResearchLaunch(root: string, argv: string[], id = crypto.
 }
 
 export function researchAgentArgs(root: string, model: string): string[] {
-  return ["--model", model, "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-tools", "-e", join(root, "src", "research.ts")];
+  return ["--model", model, "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")];
 }
