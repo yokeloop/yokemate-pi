@@ -44,6 +44,11 @@ import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
 import { parseShipArgs } from "./ship-args.ts";
 
+function incompleteTerminalCapture(error: unknown): boolean {
+  const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
+  return cause?.code === "ENOBUFS" || /(?:maxBuffer|ENOBUFS)/i.test((error as Error).message);
+}
+
 export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
 
@@ -188,7 +193,7 @@ if (import.meta.filename === process.argv[1]) {
         const terminal = herdrRaw(["pane", "read", root_pane.pane_id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text", "--raw"], { timeout: 2000, maxBuffer: 64 * 1024 });
         diagnostics.push(terminal ? `Pi terminal output:\n${terminal}` : "Pi terminal diagnostics were unavailable: pane read returned no output");
       } catch (capture) {
-        diagnostics.push(`Pi terminal diagnostics were unavailable:\n${formatHerdrError(capture)}`);
+        diagnostics.push(`${incompleteTerminalCapture(capture) ? "Pi terminal diagnostics were incomplete; the available tail follows" : "Pi terminal diagnostics were unavailable"}:\n${formatHerdrError(capture)}`);
       } finally {
         try {
           herdr(["tab", "close", tab.tab_id]);

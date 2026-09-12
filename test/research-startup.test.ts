@@ -31,6 +31,10 @@ test("the real research entry loads without action APIs before runtime binding",
     assert.ok(extension.handlers.has("tool_call"));
     assert.ok(extension.tools.has("send_message"));
     assert.ok(extension.tools.has("subagent"));
+    const userBash = extension.handlers.get("user_bash")?.[0];
+    assert.ok(userBash);
+    const closedBash = await (userBash as never as (event: { command: string }) => Promise<{ result: { output: string; exitCode: number } }>)({ command: "pnpm where research" });
+    assert.deepEqual(closedBash.result, { output: "research tools are not ready", exitCode: 1, cancelled: false, truncated: false });
 
     const previous = { ...process.env };
     process.env.YOKEMATE_MODE = "research";

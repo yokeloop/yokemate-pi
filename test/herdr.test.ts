@@ -16,6 +16,12 @@ test("herdr preserves raw streams, status, signal, and subprocess cause", () => 
     return true;
   });
   assert.throws(() => runHerdr(["pane", "read", "p"], {}, spawn({ status: null, signal: "SIGTERM", stdout: "tail\n" })), /signal SIGTERM/);
+  const limited = Object.assign(new Error("spawnSync ENOBUFS"), { code: "ENOBUFS" });
+  assert.throws(() => runHerdr(["pane", "read", "p"], { maxBuffer: 64 * 1024 }, spawn({ status: null, stdout: "partial tail\n", error: limited })), (error: Error) => {
+    assert.equal(error.cause, limited);
+    assert.match(formatHerdrError(error), /partial tail/);
+    return true;
+  });
 });
 
 test("raw herdr output does not parse JSON and malformed JSON retains streams", () => {
