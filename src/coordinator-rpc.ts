@@ -1,11 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { RuntimeIdentity } from "./coordinator-runtime.ts";
 import type { ExpectedCoordinatorModel } from "./coordinator-model.ts";
-import { OwnedChildState, RunSnapshots, errorMetadata, fileProvenance } from "./subagent-runs.ts";
+import { JsonlObservation, OwnedChildState, RunSnapshots, errorMetadata, fileProvenance, sha256 } from "./subagent-runs.ts";
 import { processStarttime } from "./coordinator-control.ts";
 import { createHash } from "node:crypto";
 import { THINKING_LEVELS } from "./pi-model.ts";
@@ -15,7 +14,6 @@ export interface CoordinatorRpc { process: ChildProcess; send(command: Record<st
 export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
 export interface CoordinatorRpcOptions { invocation?: { command: string; args: string[] }; readyTimeoutMs?: number; stopGraceMs?: number }
 
-function cap(text: string): string { return Buffer.byteLength(text) <= 50 * 1024 ? text : Buffer.from(text).subarray(0, 50 * 1024).toString(); }
 
 function processParent(pid: number): number | undefined {
   try {
@@ -53,7 +51,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const childState = new OwnedChildState(identity.runId, child.pid ?? -1, child.pid ? processStarttime(child.pid) ?? "" : "");
   let snapshots: RunSnapshots | undefined;
   try { if (prepared.plan) snapshots = new RunSnapshots(prepared.resourcesPath, prepared.plan); } catch { console.error("[coordinator] diagnostic initialization failed"); }
-  const metadata: Record<string, unknown> = { pid: child.pid, starttime: child.pid ? processStarttime(child.pid) : undefined, cwd: prepared.cwd, spawnAt: new Date().toISOString(), requested: { model: prepared.model }, effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown" };
+  const metadata: Record<string, unknown> = { pid: child.pid, starttime: child.pid ? processStarttime(child.pid) : undefined, cwd: prepared.cwd, spawnAt: new Date().toISOString(), requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown" };
   const save = (completed: boolean) => { snapshots?.write(identity.runId, identity.runId, metadata, completed); };
   save(false);
   const stderrHash = createHash("sha256");
@@ -90,7 +88,6 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const events: RpcEvent[] = [];
   const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
 
-  let buffer = "";
   let closed = false;
   let terminal = false;
   let blocked = false;
@@ -124,14 +121,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const maybeReady = () => {
     if (commandsAck && readyAck && readyMessage && stateAck && !blocked) { clearTimeout(readyTimer); readyResolve(); }
   };
-  const emit = (line: string) => {
-    if (!line) return;
-    let event: RpcEvent;
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (!isRecord(parsed)) { fail("invalid RPC event: expected object envelope"); return; }
-      event = parsed as RpcEvent;
-    } catch (error) { fail(`invalid RPC JSONL: ${(error as Error).message}`); return; }
+  const emit = (event: RpcEvent) => {
     events.push(event);
     if (event.type === "tool_execution_start" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolStart(event.toolCallId, event.args);
     if (event.type === "tool_execution_end" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolEnd(event.toolCallId, isRecord(event.result) ? event.result.details : undefined, event.isError === true);
@@ -149,7 +139,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
         const commandsValue = isRecord(event.data) ? event.data.commands : undefined;
         const commands = Array.isArray(commandsValue) ? commandsValue.filter(isRecord).map((command) => command.name) : [];
         if (event.success !== true || !commands.includes("yokemate-coordinator-ready") || !commands.includes(`skill:${prepared.mode}-worker`)) fail("coordinator lacks ready command or worker skill");
-        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan } })).toString("base64")}` }); }
+        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan, diagnosticRoot: prepared.resourcesPath } })).toString("base64")}` }); }
       } else if (event.id === `${identity.runId}:ready`) {
         if (event.success !== true) fail("coordinator ready command was refused");
         else { readyAck = true; send({ id: `${identity.runId}:state`, type: "get_state" }); }
@@ -193,10 +183,10 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, send);
     callbacks.onEvent?.(event);
   };
-  const decoder = new StringDecoder("utf8");
-  child.stdout.on("data", (chunk: Buffer) => { buffer += decoder.write(chunk); for (;;) { const newline = buffer.indexOf("\n"); if (newline < 0) break; const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); emit(line.endsWith("\r") ? line.slice(0, -1) : line); } });
+  const observation = new JsonlObservation((event) => emit(event as RpcEvent));
+  child.stdout.on("data", (chunk: Buffer) => { observation.write(chunk); if (observation.protocolError) fail("coordinator RPC protocol_error"); });
   child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; stderrHash.update(chunk); });
-  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") }; save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail("coordinator RPC exited without outcome"); });
+  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") }; observation.end(); metadata.stream = observation.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (observation.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!terminal && !blocked) fail("coordinator RPC exited without outcome"); });
   child.on("error", (error) => { metadata.spawnError = errorMetadata(error); save(false); fail("coordinator RPC spawn error"); });
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = (reason = "parent_rpc_stop") => new Promise<void>((resolve) => {
@@ -221,4 +211,17 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   });
   const hasLiveDescendants = () => liveOwned().some(([pid]) => pid !== child.pid);
   return { process: child, send, request, acceptTerminal: () => { terminal = true; }, hasLiveDescendants, ready, stop, childState, events };
+}
+
+export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, reportBlocked: (reason: string) => void): void {
+  if (event.type === "extension_error" && event.event === "send_message") {
+    void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${rpc.childState.ownerRunId()}` }).catch(() => {});
+  }
+  const deliveryFailure = rpc.childState.deliveryFailureReason();
+  if (deliveryFailure) { reportBlocked(deliveryFailure); return; }
+  if (event.type !== "agent_settled") return;
+  const verdict = rpc.childState.settled();
+  if (verdict === "wait") return;
+  if (verdict === "blocked") { reportBlocked("coordinator stopped without outcome"); return; }
+  void rpc.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch(() => reportBlocked("coordinator completion prompt delivery failed"));
 }

@@ -332,6 +332,7 @@ export class OwnedChildState {
   compaction = false;
   queue = false;
   constructor(runId: string, pid: number, starttime: string) { this.runId = runId; this.pid = pid; this.starttime = starttime; }
+  ownerRunId(): string { return this.runId; }
   bindSession(sessionId: string): void {
     if (this.sessionId && this.sessionId !== sessionId) { this.invalid = true; return; }
     this.sessionId = sessionId;
@@ -405,6 +406,12 @@ export class OwnedChildState {
     if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size) return false;
     if (!this.pendingIds().length) return true;
     return outcome === "blocked" && (this.deliveryError || this.snapshot.deliveries.some((delivery) => delivery.state === "delivery_failed")) && this.pendingIds().every((id) => reason?.includes(id));
+  }
+  verificationCount(outcome: "done" | "blocked", reason?: string): number { return this.canFinish(outcome, reason) ? 0 : Math.max(1, this.busyCount()); }
+  deliveryFailureReason(): string | undefined {
+    if (!this.deliveryError && !this.snapshot?.deliveries.some((delivery) => delivery.state === "delivery_failed")) return;
+    const reason = `report delivery failure; unobserved IDs: ${this.pendingIds().join(", ")}`;
+    return this.pendingIds().length && this.canFinish("blocked", reason) ? reason : undefined;
   }
   settled(): "wait" | "nudge" | "blocked" {
     if (this.busyCount() || this.retry || this.compaction || this.queue) return "wait";

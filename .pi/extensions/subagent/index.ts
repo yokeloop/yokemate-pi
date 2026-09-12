@@ -32,8 +32,8 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
-import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
-import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
+import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
@@ -42,7 +42,6 @@ import { researchChildLaunch, researchIdentity } from "../../../src/research-gua
 import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 interface Limits {
 	maxParallelTasks: number;
@@ -359,16 +358,6 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
@@ -671,7 +660,12 @@ export default function (pi: ExtensionAPI) {
 				delivery.state = "observed";
 				for (const runId of delivery.runIds) {
 					const diagnostic = diagnostics.get(runId);
-					if (diagnostic) { diagnostic.metadata.delivery = { id: delivery.deliveryId, state: delivery.state, observedAt: new Date().toISOString() }; diagnostic.save(true); }
+					if (diagnostic) {
+						const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+						states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, observedAt: new Date().toISOString() };
+						diagnostic.metadata.deliveries = states;
+						diagnostic.save(true);
+					}
 				}
 				changed = true;
 			}
@@ -738,29 +732,24 @@ export default function (pi: ExtensionAPI) {
 				uiAbortByRun.delete(ownedRun.identity.runId);
 				const blocked = coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
 				releaseCoordinatorUnit(ownedRun.identity.runId);
-				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.busyCount() ?? 1);
+				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.verificationCount("blocked", reason) ?? 1);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+				void rpc?.stop();
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
-				if (event.type === "agent_settled" && !terminalReported) {
-					const verdict = rpc?.childState.settled() ?? "wait";
-					if (verdict === "wait") return;
-					if (verdict === "blocked") { reportBlocked?.("coordinator stopped without outcome"); return; }
-					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked?.((error as Error).message));
-					return;
-				}
+				if (rpc && !terminalReported) continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
 				terminalReported = true;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
 				if (!rpc?.childState.canFinish(proposal.outcome, proposal.reason)) { terminalReported = false; return; }
-				const verification = verifyCoordinatorOutcome(root, prepared, proposal, rpc.childState.canFinish(proposal.outcome, proposal.reason) ? 0 : rpc.childState.busyCount());
+				const verification = verifyCoordinatorOutcome(root, prepared, proposal, rpc.childState.verificationCount(proposal.outcome, proposal.reason));
 				if (!verification.ok) {
 					terminalReported = false;
 					void rpc?.request({ type: "prompt", message: `coordinator_finish was not verified: ${verification.reason ?? "missing facts"}. Continue the pipeline or finish blocked.`, streamingBehavior: "followUp" }).catch(() => {});
@@ -843,13 +832,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
 			try {
-				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string } };
+				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string; diagnosticRoot?: string } };
 				const identity = payload.identity;
 				if (!identity || identity.role !== "coordinator" || identity.runId !== process.env.YOKEMATE_RUN_ID || identity.cwd !== ctx.cwd || payload.prepared?.cwd !== ctx.cwd || !ctx.isProjectTrusted()) throw new Error("invalid coordinator ready identity");
 				const commands = pi.getCommands().map((command) => command.name);
 				if (!commands.includes(`skill:${process.env.YOKEMATE_MODE}-worker`)) throw new Error("worker skill unavailable");
 				if (payload.prepared?.plan) {
-					try { snapshots = new RunSnapshots(ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
+					try { snapshots = new RunSnapshots(payload.prepared.diagnosticRoot ?? ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
 				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
 				emitChildState();
@@ -858,6 +847,14 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "blocked", display: false, details: { ok: false, reason: (error as Error).message } }, { deliverAs: "followUp", triggerTurn: false });
 			}
+		},
+	});
+	pi.registerCommand("yokemate-delivery-error", {
+		description: "Record an owned asynchronous report transport error.",
+		handler: async (args) => {
+			if (args.trim() !== ownedReadyRunId) throw new Error("invalid delivery error owner");
+			for (const { delivery } of deliveries.values()) if (delivery.state !== "observed" && delivery.state !== "delivery_failed") delivery.state = "delivery_unknown";
+			emitChildState();
 		},
 	});
 	pi.registerCommand("yokemate-child-cancel", {
@@ -912,6 +909,15 @@ export default function (pi: ExtensionAPI) {
 			pi.sendMessage({ customType: "subagent-report", content: reportContent(envelope, delivery), display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } }, { deliverAs: "followUp", triggerTurn: true });
 			if (delivery.state === "pending") delivery.state = "enqueued";
 		} catch { delivery.state = "delivery_failed"; }
+		for (const runId of delivery.runIds) {
+			const diagnostic = diagnostics.get(runId);
+			if (diagnostic) {
+				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, enqueuedAt: new Date().toISOString() };
+				diagnostic.metadata.deliveries = states;
+				diagnostic.save(true);
+			}
+		}
 		emitChildState();
 	};
 	const settleBatch = (batchId: string): void => {
@@ -1047,7 +1053,9 @@ export default function (pi: ExtensionAPI) {
 						trackRunning(proc, identity.agent, task);
 					}, identity, diagnostics.get(identity.runId)!);
 					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
-				} catch {
+				} catch (error) {
+					const diagnostic = diagnostics.get(identity.runId);
+					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
 					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
 				} finally {
 					if (child) detached.delete(child);
@@ -1061,7 +1069,7 @@ export default function (pi: ExtensionAPI) {
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
 				for (const { identity } of ack.children) {
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date().toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", delivery: "pending" };
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date().toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
 					diagnostics.set(identity.runId, diagnostic);
 					diagnostic.save(false);

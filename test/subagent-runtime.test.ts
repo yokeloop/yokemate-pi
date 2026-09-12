@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, type Socket } from "node:net";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
-import { startCoordinatorRpc, type RpcEvent } from "../src/coordinator-rpc.ts";
+import { fileProvenance } from "../src/subagent-runs.ts";
+import { continueOwnedCoordinator, startCoordinatorRpc, type RpcEvent } from "../src/coordinator-rpc.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
 const provider = join(root, "test/fixtures/subagent-runtime-provider.ts");
+const piVersion = JSON.parse(readFileSync(join(root, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
 const cli = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
 
 test("real Pi correlates delayed A batch after B admission and keeps B owned", { timeout: 30000 }, async () => {
@@ -30,6 +32,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
   const sockets = new Set<Socket>();
   let wake: (() => void) | undefined;
   let oldBatch = false;
+  let tearingDown = false;
   let bWorking = false;
   let settledWithB = false;
   let releaseB = false;
@@ -68,6 +71,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
       { onEvent(event) { events.push(event); if (event.type === "agent_settled" && oldBatch) { settledWithB = true; check(); }
         const state = event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state" ? (event.entry as any).data : undefined;
+        if (rpc && !observedB && !tearingDown) continueOwnedCoordinator(rpc, event, (reason) => assert.fail(`unexpected parent blocked: ${reason}`));
         if (state && releaseB && state.children.length === 0 && state.deliveries.filter((delivery: any) => delivery.batchId === "batch-B").length === 2 && state.deliveries.every((delivery: any) => delivery.state === "observed")) { observedB = true; resolveObserved(); } } },
       { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: 50 });
     await rpc.ready;
@@ -78,7 +82,12 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
     } finally { clearTimeout(timeout); }
     const acknowledgments = events.filter((event) => event.type === "tool_execution_end" && event.toolName === "subagent");
     assert.equal(acknowledgments.length, 2);
+    const refused = events.find((event) => event.type === "tool_execution_end" && event.toolCallId === "premature-finish");
+    assert.match(JSON.stringify(refused?.result), /coordinator still has active child batches/);
+    assert.notEqual((refused?.result as any)?.terminate, true);
     assert.ok(phases.filter((p) => p.phase === "loaded").every((p) => p.data.file === provider));
+    assert.equal(phases.find((p) => p.phase === "loaded" && p.role === "coordinator").data.tools.find((tool: any) => tool.name === "subagent")?.path, extension);
+    assert.ok(phases.filter((p) => p.phase === "loaded").every((p) => p.data.commands.find((command: any) => command.name === "yokemate-coordinator-ready")?.path === extension), JSON.stringify(phases.filter((p) => p.phase === "loaded").map((p) => p.data)));
     assert.equal(rpc.hasLiveDescendants(), true);
     assert.ok(events.some((event) => event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state"), "owned child state must bypass follow-up delivery");
     const a = (acknowledgments[0]!.result as any).details;
@@ -90,6 +99,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
     assert.match(JSON.stringify(old), /batch-A/);
     assert.equal(rpc.childState.settled(), "wait");
     assert.equal(rpc.childState.canFinish("done"), false);
+    assert.doesNotMatch(JSON.stringify(phases), /Continue the pipeline or call coordinator_finish/);
     releaseB = true;
     held.get("B")!.end("release\n");
     held.delete("B");
@@ -113,7 +123,9 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
     assert.equal(envelope.exitCode, 0);
     assert.equal(envelope.signal, null);
     assert.deepEqual(JSON.parse(envelope.payload), { status: "approved", findings: [] });
+    console.log(JSON.stringify({ piVersion, scenario: "delayed-A-B", extension: fileProvenance(extension), guard: fileProvenance(join(root, "src/guards.ts")), baseSha: head, headSha: head, ack: [a, b], order: events.filter((event) => event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state").map((event) => (event.entry as any).data), terminal: envelope, observed: true, modelThinking: phases.filter((p) => p.phase === "loaded").map((p) => ({ model: p.data.model, thinking: p.data.thinking, sessionId: p.data.sessionId })) }));
   } finally {
+    tearingDown = true;
     for (const socket of held.values()) socket.end("release\n");
     await rpc?.stop();
     for (const socket of sockets) socket.destroy();
@@ -121,5 +133,119 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
     for (const key of Object.keys(process.env)) delete process.env[key];
     Object.assign(process.env, priorEnv);
     rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+test("real Pi single, parallel, chain and terminal fault variants retain primary outcomes", { timeout: 90000 }, async () => {
+  const cases = [
+    ["parallel", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
+    ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
+    ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
+  ] as const;
+  for (const [scenario, outcome] of cases) {
+    const sandbox = mkdtempSync(join(tmpdir(), "ym204-fault-"));
+    const cwd = join(sandbox, "cwd");
+    const agentDir = join(sandbox, "agent");
+    const folder = join(sandbox, "home/knowledge/org/repo/ai/task");
+    mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
+    mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
+    mkdirSync(join(sandbox, "tmp"), { recursive: true });
+    mkdirSync(folder, { recursive: true });
+    mkdirSync(join(agentDir, "extensions"), { recursive: true });
+    symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
+    writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
+    writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
+    writeFileSync(join(folder, "plan.md"), "fixture plan");
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    const priorEnv = { ...process.env };
+    for (const key of Object.keys(process.env)) if (key !== "PATH") delete process.env[key];
+    Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
+    const sockets = new Set<Socket>();
+    const loaded: any[] = [];
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+        if (!buffer.includes("\n")) return;
+        const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        if (event.phase === "loaded") loaded.push(event);
+        if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
+        else socket.end("release\n");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve));
+    let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+    let complete!: () => void;
+    const delivered = new Promise<void>((resolve) => { complete = resolve; });
+    let batch: any;
+    let failureReason: string | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-204"], model: "ym204-fixture/deterministic:high", cwd, plan: join(folder, "plan.md"), plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
+        { runId: `owner-${scenario.replaceAll("_", "-")}`, parentSessionId: "fixture-parent", mode: "do", ticket: "YM-204", project: [], role: "coordinator", cwd, model: "ym204-fixture/deterministic:high" },
+        { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
+        { onEvent(event) {
+          if (rpc && scenario.startsWith("delivery_")) continueOwnedCoordinator(rpc, event, (reason) => { failureReason = reason; complete(); });
+          const envelope = event.type === "message_end" ? (event.message as any)?.details?.envelope : undefined;
+          if (envelope?.kind === "batch") batch = envelope;
+          if (event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state") {
+            const state = (event.entry as any).data;
+            if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
+          }
+        } },
+        { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: 50 });
+      await rpc.ready;
+      await rpc.request({ type: "prompt", message: "work" });
+      await Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]);
+      if (scenario.startsWith("delivery_")) {
+        assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
+        assert.equal(rpc.childState.canFinish("done"), false);
+        assert.equal(rpc.childState.canFinish("blocked", failureReason), true);
+        assert.equal(rpc.events.filter((event) => event.type === "tool_execution_start" && event.toolName === "subagent").length, 1);
+        assert.equal(rpc.childState.pendingIds().length, 2);
+        if (scenario === "delivery_async") assert.ok(rpc.events.some((event) => event.type === "extension_error" && event.event === "send_message"));
+        rpc.acceptTerminal();
+        continue;
+      }
+      assert.ok(batch, scenario);
+      const results = batch.results;
+      assert.equal(results[scenario === "chain" ? 1 : 0].payloadOutcome, outcome, scenario);
+      if (scenario === "chain") {
+        assert.equal(results.length, 3);
+        assert.equal(results[0].payloadOutcome, "valid");
+        assert.equal(results[2].processOutcome, "not_started");
+        assert.notEqual(results[1].actualTaskHash, results[1].identity.taskHash);
+      }
+      if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
+      if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
+      if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
+      if (scenario === "spawn_error") assert.equal(results[0].processOutcome, "spawn_error");
+      if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
+      assert.equal(rpc.childState.busyCount(), 0, scenario);
+      assert.equal(rpc.childState.canFinish("done"), true, scenario);
+      assert.ok(loaded.every((entry) => entry.data.file === provider));
+      const fs = await import("node:fs");
+      const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
+      assert.doesNotMatch(JSON.stringify(snapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
+      if (!["diagnostic_error", "spawn_error"].includes(scenario)) {
+        const childSnapshot = snapshots.find((snapshot) => snapshot.identity?.runId === results[0].identity.runId);
+        assert.equal(childSnapshot.terminal.exitCode, results[0].exitCode, scenario);
+        assert.equal(childSnapshot.guard.path, join(root, "src/guards.ts"));
+        assert.equal(childSnapshot.extension.path, extension);
+        assert.equal(childSnapshot.effective.thinking, "unknown");
+      }
+      console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(extension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
+      rpc.acceptTerminal();
+    } finally {
+      clearTimeout(timeout);
+      await rpc?.stop();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const key of Object.keys(process.env)) delete process.env[key];
+      Object.assign(process.env, priorEnv);
+      rmSync(sandbox, { recursive: true, force: true });
+    }
   }
 });
