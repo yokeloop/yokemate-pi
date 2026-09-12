@@ -21,7 +21,6 @@ export default function research(pi: ExtensionAPI): void {
     }
     return undefined;
   });
-  pi.setActiveTools([]);
   pi.on("user_bash", async (event) => {
     try {
       return { result: { output: await executeResearchBash(event.command), exitCode: 0, cancelled: false, truncated: false } };
@@ -31,13 +30,19 @@ export default function research(pi: ExtensionAPI): void {
   });
   bus(pi);
   subagent(pi);
-  void installResearchMcp(pi).catch(() => undefined);
+  const mcpLoad = installResearchMcp(pi).then(
+    () => null,
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  );
   pi.on("session_start", async (_event, ctx) => {
+    pi.setActiveTools([]);
     const identity = researchIdentity(process.env, String((ctx as unknown as { sessionId?: string }).sessionId ?? "runtime"));
     if (!identity || process.env.YOKEMATE_MODE !== "research" || ctx.cwd !== identity.root) {
       ctx.ui.notify("research identity is invalid; no tools were enabled", "error");
       return;
     }
+    const mcpError = await mcpLoad;
+    if (mcpError) ctx.ui.notify(`research MCP did not load: ${mcpError}`, "error");
     pi.registerTool(createReadTool(identity.root) as never);
     pi.registerTool(createGrepTool(identity.root) as never);
     pi.registerTool(createFindTool(identity.root) as never);
