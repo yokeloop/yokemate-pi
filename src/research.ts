@@ -37,7 +37,8 @@ export default function research(pi: ExtensionAPI): void {
     return undefined;
   });
   pi.on("user_bash", async (event) => {
-    if (!ready)
+    const identity = researchIdentity();
+    if (!ready || !identity || resolve(event.cwd) !== identity.root)
       return { result: { output: "research tools are not ready", exitCode: 1, cancelled: false, truncated: false } };
     try {
       return { result: { output: await executeResearchBash(event.command), exitCode: 0, cancelled: false, truncated: false } };

@@ -33,7 +33,8 @@ test("the real research entry loads without action APIs before runtime binding",
     assert.ok(extension.tools.has("subagent"));
     const userBash = extension.handlers.get("user_bash")?.[0];
     assert.ok(userBash);
-    const closedBash = await (userBash as never as (event: { command: string }) => Promise<{ result: { output: string; exitCode: number } }>)({ command: "pnpm where research" });
+    const invokeUserBash = userBash as never as (event: { command: string; cwd: string }) => Promise<{ result: { output: string; exitCode: number } }>;
+    const closedBash = await invokeUserBash({ command: "pnpm where research", cwd: root });
     assert.deepEqual(closedBash.result, { output: "research tools are not ready", exitCode: 1, cancelled: false, truncated: false });
 
     const previous = { ...process.env };
@@ -62,6 +63,8 @@ test("the real research entry loads without action APIs before runtime binding",
         assert.equal(resolve(tool.sourceInfo.path), entry);
         assert.notEqual(tool.sourceInfo.source, "builtin");
       }
+      const wrongCwd = await invokeUserBash({ command: "pnpm where research", cwd: "/tmp" });
+      assert.deepEqual(wrongCwd.result, { output: "research tools are not ready", exitCode: 1, cancelled: false, truncated: false });
       const bash = session.getToolDefinition("bash");
       assert.ok(bash);
       const result = await bash.execute("research-bash", { command: "pnpm where research" }, undefined, () => undefined, {} as never);
