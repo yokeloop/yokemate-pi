@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
@@ -27,6 +27,17 @@ test("do preparation resolves exact plan parts and CAS prevents stale running wr
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-1','u','review')").run();
     assert.throws(() => markDoRunning(dir, prepared, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator" }), /changed from absent to review/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("do preparation preserves an explicit model without a thinking setting", () => {
+  const dir = root();
+  try {
+    const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
+    const prepared = prepareDo(dir, { mode: "do", tickets: ["YM-1"], plan, model: "test/model:high" }, {});
+    assert.equal(prepared.model, "test/model:high");
+    const settings = JSON.parse(readFileSync(join(prepared.cwd, ".pi", "settings.json"), "utf8"));
+    assert.equal("thinkingLevel" in settings, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

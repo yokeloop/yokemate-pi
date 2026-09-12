@@ -33,6 +33,7 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
 import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
+import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
@@ -739,8 +740,10 @@ export default function (pi: ExtensionAPI) {
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
+			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
+			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
-			rpc = startCoordinatorRpc(prepared, ownedRun.identity, { onEvent: (event) => {
+			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (event.type === "agent_start") { nudgeSent = false; return; }
 				if (event.type === "agent_settled" && !terminalReported) {
 					if (nudgeSent) { reportBlocked?.("coordinator stopped without outcome"); return; }
