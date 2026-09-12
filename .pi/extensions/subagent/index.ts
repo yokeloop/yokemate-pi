@@ -852,8 +852,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("yokemate-delivery-error", {
 		description: "Record an owned asynchronous report transport error.",
 		handler: async (args) => {
-			if (args.trim() !== ownedReadyRunId) throw new Error("invalid delivery error owner");
-			for (const { delivery } of deliveries.values()) if (delivery.state !== "observed" && delivery.state !== "delivery_failed") delivery.state = "delivery_unknown";
+			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
+			if (payload.runId !== ownedReadyRunId || !Array.isArray(payload.deliveryIds)) throw new Error("invalid delivery error owner");
+			for (const id of payload.deliveryIds) {
+				const delivery = deliveries.get(id)?.delivery;
+				if (delivery && delivery.state !== "observed" && delivery.state !== "delivery_failed") delivery.state = "delivery_unknown";
+			}
 			emitChildState();
 		},
 	});

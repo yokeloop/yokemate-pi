@@ -327,7 +327,10 @@ export class OwnedChildState {
   private inFlight = new Set<string>();
   private progress = 0;
   private lastNudgeProgress = -1;
-  deliveryError = false;
+  private deliveryErrors = new Set<string>();
+  recordDeliveryError(): void { for (const id of this.pendingIds()) this.deliveryErrors.add(id); }
+  uncertainDeliveryIds(): string[] { return [...this.deliveryErrors]; }
+  get deliveryError(): boolean { return this.deliveryErrors.size > 0; }
   retry = false;
   compaction = false;
   queue = false;
@@ -398,6 +401,8 @@ export class OwnedChildState {
     }
     for (const prior of this.snapshot?.deliveries ?? []) if (!next.deliveries.some((item) => item.deliveryId === prior.deliveryId)) { this.invalid = true; return false; }
     this.snapshot = structuredClone(next);
+    const pending = new Set(this.pendingIds());
+    for (const id of this.deliveryErrors) if (!pending.has(id)) this.deliveryErrors.delete(id);
     return true;
   }
   pendingIds(): string[] { return this.snapshot?.deliveries.filter((delivery) => delivery.state !== "observed").map((delivery) => delivery.deliveryId) ?? []; }

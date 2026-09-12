@@ -133,7 +133,7 @@ test("owned state requires matching transport identity, launch admission and del
   const delivery = deliveryFor(result);
   assert.equal(tracker.accept({ ...initial, sequence: 3, deliveries: [delivery] }), true);
   assert.equal(tracker.settled(), "wait");
-  tracker.deliveryError = true;
+  tracker.recordDeliveryError();
   assert.equal(tracker.canFinish("done"), false);
   assert.equal(tracker.canFinish("blocked", `delivery failed: ${delivery.deliveryId}`), true);
   assert.equal(tracker.accept({ ...initial, sequence: 4, deliveries: [{ ...delivery, state: "observed" }] }), true);
@@ -149,4 +149,29 @@ test("owned state requires matching transport identity, launch admission and del
     assert.equal(invalid.canFinish("done"), false);
     assert.equal(invalid.settled(), "wait");
   }
+});
+
+test("an observed delivery retires its asynchronous error before a later healthy batch", async () => {
+  const { ChildRuns, OwnedChildState, deliveryFor, resultEnvelope } = await import("../src/subagent-runs.ts");
+  const tracker = new OwnedChildState("owner", 100, "start");
+  tracker.bindSession("session");
+  const initial = { version: 1 as const, ownerRunId: "owner", ownerSessionId: "session", pid: 100, starttime: "start", sequence: 1, children: [], deliveries: [] };
+  tracker.accept(initial);
+  const runs = new ChildRuns("owner", "session");
+  const tasks = ["A", "B"].map((task) => ({ agent: "worker", task, cwd: process.cwd() }));
+  const a = runs.admit("A", [tasks[0]!], process.cwd());
+  const b = runs.admit("B", [tasks[1]!], process.cwd());
+  tracker.toolStart("A", tasks[0]);
+  tracker.toolEnd("A", a, false);
+  tracker.toolStart("B", tasks[1]);
+  tracker.toolEnd("B", b, false);
+  const terminal = { processOutcome: "exited" as const, exitCode: 0, signal: null, stopReason: "stop" };
+  const deliveryA = deliveryFor(resultEnvelope(a.children[0]!.identity, "A", terminal, "A"));
+  const deliveryB = deliveryFor(resultEnvelope(b.children[0]!.identity, "B", terminal, "B"));
+  tracker.accept({ ...initial, sequence: 2, children: b.children, deliveries: [deliveryA] });
+  tracker.recordDeliveryError();
+  tracker.accept({ ...initial, sequence: 3, children: b.children, deliveries: [{ ...deliveryA, state: "observed" }] });
+  tracker.accept({ ...initial, sequence: 4, deliveries: [{ ...deliveryA, state: "observed" }, deliveryB] });
+  assert.equal(tracker.deliveryFailureReason(), undefined);
+  assert.equal(tracker.settled(), "wait");
 });

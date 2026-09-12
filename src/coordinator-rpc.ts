@@ -131,7 +131,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (event.type === "compaction_start") childState.compaction = true;
     if (event.type === "compaction_end") childState.compaction = false;
     if (event.type === "queue_update") childState.queue = (Array.isArray(event.steering) && event.steering.length > 0) || (Array.isArray(event.followUp) && event.followUp.length > 0);
-    if (event.type === "extension_error" && event.event === "send_message") { childState.deliveryError = true; metadata.deliveryError = "send_message"; save(false); }
+    if (event.type === "extension_error" && event.event === "send_message") { childState.recordDeliveryError(); metadata.deliveryError = "send_message"; save(false); }
     if (event.type === "response" && typeof event.id === "string") {
       const waiter = pending.get(event.id);
       if (waiter) { clearTimeout(waiter.timer); pending.delete(event.id); waiter.resolve(event); }
@@ -215,7 +215,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
 
 export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, reportBlocked: (reason: string) => void): void {
   if (event.type === "extension_error" && event.event === "send_message") {
-    void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${rpc.childState.ownerRunId()}` }).catch(() => {});
+    void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${Buffer.from(JSON.stringify({ runId: rpc.childState.ownerRunId(), deliveryIds: rpc.childState.uncertainDeliveryIds() })).toString("base64")}` }).catch(() => {});
   }
   const deliveryFailure = rpc.childState.deliveryFailureReason();
   if (deliveryFailure) { reportBlocked(deliveryFailure); return; }
