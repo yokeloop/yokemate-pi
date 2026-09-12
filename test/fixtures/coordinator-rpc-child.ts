@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 
+const scenario = process.argv[2] ?? "ready";
 const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
 let buffer = "";
 const send = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
@@ -16,12 +17,17 @@ process.stdin.on("data", (chunk) => {
     if (command.type === "get_commands") {
       send({ type: "response", id: command.id, success: true, data: { commands: [{ name: "yokemate-coordinator-ready" }, { name: "skill:do-worker" }] } });
     } else if (command.type === "get_state") {
-      send({ type: "response", id: command.id, success: true, data: { model: { provider: "test", id: "model" } } });
+      if (scenario === "state-false") send({ type: "response", id: command.id, success: false, error: "refused" });
+      else if (scenario === "invalid-state") send({ type: "response", id: command.id, success: true, data: { model: { provider: "test", id: "model" }, thinkingLevel: "HIGH" } });
+      else if (scenario === "provider-mismatch") send({ type: "response", id: command.id, success: true, data: { model: { provider: "wrong", id: "model" }, thinkingLevel: "high" } });
+      else if (scenario === "thinking-mismatch") send({ type: "response", id: command.id, success: true, data: { model: { provider: "test", id: "model" }, thinkingLevel: "medium" } });
+      else send({ type: "response", id: command.id, success: true, data: { model: { provider: "test", id: "model" }, thinkingLevel: "high" } });
     } else if (command.type === "prompt" && command.message?.startsWith("/yokemate-coordinator-ready")) {
       const runId = command.id?.replace(/:ready$/, "");
       send({ type: "response", id: command.id, success: true });
       send({ type: "message_end", message: { details: { runId, ok: true } } });
     } else if (command.type === "prompt") {
+      send({ type: "work_prompt" });
       send({ type: "response", id: command.id, success: true });
       setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
     } else if (command.type === "abort") {
