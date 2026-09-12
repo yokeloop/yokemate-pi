@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { startCoordinatorRpc } from "../src/coordinator-rpc.ts";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { coordinatorInvocationArgs, startCoordinatorRpc } from "../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../src/coordinator-model.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/coordinator-rpc-child.ts", import.meta.url));
+const taskRoot = mkdtempSync(join(tmpdir(), "coordinator-rpc-"));
 
 const prepared = {
   mode: "do",
   tickets: ["YM-1"],
   model: "test/model",
-  cwd: process.cwd(),
+  cwd: taskRoot,
   plans: {},
   parts: [],
   prompt: "work",
@@ -90,9 +94,19 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
     await Promise.race([nested, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("fixture did not deliver its delayed nested report")), 1000))]);
     assert.equal(rpc.process.exitCode, null);
     assert.ok(grandchildPid);
+    assert.equal(rpc.hasLiveDescendants(), true);
   } finally {
     await rpc.stop();
   }
   assert.notEqual(rpc.process.exitCode, null);
   assert.throws(() => process.kill(grandchildPid!, 0));
+  assert.equal(rpc.hasLiveDescendants(), false);
+  assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
+});
+
+test("coordinator invocation keeps a session under the task folder", () => {
+  const args = coordinatorInvocationArgs({ mode: "do", model: "test/model", cwd: "/tasks/YM-1", skillsPath: "/skills", resourcesPath: "/resources" });
+  assert.ok(!args.includes("--no-session"));
+  assert.equal(args[args.indexOf("--session-dir") + 1], "/tasks/YM-1/sessions");
+  assert.equal(args[args.indexOf("--append-system-prompt") + 1], "/resources/.pi/agents/do-coordinator.md");
 });
