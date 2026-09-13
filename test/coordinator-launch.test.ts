@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
@@ -39,6 +41,79 @@ test("do preparation preserves an explicit model without a thinking setting", ()
     const settings = JSON.parse(readFileSync(join(prepared.cwd, ".pi", "settings.json"), "utf8"));
     assert.equal("thinkingLevel" in settings, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("failed coordinator starts release duplicate reservations and capacity before retry", async () => {
+  const source = join(import.meta.dirname, "..");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "coordinator-start-"));
+  const previous = { ...process.env };
+  const script = process.argv[1];
+  delete process.env.YOKEMATE_MODE;
+  delete process.env.YOKEMATE_ROLE;
+  try {
+    cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    const agentDir = join(dir, "agent");
+    const loader = new DefaultResourceLoader({
+      cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir),
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")],
+    });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const reports: unknown[] = [];
+    loaded.runtime.sendMessage = (message) => { reports.push(message); };
+    loaded.runtime.appendEntry = () => undefined;
+    const tool = loaded.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "subagent");
+    assert.ok(tool);
+    const widgets: unknown[] = [];
+    const ctx = {
+      cwd: dir, mode: "rpc", hasUI: true,
+      ui: { setWidget: (_key: string, lines: unknown) => { widgets.push(lines); } },
+      modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true },
+    } as unknown as ExtensionContext;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const result: AgentToolResult<unknown> = await tool.definition.execute(`retry-${attempt}`, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      assert.equal("isError" in result && result.isError, true);
+      const text = result.content[0];
+      assert.ok(text?.type === "text");
+      assert.match(text.text, /plan not found:/);
+      assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
+    }
+    assert.deepEqual(reports, []);
+    mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "Fixture");
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'github', 'YM', 'test/model')").run(join(dir, "clone"));
+    db.close();
+    const plan = join(dir, "recovered-plan.md");
+    writeFileSync(plan, "# YM-1 — recovered\n\n## Affected repositories\n- `org/repo` — app\n");
+    process.argv[1] = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
+    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["YM-1"], plan } }, undefined, () => undefined, ctx);
+    assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
+    const { runId } = accepted.details as { runId: string };
+    assert.ok(runId);
+    const pids = JSON.parse(readFileSync(join(dir, "work", "YM-1", "fixture-pids.json"), "utf8")) as number[];
+    try {
+      assert.ok(widgets.some((lines) => Array.isArray(lines) && lines.some((line) => /^do YM-1 /.test(line)) && lines.some((line) => /task-reviewer/.test(line))));
+      const cancellation = tool.definition.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+      assert.equal(widgets.at(-1), undefined);
+      const cancelled = await cancellation;
+      assert.deepEqual(cancelled.content, [{ type: "text", text: `${runId} cancelled` }]);
+      for (const pid of pids) assert.throws(() => process.kill(pid, 0));
+      const again = await tool.definition.execute("cancel-again", { cancelRun: runId }, undefined, () => undefined, ctx);
+      assert.deepEqual(again.content, cancelled.content);
+      assert.deepEqual(reports, []);
+    } finally {
+      await tool.definition.execute("cleanup", { cancelRun: runId }, undefined, () => undefined, ctx);
+    }
+  } finally {
+    process.argv[1] = script;
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("coordinator requests reject malformed keys, duplicate batches and multi-ticket do", () => {

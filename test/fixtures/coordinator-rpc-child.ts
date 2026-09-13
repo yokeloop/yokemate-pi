@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { closeSync, writeFileSync } from "node:fs";
 
 const scenario = process.argv[2] ?? "ready";
 const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
 let buffer = "";
 const send = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
 send({ type: "grandchild", pid: grandchild.pid });
+writeFileSync("fixture-pids.json", JSON.stringify([process.pid, grandchild.pid]));
 
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString("utf8");
@@ -28,8 +30,12 @@ process.stdin.on("data", (chunk) => {
       send({ type: "message_end", message: { details: { runId, ok: true } } });
     } else if (command.type === "prompt") {
       send({ type: "work_prompt" });
+      send({ type: "extension_ui_request", id: "w1", method: "setWidget", widgetKey: "subagent-running", widgetLines: ["task-reviewer 0:05 review"] });
       send({ type: "response", id: command.id, success: true });
       setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
+    } else if (command.type === "close_stdin" && scenario === "closed-stdin") {
+      closeSync(0);
+      send({ type: "stdin_closed" });
     } else if (command.type === "abort") {
       process.exit(0);
     }

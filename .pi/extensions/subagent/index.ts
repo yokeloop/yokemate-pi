@@ -32,6 +32,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
 import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
@@ -139,25 +140,12 @@ const batches = new Map<string, Batch>();
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
 const runningAgents = new Map<ChildProcess, { name: string; task: string; startedAt: number }>();
+const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
+const coordinatorChildren = new Map<string, string[]>();
 let widgetTimer: NodeJS.Timeout | undefined;
 // ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
 // пришёл в execute текущего вызова или в turn_start, а не захваченному.
 let latestCtx: ExtensionContext | undefined;
-
-function formatElapsed(ms: number): string {
-	const total = Math.max(0, Math.floor(ms / 1000));
-	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-}
-
-const TASK_EXCERPT_BUDGET = 24;
-
-// Задача сабагента — это его промт целиком: многострочный, на тысячи знаков, а
-// в цепочке ещё и с подставленным отчётом предыдущего шага. В строке виджета от
-// него нужен только опознавательный кусок начала, и без переводов строк: первая
-// строка промта бывает служебной и у двух детей одинаковой.
-function taskExcerpt(task: string): string {
-	return task.replace(/\s+/g, " ").trim().slice(0, TASK_EXCERPT_BUDGET).trimEnd();
-}
 
 // Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
 // срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
@@ -190,13 +178,16 @@ function renderRunningWidget(): void {
 			latestCtx.ui.setWidget("subagent-running", undefined);
 			return;
 		}
-		const now = Date.now();
-		const parts = Array.from(runningAgents.values()).map((a) =>
-			a.task
-				? `${a.name} ${formatElapsed(now - a.startedAt)} ${a.task}`
-				: `${a.name} ${formatElapsed(now - a.startedAt)}`,
-		);
-		latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
+		const lines = widgetParts(runningAgents.values(), Date.now());
+		const running = Array.from(runningAgents.keys(), (proc, i) => [proc, lines[i]!] as const);
+		const childrenByProcess = new Map<ChildProcess, string[]>();
+		for (const [runId, rpc] of rpcByRun) {
+			const children = coordinatorChildren.get(runId);
+			if (children) childrenByProcess.set(rpc.process, children);
+		}
+		const parts = composeWidgetParts(running, childrenByProcess);
+		if (latestCtx.mode === "tui") latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
+		else latestCtx.ui.setWidget("subagent-running", parts);
 	} catch (e) {
 		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
 	}
@@ -218,6 +209,9 @@ function trackRunning(proc: ChildProcess, name: string, task: string): void {
 }
 
 function untrackRunning(proc: ChildProcess | undefined): void {
+	for (const [runId, rpc] of rpcByRun) {
+		if (rpc.process === proc) coordinatorChildren.delete(runId);
+	}
 	if (proc) runningAgents.delete(proc);
 	if (runningAgents.size === 0) stopWidgetTimer();
 	renderRunningWidget();
@@ -700,7 +694,6 @@ const SubagentParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
-	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
 		if (coordinatorUnits.delete(runId)) activeUnits -= 1;
@@ -709,6 +702,20 @@ export default function (pi: ExtensionAPI) {
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
+	const cancelCoordinator = async (runId: string) => {
+		const run = coordinators.get(runId);
+		if (!run) throw new Error(`unknown coordinator run ${runId}`);
+		coordinators.finalize(runId, "blocked", "cancelled");
+		releaseCoordinatorUnit(runId);
+		uiAbortByRun.get(runId)?.abort();
+		uiAbortByRun.delete(runId);
+		const rpc = rpcByRun.get(runId);
+		untrackRunning(rpc?.process);
+		coordinatorChildren.delete(runId);
+		await rpc?.stop();
+		rpcByRun.delete(runId);
+		return run;
+	};
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
 	pi.on("input", (event, ctx) => {
@@ -737,12 +744,27 @@ export default function (pi: ExtensionAPI) {
 		let run: CoordinatorRun | undefined;
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
 		let reportBlocked: ((reason: string) => void) | undefined;
+		let cleanupReservation: ((reason: string) => Promise<void>) | undefined;
 		const finishCalls = new Set<string>();
 		try {
 			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorUnits.add(ownedRun.identity.runId);
+			let cleanup: Promise<void> | undefined;
+			cleanupReservation = (reason) => cleanup ??= (async () => {
+				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
+				uiAbortByRun.delete(ownedRun.identity.runId);
+				untrackRunning(rpc?.process);
+				coordinatorChildren.delete(ownedRun.identity.runId);
+				await rpc?.stop();
+				if (reportBlocked) reportBlocked(reason);
+				else {
+					coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
+					releaseCoordinatorUnit(ownedRun.identity.runId);
+				}
+				rpcByRun.delete(ownedRun.identity.runId);
+			})();
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
@@ -760,6 +782,7 @@ export default function (pi: ExtensionAPI) {
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+				untrackRunning(rpc?.process);
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
@@ -792,8 +815,18 @@ export default function (pi: ExtensionAPI) {
 				releaseCoordinatorUnit(ownedRun.identity.runId);
 				pi.appendEntry("yokemate-coordinator-run", { identity: ownedRun.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${ownedRun.identity.mode} ${ownedRun.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: ownedRun.identity.runId, mode: ownedRun.identity.mode, tickets: ownedRun.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+				untrackRunning(rpc?.process);
 				void rpcByRun.get(ownedRun.identity.runId)?.stop(); rpcByRun.delete(ownedRun.identity.runId);
 			}, onUiRequest: (event, reply) => {
+				if (event.method === "setWidget" && event.widgetKey === "subagent-running") {
+					if (terminalReported || ["done", "blocked"].includes(ownedRun.state)) return;
+					if (event.widgetLines === undefined) coordinatorChildren.delete(ownedRun.identity.runId);
+					else if (Array.isArray(event.widgetLines) && event.widgetLines.every((line) => typeof line === "string"))
+						coordinatorChildren.set(ownedRun.identity.runId, event.widgetLines);
+					else return;
+					renderRunningWidget();
+					return;
+				}
 				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
 				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
 				const controller = uiAbortByRun.get(ownedRun.identity.runId) ?? new AbortController();
@@ -820,16 +853,18 @@ export default function (pi: ExtensionAPI) {
 			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
 			coordinators.attachProcess(ownedRun.identity.runId, rpc.process);
+			const { mode, tickets } = prepared;
+			const plan = mode === "do" ? prepared.plans[tickets[0]!] : undefined;
+			const heading = plan ? fs.readFileSync(plan, "utf8").split(/\r?\n/, 1)[0]! : "";
+			const prefix = `# ${tickets[0]} — `;
+			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
+			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
-			if (run) {
-				uiAbortByRun.get(run.identity.runId)?.abort();
-				uiAbortByRun.delete(run.identity.runId);
-				await rpc?.stop();
-				reportBlocked?.((error as Error).message);
-			} else activeUnits -= 1;
+			if (cleanupReservation) await cleanupReservation((error as Error).message);
+			else activeUnits -= 1;
 			throw error;
 		}
 	};
@@ -854,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 					const run = coordinators.get(runId);
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
+				cancel: async (runId, _origin) => { await cancelCoordinator(runId); },
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -883,6 +918,7 @@ export default function (pi: ExtensionAPI) {
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
 		for (const rpc of rpcByRun.values()) void rpc.stop();
 		rpcByRun.clear();
+		coordinatorChildren.clear();
 		for (const proc of detached) {
 			try {
 				proc.kill("SIGTERM");
@@ -962,6 +998,7 @@ export default function (pi: ExtensionAPI) {
 			coordinators.finalize(runId, params.outcome, params.reason);
 			pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: params.outcome, verification, summary: params.summary, reason: params.reason });
 			pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${params.outcome}: ${params.summary}`, display: true, details: { runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: params.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+			untrackRunning(rpcByRun.get(runId)?.process);
 			void rpcByRun.get(runId)?.stop();
 			rpcByRun.delete(runId);
 			return { content: [{ type: "text", text: `${params.outcome} verified` }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, verification }, terminate: true };
@@ -984,7 +1021,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = await cancelCoordinator(params.cancelRun); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {

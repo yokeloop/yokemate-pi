@@ -10,6 +10,21 @@ test("coordinator registry reserves ticket batches atomically and releases termi
   assert.doesNotThrow(() => registry.reserve({ mode: "ship", tickets: ["ACME-2"] }, {}, "main", "model", "/root", ["acme/a"]));
 });
 
+test("a failed preparing reservation finalizes once and can be reserved again", () => {
+  const registry = new CoordinatorRegistry();
+  const request = { mode: "do" as const, tickets: ["YM-1"] };
+  const run = registry.reserve(request, {}, "main", "pending", "/root", []);
+  assert.equal(run.state, "preparing");
+  assert.equal(registry.active().length, 1);
+  const blocked = registry.finalize(run.identity.runId, "blocked", "plan not found");
+  assert.deepEqual(registry.active(), []);
+  assert.equal(registry.finalize(run.identity.runId, "blocked", "second failure"), blocked);
+  assert.equal(blocked.reason, "plan not found");
+  const retry = registry.reserve(request, {}, "main", "pending", "/root", []);
+  assert.notEqual(retry.identity.runId, run.identity.runId);
+  assert.deepEqual(registry.active(), [retry]);
+});
+
 test("ship permit is exact, single-use and invalidated by later input", () => {
   const permits = new ShipPermitStore();
   permits.observeInteractiveShip(["ACME-1", "ACME-2"], "main");
