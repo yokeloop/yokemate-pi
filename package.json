@@ -13,6 +13,8 @@
     "import-projects": "node --experimental-strip-types --no-warnings src/import-projects.ts",
     "spawn": "node --experimental-strip-types --no-warnings src/spawn.ts",
     "record-report": "node --experimental-strip-types --no-warnings src/record-report.ts",
+    "ready": "node --experimental-strip-types --no-warnings src/ready.ts",
+    "gate": "node --experimental-strip-types --no-warnings src/gate.ts",
     "adopt": "node --experimental-strip-types --no-warnings src/adopt.ts",
     "accept": "node --experimental-strip-types --no-warnings src/accept.ts",
     "drop": "node --experimental-strip-types --no-warnings src/drop.ts",
@@ -38,9 +40,16 @@
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1",
+    "@types/cross-spawn": "6.0.6",
     "@types/node": "^26.2.0",
     "pi-mcp-adapter": "2.20.1",
     "typebox": "1.3.7",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "yaml": "2.9.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "pi-mcp-adapter@2.20.1": "patches/pi-mcp-adapter@2.20.1.patch"
+    }
   }
 }

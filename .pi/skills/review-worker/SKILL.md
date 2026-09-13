@@ -23,6 +23,8 @@ pnpm where review <TICKET>
 
 No `work/<TICKET>/` on this machine — run `pnpm adopt <TICKET>` first: it rebuilds the stand and the review row from observable facts (the plan in `home/knowledge/`, the `<TICKET>` branches, the open PRs). If adopt fails, print its line to the engineer exactly as it came and stop — it is transfer diagnostics (a plan not pushed from the dev machine, a missing PR), and it cannot be fixed from this pane. After adopt the order below is unchanged: fetch, the behind-base check, the stand recipes.
 
+After adopt — and when the folder was already there — `pnpm ready <TICKET>` from the yokemate-pi instance root, before the stand is raised: adopt restores the worktrees and the row, not the runtime. A `ready` blocker is printed to the engineer as it came, and the stand is not raised.
+
 Read the parts and their roles from the plan (and `part.role` in the orchestrator's report if given).
 
 First read how the project runs itself: `justfile`, `package.json` scripts, README, `.yoke/flow.md`, `home/knowledge/<org>/<repo>/context.md` and `flow.md`. The stand runs on the project's own dev recipe — never a production build, never a hand-assembled command when a recipe exists. Before raising anything: `git fetch`; if the branch is behind its base, the proof block says so.
@@ -48,6 +50,7 @@ Print the proof block — every line is a checked fact, not trust:
     builds against linked lib        ✓/✗
     → http://localhost:<port>
   versions agree: lib declares X, app asks ^X
+  <repo>   ready receipt for <sha>  ✓/✗
 ```
 
 Any ✗ — fix the stand first; the engineer's time starts when the block is green.

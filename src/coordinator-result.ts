@@ -1,14 +1,103 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
+import type { ReadyEntry, ReadyReceipt } from "./ready.ts";
+import { requiredJobs, type RequiredJob } from "./required-checks.ts";
 
 export interface CoordinatorOutcome { outcome: "done" | "blocked"; summary: string; reason?: string; passedTickets?: string[] }
 export interface OutcomeVerification { ok: boolean; reason?: string; parts?: string[]; merged?: string[]; remaining?: string[] }
 
 function gh(cwd: string, args: string[]): unknown { return JSON.parse(execFileSync("gh", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })); }
+
+export interface RollupEntry { name?: string; context?: string; workflowName?: string; status?: string; conclusion?: string | null; state?: string }
+export interface GatePrSnapshot { url: string; state: string; headRefName: string; headRefOid: string; baseRefName: string; baseRefOid: string; statusCheckRollup: RollupEntry[] }
+export interface GatePartFacts {
+  repo: string; pr: GatePrSnapshot;
+  localHead: string | null;
+  baseHead: string;
+  baseInHead: boolean;
+  required: RequiredJob[];
+  manifestHash: string | null; lockHash: string | null;
+  receipt: ReadyEntry | null;
+}
+export interface GateFacts { ticket: string; parts: GatePartFacts[] }
+export type GateVerdict = { ok: true; heads: Record<string, string> } | { ok: false; reason: string };
+
+const short = (sha: string | null | undefined) => sha ? sha.slice(0, 7) : "none";
+
+export function verifyGate(facts: GateFacts): GateVerdict {
+  const { ticket } = facts;
+  const heads: Record<string, string> = {};
+  for (const part of facts.parts) {
+    const { repo, pr, receipt } = part;
+    if (pr.state !== "OPEN" || pr.headRefName !== ticket) return { ok: false, reason: `${repo}: PR is not open on ${ticket}` };
+    if (part.localHead === null || part.localHead !== pr.headRefOid) return { ok: false, reason: `${repo}: PR head ${short(pr.headRefOid)} differs from local branch ${ticket} head ${short(part.localHead)}` };
+    if (receipt === null) return { ok: false, reason: `${repo}: no ready receipt — run pnpm ready ${ticket}` };
+    if (receipt.head !== pr.headRefOid) return { ok: false, reason: `${repo}: ready receipt is for ${short(receipt.head)} but the PR head is ${short(pr.headRefOid)} — run pnpm ready ${ticket}` };
+    if (receipt.lockHash !== part.lockHash || receipt.manifestHash !== part.manifestHash) return { ok: false, reason: `${repo}: ready receipt was taken on a lockfile or package.json that differs from the committed head — run pnpm ready ${ticket}` };
+    if (receipt.exit !== 0) return { ok: false, reason: `${repo}: ready receipt records a failed bootstrap (exit ${receipt.exit})` };
+    if (!part.baseInHead) return { ok: false, reason: `${repo}: base ${pr.baseRefName} is at ${short(part.baseHead)} and it is not in the PR head — update from the base` };
+    for (const job of part.required) {
+      const runs = pr.statusCheckRollup.filter((entry) => entry.workflowName === job.workflow && entry.name !== undefined && (entry.name === job.job || entry.name.startsWith(`${job.job} / `) || entry.name.startsWith(`${job.job} (`)));
+      const label = `${repo}: required job ${job.workflow}/${job.job}`;
+      if (runs.length === 0) return { ok: false, reason: `${label} is missing from the PR checks` };
+      if (runs.some((entry) => entry.status !== "COMPLETED")) return { ok: false, reason: `${label} is pending` };
+      const failed = runs.find((entry) => entry.conclusion !== "SUCCESS");
+      if (failed) return { ok: false, reason: `${label} is ${failed.conclusion ?? "without a conclusion"}` };
+    }
+    heads[repo] = pr.headRefOid;
+  }
+  return { ok: true, heads };
+}
+
+function run(cwd: string, file: string, args: string[]): string {
+  return execFileSync(file, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+function blobHash(cwd: string, oid: string, path: string): string | null {
+  try {
+    return createHash("sha256").update(execFileSync("git", ["show", `${oid}:${path}`], { cwd, stdio: ["ignore", "pipe", "pipe"] })).digest("hex");
+  } catch { return null; }
+}
+
+function readReceipt(root: string, ticket: string): ReadyReceipt | null {
+  try { return JSON.parse(readFileSync(join(root, "work", ticket, "ready.json"), "utf8")) as ReadyReceipt; } catch { return null; }
+}
+
+export function gatherGateFacts(root: string, ticket: string, parts: { repo: string; selector: string }[]): GateFacts {
+  const receipts = readReceipt(root, ticket);
+  return {
+    ticket,
+    parts: parts.map(({ repo, selector }) => {
+      const worktree = join(root, "work", ticket, repo.split("/")[1]!);
+      if (!existsSync(worktree)) throw new Error(`${repo}: no worktree ${worktree}`);
+      const pr = JSON.parse(run(worktree, "gh", ["pr", "view", selector, "--json", "url,state,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup"])) as GatePrSnapshot;
+      pr.statusCheckRollup ??= [];
+      let localHead: string | null;
+      try { localHead = run(worktree, "git", ["rev-parse", "--verify", "--quiet", `refs/heads/${ticket}`]).trim() || null; } catch { localHead = null; }
+      const baseHead = run(worktree, "git", ["ls-remote", "origin", `refs/heads/${pr.baseRefName}`]).split(/\s/)[0] ?? "";
+      let baseInHead: boolean;
+      try { run(worktree, "git", ["merge-base", "--is-ancestor", baseHead, pr.headRefOid]); baseInHead = baseHead !== ""; } catch { baseInHead = false; }
+      let listing: string;
+      try { listing = run(worktree, "git", ["ls-tree", "--name-only", pr.headRefOid, ".github/workflows/"]); } catch { listing = ""; }
+      const files = listing.split("\n")
+        .filter((path) => /\.ya?ml$/.test(path))
+        .map((path) => ({ path, text: run(worktree, "git", ["show", `${pr.headRefOid}:${path}`]) }));
+      const receipt = receipts?.parts?.[repo] ?? null;
+      return {
+        repo, pr, localHead, baseHead, baseInHead,
+        required: requiredJobs(files),
+        manifestHash: blobHash(worktree, pr.headRefOid, "package.json"),
+        lockHash: receipt ? blobHash(worktree, pr.headRefOid, receipt.lockfile) : null,
+        receipt,
+      };
+    }),
+  };
+}
 
 export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordinator, outcome: CoordinatorOutcome, pending = 0): OutcomeVerification {
   if (outcome.outcome === "blocked") return { ok: true, reason: outcome.reason || "blocked", remaining: prepared.tickets.filter((ticket) => existsSync(join(root, "work", ticket))) };
@@ -24,25 +113,23 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
       for (const expected of prepared.parts) {
         const row = rows.find((part) => part.repo === expected.repo && part.branch === ticket);
         if (!row?.pr) return { ok: false, reason: `missing recorded part ${expected.repo}` };
-        const pr = gh(expected.path, ["pr", "view", row.pr, "--json", "state,headRefName,statusCheckRollup"] ) as { state: string; headRefName: string; statusCheckRollup?: { conclusion?: string | null }[] };
-        if (pr.state !== "OPEN" || pr.headRefName !== ticket) return { ok: false, reason: `${expected.repo} PR is not open on ${ticket}` };
-        const checks = pr.statusCheckRollup ?? [];
-        if (checks.length === 0 || checks.some((check) => check.conclusion !== "SUCCESS" && check.conclusion !== "SKIPPED")) return { ok: false, reason: `${expected.repo} has pending or red PR checks` };
       }
+      const verdict = verifyGate(gatherGateFacts(root, ticket, rows.map((row) => ({ repo: row.repo, selector: row.pr }))));
+      if (!verdict.ok) return { ok: false, reason: verdict.reason };
       return { ok: true, parts: rows.map((row) => row.repo) };
     }
     const merged: string[] = [];
     const remaining: string[] = [];
     for (const part of prepared.parts) {
       if (!part.pr) return { ok: false, reason: `missing PR snapshot for ${part.repo}` };
-      const pr = gh(part.path, ["pr", "view", part.pr, "--json", "state,mergedAt,headRefName,url"]) as { state: string; mergedAt?: string; headRefName: string; url: string };
+      const pr = gh(root, ["pr", "view", part.pr, "--json", "state,mergedAt,headRefName,url"]) as { state: string; mergedAt?: string; headRefName: string; url: string };
       if (pr.state !== "MERGED" || !pr.mergedAt || pr.headRefName !== part.branch) return { ok: false, reason: `${part.repo} is not merged` };
       merged.push(pr.url);
     }
     for (const ticket of prepared.tickets) if (existsSync(join(root, "work", ticket))) remaining.push(ticket);
     if (remaining.length) return { ok: false, reason: `task folders remain: ${remaining.join(", ")}`, merged, remaining };
     const journalDir = join(dataRoot(root), "journal");
-    const lines = existsSync(journalDir) ? readdirSync(journalDir).filter((name) => /^\\d{4}-\\d{2}\\.md$/.test(name)).map((name) => readFileSync(join(journalDir, name), "utf8")).join("\n") : "";
+    const lines = existsSync(journalDir) ? readdirSync(journalDir).filter((name) => /^\d{4}-\d{2}\.md$/.test(name)).map((name) => readFileSync(join(journalDir, name), "utf8")).join("\n") : "";
     const missing = prepared.tickets.filter((ticket) => !new RegExp(`^\\- \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} ${ticket} отгружено(?:$|:)`, "m").test(lines));
     return missing.length ? { ok: false, reason: `missing shipped journal lines: ${missing.join(", ")}`, merged, remaining } : { ok: true, merged, remaining };
   } catch (error) { return { ok: false, reason: (error as Error).message }; }
