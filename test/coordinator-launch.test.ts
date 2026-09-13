@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
@@ -39,6 +41,45 @@ test("do preparation preserves an explicit model without a thinking setting", ()
     const settings = JSON.parse(readFileSync(join(prepared.cwd, ".pi", "settings.json"), "utf8"));
     assert.equal("thinkingLevel" in settings, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("failed coordinator starts release duplicate reservations and capacity before retry", async () => {
+  const source = join(import.meta.dirname, "..");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "coordinator-start-"));
+  const previous = { ...process.env };
+  delete process.env.YOKEMATE_MODE;
+  delete process.env.YOKEMATE_ROLE;
+  try {
+    cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    const agentDir = join(dir, "agent");
+    const loader = new DefaultResourceLoader({
+      cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir),
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")],
+    });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const reports: unknown[] = [];
+    loaded.runtime.sendMessage = (message) => { reports.push(message); };
+    const tool = loaded.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "subagent");
+    assert.ok(tool);
+    const ctx = { cwd: dir, mode: "rpc", hasUI: true, ui: { setWidget: () => undefined } } as unknown as ExtensionContext;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const result: AgentToolResult<unknown> = await tool.definition.execute(`retry-${attempt}`, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      assert.equal("isError" in result && result.isError, true);
+      const text = result.content[0];
+      assert.ok(text?.type === "text");
+      assert.match(text.text, /plan not found:/);
+      assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
+    }
+    assert.deepEqual(reports, []);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("coordinator requests reject malformed keys, duplicate batches and multi-ticket do", () => {

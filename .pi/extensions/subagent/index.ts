@@ -730,12 +730,27 @@ export default function (pi: ExtensionAPI) {
 		let run: CoordinatorRun | undefined;
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
 		let reportBlocked: ((reason: string) => void) | undefined;
+		let cleanupReservation: ((reason: string) => Promise<void>) | undefined;
 		const finishCalls = new Set<string>();
 		try {
 			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorUnits.add(ownedRun.identity.runId);
+			let cleanup: Promise<void> | undefined;
+			cleanupReservation = (reason) => cleanup ??= (async () => {
+				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
+				uiAbortByRun.delete(ownedRun.identity.runId);
+				untrackRunning(rpc?.process);
+				coordinatorChildren.delete(ownedRun.identity.runId);
+				await rpc?.stop();
+				if (reportBlocked) reportBlocked(reason);
+				else {
+					coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
+					releaseCoordinatorUnit(ownedRun.identity.runId);
+				}
+				rpcByRun.delete(ownedRun.identity.runId);
+			})();
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
@@ -834,12 +849,8 @@ export default function (pi: ExtensionAPI) {
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
-			if (run) {
-				uiAbortByRun.get(run.identity.runId)?.abort();
-				uiAbortByRun.delete(run.identity.runId);
-				await rpc?.stop();
-				reportBlocked?.((error as Error).message);
-			} else activeUnits -= 1;
+			if (cleanupReservation) await cleanupReservation((error as Error).message);
+			else activeUnits -= 1;
 			throw error;
 		}
 	};
