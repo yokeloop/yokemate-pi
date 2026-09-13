@@ -719,6 +719,10 @@ test("do prompt preserves its key through where", async () => {
   assert.match(expanded, /Do not pass top-level `agent` or `task`/);
   assert.match(expanded, /Omit `plan` and `model` unless their literal values appear in the entered command/);
   assert.match(expanded, /Never use words from these instructions as parameter values/);
+  assert.match(expanded, /Entered command: `\/do YM-1`/);
+  const explicit = promptTemplates.expandPromptTemplate("/do YM-1 --plan /tmp/explicit-plan.md --model test/explicit-model", templates);
+  assert.match(explicit, /Entered command: `\/do YM-1 --plan \/tmp\/explicit-plan\.md --model test\/explicit-model`/);
+  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \["YM-1"\] \}/);
   assert.ok(where);
   const args = where.split(/\s+/).slice(3);
   const run = (env: Record<string, string>) => spawnSync(
