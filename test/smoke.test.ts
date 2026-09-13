@@ -710,6 +710,25 @@ test("ship prompt preserves single and batch arguments through where", async () 
   );
 });
 
+test("plan prompt preserves several keys", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({
+    cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts", "plan.md")], includeDefaults: false,
+  });
+  for (const keys of [["YM-1"], ["YM-1", "YM-2"]]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/plan ${keys.join(" ")}`, templates);
+    assert.ok(expanded.includes(`Ticket or problem: ${keys.join(" ")}`));
+    assert.ok(expanded.includes(".pi/skills/plan/SKILL.md"));
+  }
+  const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
+  assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
+  assert.ok(skill.includes("pnpm where plan [KEY …]"));
+});
+
 test("do prompt preserves its keys through where", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");
