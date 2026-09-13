@@ -86,6 +86,8 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   let stderr = "";
   let buffer = "";
   let closed = false;
+  let stopping = false;
+  let stopPromise: Promise<void> | undefined;
   let terminal = false;
   let blocked = false;
   let commandsAck = false;
@@ -105,9 +107,17 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     pending.clear();
     callbacks.onBlocked?.(reason);
   };
-  const send = (command: Record<string, unknown>) => {
-    if (closed || !child.stdin?.writable) throw new Error("coordinator RPC is not running");
+  child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+    if (stopping && error.code === "EPIPE") return;
+    fail(`coordinator RPC stdin: ${error.message}`);
+  });
+  const write = (command: Record<string, unknown>) => {
+    if (closed || !child.stdin.writable) throw new Error("coordinator RPC is not running");
     child.stdin.write(JSON.stringify(command) + "\n");
+  };
+  const send = (command: Record<string, unknown>) => {
+    if (stopping) throw new Error("coordinator RPC is stopping");
+    write(command);
   };
   const request = (command: Record<string, unknown>) => new Promise<RpcEvent>((resolve, reject) => {
     const id = typeof command.id === "string" ? command.id : `${identity.runId}:${Math.random().toString(36).slice(2)}`;
@@ -119,7 +129,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (commandsAck && readyAck && readyMessage && stateAck && !blocked) { clearTimeout(readyTimer); readyResolve(); }
   };
   const emit = (line: string) => {
-    if (!line) return;
+    if (!line || stopping) return;
     let event: RpcEvent;
     try {
       const parsed: unknown = JSON.parse(line);
@@ -171,22 +181,32 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
       if (messageDetails.ok === true) { readyMessage = true; maybeReady(); }
       else fail("coordinator ready handshake failed");
     }
-    if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, send);
+    if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, (response) => { if (!stopping && !closed) send(response); });
     callbacks.onEvent?.(event);
   };
   const decoder = new StringDecoder("utf8");
   child.stdout.on("data", (chunk: Buffer) => { buffer += decoder.write(chunk); for (;;) { const newline = buffer.indexOf("\n"); if (newline < 0) break; const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); emit(line.endsWith("\r") ? line.slice(0, -1) : line); } });
   child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString("utf8"); log?.(text); stderr = cap(stderr + text); });
-  child.on("close", (code, signal) => { closed = true; log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); buffer += decoder.end(); if (buffer.trim()) fail("RPC EOF in JSONL record"); else if (!terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); });
+  child.on("close", (code, signal) => { closed = true; log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); buffer += decoder.end(); if (!stopping && buffer.trim()) fail("RPC EOF in JSONL record"); else if (!stopping && !terminal && !blocked) fail(`coordinator RPC exited without outcome${stderr ? `: ${stderr.split("\n").at(-1)}` : ""}`); });
   child.on("error", (error) => fail(error.message));
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
-  const stop = () => new Promise<void>((resolve) => {
+  const stop = () => stopPromise ??= new Promise<void>((resolve) => {
+    stopping = true;
+    clearTimeout(readyTimer);
+    const error = new Error("coordinator RPC stopped");
+    readyReject(error);
+    for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(error); }
+    pending.clear();
     captureOwned();
     if (liveOwned().length === 0) return resolve();
     const grace = options.stopGraceMs ?? 5000;
     let settled = false;
     const finish = () => { if (!settled) { settled = true; resolve(); } };
-    try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
+    for (const type of ["clear_queue", "abort_retry", "abort", "abort_bash"]) {
+      if (closed || !child.stdin.writable) break;
+      try { write({ type }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPIPE") fail(`coordinator RPC stop: ${(error as Error).message}`); break; }
+    }
     const waitForOwnedExit = (deadline: number) => {
       if (liveOwned().length === 0 || Date.now() >= deadline) return finish();
       setTimeout(() => waitForOwnedExit(deadline), 10);

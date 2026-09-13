@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { ChildProcess } from "node:child_process";
+import { errorMonitor } from "node:events";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdtempSync } from "node:fs";
@@ -108,6 +109,81 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
   assert.throws(() => process.kill(grandchildPid!, 0));
   assert.equal(rpc.hasLiveDescendants(), false);
   assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
+});
+
+test("RPC stop absorbs expected EPIPE and resolves", async () => {
+  let stdinClosed!: () => void;
+  const closed = new Promise<void>((resolve) => { stdinClosed = resolve; });
+  const blocked: string[] = [];
+  const pipeErrors: string[] = [];
+  const rpc = startCoordinatorRpc(prepared, identity, expected, {
+    onEvent(event) { if (event.type === "stdin_closed") stdinClosed(); },
+    onBlocked(reason) { blocked.push(reason); },
+  }, {
+    invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture, "closed-stdin"] },
+    readyTimeoutMs: 1000,
+    stopGraceMs: 100,
+  });
+  rpc.process.stdin!.on(errorMonitor, (error: NodeJS.ErrnoException) => { pipeErrors.push(error.code!); });
+  try {
+    await rpc.ready;
+    rpc.send({ type: "close_stdin" });
+    await closed;
+    const stopping = rpc.stop();
+    assert.equal(rpc.stop(), stopping);
+    await stopping;
+    assert.deepEqual(pipeErrors, ["EPIPE"]);
+    assert.deepEqual(blocked, []);
+    assert.throws(() => process.kill(rpc.process.pid!, 0));
+    assert.equal(rpc.hasLiveDescendants(), false);
+  } finally {
+    await rpc.stop();
+  }
+});
+
+test("RPC stdin errors remain blocking outside expected stop EPIPE", async () => {
+  for (const duringStop of [false, true]) {
+    const blocked: string[] = [];
+    const rpc = startCoordinatorRpc(prepared, identity, expected, {
+      onBlocked(reason) { blocked.push(reason); },
+    }, {
+      invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture] },
+      readyTimeoutMs: 1000, stopGraceMs: 100,
+    });
+    try {
+      await rpc.ready;
+      const stopping = duringStop ? rpc.stop() : undefined;
+      const error = Object.assign(new Error(duringStop ? "unexpected stdin failure" : "write EPIPE"), { code: duringStop ? "EIO" : "EPIPE" });
+      rpc.process.stdin!.emit("error", error);
+      assert.deepEqual(blocked, [`coordinator RPC stdin: ${error.message}`]);
+      await stopping;
+    } finally {
+      await rpc.stop();
+    }
+  }
+});
+
+test("RPC ignores delayed UI replies after stop begins", async (t) => {
+  let reply: ((response: Record<string, unknown>) => void) | undefined;
+  const rpc = startCoordinatorRpc(prepared, identity, expected, {
+    onUiRequest(_event, respond) { reply = respond; },
+  }, {
+    invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture] },
+    readyTimeoutMs: 1000, stopGraceMs: 100,
+  });
+  try {
+    await rpc.ready;
+    await rpc.request({ type: "prompt", message: "work" });
+    assert.ok(reply);
+    const writes = t.mock.method(rpc.process.stdin!, "write");
+    const stopping = rpc.stop();
+    const count = writes.mock.callCount();
+    reply({ type: "extension_ui_response", id: "w1", cancelled: true });
+    assert.equal(writes.mock.callCount(), count);
+    await stopping;
+  } finally {
+    await rpc.stop();
+  }
 });
 
 test("coordinator invocation keeps a session under the task folder", () => {

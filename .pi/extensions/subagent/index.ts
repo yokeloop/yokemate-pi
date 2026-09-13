@@ -702,6 +702,20 @@ export default function (pi: ExtensionAPI) {
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
+	const cancelCoordinator = async (runId: string) => {
+		const run = coordinators.get(runId);
+		if (!run) throw new Error(`unknown coordinator run ${runId}`);
+		coordinators.finalize(runId, "blocked", "cancelled");
+		releaseCoordinatorUnit(runId);
+		uiAbortByRun.get(runId)?.abort();
+		uiAbortByRun.delete(runId);
+		const rpc = rpcByRun.get(runId);
+		untrackRunning(rpc?.process);
+		coordinatorChildren.delete(runId);
+		await rpc?.stop();
+		rpcByRun.delete(runId);
+		return run;
+	};
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
 	pi.on("input", (event, ctx) => {
@@ -875,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 					const run = coordinators.get(runId);
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); untrackRunning(rpcByRun.get(run.identity.runId)?.process); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
+				cancel: async (runId, _origin) => { await cancelCoordinator(runId); },
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -1007,7 +1021,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); untrackRunning(rpcByRun.get(run.identity.runId)?.process); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = await cancelCoordinator(params.cancelRun); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {
