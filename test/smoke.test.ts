@@ -800,7 +800,28 @@ test("a ticketless mode takes the first free name in its series", () => {
 // pane, the pane does the work. Only the env stamp tells them apart — cwd
 // cannot, because review, ship and worklog run from the root the main chat already
 // sits in.
-test("a mode skill knows whether to launch the pane or do the work", () => {
+test("a mode skill knows whether to launch the pane or do the work", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const run = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", ...args],
+    { cwd: join(import.meta.dirname, ".."), env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  for (const mode of ["do", "plan"]) {
+    const launch = run([mode, "YM-1", "YM-2"]);
+    assert.equal(launch.status, 0, launch.stderr);
+    assert.equal(launch.stdout.trim(), "launch");
+    const refused = run([mode, "YM-1", "YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stdout, /^refuse: /);
+    const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+    assert.equal(own.status, 0);
+    assert.equal(own.stdout.trim(), "run");
+  }
+  const invalid = run(["do", "YM-1", "not-a-key"]);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /usage: where do .*not-a-key/);
+  const problem = run(["plan", "fix", "the", "problem"], { YOKEMATE_MODE: "plan" });
+  assert.equal(problem.status, 0);
+  assert.equal(problem.stdout.trim(), "run");
   // Main chat: nobody stamped it — with or without a key.
   assert.deepEqual(decide({}, "review", "ACME-342"), { kind: "launch" });
   assert.deepEqual(decide({}, "plan"), { kind: "launch" });
