@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { ChildProcess } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdtempSync } from "node:fs";
@@ -91,6 +92,9 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
     await rpc.ready;
     const accepted = await rpc.request({ id: "run-1:work", type: "prompt", message: "work" });
     assert.equal(accepted.success, true);
+    assert.ok(rpc.process instanceof ChildProcess);
+    const runningAgents = new Map<ChildProcess, string>([[rpc.process, "do YM-1"]]);
+    assert.equal(runningAgents.get(rpc.process), "do YM-1");
     await Promise.race([nested, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("fixture did not deliver its delayed nested report")), 1000))]);
     assert.equal(rpc.process.exitCode, null);
     assert.ok(grandchildPid);

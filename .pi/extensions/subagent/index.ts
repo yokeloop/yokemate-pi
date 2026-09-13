@@ -742,6 +742,7 @@ export default function (pi: ExtensionAPI) {
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+				untrackRunning(rpc?.process);
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
@@ -774,6 +775,7 @@ export default function (pi: ExtensionAPI) {
 				releaseCoordinatorUnit(ownedRun.identity.runId);
 				pi.appendEntry("yokemate-coordinator-run", { identity: ownedRun.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${ownedRun.identity.mode} ${ownedRun.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: ownedRun.identity.runId, mode: ownedRun.identity.mode, tickets: ownedRun.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+				untrackRunning(rpc?.process);
 				void rpcByRun.get(ownedRun.identity.runId)?.stop(); rpcByRun.delete(ownedRun.identity.runId);
 			}, onUiRequest: (event, reply) => {
 				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
@@ -802,8 +804,14 @@ export default function (pi: ExtensionAPI) {
 			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
 			coordinators.attachProcess(ownedRun.identity.runId, rpc.process);
+			const { mode, tickets } = prepared;
+			const plan = mode === "do" ? prepared.plans[tickets[0]!] : undefined;
+			const heading = plan ? fs.readFileSync(plan, "utf8").split(/\r?\n/, 1)[0]! : "";
+			const prefix = `# ${tickets[0]} — `;
+			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
+			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
 			if (run) {
@@ -836,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 					const run = coordinators.get(runId);
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
+				cancel: async (runId, _origin) => { const run = coordinators.cancel(runId); untrackRunning(rpcByRun.get(run.identity.runId)?.process); await rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); },
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -944,6 +952,7 @@ export default function (pi: ExtensionAPI) {
 			coordinators.finalize(runId, params.outcome, params.reason);
 			pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: params.outcome, verification, summary: params.summary, reason: params.reason });
 			pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${params.outcome}: ${params.summary}`, display: true, details: { runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: params.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+			untrackRunning(rpcByRun.get(runId)?.process);
 			void rpcByRun.get(runId)?.stop();
 			rpcByRun.delete(runId);
 			return { content: [{ type: "text", text: `${params.outcome} verified` }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, verification }, terminate: true };
@@ -966,7 +975,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = coordinators.cancel(params.cancelRun); uiAbortByRun.get(run.identity.runId)?.abort(); uiAbortByRun.delete(run.identity.runId); untrackRunning(rpcByRun.get(run.identity.runId)?.process); void rpcByRun.get(run.identity.runId)?.stop(); rpcByRun.delete(run.identity.runId); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {
