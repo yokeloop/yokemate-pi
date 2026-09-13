@@ -19,7 +19,7 @@ import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
 import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
 import { decide } from "../src/mode-guard.ts";
-import { parseShipArgs } from "../src/ship-args.ts";
+import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
 import { resolveGuardPolicy } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
@@ -591,6 +591,15 @@ test("note splits at the root with the topic in the worker prompt", () => {
 });
 
 test("ship argument parser preserves launcher semantics", () => {
+  for (const [words, joined, expected] of [
+    [["YM-199", "YM-198", "YM-197"], false, { keys: ["YM-199", "YM-198", "YM-197"], tail: [] }],
+    [["YM-199", "note", "YM-198", "--model", "terra", "later"], false, { keys: ["YM-199", "YM-198"], tail: ["note", "--model", "terra", "later"] }],
+    [["YM-199", "--model", "terra", "YM-198"], false, { keys: ["YM-199"], tail: ["--model", "terra", "YM-198"] }],
+    [["YM-199", "YM-199"], false, { keys: ["YM-199", "YM-199"], tail: [] }],
+    [["note", "--model", "terra"], false, { keys: [], tail: ["note", "--model", "terra"] }],
+    [["YM-199+YM-198"], true, { keys: ["YM-199", "YM-198"], tail: [] }],
+    [["YM-199+YM-198"], false, { keys: [], tail: ["YM-199+YM-198"] }],
+  ] as const) assert.deepEqual(parseKeyList(words, joined), expected);
   assert.deepEqual(parseShipArgs(["YM-199", "YM-198", "YM-197"]), {
     ticket: "YM-199+YM-198+YM-197",
     tail: [],
