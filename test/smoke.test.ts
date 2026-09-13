@@ -753,6 +753,35 @@ test("do prompt preserves its keys through where", async () => {
   const explicit = promptTemplates.expandPromptTemplate("/do YM-1 --plan /tmp/explicit-plan.md --model test/explicit-model", templates);
   assert.match(explicit, /Entered command: `\/do YM-1 --plan \/tmp\/explicit-plan\.md --model test\/explicit-model`/);
   assert.match(explicit, /coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
+  const runWhere = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "do", ...args],
+    { cwd: root, env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  const malformed = promptTemplates.expandPromptTemplate("/do YM-1 not-a-key YM-2", templates);
+  const malformedArgs = malformed.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/);
+  const usage = runWhere(malformedArgs);
+  assert.equal(usage.status, 1);
+  assert.match(usage.stderr, /unexpected not-a-key/);
+  assert.ok(malformed.includes("**usage: … unexpected WORD**"));
+  assert.ok(malformed.includes("Do not discard malformed candidates from the eventual tool request."));
+  const remainingKeys = parseKeyList(malformedArgs).keys;
+  assert.deepEqual(remainingKeys, ["YM-1", "YM-2"]);
+  const recovered = runWhere(remainingKeys);
+  assert.equal(recovered.status, 0);
+  assert.equal(recovered.stdout.trim(), "launch");
+  const stampedRecovery = runWhere(remainingKeys, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" });
+  assert.equal(stampedRecovery.status, 1);
+  assert.match(stampedRecovery.stdout, /^refuse:/);
+  for (const command of ["/do YM-1 на gpt-6-astra", "/do YM-1 запусти на gpt-6-astra, задача сложная", "/do YM-1 --model gpt-6-astra", "/do YM-1 --plan /tmp/explicit-plan.md"]) {
+    const named = promptTemplates.expandPromptTemplate(command, templates);
+    assert.ok(named.includes(`Entered command: \`${command}\``));
+    assert.ok(named.includes("first separate that value and its surrounding instruction words from the ticket candidates"));
+    assert.ok(named.includes("Never interpret these model/plan instructions as malformed keys."));
+    const normalizedWhere = named.match(/check `([^`]+)`/)![1];
+    assert.equal(normalizedWhere, "pnpm where do YM-1");
+    const namedLaunch = runWhere(normalizedWhere.split(/\s+/).slice(3));
+    assert.equal(namedLaunch.status, 0);
+    assert.equal(namedLaunch.stdout.trim(), "launch");
+  }
   const batch = promptTemplates.expandPromptTemplate("/do YM-1 YM-2", templates);
   assert.match(batch, /pnpm where do YM-1 YM-2/);
   assert.match(batch, /Entered command: `\/do YM-1 YM-2`/);

@@ -71,6 +71,21 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     loaded.runtime.appendEntry = () => undefined;
     const tool = loaded.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "subagent");
     assert.ok(tool);
+    const render = tool.definition.renderResult!;
+    const renderTheme = {} as Parameters<typeof render>[2];
+    for (const rows of [
+      ["accepted run-1, model test/model, cwd /one", "accepted run-2, model test/model, cwd /two"],
+      ["refused bad: invalid ticket key", "accepted run-2, model test/model, cwd /two"],
+      ["refused bad: invalid ticket key", "refused worse: invalid ticket key"],
+    ]) {
+      const runs = rows.filter((row) => row.startsWith("accepted")).map((row) => ({ ticket: "YM-1", runId: row.split(" ")[1] }));
+      const result = { content: rows.map((text) => ({ type: "text" as const, text })), details: { runs } };
+      for (const expanded of [false, true]) {
+        const rendered = render(result, { expanded, isPartial: false }, renderTheme, {} as Parameters<typeof render>[3]);
+        const text = rendered.render(200).join("\n");
+        for (const row of rows) assert.ok(text.includes(row), text);
+      }
+    }
     const widgets: unknown[] = [];
     const ctx = {
       cwd: dir, mode: "rpc", hasUI: true,

@@ -1387,9 +1387,9 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, { expanded }, theme, _context) {
 			const details = result.details as SubagentDetails | undefined;
-			if (!details || details.results.length === 0) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			if (!details?.results?.length) {
+				const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+				return new Text(text || "(no output)", 0, 0);
 			}
 
 			const mdTheme = getMarkdownTheme();
