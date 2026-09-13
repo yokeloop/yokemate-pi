@@ -710,7 +710,7 @@ test("ship prompt preserves single and batch arguments through where", async () 
   );
 });
 
-test("do prompt preserves its key through where", async () => {
+test("do prompt preserves its keys through where", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
@@ -724,14 +724,19 @@ test("do prompt preserves its key through where", async () => {
   });
   const expanded = promptTemplates.expandPromptTemplate("/do YM-1", templates);
   const where = expanded.match(/pnpm where do(?: [^`\n]*)?/)?.[0];
-  assert.match(expanded, /subagent.*coordinator: \{ mode: "do", tickets: \["YM-1"\] \}/);
+  assert.match(expanded, /subagent.*coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
   assert.match(expanded, /Do not pass top-level `agent` or `task`/);
   assert.match(expanded, /Omit `plan` and `model` unless their literal values appear in the entered command/);
   assert.match(expanded, /Never use words from these instructions as parameter values/);
   assert.match(expanded, /Entered command: `\/do YM-1`/);
   const explicit = promptTemplates.expandPromptTemplate("/do YM-1 --plan /tmp/explicit-plan.md --model test/explicit-model", templates);
   assert.match(explicit, /Entered command: `\/do YM-1 --plan \/tmp\/explicit-plan\.md --model test\/explicit-model`/);
-  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \["YM-1"\] \}/);
+  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
+  const batch = promptTemplates.expandPromptTemplate("/do YM-1 YM-2", templates);
+  assert.match(batch, /pnpm where do YM-1 YM-2/);
+  assert.match(batch, /Entered command: `\/do YM-1 YM-2`/);
+  assert.match(batch, /tickets: \[ordered engineer keys\]/);
+  assert.deepEqual(parseKeyList(batch.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/)).keys, ["YM-1", "YM-2"]);
   assert.ok(where);
   const args = where.split(/\s+/).slice(3);
   const run = (env: Record<string, string>) => spawnSync(

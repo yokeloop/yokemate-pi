@@ -30,7 +30,7 @@ import {
 import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
+import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
 import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
@@ -726,7 +726,7 @@ export default function (pi: ExtensionAPI) {
 			if (tickets.length) shipPermits.observeInteractiveShip(tickets, (ctx as any).sessionManager?.getSessionId?.() ?? "main");
 		} else shipPermits.invalidate();
 	});
-	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 		const checks = legacyCoordinatorChecks(loadLimits(root).maxDetached);
 		validateCoordinatorRequest(request);
@@ -867,6 +867,24 @@ export default function (pi: ExtensionAPI) {
 			else activeUnits -= 1;
 			throw error;
 		}
+	};
+	const startCoordinator = async (...[request, ctx, origin]: Parameters<typeof startOneCoordinator>) => {
+		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin);
+		const content: { type: "text"; text: string }[] = [];
+		const runs: { ticket: string; runId: string }[] = [];
+		let first: Awaited<ReturnType<typeof startOneCoordinator>>["details"] | undefined;
+		for (const part of splitDoRequest(request)) {
+			const ticket = part.tickets[0]!;
+			try {
+				const result = await startOneCoordinator(part, ctx, origin);
+				content.push(...result.content as { type: "text"; text: string }[]);
+				runs.push({ ticket, runId: result.details.runId });
+				first ??= result.details;
+			} catch (error) {
+				content.push({ type: "text", text: `refused ${ticket}: ${(error as Error).message}` });
+			}
+		}
+		return { content, details: { ...first, runs }, isError: runs.length === 0 };
 	};
 	pi.on("session_start", (_event, ctx) => {
 		latestCtx = ctx;

@@ -1,3 +1,7 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { once } from "node:events";
+import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -6,7 +10,7 @@ import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
-import { markDoRunning, prepareDo, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
+import { markDoRunning, prepareDo, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
 
 function root(): string {
   const root = mkdtempSync(join(tmpdir(), "coordinator-launch-"));
@@ -90,10 +94,28 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     const plan = join(dir, "recovered-plan.md");
     writeFileSync(plan, "# YM-1 — recovered\n\n## Affected repositories\n- `org/repo` — app\n");
     process.argv[1] = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
-    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["YM-1"], plan } }, undefined, () => undefined, ctx);
+    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"], plan } }, undefined, () => undefined, ctx);
     assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
     const { runId } = accepted.details as { runId: string };
     assert.ok(runId);
+    const { runs } = accepted.details as { runs: { ticket: string; runId: string }[] };
+    assert.deepEqual(runs.map((run) => run.ticket), ["YM-1", "YM-2"]);
+    assert.equal(runId, runs[0].runId);
+    assert.notEqual(runs[0].runId, runs[1].runId);
+    assert.deepEqual(accepted.content.map((part) => part.type === "text" ? part.text.split(",")[0] : ""), [
+      'refused not-a-key: invalid ticket key "not-a-key"', `accepted ${runs[0].runId}`, `accepted ${runs[1].runId}`,
+    ]);
+    const queue = openDb(join(dir, "yokemate.db"));
+    assert.deepEqual(queue.prepare("SELECT ticket, stage FROM work ORDER BY ticket").all().map((row) => ({ ...row })), [
+      { ticket: "YM-1", stage: "running" }, { ticket: "YM-2", stage: "running" },
+    ]);
+    queue.close();
+    const repeated = await tool.definition.execute("repeated", { coordinator: { mode: "do", tickets: ["YM-1", "YM-3"], plan } }, undefined, () => undefined, ctx);
+    assert.equal("isError" in repeated && repeated.isError, false);
+    assert.match((repeated.content[0] as { text: string }).text, /^refused YM-1: .*already runs/);
+    const extra = (repeated.details as { runs: { ticket: string; runId: string }[] }).runs;
+    assert.deepEqual(extra.map((run) => run.ticket), ["YM-3"]);
+    for (const run of [...runs.slice(1), ...extra]) await tool.definition.execute("cancel-sibling", { cancelRun: run.runId }, undefined, () => undefined, ctx);
     const pids = JSON.parse(readFileSync(join(dir, "work", "YM-1", "fixture-pids.json"), "utf8")) as number[];
     try {
       assert.ok(widgets.some((lines) => Array.isArray(lines) && lines.some((line) => /^do YM-1 /.test(line)) && lines.some((line) => /task-reviewer/.test(line))));
@@ -116,8 +138,48 @@ test("failed coordinator starts release duplicate reservations and capacity befo
   }
 });
 
-test("coordinator requests reject malformed keys, duplicate batches and multi-ticket do", () => {
-  assert.throws(() => validateCoordinatorRequest({ mode: "do", tickets: ["YM-1", "YM-2"] }), /exactly one/);
+test("coordinator requests reject malformed keys, duplicate batches and split a do batch per key", () => {
+  const request = { mode: "do" as const, tickets: ["YM-1", "YM-2"], plan: "/plan.md", model: "test/model:high" };
+  assert.doesNotThrow(() => validateCoordinatorRequest(request));
+  assert.deepEqual(splitDoRequest(request), [
+    { ...request, tickets: ["YM-1"] }, { ...request, tickets: ["YM-2"] },
+  ]);
+  assert.deepEqual(request.tickets, ["YM-1", "YM-2"]);
+  const ship = { mode: "ship" as const, tickets: ["YM-2", "YM-1"] };
+  assert.deepEqual(splitDoRequest(ship), [ship]);
+  assert.throws(() => validateCoordinatorRequest({ mode: "do", tickets: ["YM-1", "YM-1"] }), /duplicates/);
+  assert.throws(() => splitDoRequest({ mode: "do", tickets: ["YM-1", "YM-1"] }), /duplicates/);
   assert.throws(() => validateCoordinatorRequest({ mode: "ship", tickets: ["YM-1", "YM-1"] }), /duplicates/);
   assert.throws(() => validateCoordinatorRequest({ mode: "do", tickets: ["../YM-1"] }), /invalid/);
+});
+
+
+test("spawn routes each key independently through its retained parent", async () => {
+  const source = join(import.meta.dirname, "..");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "spawn-batch-"));
+  const requests: unknown[] = [];
+  const parent = bindCoordinatorControl(dir, {
+    launch: async (request) => {
+      requests.push(request);
+      if (request.tickets[0] === "YM-1") throw new Error("already running");
+      return { runId: "fixture-run-2", identity: {} };
+    },
+    status: () => ({ requestId: "unused", state: "refused" }),
+    cancel: async () => {},
+  }, { root: dir, sessionId: "fixture-session", runtimeId: "fixture-runtime", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir });
+  try {
+    await once(parent, "listening");
+    cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
+    const out = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"], {
+      cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "fixture-session" },
+    });
+    assert.deepEqual(out.stdout.trim().split("\n"), ["refused YM-1: already running", "YM-2 → background run fixture-run-2"]);
+    assert.deepEqual(requests, [
+      { mode: "do", tickets: ["YM-1"], plan: "/explicit.md", model: "test/model" },
+      { mode: "do", tickets: ["YM-2"], plan: "/explicit.md", model: "test/model" },
+    ]);
+  } finally {
+    await new Promise<void>((resolve, reject) => parent.close((error) => error ? reject(error) : resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
