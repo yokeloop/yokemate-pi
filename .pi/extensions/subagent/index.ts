@@ -186,7 +186,7 @@ function renderRunningWidget(): void {
 			if (children) childrenByProcess.set(rpc.process, children);
 		}
 		const parts = composeWidgetParts(running, childrenByProcess);
-		if (latestCtx.hasUI) latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
+		if (latestCtx.mode === "tui") latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
 		else latestCtx.ui.setWidget("subagent-running", parts);
 	} catch (e) {
 		console.error(`[subagent] widget not drawn: ${(e as Error)?.message || String(e)}`);
