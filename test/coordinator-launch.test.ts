@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { once } from "node:events";
 import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
@@ -10,7 +10,7 @@ import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
-import { markDoRunning, prepareDo, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
+import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
 
 function root(): string {
   const root = mkdtempSync(join(tmpdir(), "coordinator-launch-"));
@@ -180,6 +180,36 @@ test("spawn routes each key independently through its retained parent", async ()
     ]);
   } finally {
     await new Promise<void>((resolve, reject) => parent.close((error) => error ? reject(error) : resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("ship preparation keeps the ordered batch", async () => {
+  const dir = root();
+  const previousPath = process.env.PATH;
+  try {
+    const shim = join(dir, "shim");
+    mkdirSync(shim);
+    writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf "main\\thttps://github.com/org/repo/pull/%s\\n" "${3#YM-}"\n', { mode: 0o755 });
+    for (const ticket of ["YM-1", "YM-2"]) {
+      const folder = join(dir, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`);
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, `${ticket}-work-plan.md`), `# ${ticket}\n\n## Affected repositories\n- \`org/repo\` — app\n`);
+      const worktree = join(dir, "work", ticket, "repo");
+      mkdirSync(worktree, { recursive: true });
+      execFileSync("git", ["init", "-b", ticket, worktree], { stdio: "pipe" });
+      execFileSync("git", ["-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git"]);
+    }
+    process.env.PATH = `${shim}:${previousPath ?? ""}`;
+    const prepared = await prepareShip(dir, { mode: "ship", tickets: ["YM-2", "YM-1"] });
+    assert.deepEqual(prepared.tickets, ["YM-2", "YM-1"]);
+    assert.deepEqual(Object.keys(prepared.plans), ["YM-2", "YM-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.branch), ["YM-2", "YM-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.pr), ["https://github.com/org/repo/pull/2", "https://github.com/org/repo/pull/1"]);
+    assert.match(prepared.prompt, /^\/skill:ship-worker YM-2\+YM-1\./);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     rmSync(dir, { recursive: true, force: true });
   }
 });

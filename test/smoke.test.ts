@@ -650,17 +650,19 @@ test("ship prompt preserves single and batch arguments through where", async () 
       { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
     );
 
-  for (const keys of [["YM-197"], ["YM-199", "YM-198", "YM-197"]]) {
+  for (const keys of [["YM-197"], ["YM-199", "YM-198"], ["YM-199", "YM-198", "YM-197"]]) {
     const stamp = keys.join("+");
     const expanded = promptTemplates.expandPromptTemplate(`/ship ${keys.join(" ")}`, templates);
     const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
     assert.match(expanded, /subagent.*coordinator/);
+    assert.match(expanded, /tickets: \[ordered engineer keys\]/);
     assert.ok(where);
     const whereArgs = where.split(/\s+/).slice(3);
     const main = runWhere(whereArgs, {});
     assert.equal(main.status, 0, main.stderr);
     assert.equal(main.stdout.trim(), "launch");
     assert.deepEqual(whereArgs, keys);
+    assert.deepEqual(parseKeyList(whereArgs).keys, keys);
 
     const own = runWhere(whereArgs, { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
     assert.equal(own.status, 0, own.stderr);
