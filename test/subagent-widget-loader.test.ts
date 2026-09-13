@@ -11,6 +11,7 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
   const dir = mkdtempSync(join(tmpdir(), "subagent-widget-"));
   const agentDir = join(dir, "agent");
   const script = process.argv[1];
+  const cwd = process.cwd();
   let timer: NodeJS.Timeout | undefined;
   try {
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
@@ -45,6 +46,7 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
         if (content === undefined && widgets.length > 1) cleared();
       } },
     } as ExtensionContext;
+    process.chdir(dir);
     process.argv[1] = join(root, "test", "fixtures", "subagent-widget-child.js");
     const result = await tool.definition.execute("widget-test", { agent: "task-reviewer", task: "review the diff", cwd: dir }, undefined, () => undefined, ctx);
     assert.equal("isError" in result && result.isError, false);
@@ -55,6 +57,7 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
   } finally {
     clearTimeout(timer);
     process.argv[1] = script;
+    process.chdir(cwd);
     rmSync(dir, { recursive: true, force: true });
   }
 });
