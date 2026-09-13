@@ -32,7 +32,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
 import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
-import { taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
+import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
@@ -140,6 +140,8 @@ const batches = new Map<string, Batch>();
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
 const runningAgents = new Map<ChildProcess, { name: string; task: string; startedAt: number }>();
+const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
+const coordinatorChildren = new Map<string, string[]>();
 let widgetTimer: NodeJS.Timeout | undefined;
 // ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
 // пришёл в execute текущего вызова или в turn_start, а не захваченному.
@@ -176,7 +178,14 @@ function renderRunningWidget(): void {
 			latestCtx.ui.setWidget("subagent-running", undefined);
 			return;
 		}
-		const parts = widgetParts(runningAgents.values(), Date.now());
+		const lines = widgetParts(runningAgents.values(), Date.now());
+		const running = Array.from(runningAgents.keys(), (proc, i) => [proc, lines[i]!] as const);
+		const childrenByProcess = new Map<ChildProcess, string[]>();
+		for (const [runId, rpc] of rpcByRun) {
+			const children = coordinatorChildren.get(runId);
+			if (children) childrenByProcess.set(rpc.process, children);
+		}
+		const parts = composeWidgetParts(running, childrenByProcess);
 		if (latestCtx.hasUI) latestCtx.ui.setWidget("subagent-running", () => new RunningAgentsWidget(parts));
 		else latestCtx.ui.setWidget("subagent-running", parts);
 	} catch (e) {
@@ -200,6 +209,9 @@ function trackRunning(proc: ChildProcess, name: string, task: string): void {
 }
 
 function untrackRunning(proc: ChildProcess | undefined): void {
+	for (const [runId, rpc] of rpcByRun) {
+		if (rpc.process === proc) coordinatorChildren.delete(runId);
+	}
 	if (proc) runningAgents.delete(proc);
 	if (runningAgents.size === 0) stopWidgetTimer();
 	renderRunningWidget();
@@ -682,7 +694,6 @@ const SubagentParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
-	const rpcByRun = new Map<string, ReturnType<typeof startCoordinatorRpc>>();
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
 		if (coordinatorUnits.delete(runId)) activeUnits -= 1;
@@ -778,6 +789,15 @@ export default function (pi: ExtensionAPI) {
 				untrackRunning(rpc?.process);
 				void rpcByRun.get(ownedRun.identity.runId)?.stop(); rpcByRun.delete(ownedRun.identity.runId);
 			}, onUiRequest: (event, reply) => {
+				if (event.method === "setWidget" && event.widgetKey === "subagent-running") {
+					if (terminalReported || ["done", "blocked"].includes(ownedRun.state)) return;
+					if (event.widgetLines === undefined) coordinatorChildren.delete(ownedRun.identity.runId);
+					else if (Array.isArray(event.widgetLines) && event.widgetLines.every((line) => typeof line === "string"))
+						coordinatorChildren.set(ownedRun.identity.runId, event.widgetLines);
+					else return;
+					renderRunningWidget();
+					return;
+				}
 				const request = event as { id?: string; method?: string; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string };
 				if (!request.id || !["select", "confirm", "input", "editor"].includes(request.method ?? "")) return;
 				const controller = uiAbortByRun.get(ownedRun.identity.runId) ?? new AbortController();
@@ -873,6 +893,7 @@ export default function (pi: ExtensionAPI) {
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
 		for (const rpc of rpcByRun.values()) void rpc.stop();
 		rpcByRun.clear();
+		coordinatorChildren.clear();
 		for (const proc of detached) {
 			try {
 				proc.kill("SIGTERM");

@@ -16,3 +16,10 @@ export function widgetParts(running: Iterable<{ name: string; task: string; star
       : `${a.name} ${formatElapsed(now - a.startedAt)}`,
   );
 }
+
+export function composeWidgetParts<Process>(running: Iterable<readonly [Process, string]>, childrenByProcess: ReadonlyMap<Process, string[]>): string[] {
+  return Array.from(running).flatMap(([process, part]) => [
+    part,
+    ...(childrenByProcess.get(process) ?? []).map((child) => `↳ ${child}`),
+  ]);
+}

@@ -28,6 +28,7 @@ process.stdin.on("data", (chunk) => {
       send({ type: "message_end", message: { details: { runId, ok: true } } });
     } else if (command.type === "prompt") {
       send({ type: "work_prompt" });
+      send({ type: "extension_ui_request", id: "w1", method: "setWidget", widgetKey: "subagent-running", widgetLines: ["task-reviewer 0:05 review"] });
       send({ type: "response", id: command.id, success: true });
       setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
     } else if (command.type === "abort") {
