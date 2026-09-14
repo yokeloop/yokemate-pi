@@ -13,7 +13,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,9 +32,9 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
-import { CoordinatorRegistry, ShipPermitStore, idleVerdict, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
-import { startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
+import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
@@ -42,7 +43,6 @@ import { researchChildLaunch, researchIdentity } from "../../../src/research-gua
 import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 interface Limits {
 	maxParallelTasks: number;
@@ -54,22 +54,6 @@ const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDeta
 
 const limitsByCwd = new Map<string, Limits>();
 
-function openChildLog(taskRoot: string, agentName: string, runId: string | undefined): ((chunk: string) => void) | undefined {
-	try {
-		const dir = path.join(taskRoot, "logs");
-		fs.mkdirSync(dir, { recursive: true });
-		const file = path.join(dir, `${agentName}-${runId ?? "unknown"}.log`);
-		return (chunk) => {
-			try {
-				fs.appendFileSync(file, chunk);
-			} catch {
-				/* ignore */
-			}
-		};
-	} catch {
-		return undefined;
-	}
-}
 
 function validateLimits(limits: Limits): string | undefined {
 	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
@@ -121,6 +105,8 @@ function loadLimits(cwd: string): Limits {
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
+const cancellationByProcess = new Map<ChildProcess, (initiator: string) => void>();
+const childCompletions = new Map<ChildProcess, Promise<void>>();
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -134,8 +120,7 @@ let shuttingDown = false;
 
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
-type Batch = { total: number; settled: number; outcomes: { agent: string; failed: boolean }[] };
-const batches = new Map<string, Batch>();
+const batches = new Set<string>();
 
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
@@ -329,10 +314,11 @@ interface UsageStats {
 }
 
 interface SingleResult {
+	envelope?: ResultEnvelope;
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
-	exitCode: number;
+	exitCode: number | null;
 	messages: Message[];
 	stderr: string;
 	usage: UsageStats;
@@ -347,22 +333,17 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	batchId?: string;
+	children?: LaunchAck["children"];
 }
 
 function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
+	const last = messages.findLast((message) => message.role === "assistant");
+	return last?.role === "assistant" ? last.content.filter((part) => part.type === "text").map((part) => part.text).join("") : "";
 }
 
 function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return result.envelope ? failedEnvelope(result.envelope) : result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
 
 function getResultOutput(result: SingleResult): string {
@@ -372,16 +353,6 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
 
@@ -462,7 +433,9 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	onSpawn?: (proc: ChildProcess) => void,
+	onSpawn: ((proc: ChildProcess) => void) | undefined,
+	identity: ChildIdentity,
+	diagnostic: { metadata: Record<string, unknown>; save(completed: boolean): void },
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -529,112 +502,84 @@ async function runSingleAgent(
 			args.push("--no-approve", "-e", path.join(root, "src", "guards.ts"), "-e", path.join(root, ".pi", "extensions", "subagent", "index.ts"), "--skill", path.join(root, ".pi", "skills"));
 		}
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const child = research
-				? researchChildLaunch(research, cwd ?? defaultCwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])])
-				: undefined;
-			const env: NodeJS.ProcessEnv = {
-				...process.env,
-				YOKEMATE_ROLE: "executor",
-				YOKEMATE_RUN_ID: randomUUID(),
-				...(process.env.YOKEMATE_RUN_ID ? { YOKEMATE_PARENT_RUN_ID: process.env.YOKEMATE_RUN_ID } : {}),
-				...(child?.env ?? {}),
-			};
-			if (coordinatorChild) {
-				env.YOKEMATE_PARENT_RUN_ID = process.env.YOKEMATE_RUN_ID;
-				env.YOKEMATE_RUN_ID = randomUUID();
-			}
-			delete env.HERDR_PANE_ID;
-			delete env.YOKEMATE_PARENT_PANE;
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: child?.cwd ?? cwd ?? defaultCwd,
-				env,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			onSpawn?.(proc);
-			const log = coordinatorChild ? openChildLog(process.cwd(), agentName, env.YOKEMATE_RUN_ID) : undefined;
-			log?.(`[start ${new Date().toISOString()}] pid=${proc.pid} cwd=${child?.cwd ?? cwd ?? defaultCwd} ${invocation.command} ${invocation.args.join(" ")}\n`);
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+		diagnostic.metadata.launch = fileProvenance(getPiInvocation(args).args[0] ?? process.execPath);
+		diagnostic.metadata.appendedPromptHash = sha256(agent.systemPrompt);
+		diagnostic.metadata.agentDefinition = fileProvenance(agent.filePath);
+		diagnostic.metadata.requested = { model, thinking: inheritsDispatchConfig ? dispatchDefaults.thinkingLevel : "unknown" };
+		let stderrBytes = 0;
+		const stderrHash = createHash("sha256");
+		const observation = new JsonlObservation((event) => {
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				const msg = event.message as Message;
+				currentResult.messages = [msg];
+				if (msg.role === "assistant") {
+					currentResult.stopReason = msg.stopReason;
+					currentResult.model = msg.model;
+					currentResult.usage.turns++;
+					if (msg.usage) {
+						currentResult.usage.input += msg.usage.input || 0;
+						currentResult.usage.output += msg.usage.output || 0;
+						currentResult.usage.cacheRead += msg.usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += msg.usage.cacheWrite || 0;
+						currentResult.usage.cost += msg.usage.cost?.total || 0;
+						currentResult.usage.contextTokens = msg.usage.totalTokens || 0;
 					}
-					emitUpdate();
 				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				log?.(data.toString());
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				log?.(data.toString());
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code, signalName) => {
-				log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signalName}\n`);
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
+				emitUpdate();
 			}
 		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		const refreshObservation = () => {
+			diagnostic.metadata.stream = observation.metadata();
+			diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
+			diagnostic.metadata.sessionId = observation.sessionId;
+			diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
+		};
+		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
+			const invocation = getPiInvocation(args);
+			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
+			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, ...(child?.env ?? {}) };
+			delete env.HERDR_PANE_ID;
+			delete env.YOKEMATE_PARENT_PANE;
+			let spawnError: Error | undefined;
+			let cancelled = false;
+			let killTimer: NodeJS.Timeout | undefined;
+			const proc = spawn(invocation.command, invocation.args, { cwd: child?.cwd ?? identity.cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			diagnostic.metadata.pid = proc.pid;
+			diagnostic.metadata.starttime = proc.pid ? processStarttime(proc.pid) : undefined;
+			diagnostic.metadata.spawnAt = new Date().toISOString();
+			cancellationByProcess.set(proc, (initiator) => {
+				cancelled = true;
+				if (diagnostic.metadata.cancellationInitiator === "unknown") diagnostic.metadata.cancellationInitiator = initiator;
+				refreshObservation();
+				diagnostic.save(false);
+			});
+			diagnostic.save(false);
+			onSpawn?.(proc);
+			const abort = () => {
+				cancellationByProcess.get(proc)?.("tool_abort_signal");
+				proc.kill("SIGTERM");
+				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
+			};
+			proc.stdout.on("data", (data: Buffer) => observation.write(data));
+			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
+			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
+			proc.once("close", (exitCode, signalName) => {
+				clearTimeout(killTimer);
+				signal?.removeEventListener("abort", abort);
+				observation.end();
+				cancellationByProcess.delete(proc);
+				diagnostic.metadata.closeAt = new Date().toISOString();
+				resolve({ exitCode, signal: signalName, processOutcome: cancelled ? "cancelled" : spawnError ? "spawn_error" : signalName ? "signaled" : "exited" });
+			});
+			if (signal?.aborted) abort();
+			else signal?.addEventListener("abort", abort, { once: true });
+		});
+		currentResult.exitCode = terminal.exitCode;
+		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
+		refreshObservation();
+		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
+		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.save(true);
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -652,15 +597,19 @@ async function runSingleAgent(
 	}
 }
 
+const ReviewRevisionSchema = Type.Object({ baseSha: Type.String(), headSha: Type.String() });
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
+	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -678,6 +627,7 @@ const CoordinatorRequestSchema = Type.Object({
 });
 
 const SubagentParams = Type.Object({
+	review: Type.Optional(ReviewRevisionSchema),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
 	cancelRun: Type.Optional(Type.String()),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
@@ -692,6 +642,40 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	let runs: ChildRuns | undefined;
+	let snapshots: RunSnapshots | undefined;
+	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
+	const sentBatches = new Set<string>();
+	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
+	let childSequence = 0;
+	const emitChildState = () => {
+		if (!runs) return;
+		pi.appendEntry("yokemate-child-state", { version: 1, ownerRunId: runs.ownerRunId, ownerSessionId: runs.ownerSessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", sequence: ++childSequence, children: runs.active(), deliveries: [...deliveries.values()].map(({ delivery }) => ({ ...delivery })) });
+	};
+	pi.on("context", (event) => {
+		let changed = false;
+		for (const message of event.messages) {
+			if (message.role !== "custom" || message.customType !== "subagent-report") continue;
+			for (const { delivery, envelope } of deliveries.values()) {
+				if (delivery.state === "observed" || message.content !== reportContent(envelope, delivery)) continue;
+				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
+				if (details?.deliveryId !== delivery.deliveryId || details.envelopeHash !== delivery.envelopeHash) continue;
+				delivery.state = "observed";
+				for (const runId of delivery.runIds) {
+					const diagnostic = diagnostics.get(runId);
+					if (diagnostic) {
+						const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+						states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, observedAt: new Date().toISOString() };
+						diagnostic.metadata.deliveries = states;
+						diagnostic.save(true);
+					}
+				}
+				changed = true;
+			}
+		}
+		if (changed) emitChildState();
+	});
+	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
 	const coordinatorUnits = new Set<string>();
@@ -702,7 +686,7 @@ export default function (pi: ExtensionAPI) {
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
-	const cancelCoordinator = async (runId: string) => {
+	const cancelCoordinator = async (runId: string, reason: "parent_control_cancel" | "parent_cancel_run") => {
 		const run = coordinators.get(runId);
 		if (!run) throw new Error(`unknown coordinator run ${runId}`);
 		coordinators.finalize(runId, "blocked", "cancelled");
@@ -712,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 		const rpc = rpcByRun.get(runId);
 		untrackRunning(rpc?.process);
 		coordinatorChildren.delete(runId);
-		await rpc?.stop();
+		await rpc?.stop(reason);
 		rpcByRun.delete(runId);
 		return run;
 	};
@@ -771,7 +755,7 @@ export default function (pi: ExtensionAPI) {
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
 			coordinators.setPrepared(ownedRun.identity.runId, prepared);
 			let terminalReported = false;
-			let nudges = 0;
+
 			reportBlocked = (reason: string) => {
 				if (terminalReported) return;
 				terminalReported = true;
@@ -779,30 +763,25 @@ export default function (pi: ExtensionAPI) {
 				uiAbortByRun.delete(ownedRun.identity.runId);
 				const blocked = coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
 				releaseCoordinatorUnit(ownedRun.identity.runId);
-				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, 0);
+				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.verificationCount("blocked", reason) ?? 1);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
 				untrackRunning(rpc?.process);
+				void rpc?.stop();
 				rpcByRun.delete(ownedRun.identity.runId);
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
-				if (event.type === "agent_settled" && !terminalReported) {
-					const verdict = idleVerdict({ nudges, hasChildren: rpc?.hasLiveDescendants() ?? false });
-					if (verdict === "wait") return;
-					if (verdict === "blocked") { reportBlocked?.("coordinator stopped without outcome"); return; }
-					nudges += 1;
-					void rpc?.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch((error) => reportBlocked?.((error as Error).message));
-					return;
-				}
+				if (rpc && !terminalReported) continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
 				terminalReported = true;
 				const proposal = { outcome: result.details.outcome, summary: result.details.summary ?? "coordinator finished", reason: result.details.reason };
-				const verification = verifyCoordinatorOutcome(root, prepared, proposal, 0);
+				if (!rpc?.childState.canFinish(proposal.outcome, proposal.reason)) { terminalReported = false; return; }
+				const verification = verifyCoordinatorOutcome(root, prepared, proposal, rpc.childState.verificationCount(proposal.outcome, proposal.reason));
 				if (!verification.ok) {
 					terminalReported = false;
 					void rpc?.request({ type: "prompt", message: `coordinator_finish was not verified: ${verification.reason ?? "missing facts"}. Continue the pipeline or finish blocked.`, streamingBehavior: "followUp" }).catch(() => {});
@@ -907,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 					const run = coordinators.get(runId);
 					return run ? { requestId, state: "status", runId, identity: run.identity, reason: run.state } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { await cancelCoordinator(runId); },
+				cancel: async (runId, _origin) => { await cancelCoordinator(runId, "parent_control_cancel"); },
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -915,11 +894,16 @@ export default function (pi: ExtensionAPI) {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
 			try {
-				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string } };
+				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string; diagnosticRoot?: string } };
 				const identity = payload.identity;
 				if (!identity || identity.role !== "coordinator" || identity.runId !== process.env.YOKEMATE_RUN_ID || identity.cwd !== ctx.cwd || payload.prepared?.cwd !== ctx.cwd || !ctx.isProjectTrusted()) throw new Error("invalid coordinator ready identity");
 				const commands = pi.getCommands().map((command) => command.name);
 				if (!commands.includes(`skill:${process.env.YOKEMATE_MODE}-worker`)) throw new Error("worker skill unavailable");
+				if (payload.prepared?.plan) {
+					try { snapshots = new RunSnapshots(payload.prepared.diagnosticRoot ?? ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
+				}
+				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
+				emitChildState();
 				ownedReadyRunId = identity.runId;
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
 			} catch (error) {
@@ -927,24 +911,47 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 	});
-	pi.on("session_shutdown", () => {
+	pi.registerCommand("yokemate-delivery-error", {
+		description: "Record an owned asynchronous report transport error.",
+		handler: async (args) => {
+			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
+			if (payload.runId !== ownedReadyRunId || !Array.isArray(payload.deliveryIds)) throw new Error("invalid delivery error owner");
+			for (const id of payload.deliveryIds) {
+				const delivery = deliveries.get(id)?.delivery;
+				if (delivery && delivery.state !== "observed" && delivery.state !== "delivery_failed") delivery.state = "delivery_unknown";
+			}
+			emitChildState();
+		},
+	});
+	pi.registerCommand("yokemate-child-cancel", {
+		description: "Record an owned parent cancellation before teardown.",
+		handler: async (args) => {
+			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
+			if (payload.runId !== ownedReadyRunId || !["parent_rpc_stop", "parent_control_cancel", "parent_cancel_run", "parent_session_shutdown"].includes(payload.reason)) throw new Error("invalid owned child cancellation");
+			for (const mark of cancellationByProcess.values()) mark(payload.reason);
+		},
+	});
+	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
-		for (const rpc of rpcByRun.values()) void rpc.stop();
+		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
 		coordinatorChildren.clear();
-		for (const proc of detached) {
+		await Promise.all([...detached].map(async (proc) => {
+			const completion = childCompletions.get(proc);
+			cancellationByProcess.get(proc)?.("session_shutdown");
+			const timer = setTimeout(() => { if (cancellationByProcess.has(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 5000);
 			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* ignore */
-			}
-		}
-		shuttingDown = true;
+				try { proc.kill("SIGTERM"); } catch {}
+				await completion;
+			} finally { clearTimeout(timer); }
+		}));
+		await Promise.all(coordinatorStops);
 		detached.clear();
 		batches.clear();
 		runningAgents.clear();
@@ -958,36 +965,47 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
-	// Отчёт приходит из отложенного колбэка: ловить бросок отсюда некому, и
-	// протухший ctx уронил бы весь процесс pi вместе с самим отчётом.
-	const sendReport = (content: string): void => {
-		try {
-			pi.sendMessage(
-				{ customType: "subagent-report", content, display: true },
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		} catch (e) {
-			console.error(`[subagent] report lost: ${(e as Error)?.message || String(e)}\n${content}`);
+	const registerDelivery = (envelope: ReportEnvelope) => {
+		const delivery = deliveryFor(envelope);
+		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope });
+		return deliveries.get(delivery.deliveryId)!;
+	};
+	const sendReport = (envelope: ReportEnvelope): void => {
+		const { delivery } = registerDelivery(envelope);
+		if (delivery.state !== "pending") return;
+		emitChildState();
+		if (shuttingDown) delivery.state = "delivery_unknown";
+		else try {
+			pi.sendMessage({ customType: "subagent-report", content: reportContent(envelope, delivery), display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } }, { deliverAs: "followUp", triggerTurn: true });
+			if (delivery.state === "pending") delivery.state = "enqueued";
+		} catch { delivery.state = "delivery_failed"; }
+		for (const runId of delivery.runIds) {
+			const diagnostic = diagnostics.get(runId);
+			if (diagnostic) {
+				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, enqueuedAt: new Date().toISOString() };
+				diagnostic.metadata.deliveries = states;
+				diagnostic.save(true);
+			}
 		}
+		emitChildState();
 	};
-
-	const reportDetached = (agentName: string, failed: boolean, text: string): void => {
-		sendReport(`[subagent ${agentName}${failed ? " failed" : ""}] ${text || "(no output)"}`);
-	};
-
-	const openBatch = (batchId: string, total: number): void => {
-		batches.set(batchId, { total, settled: 0, outcomes: [] });
-	};
-
-	const settleBatch = (batchId: string, agentName: string, failed: boolean): void => {
-		const batch = batches.get(batchId);
-		if (!batch) return;
-		batch.settled += 1;
-		batch.outcomes.push({ agent: agentName, failed });
-		if (batch.settled < batch.total) return;
+	const settleBatch = (batchId: string): void => {
+		const batch = runs?.batch(batchId);
+		if (!batch || sentBatches.has(batchId)) return;
+		sentBatches.add(batchId);
+		sendReport(batch);
 		batches.delete(batchId);
-		const outcomes = batch.outcomes.map((o) => `${o.agent} ${o.failed ? "failed" : "✓"}`).join(" · ");
-		sendReport(`[subagent batch complete] ${batch.settled}/${batch.total} · ${outcomes}`);
+	};
+	const settleResult = (result: ResultEnvelope, report: boolean) => {
+		if (!runs?.settle(result)) return;
+		if (report) registerDelivery(result);
+		const batch = runs.batch(result.identity.batchId);
+		if (batch) {
+			registerDelivery(batch);
+			if (!report) registerDelivery({ ...batch, kind: "chain" });
+		}
+		if (report) sendReport(result);
 	};
 
 	pi.registerTool({
@@ -1002,7 +1020,9 @@ export default function (pi: ExtensionAPI) {
 			if (params.outcome === "blocked" && !params.reason)
 				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
 			if (finishingCoordinatorRunId) return { content: [{ type: "text", text: "coordinator is already finishing" }], isError: true };
-			if (batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
+			if (runs?.active().length || batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
+			const pending = [...deliveries.values()].map(({ delivery }) => delivery).filter((delivery) => delivery.state !== "observed");
+			if (pending.length && !(params.outcome === "blocked" && pending.some((delivery) => delivery.state === "delivery_failed" || delivery.state === "delivery_unknown") && pending.every((delivery) => params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
 			const run = coordinators.get(runId);
 			if (!run) {
 				finishingCoordinatorRunId = runId;
@@ -1039,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = await cancelCoordinator(params.cancelRun); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
+				try { const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run"); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (params.coordinator) {
@@ -1088,66 +1108,80 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			// Один ребёнок, отвязанный: тул-колл уже вернулся, поэтому исход
-			// доходит только сообщением, и своим на каждого агента.
-			const runDetachedAgent = async (
-				mode: "single" | "parallel",
-				agentName: string,
-				task: string,
-				taskCwd: string | undefined,
-				formatOutput: (result: SingleResult) => string,
-			): Promise<void> => {
-				if (shuttingDown) {
-					activeUnits -= 1;
-					console.error(`[subagent] ${agentName} dropped from the queue at shutdown, it never ran`);
-					return;
-				}
+			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
+			if (!runs) runs = new ChildRuns(ownerRunId, sessionId);
+			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
+			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
-				// Убитый сигналом ребёнок закрывается с code === null, а
-				// runSingleAgent превращает его в exitCode 0 — без этого флага
-				// снятый руками процесс отчитался бы как успех.
-				let killedBySignal = false;
-				let killSignal: NodeJS.Signals | null = null;
-				const settle = (failed: boolean, text: string) => {
-					activeUnits -= 1;
+				let completeChild: (() => void) | undefined;
+				let envelope: ResultEnvelope;
+				let output = "";
+				try {
+					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
+					runs!.start(identity);
+					emitChildState();
+					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
+						child = proc;
+						childCompletions.set(proc, new Promise<void>((resolve) => { completeChild = resolve; }));
+						detached.add(proc);
+						trackRunning(proc, identity.agent, task);
+					}, identity, diagnostics.get(identity.runId)!);
+					output = getFinalOutput(result.messages);
+					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
+					const diagnostic = diagnostics.get(identity.runId)!;
+					diagnostic.metadata.payload = { ...(diagnostic.metadata.payload as Record<string, unknown>), outcome: envelope.payloadOutcome, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
+					diagnostic.save(true);
+				} catch (error) {
+					const diagnostic = diagnostics.get(identity.runId);
+					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
+					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
+				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
-					reportDetached(agentName, failed || killedBySignal, killedBySignal ? `terminated by ${killSignal}${text ? `\n${text}` : ""}` : text);
-					settleBatch(toolCallId, agentName, failed || killedBySignal);
-				};
-				let failed: boolean;
-				let text: string;
-				try {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
-						agentName,
-						task,
-						taskCwd,
-						undefined, // step
-						undefined, // signal: тул-колл уже вернулся, отменять нечем
-						undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-						makeDetails(mode),
-						(proc) => {
-							child = proc;
-							detached.add(proc);
-							trackRunning(proc, agentName, task);
-							proc.once("close", (_code, signalName) => {
-								if (signalName) { killedBySignal = true; killSignal = signalName; }
-								detached.delete(proc);
-							});
-						},
-					);
-					failed = isFailedResult(result);
-					text = formatOutput(result);
-				} catch (e) {
-					failed = true;
-					text = (e as Error)?.message || String(e);
+					if (child) childCompletions.delete(child);
+					completeChild?.();
 				}
-				// Один вызов settle на все исходы: из try он мог бы уйти в свой
-				// же catch и отчитаться дважды.
-				settle(failed, text);
+				return { envelope, output };
+			};
+			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
+				const units = mode === "chain" ? 1 : tasks.length;
+				const admission = subagentAdmission(policy, limits, mode, units, activeUnits);
+				if (admission) throw new Error(admission);
+				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				for (const { identity } of ack.children) {
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date().toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
+					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
+					diagnostics.set(identity.runId, diagnostic);
+					diagnostic.save(false);
+				}
+				activeUnits += units;
+				batches.add(toolCallId);
+				emitChildState();
+				const execute = async () => {
+					try {
+						if (mode === "chain") {
+							let previous = "";
+							let failed = false;
+							for (let i = 0; i < tasks.length; i++) {
+								const identity = ack.children[i]!.identity;
+								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
+								const { envelope: result, output } = failed ? { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output: "" } : await runDetachedAgent(mode, identity, task, i + 1);
+								settleResult(result, false);
+								failed ||= failedEnvelope(result);
+								previous = output;
+							}
+							sendReport(runs!.batch(toolCallId, "chain")!);
+						} else {
+							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
+								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
+								settleResult(result, true);
+							});
+						}
+						settleBatch(toolCallId);
+					} finally { activeUnits -= units; }
+				};
+				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
+				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack } };
 			};
 
 			if (modeCount !== 1) {
@@ -1194,145 +1228,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const steps = params.chain;
-				const admission = subagentAdmission(policy, limits, "chain", 1, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("chain")([]),
-						isError: true,
-					};
-				}
-
-				activeUnits += 1;
-				openBatch(toolCallId, 1);
-
-				// Цепочка — одна единица: каждый шаг питается {previous}
-				// предыдущего, промежуточный вывод сам по себе не результат.
-				// Отсюда один отчёт, в конце, и одна запись в батче.
-				const runChain = async (): Promise<void> => {
-					let previousOutput = "";
-					let lastAgent = steps[steps.length - 1].agent;
-					const settle = (failed: boolean, agentName: string, text: string) => {
-						activeUnits -= 1;
-						reportDetached(failed ? "chain" : agentName, failed, text);
-						settleBatch(toolCallId, agentName, failed);
-					};
-
-					for (let i = 0; i < steps.length; i++) {
-						if (shuttingDown) {
-							activeUnits -= 1;
-							console.error(
-								`[subagent] chain dropped at shutdown before step ${i + 1} (${steps[i].agent}), it never ran`,
-							);
-							return;
-						}
-						const step = steps[i];
-						lastAgent = step.agent;
-						const stepTask = step.task.replace(/\{previous\}/g, previousOutput);
-						let killedBySignal = false;
-						let result: SingleResult;
-						try {
-							result = await runSingleAgent(
-								ctx.cwd,
-								dispatchDefaults,
-								agents,
-								step.agent,
-								stepTask,
-								step.cwd,
-								i + 1,
-								undefined, // signal: тул-колл уже вернулся, отменять нечем
-								undefined, // onUpdate: рисовать некуда, тул-колл свёрнут
-								makeDetails("chain"),
-								(proc) => {
-									detached.add(proc);
-									trackRunning(proc, step.agent, stepTask);
-									proc.once("close", (_code, signalName) => {
-										if (signalName) killedBySignal = true;
-										detached.delete(proc);
-										untrackRunning(proc);
-									});
-								},
-							);
-						} catch (e) {
-							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${(e as Error)?.message || String(e)}`);
-							return;
-						}
-						if (isFailedResult(result) || killedBySignal) {
-							settle(true, step.agent, `шаг ${i + 1} (${step.agent}): ${getResultOutput(result)}`);
-							return;
-						}
-						previousOutput = getFinalOutput(result.messages);
-					}
-					settle(false, lastAgent, previousOutput);
-				};
-				void runChain().catch((e) => console.error(`[subagent] chain failed: ${(e as Error)?.message || String(e)}`));
-
-				const names = steps.map((step) => step.agent).join(" → ");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: chain of ${steps.length} steps running (${names}). Its report will arrive as a separate message.`,
-						},
-					],
-					details: makeDetails("chain")([]),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				const tasks = params.tasks;
-				const admission = subagentAdmission(policy, limits, "parallel", tasks.length, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("parallel")([]),
-						isError: true,
-					};
-				}
-
-				activeUnits += tasks.length;
-				openBatch(toolCallId, tasks.length);
-				void mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), (t) =>
-					runDetachedAgent("parallel", t.agent, t.task, t.cwd, (r) => truncateParallelOutput(getResultOutput(r))),
-				).catch((e) => console.error(`[subagent] parallel batch failed: ${(e as Error)?.message || String(e)}`));
-
-				const names = tasks.map((t) => t.agent).join(", ");
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: ${tasks.length} agents running (${names}). Their reports will arrive as separate messages prefixed "[subagent <name>]" — do not call subagent again for these tasks.`,
-						},
-					],
-					details: makeDetails("parallel")([]),
-				};
-			}
-
-			if (params.agent && params.task) {
-				const admission = subagentAdmission(policy, limits, "single", 1, activeUnits);
-				if (admission) {
-					return {
-						content: [{ type: "text", text: admission }],
-						details: makeDetails("single")([]),
-						isError: true,
-					};
-				}
-				const agentName = params.agent;
-				activeUnits += 1;
-				openBatch(toolCallId, 1);
-				void runDetachedAgent("single", agentName, params.task, params.cwd, getResultOutput);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Detached: ${agentName} is running. Its report will arrive as a separate message prefixed "[subagent ${agentName}]" — do not call subagent again for this task.`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
-			}
+			if (params.chain?.length) return launch("chain", params.chain);
+			if (params.tasks?.length) return launch("parallel", params.tasks);
+			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, review: params.review }]);
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
@@ -1482,7 +1380,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter((r) => !isFailedResult(r)).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
 				if (expanded) {
@@ -1499,7 +1397,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1551,7 +1449,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = !isFailedResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
