@@ -1,0 +1,2 @@
+patchedDependencies:
+  pi-mcp-adapter@2.20.1: patches/pi-mcp-adapter@2.20.1.patch

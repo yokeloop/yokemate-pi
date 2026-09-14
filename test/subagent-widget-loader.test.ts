@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,6 +31,11 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
     await loader.reload();
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []);
+    const childStates: { children: { identity: { runId: string } }[] }[] = [];
+    loaded.runtime.appendEntry = (type, data) => {
+      assert.equal(type, "yokemate-child-state");
+      childStates.push(data as (typeof childStates)[number]);
+    };
     loaded.runtime.sendMessage = () => undefined;
     const tool = loaded.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "subagent");
     assert.ok(tool);
@@ -48,12 +54,16 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
     } as ExtensionContext;
     process.chdir(dir);
     process.argv[1] = join(root, "test", "fixtures", "subagent-widget-child.js");
-    const result = await tool.definition.execute("widget-test", { agent: "task-reviewer", task: "review the diff", cwd: dir }, undefined, () => undefined, ctx);
+    const headSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const result = await tool.definition.execute("widget-test", { agent: "task-reviewer", task: "review the diff", cwd: root, review: { baseSha: headSha, headSha } }, undefined, () => undefined, ctx);
     assert.equal("isError" in result && result.isError, false);
     await Promise.race([completion, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("child widget did not clear")), 5000); })]);
     assert.ok(Array.isArray(widgets[0]), "RPC widget must be string lines, not a component factory");
     assert.match((widgets[0] as string[])[0]!, /^task-reviewer \d+:\d{2} review the diff$/);
     assert.equal(widgets.at(-1), undefined);
+    const ack = result.details as { children: { identity: { runId: string } }[] };
+    assert.deepEqual(childStates[0]!.children.map((child) => child.identity.runId), ack.children.map((child) => child.identity.runId));
+    assert.deepEqual(childStates.at(-1)!.children, []);
   } finally {
     clearTimeout(timer);
     process.argv[1] = script;
