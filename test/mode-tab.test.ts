@@ -75,18 +75,19 @@ function value(args: string[], option: string): string | undefined {
 
 for (const mode of modes) {
   for (const entry of ["node", "package"]) {
-    test(`${entry} ${mode}: default, explicit split and literal separator preserve identity`, () => {
+    test(`${entry} ${mode}: supported surfaces and literal separator preserve identity`, () => {
       const f = fixture();
       try {
-        for (const variant of ["default", "split", "literal"]) {
-          const args = [...inputs[mode], ...(variant === "split" ? ["--split"] : variant === "literal" ? ["--", "--split"] : [])];
+        for (const variant of (mode === "plan" ? ["split", "literal"] : ["default", "split", "literal"])) {
+          const isSplit = mode === "plan" || variant === "split";
+          const args = [...(mode === "plan" ? ["--split"] : []), ...inputs[mode], ...(variant === "split" ? ["--split"] : variant === "literal" ? ["--", "--split"] : [])];
           const out = f.run(mode, args, {}, entry);
           assert.equal(out.status, 0, out.stderr);
           const created = out.calls.filter((c) => c[1] === "create" || c[1] === "split");
           assert.equal(created.length, 1);
           const surface = created[0]!;
-          assert.deepEqual(surface.slice(0, 2), variant === "split" ? ["pane", "split"] : ["tab", "create"]);
-          if (variant === "split") assert.equal(surface[2], ids.parent);
+          assert.deepEqual(surface.slice(0, 2), isSplit ? ["pane", "split"] : ["tab", "create"]);
+          if (isSplit) assert.equal(surface[2], ids.parent);
           else assert.equal(value(surface, "--workspace"), "w-fixture");
           assert.equal(value(surface, "--cwd"), f.root);
           const stampEnv = Object.fromEntries(surface.flatMap((word, index) => word === "--env" ? [surface[index + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
@@ -94,7 +95,7 @@ for (const mode of modes) {
           assert.equal(stampEnv.YOKEMATE_TICKET, stamps[mode]);
           assert.equal(stampEnv.YOKEMATE_PARENT_PANE, ids.parent);
           const start = out.calls.find((c) => c[0] === "agent" && c[1] === "start")!;
-          assert.equal(value(start, "--pane"), variant === "split" ? ids.split : ids.tabPane);
+          assert.equal(value(start, "--pane"), isSplit ? ids.split : ids.tabPane);
           const expectedModel = mode === "note" || mode === "research" ? "test/pool" : "test/passport";
           assert.equal(value(start, "--model"), expectedModel);
           assert.equal(value(start, "--skill"), join(f.root, ".pi/skills"));
@@ -112,7 +113,7 @@ for (const mode of modes) {
           const prompt = out.calls.find((c) => c[0] === "agent" && c[1] === "prompt")!;
           assert.equal(prompt[3], prompts[mode] + (variant === "literal" ? " --split" : ""));
           assert.equal(out.calls.some((c) => c[1] === "close"), false);
-          assert.ok(out.stdout.includes(variant === "split" ? `→ pane ${ids.split}` : `→ tab ${ids.tab}, pane ${ids.tabPane}`));
+          assert.ok(out.stdout.includes(isSplit ? `→ pane ${ids.split}` : `→ tab ${ids.tab}, pane ${ids.tabPane}`));
           if (mode === "plan") {
             const where = spawnSync("pnpm", ["where", "plan", "YM-1", "YM-2"], { cwd: f.root, env: { ...f.env, ...stampEnv }, encoding: "utf8" });
             assert.equal(where.status, 0, where.stderr);
@@ -123,10 +124,10 @@ for (const mode of modes) {
     });
   }
 
-  test(`${mode}: explicit model is control only before separator on both surfaces`, () => {
+  test(`${mode}: explicit model is control only before separator on supported surfaces`, () => {
     const f = fixture();
     try {
-      for (const split of [[], ["--split"]]) {
+      for (const split of (mode === "plan" ? [["--split"]] : [[], ["--split"]])) {
         for (const literal of [false, true]) {
           const out = f.run(mode, [...split, ...inputs[mode], ...(literal ? ["--"] : []), "--model", literal ? "literal" : "test/explicit"]);
           assert.equal(out.status, 0, out.stderr);
@@ -138,7 +139,7 @@ for (const mode of modes) {
     } finally { f.cleanup(); }
   });
 
-  for (const surface of ["tab", "split"]) {
+  for (const surface of (mode === "plan" ? ["split"] : ["tab", "split"])) {
     for (const failAt of ["start", "prompt"]) {
       test(`${mode} ${surface}: ${failAt} failure closes exactly the created surface`, () => {
         const f = fixture();
@@ -160,14 +161,15 @@ test("generic duplicate guards and ticketless name series are surface independen
   try {
     for (const split of [[], ["--split"]]) {
       for (const mode of ["plan", "review", "worklog"] as const) {
+        const controls = mode === "plan" ? ["--split"] : split;
         const agents = JSON.stringify([{ name: names[mode], pane_id: "w-fixture:p-neighbor" }]);
         f.policy();
-        const refused = f.run(mode, [...split, ...inputs[mode]], { AGENTS: agents });
+        const refused = f.run(mode, [...controls, ...inputs[mode]], { AGENTS: agents });
         assert.equal(refused.status, 1);
         assert.match(refused.stderr, /already runs in pane w-fixture:p-neighbor/);
         assert.deepEqual(refused.calls, [["agent", "list"]]);
         f.policy(false);
-        const allowed = f.run(mode, [...split, ...inputs[mode]], { AGENTS: agents });
+        const allowed = f.run(mode, [...controls, ...inputs[mode]], { AGENTS: agents });
         assert.equal(allowed.status, 0, allowed.stderr);
         const start = allowed.calls.find((c) => c[1] === "start")!;
         assert.match(start[2]!, new RegExp(`^${names[mode]}-[a-f0-9]{8}$`));
@@ -179,7 +181,7 @@ test("generic duplicate guards and ticketless name series are surface independen
       for (const mode of ["plan", "note"] as const) {
         for (const guarded of [true, false]) {
           f.policy(guarded);
-          const out = f.run(mode, [...split, "problem"], { AGENTS: JSON.stringify([{ name: mode }, { name: `${mode}-3` }]) });
+          const out = f.run(mode, [...(mode === "plan" ? ["--split"] : split), "problem"], { AGENTS: JSON.stringify([{ name: mode }, { name: `${mode}-3` }]) });
           assert.equal(out.status, 0, out.stderr);
           assert.equal(out.calls.find((c) => c[1] === "start")![2], `${mode}-2`);
           assert.equal(value(out.calls.find((c) => c[1] === "start")!, "--model"), "test/pool");
@@ -201,7 +203,7 @@ test("preflight refusals and review adopt happen before creating either surface"
       assert.match(adopt.calls.find((c) => c[1] === "prompt")![3]!, /pnpm adopt YM-2.*note$/);
       for (const [mode, args, error] of [
         ["review", ["YM-99"], /no task folder/],
-        ["plan", ["OTHER-1"], /no passport/],
+        ["plan", ["--split", "OTHER-1"], /no passport/],
         ["note", ["--model"], /--model needs a value/],
         ["research", ["--topic", "topic", "--unknown"], /unknown research option/],
         ["research", ["--topic", "topic", "--model", "test/missing"], /не найдена/],
@@ -222,7 +224,7 @@ test("preflight refusals and review adopt happen before creating either surface"
 test("plan worker keeps literal ticket words out of ownership and ticket inputs", () => {
   const f = fixture();
   try {
-    for (const split of [[], ["--split"]]) {
+    for (const split of [["--split"]]) {
       for (const keys of [["YM-1"], []]) {
         const literal = keys.length ? ["YM-2"] : ["YM-1"];
         const out = f.run("plan", [...split, ...keys, "--", ...literal]);
@@ -244,3 +246,17 @@ test("plan worker keeps literal ticket words out of ownership and ticket inputs"
     assert.match(skill, /never planning keys or launch controls/);
   } finally { f.cleanup(); }
 });
+
+for (const entry of ["node", "package"]) {
+  test(`${entry} ordinary plan refuses surface launch before any herdr or model call`, () => {
+    const f = fixture();
+    try {
+      for (const args of [["YM-1", "YM-2"], ["fix", "the", "problem"], ["YM-1", "--", "--split"], ["YM-1", "--model", "--split"], ["--tab", "YM-1"]]) {
+        const out = f.run("plan", args, {}, entry);
+        assert.equal(out.status, 1);
+        assert.match(out.stderr, /plan runs inline; use \/plan --split/);
+        assert.deepEqual(out.calls, []);
+      }
+    } finally { f.cleanup(); }
+  });
+}

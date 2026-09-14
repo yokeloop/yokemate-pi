@@ -72,6 +72,7 @@ export function resolveLaunch(
   workerWords = [...(ticket ? ticket.split("+") : []), ...(rest ? [rest] : [])],
 ): Launch {
   if (mode === "ship") throw new Error("ship runs in the background coordinator, not a tab");
+  if (mode === "plan" && surface !== "split") throw new Error("plan runs inline; use /plan --split for a separate pane");
   if (mode === "review" && stand && !stand.folder) {
     if (!stand.plan)
       throw new Error(
@@ -168,6 +169,7 @@ if (import.meta.filename === process.argv[1]) {
     try { parsed = parseSurfaceArgs(argv.slice(1)); } catch (e) { fail((e as Error).message); }
     workerWords = [...parsed.words, ...parsed.literal];
     if (mode === "plan") {
+      if (parsed.surface !== "split") fail("plan runs inline; use /plan --split for a separate pane");
       const keys = parseKeyList(parsed.words, true).keys;
       ticket = keys.join("+");
       workerWords = [...parsed.words.flatMap((word) => parseKeyList([word], true).keys.length ? word.split("+") : [word]), ...parsed.literal];

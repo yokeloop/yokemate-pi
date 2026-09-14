@@ -1,11 +1,11 @@
 ---
 name: plan
-description: Take a problem or an existing ticket to a plan ready for /do, in a new tab by default, or a split with --split — questions to the engineer in that surface, code reconnaissance and plan-writing in subagents. Triggered by "/plan [--split] <problem>" or "/plan [--split] <KEY> [<KEY> …]".
+description: Take a problem or an existing ticket to a plan ready for /do, inline in the current chat, or an explicit split with --split — questions to the engineer in that same feed, code reconnaissance and plan-writing in subagents. Triggered by "/plan [--split] <problem>" or "/plan [--split] <KEY> [<KEY> …]".
 ---
 
 # /plan — from problem or ticket to a ready plan
 
-You drive one request to a plan `/do` executes without follow-ups, in this mode surface: questions to the engineer land in this same feed, code reconnaissance and plan-writing run in the `plan-scout` and `plan-writer` subagents. The plan is the only thing `/do` receives: everything it gets wrong traces back to a line this conversation left soft. Do not stop halfway: a plan with «разберёмся по ходу» in it is not done. Read the effective guard policy from the system context. `workflowApproval=true` preserves every textual confirmation below. When it is false, a fully delegated task continues through planning and worker launch without another permission question; explicit «стоп», «только план», missing facts, scope changes and external authentication remain blockers.
+You drive one request to a plan `/do` executes without follow-ups, in this same chat: questions to the engineer land in this same feed, code reconnaissance and plan-writing run in the `plan-scout` and `plan-writer` subagents. The plan is the only thing `/do` receives: everything it gets wrong traces back to a line this conversation left soft. Do not stop halfway: a plan with «разберёмся по ходу» in it is not done. Read the effective guard policy from the system context. `workflowApproval=true` preserves every textual confirmation below. When it is false, a fully delegated task continues through planning and worker launch without another permission question; explicit «стоп», «только план», missing facts, scope changes and external authentication remain blockers.
 
 ## Where this runs
 
@@ -17,10 +17,11 @@ pnpm where plan "$YOKEMATE_TICKET"
 
 With no ticket stamp, run `pnpm where plan`. The optional `YOKEMATE_PLAN_LITERAL` environment value is a JSON array identifying the literal suffix of the delivered worker words. Those suffix words are note/problem context, never planning keys or launch controls, even when they look like ticket keys. Preserve them as context; take existing planning keys only from the ordered ticket stamp. The separator itself is not worker text.
 
-Outside a stamped plan surface, run `pnpm where plan [KEY …]` with every named key before the first `--` in input order, excluding control values; without keys when it is only a problem statement. Keep the full input separately for the launcher.
+Outside a stamped plan surface, run `pnpm where plan [KEY …]` with every named key before the first `--` in input order, excluding control values; without keys when it is only a problem statement. Keep the full input separately. The literal suffix is note/problem context, never planning keys or launch controls. In inline flow take planning keys only from the input before the separator, excluding control values. Only `--split` before that separator, outside a `--model` value, requests a surface; `--model` is a launch control only for explicit split. Ordinary inline planning uses the model of the current main Pi chat.
 
-- **`launch`** — the unstamped main chat: run `pnpm split plan <original arguments>` unchanged and return its one output line, then stop. A new tab is the default; `--split` before `--` requests a split. No planning work happens in the main chat.
-- **`run`** — the stamped /plan mode surface: do the work below, then report as «In a mode surface» says.
+- **`launch`** without an explicit `--split` before the first `--` — continue the work below inline in this same chat, with scout/writer subagents and questions here. Do not run a launcher.
+- **`launch`** with an explicit `--split` before the first `--` — run `pnpm split plan <original arguments>` unchanged and return its one output line, then stop. `/split plan <arguments>` is the compatibility alias, prepending `--split` before the entire original tail.
+- **`run`** — the stamped /plan split: do the work below, then report as «In an explicit split» says.
 - **`refuse: …`** — print that line as it came and stop.
 
 ## Input
@@ -74,11 +75,11 @@ Then take each created ticket through «By ticket» below. The interview already
 
 The four steps above run to their end even when the engineer types into the feed midway: answer what they asked, then take up the same step and say which one you are returning to — «отвечаю и возвращаюсь к шагу 2, вопросы». Only a message aimed at the planning itself — stop, another ticket, a decision changed — replaces the step instead of resuming it. A flow that ends on a stray question leaves no plan, no `planned` row, and nothing in the feed saying so.
 
-## In a mode surface
+## In an explicit split
 
-When every plan of the run is recorded, send the outcome to the pane the mode was launched from as a courtesy: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines: the keys and their plan paths, ready for `/do`. A result of `unreachable: <reason>` → say the report in this pane — the plans are already recorded either way.
+Only in a stamped plan split, when every plan of the run is recorded, send the outcome to the pane the mode was launched from as a courtesy: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines: the keys and their plan paths, ready for `/do`. A result of `unreachable: <reason>` → say the report in this pane — the plans are already recorded either way.
 
-Then wait: the mode surface (default tab or explicit split) is conversational, and closing it is the engineer's — never yours, and never the main chat's (`close-mode` does not know plan).
+Then wait: the explicit split is conversational, and closing it is the engineer's — never yours, and never the main chat's (`close-mode` does not know plan).
 
 ## Glossary and ADRs — maintained inline, as decisions crystallize
 
@@ -92,5 +93,7 @@ The rule for choosing the layer: a word about the *product* goes to the project 
 A decision that constrains future work (architecture, contract, irreversible choice) → one ADR in `home/knowledge/<org>/<project>/adr/NNNN-<slug>.md`: context, decision, consequences. Number sequentially.
 
 ## Outcome
+
+Inline completion: report only in this feed; do not send a parent report or close a surface.
 
 One report in the feed after the run, with one line per input key in input order: key — plan path, or key — refusal reason. Every successful ticket has its plan recorded and `pnpm queue` showing `planned`. With `workflowApproval=true`, the tickets go to work only when the engineer says so. With it false, the already delegated task continues to a worker after a successful record unless the engineer explicitly limited it to planning.

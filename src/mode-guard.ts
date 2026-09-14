@@ -5,7 +5,7 @@
 // `mode-tab.ts` runs review and worklog from the yokemate root, where the
 // main chat already sits.
 //
-// The pane is raised with `herdr tab create --env`, so the mode and its ticket
+// The surface is raised with `herdr tab create --env` or `herdr pane split --env`, so the mode and its ticket
 // are in the environment of everything inside it. The main chat has neither.
 //
 // Usage: pnpm where <mode> <TICKET>   → prints `launch`, `run`, or `refuse: …`
@@ -22,8 +22,8 @@ export const TICKETLESS: readonly Mode[] = ["plan", "note", "research"];
 export type Mode = (typeof MODES)[number];
 
 export type Decision =
-  | { kind: "launch" }                    // main chat: raise the tab, say one line, stop
-  | { kind: "run" }                       // the mode's own tab: do the work
+  | { kind: "launch" }                    // main chat: plan stays inline unless split was requested; other modes launch
+  | { kind: "run" }                       // the mode's own surface: do the work
   | { kind: "refuse"; reason: string };   // someone else's tab
 
 export interface ModeEnv {
