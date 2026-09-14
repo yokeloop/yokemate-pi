@@ -144,18 +144,16 @@ if (import.meta.filename === process.argv[1]) {
     const agents = (herdr(["agent", "list"]) as { result: { agents: { name?: string }[] } }).result.agents;
     if (findRunningAgent(agents as { name?: string; pane_id: string }[], research.agentName))
       fail(`${research.label} already runs`);
-    const { tab, root_pane } = (herdr([
-      "tab", "create", "--workspace", parentWorkspace, "--cwd", ROOT, "--label", research.label,
-      ...[...research.env, `YOKEMATE_PARENT_PANE=${parentPane}`].flatMap((e) => ["--env", e]),
-    ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
+    const opened = openModeSurface(research.surface, parentPane, parentWorkspace, ROOT, research.label,
+      [...research.env, `YOKEMATE_PARENT_PANE=${parentPane}`]);
     try {
-      startAgent(research.agentName, root_pane.pane_id, research.label, researchAgentArgs(ROOT, research.model));
+      startAgent(research.agentName, opened.paneId, research.label, researchAgentArgs(ROOT, research.model));
       herdr(["agent", "prompt", research.agentName, research.prompt]);
     } catch (e) {
-      try { herdr(["tab", "close", tab.tab_id]); } catch {}
+      try { opened.cleanup(); } catch {}
       fail(`${research.label}: ${(e as Error).message.split("\n")[0]}`);
     }
-    console.log(`/research → tab ${tab.tab_id}, pane ${root_pane.pane_id}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
+    console.log(`/research → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${opened.paneId}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
     process.exit(0);
   }
 

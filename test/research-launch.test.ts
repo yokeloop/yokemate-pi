@@ -34,3 +34,27 @@ test("research resolves canonical project aliases and topic without a ticket", (
     assert.equal(launch.env.some((v) => v.startsWith("YOKEMATE_TICKET=")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("research shares surface controls without changing topic or security argv", async () => {
+  const { parseResearchArgs, researchAgentArgs } = await import("../src/research-launch.ts");
+  const { root } = fixture();
+  try {
+    assert.equal(resolveResearchLaunch(root, ["--topic", "audit"]).surface, "tab");
+    const split = resolveResearchLaunch(root, ["--split", "app", "--model", "explicit", "audit"]);
+    assert.equal(split.surface, "split");
+    assert.equal(split.model, "explicit");
+    assert.equal(split.prompt, "/skill:research-worker audit");
+    for (const tail of [["--split"], ["--model", "x"], ["--project", "app", "--topic", "--"], ["app"]]) {
+      const launch = resolveResearchLaunch(root, ["--", ...tail]);
+      assert.equal(launch.surface, "tab");
+      assert.equal(launch.model, "pool");
+      assert.equal(launch.project, null);
+      assert.equal(launch.topic, tail.join(" "));
+    }
+    assert.throws(() => parseResearchArgs(["--unknown"]), /unknown research option --unknown/);
+    assert.throws(() => parseResearchArgs(["--model"]), /--model needs a value/);
+    assert.throws(() => parseResearchArgs(["--project"]), /--project needs/);
+    assert.equal(parseResearchArgs(["--project", "--split"]).project, "--split");
+    assert.deepEqual(researchAgentArgs(root, "explicit"), ["--model", "explicit", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-tools", "-e", join(root, "src", "research.ts")]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
