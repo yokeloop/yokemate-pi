@@ -353,6 +353,7 @@ test("note pane bash blacklist cuts writes and passes reads", () => {
     "gh pr merge 5",
     "pnpm plan YM-1 p.md",
     "pnpm spawn YM-1",
+    "pnpm ready YM-1",
     "gh gist create --public notes/a.md",
   ]) {
     assert.equal(bash("note", cmd)?.decision, "deny", cmd);
@@ -371,6 +372,8 @@ test("note pane bash blacklist cuts writes and passes reads", () => {
   // The blacklist is note's alone: the main chat and the task tab keep theirs.
   assert.equal(bash(undefined, "rm /tmp/x"), null);
   assert.equal(bash("do", "git commit -m x"), null);
+  assert.equal(bash("do", "pnpm ready YM-1"), null);
+  assert.equal(bash("do", "gh pr merge 5 --match-head-commit abc"), null);
 });
 
 test("settings edits are fenced by mode", () => {

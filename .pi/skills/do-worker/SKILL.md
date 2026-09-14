@@ -46,13 +46,15 @@ git -C <clone-path> worktree add <cwd>/<repo> -b <TICKET>
 
 The clone is the engineer's workplace: never switch branches there, never commit there. If the branch `<TICKET>` already exists (rework round), add the worktree on the existing branch — same branch, same future PR.
 
-On a resumed round inspect `progress.md`, `git status --porcelain` and the diff before changing anything. Preserve unfinished work. Restore only a clearly identified temporary acceptance-stand override (such as `link:` in package.json), and record that fact in `progress.md`; unknown dirt is a blocked outcome, not something to erase.
+Right after every worktree stands, from the task folder root: `pnpm ready <TICKET>`. Success prints one line per repository with the install command, its exit and the path of `tsc`. A blocker — its literal output goes into `progress.md` and `coordinator_finish` is called with `outcome: "blocked"` and that output as the reason, before the plan is read and before any edit. No `pnpm install` by hand, no global compiler, no links to another tree's `node_modules`: the task's environment is set up by `pnpm ready` alone.
+
+On a resumed round inspect `progress.md`, `git status --porcelain` and the diff before changing anything. Preserve unfinished work. Restore only a clearly identified temporary acceptance-stand override (such as `link:` in package.json), and record that fact in `progress.md`; unknown dirt is a blocked outcome, not something to erase. A ticked «Worktree» box does not prove the environment: on every resume `pnpm ready <TICKET>` runs first, and again after any commit that touched `package.json` or a lockfile.
 
 ### 2. Read, then keep score
 
 Read before writing: the plan fully, every file its steps name, and every source a step mirrors — «same as X» means open X now; you will copy it letter for letter, and the reviewer will compare against it.
 
-Then write `progress.md` in the task folder: the plan's path on the first line, then a checkbox per stage per part; for parts you implement yourself, a checkbox per plan step. Tick a box the moment its condition is met. A relaunched session resumes at the first unchecked box and never redoes checked work; a `progress.md` naming another plan is a finished round — overwrite it, do not resume it.
+Then write `progress.md` in the task folder: the plan's path on the first line, then a checkbox per stage per part; for parts you implement yourself, a checkbox per plan step. Tick a box the moment its condition is met. A relaunched session resumes at the first unchecked box and never redoes checked work — except readiness, which is a receipt, not a box, and is re-proven every time; a `progress.md` naming another plan is a finished round — overwrite it, do not resume it.
 
 ### 3. Subagents
 
@@ -98,7 +100,7 @@ When a part is a library consumed by another part (`role: library` in the plan):
 
 ### 6. Checks
 
-You run the project's own quality gates yourself, per worktree: its lint, its typecheck, its tests, its build — from its own package scripts or CI config, all of them, fast checks first; only commands that finish on their own, never a watcher or a dev server. Record the literal results in `progress.md`: command, exit code, failing output trimmed to what matters. Red → fix and run again; the stage exits green. A check the diff itself weakened — a skipped test, a lint-ignore, a lowered assertion — is not a green, it is a defect to undo.
+You run the project's own quality gates yourself, per worktree: its lint, its typecheck, its tests, its build — from its own package scripts or CI config, all of them, fast checks first; only commands that finish on their own, never a watcher or a dev server. Checks run only through the worktree's own scripts or `pnpm exec`, and only after `pnpm ready` on the current HEAD; `progress.md` gets the receipt line (`head`, `at`). Record the literal results in `progress.md`: command, exit code, failing output trimmed to what matters. Red → fix and run again; the stage exits green. A check the diff itself weakened — a skipped test, a lint-ignore, a lowered assertion — is not a green, it is a defect to undo.
 
 ### 7. Review
 
@@ -120,9 +122,9 @@ Before opening each PR: `git fetch origin`. The report names how far the branch 
 
 ### 10. Report
 
-When every PR is open and green — `gh pr checks <url>` per part, not an assumption:
+When every PR is open and green — `gh pr checks <url>` per part, not an assumption. Before recording, `pnpm ready <TICKET>` runs last, after the format commit — the receipt must be taken on the PR head — then `gh pr checks <url>` again.
 
-1. Record the result yourself, from the task folder root (`work/<TICKET>/`, never from inside a worktree — there pnpm resolves the repository's own package.json and the script does not exist): `pnpm record-report <TICKET> --part <org/repo>:<role>:<branch>:<pr-url>` — one `--part` per repository. The stop guard reads the stage this command writes and lets the tab finish only once it is recorded.
+1. Record the result yourself, from the task folder root (`work/<TICKET>/`, never from inside a worktree — there pnpm resolves the repository's own package.json and the script does not exist): `pnpm record-report <TICKET> --part <org/repo>:<role>:<branch>:<pr-url>` — one `--part` per repository. The stop guard reads the stage this command writes and lets the tab finish only once it is recorded. The command refuses without a passed gate: its refusal line is quoted in `progress.md`, the cause is removed (update from the base, wait for CI, `pnpm ready` again) and the command repeats; three refusals in a row — `coordinator_finish` with `outcome: "blocked"` and the last line.
 2. Call `coordinator_finish` with `outcome: "done"` and a short summary. The parent verifies the recorded parts, PR branches and checks before it emits the single terminal report.
 
 A ticket you cannot complete — no PRs to record — calls `coordinator_finish` with `outcome: "blocked"`, a short summary and the exact nonempty reason. The task folder stays for a later explicit retry.

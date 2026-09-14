@@ -89,6 +89,8 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
 
   let closed = false;
+  let stopping = false;
+  let stopPromise: Promise<void> | undefined;
   let terminal = false;
   let blocked = false;
   let commandsAck = false;
@@ -108,9 +110,17 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     pending.clear();
     callbacks.onBlocked?.(reason);
   };
-  const send = (command: Record<string, unknown>) => {
-    if (closed || !child.stdin?.writable) throw new Error("coordinator RPC is not running");
+  child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+    if (stopping && error.code === "EPIPE") return;
+    fail(`coordinator RPC stdin: ${error.message}`);
+  });
+  const write = (command: Record<string, unknown>) => {
+    if (closed || !child.stdin.writable) throw new Error("coordinator RPC is not running");
     child.stdin.write(JSON.stringify(command) + "\n");
+  };
+  const send = (command: Record<string, unknown>) => {
+    if (stopping) throw new Error("coordinator RPC is stopping");
+    write(command);
   };
   const request = (command: Record<string, unknown>) => new Promise<RpcEvent>((resolve, reject) => {
     const id = typeof command.id === "string" ? command.id : `${identity.runId}:${Math.random().toString(36).slice(2)}`;
@@ -122,6 +132,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (commandsAck && readyAck && readyMessage && stateAck && !blocked) { clearTimeout(readyTimer); readyResolve(); }
   };
   const emit = (event: RpcEvent) => {
+    if (stopping) return;
     events.push(event);
     if (event.type === "tool_execution_start" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolStart(event.toolCallId, event.args);
     if (event.type === "tool_execution_end" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolEnd(event.toolCallId, isRecord(event.result) ? event.result.details : undefined, event.isError === true);
@@ -180,26 +191,36 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
       if (messageDetails.ok === true) { readyMessage = true; maybeReady(); }
       else fail("coordinator ready handshake failed");
     }
-    if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, send);
+    if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, (response) => { if (!stopping && !closed) send(response); });
     callbacks.onEvent?.(event);
   };
   const observation = new JsonlObservation((event) => emit(event as RpcEvent));
-  child.stdout.on("data", (chunk: Buffer) => { observation.write(chunk); if (observation.protocolError) fail("coordinator RPC protocol_error"); });
+  child.stdout.on("data", (chunk: Buffer) => { observation.write(chunk); if (!stopping && observation.protocolError) fail("coordinator RPC protocol_error"); });
   child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; stderrHash.update(chunk); });
-  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") }; observation.end(); metadata.stream = observation.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (observation.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!terminal && !blocked) fail("coordinator RPC exited without outcome"); });
+  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") }; observation.end(); metadata.stream = observation.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (!stopping && observation.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!stopping && !terminal && !blocked) fail("coordinator RPC exited without outcome"); });
   child.on("error", (error) => { metadata.spawnError = errorMetadata(error); save(false); fail("coordinator RPC spawn error"); });
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
-  const stop = (reason = "parent_rpc_stop") => new Promise<void>((resolve) => {
+  const stop = (reason = "parent_rpc_stop") => stopPromise ??= new Promise<void>((resolve) => {
+    stopping = true;
+    clearTimeout(readyTimer);
+    const error = new Error("coordinator RPC stopped");
+    readyReject(error);
+    for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(error); }
+    pending.clear();
     captureOwned();
     if (liveOwned().length === 0) return resolve();
     if (closed) metadata.descendantCancellationInitiator ??= reason;
     else if (metadata.cancellationInitiator === "unknown") metadata.cancellationInitiator = reason;
     save(closed);
-    try { send({ type: "prompt", message: `/yokemate-child-cancel ${Buffer.from(JSON.stringify({ runId: identity.runId, reason })).toString("base64")}` }); } catch {}
+    try { write({ type: "prompt", message: `/yokemate-child-cancel ${Buffer.from(JSON.stringify({ runId: identity.runId, reason })).toString("base64")}` }); } catch {}
     const grace = options.stopGraceMs ?? 5000;
     let settled = false;
     const finish = () => { if (!settled) { settled = true; resolve(); } };
-    try { send({ type: "clear_queue" }); send({ type: "abort_retry" }); send({ type: "abort" }); send({ type: "abort_bash" }); } catch {}
+    for (const type of ["clear_queue", "abort_retry", "abort", "abort_bash"]) {
+      if (closed || !child.stdin.writable) break;
+      try { write({ type }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPIPE") fail(`coordinator RPC stop: ${(error as Error).message}`); break; }
+    }
     const waitForOwnedExit = (deadline: number) => {
       if (liveOwned().length === 0 || Date.now() >= deadline) return finish();
       setTimeout(() => waitForOwnedExit(deadline), 10);

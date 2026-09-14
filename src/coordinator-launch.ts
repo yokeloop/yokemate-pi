@@ -22,10 +22,16 @@ const inside = (root: string, value: string): boolean => { const r = relative(ro
 export function validateCoordinatorRequest(request: CoordinatorRequest): void {
   if (request.mode !== "do" && request.mode !== "ship") fail(`unknown coordinator mode ${request.mode}`);
   if (!Array.isArray(request.tickets) || request.tickets.length === 0) fail(`${request.mode} needs at least one ticket`);
-  if (request.mode === "do" && request.tickets.length !== 1) fail("do accepts exactly one ticket");
   if (new Set(request.tickets).size !== request.tickets.length) fail("ticket list contains duplicates");
   for (const ticket of request.tickets) if (!KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
   if (request.plan && request.mode !== "do") fail("ship does not accept a plan override");
+}
+
+export function splitDoRequest(request: CoordinatorRequest): CoordinatorRequest[] {
+  if (request.mode !== "do") return [request];
+  if (!Array.isArray(request.tickets) || request.tickets.length === 0) fail("do needs at least one ticket");
+  if (new Set(request.tickets).size !== request.tickets.length) fail("ticket list contains duplicates");
+  return request.tickets.map((ticket) => ({ ...request, tickets: [ticket] }));
 }
 
 function resolvePlan(root: string, ticket: string, explicit?: string): string {
@@ -64,6 +70,7 @@ function settings(root: string, folder: string): void {
 
 export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin): PreparedCoordinator {
   validateCoordinatorRequest(request);
+  if (request.mode !== "do" || request.tickets.length !== 1) fail("prepareDo needs exactly one do ticket");
   const ticket = request.tickets[0]!;
   const plan = resolvePlan(root, ticket, request.plan);
   const taskRoot = join(root, "work");

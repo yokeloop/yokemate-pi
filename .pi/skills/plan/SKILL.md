@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Take a problem or an existing ticket to a plan ready for /do, inline in the chat where it was typed — questions to the engineer in the same feed, code reconnaissance and plan-writing in subagents. Triggered by "/plan <problem>" or "/plan <KEY>".
+description: Take a problem or an existing ticket to a plan ready for /do, inline in the chat where it was typed — questions to the engineer in the same feed, code reconnaissance and plan-writing in subagents. Triggered by "/plan <problem>" or "/plan <KEY> [<KEY> …]".
 ---
 
 # /plan — from problem or ticket to a ready plan
@@ -12,10 +12,10 @@ You drive one request to a plan `/do` executes without follow-ups, without leavi
 One command runs before anything else — before the tracker, before the code:
 
 ```
-pnpm where plan [KEY]
+pnpm where plan [KEY …]
 ```
 
-— with the key when the input names one, without one when it is a problem statement.
+— with every named key in input order, without keys when it is only a problem statement.
 
 - **`launch`** — the unstamped main chat: work inline right here, as below.
 - **`run`** — a stamped /plan pane, raised by `/split plan`: the same work, here, ended as «In a pane» below says.
@@ -23,8 +23,8 @@ pnpm where plan [KEY]
 
 ## Input
 
-- `/plan <KEY>` — an existing ticket: reconnaissance → questions → plan. Start at «By ticket».
-- `/plan <problem>` — no ticket yet: interview → tickets in the tracker → a plan per ticket. Start at «By problem».
+- `/plan <KEY> [<KEY> …]` — existing tickets: take each through «By ticket» in input order in this one run — reconnaissance → questions → plan → record, then the next key. Name the current key in every question. A refused or unavailable key gets a line naming it and the reason; continue with the remaining keys.
+- `/plan <problem>` — no ticket yet: interview → tickets in the tracker → a plan per ticket. Start at «By problem». Mixed input (keys and problem words) also starts at «By problem», with the keys as context.
 
 ## By problem
 
@@ -68,7 +68,7 @@ Then take each created ticket through «By ticket» below. The interview already
 1. **Reconnaissance** — read the ticket and its comments from the tracker yourself (`youtrack-<org>` MCP; for a github-project — `gh issue view <номер> -R <owner>/<repo> --comments`) — the subagent has no tracker access — then spawn the `plan-scout` subagent: the ticket's text and comments (or the interview's four fields, which already carry the same), the key, the project, its clone at `projects/<org>/<project>/` and its knowledge at `home/knowledge/<org>/<project>/`. It returns facts with sources, assumptions, and forks with recommendations. The tool returns at once: the scout's report arrives later as a separate message opening with `[subagent plan-scout]`. Until it arrives the chat is free — answer whatever the engineer types and start nothing of this run's next step; on the report, continue with «Questions» below in this same run. A report opening with `[subagent plan-scout failed]` → say it in one line in the feed and stop; re-running the scout is the engineer's word. Not solvable with what is given → report exactly what is missing and stop; no plan gets written around a hole.
 2. **Questions** — close the scout's forks with the engineer, inline, one at a time: the same question shape as the interview above. Start from the forks; a gap becomes a question only when the answer changes the implementation — everything else you close from the code yourself. Order: what blocks the contract between parts first, cosmetics last. When an answer can be found in the code faster than asked — look it up and present it as a fact with the source, not as a question. The engineer's word is input, not a hypothesis: if it diverges from what the code shows, say in one line what else will be needed — then record the decision as given. The engineer's answer ends the question: never re-ask it, never argue it back, never offer the rejected option again in a later question. The plan may only get simpler as the questions go — a question that adds a step is you widening the ticket, and scope is not yours to name. The moment the talk drifts into free-form argument, return to one question at a time. An ADR is the record of a past ticket's decision, not a rule for this one: cite it as context with its date and ticket; never argue it back at the engineer as law. Never a question: extra logs, extra checks, release, versioning, merging — nothing that does not change the solution itself.
 3. **Plan** — spawn the `plan-writer` subagent: the key, the project, the scout's facts and every decision made above. It writes the plan in the shape `PLAN-FORMAT.md` defines to `home/knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` and returns the path. The tool returns at once: the path arrives later in a message opening with `[subagent plan-writer]` — the chat stays answerable meanwhile, and on that message you continue with «Record» below. A report opening with `[subagent plan-writer failed]` → say it in one line in the feed and stop. Read the result: an open question left in it is a defect — send it back with the decisions it missed.
-4. **Record** — `pnpm plan <KEY> <plan-path>`, then one report line right here in the feed: the key and the plan's path. When `workflowApproval=true`, say it is ready for `/do`. When it is false and no explicit «только план» limits the request, run `pnpm spawn <KEY>` after the successful record; report its actual run. If an enabled `spawnCaller` or transition guard refuses it, name that specific refusal without asking for a replacement general permission. Inline, no `send_message` — the chat you would report to is the one you are in.
+4. **Record** — `pnpm plan <KEY> <plan-path>`, then retain the key and plan path for the single outcome report after every input key has been processed. When `workflowApproval=true`, say it is ready for `/do`. When it is false and no explicit «только план» limits the request, run `pnpm spawn <KEY>` after the successful record; report its actual run. If an enabled `spawnCaller` or transition guard refuses it, name that specific refusal without asking for a replacement general permission. Inline, no `send_message` — the chat you would report to is the one you are in.
 
 The four steps above run to their end even when the engineer types into the feed midway: answer what they asked, then take up the same step and say which one you are returning to — «отвечаю и возвращаюсь к шагу 2, вопросы». Only a message aimed at the planning itself — stop, another ticket, a decision changed — replaces the step instead of resuming it. A flow that ends on a stray question leaves no plan, no `planned` row, and nothing in the feed saying so.
 
@@ -91,4 +91,4 @@ A decision that constrains future work (architecture, contract, irreversible cho
 
 ## Outcome
 
-Per ticket: the plan recorded, `pnpm queue` showing `planned`, one line in the feed naming the key and the plan's path. With `workflowApproval=true`, the tickets go to work only when the engineer says so. With it false, the already delegated task continues to a worker after a successful record unless the engineer explicitly limited it to planning.
+One report in the feed after the run, with one line per input key in input order: key — plan path, or key — refusal reason. Every successful ticket has its plan recorded and `pnpm queue` showing `planned`. With `workflowApproval=true`, the tickets go to work only when the engineer says so. With it false, the already delegated task continues to a worker after a successful record unless the engineer explicitly limited it to planning.

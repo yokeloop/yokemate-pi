@@ -238,6 +238,19 @@ index 041f0e6..02ad263 100644
      this.maxBytes = boundedPositiveInteger(options.maxBytes, DEFAULT_MCP_TRACE_MAX_BYTES);
      this.maxEvents = boundedPositiveInteger(options.maxEvents, DEFAULT_MCP_TRACE_MAX_EVENTS);
      this.append = options.appendFile ?? (async (path, data, appendOptions) => {
+diff --git a/npx-resolver.ts b/npx-resolver.ts
+index 3d34119090160308675a41998c6a77a2c8afdc07..d813d4c6fff4ff6e23f85fabf8fad72a99545584 100644
+--- a/npx-resolver.ts
++++ b/npx-resolver.ts
+@@ -272,7 +272,7 @@ async function forceNpxCache(packageSpec: string, signal?: AbortSignal): Promise
+         signal?.removeEventListener("abort", abort);
+         resolve();
+       });
+-      proc.on("error", (err) => {
++      proc.on("error", (err: Error) => {
+         clearTimeout(timer);
+         signal?.removeEventListener("abort", abort);
+         reject(err);
 diff --git a/sampling-handler.ts b/sampling-handler.ts
 index 40421c7..10a1bdd 100644
 --- a/sampling-handler.ts
