@@ -54,7 +54,7 @@ export const TICKETLESS: readonly string[] = ["plan", "note", "research"];
 const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 
 /** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
-export type Surface = "tab" | "split";
+import type { Surface } from "./mode-surface.ts";
 
 export interface Launch {
   cwd: string;
