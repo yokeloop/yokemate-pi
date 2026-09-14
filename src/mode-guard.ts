@@ -3,8 +3,7 @@
 // the mode's own pane was raised and prompted with the same line. The skill
 // must do different things in each case, and cwd cannot tell them apart —
 // `mode-tab.ts` runs review and worklog from the yokemate root, where the
-// main chat already sits. For /plan the `launch` verdict means «work inline
-// here» — the skill interprets it, this guard does not.
+// main chat already sits.
 //
 // The pane is raised with `herdr tab create --env`, so the mode and its ticket
 // are in the environment of everything inside it. The main chat has neither.

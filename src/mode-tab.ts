@@ -1,34 +1,3 @@
-// Every mode gets its own agent (R4.21), on the surface its ending needs.
-// `spawn` does this for /do because it also sets the stage and writes the tab's
-// settings; review, ship and worklog need nothing but a pane with the right
-// cwd and the mode's prompt.
-//
-// Ship ends by reporting and is closed from the main chat, so it takes a
-// tab. Review and worklog end in a conversation with the engineer, so they
-// split the main chat's own pane and stand under it — the engineer answers
-// without leaving the chat that asked.
-//
-// This is the orchestrator's tool, not the engineer's: the engineer types
-// `/review ACME-342` in the main chat and the skill runs this.
-//
-// /plan runs inline in the main chat by default; `pnpm split plan …` raises
-// the same conversational split explicitly, for parallel plannings on a big
-// screen (YM-96). The pane is prompted with the /plan skill itself — one
-// skill, no worker — and its `run` verdict does the same inline work.
-//
-// Every mode takes a free-text note after the ticket and passes it verbatim
-// into the mode's prompt. The model comes from the project's passport, by the
-// mode of the panel being raised; an explicit `--model <m>` — the engineer's
-// words, translated by the main chat — overrides it. A launch with no ticket
-// has no passport to ask and takes its model from home/pool.json (YM-159). No
-// launch inherits the machine's default (YM-84).
-//
-// Usage:
-//   pnpm review ACME-342 [--model <m>] [note]
-//   pnpm ship ACME-342 [ACME-343 …] [--model <m>] [note]
-//   pnpm worklog acme [--model <m>] [note]
-//   pnpm split plan [ACME-342|проблема] [--model <m>] [note]
-
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -42,7 +11,7 @@ import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
-import { parseShipArgs } from "./ship-args.ts";
+import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
@@ -51,10 +20,9 @@ export type Mode = (typeof MODES)[number];
  *  one. A plan launch takes a key or a problem statement; only the key looks
  *  like one. A note launch takes a topic — never a key. */
 export const TICKETLESS: readonly string[] = ["plan", "note", "research"];
-const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 
-/** Where the mode's agent goes: a tab of its own, or a split of the caller's pane. */
-import type { Surface } from "./mode-surface.ts";
+
+import { openModeSurface, parseSurfaceArgs, type Surface, type SurfaceArgs } from "./mode-surface.ts";
 
 export interface Launch {
   cwd: string;
@@ -100,6 +68,8 @@ export function resolveLaunch(
   model?: string,
   parentPane?: string,
   stand?: StandFacts,
+  surface: Surface = "tab",
+  workerWords = [...(ticket ? ticket.split("+") : []), ...(rest ? [rest] : [])],
 ): Launch {
   if (mode === "ship") throw new Error("ship runs in the background coordinator, not a tab");
   if (mode === "review" && stand && !stand.folder) {
@@ -108,6 +78,7 @@ export function resolveLaunch(
         `no task folder work/${ticket} and no plan in knowledge — mistyped key, or the ticket was never planned`,
       );
     rest = `стенда на этой машине нет — начни с \`pnpm adopt ${ticket}\`${rest ? `; ${rest}` : ""}`;
+    workerWords = [ticket, rest];
   }
   const named = ticket ? `${ticket} ${mode}` : mode;
   const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
@@ -120,13 +91,13 @@ export function resolveLaunch(
     cwd: root,
     label: named,
     agentName,
-    prompt: `/skill:${mode === "plan" ? "plan" : `${mode}-worker`}${ticket ? ` ${ticket}` : ""}${rest ? ` ${rest}` : ""}`,
+    prompt: `/skill:${mode === "plan" ? "plan" : `${mode}-worker`}${workerWords.length ? ` ${workerWords.join(" ")}` : ""}`,
     env: [
       `YOKEMATE_MODE=${mode}`,
       ...(ticket ? [`YOKEMATE_TICKET=${ticket}`] : []),
       ...(parentPane ? [`YOKEMATE_PARENT_PANE=${parentPane}`] : []),
     ],
-    surface: "split",
+    surface,
     model,
   };
 }
@@ -188,21 +159,28 @@ if (import.meta.filename === process.argv[1]) {
     process.exit(0);
   }
 
-  const normalizedArgv = argv.filter((a) => a !== "--");
-  // A ticketless mode eats its first word as a key only when it looks like
-  // one — anything else is already the note (a problem statement for plan).
-  const ticketless = TICKETLESS.includes(mode);
+  let parsed: SurfaceArgs = { surface: "tab", words: [], literal: [] };
   let ticket: string;
   let tail: string[];
+  let workerWords: string[] = [];
   if (mode === "ship") {
-    ({ ticket, tail } = parseShipArgs(normalizedArgv.slice(1)));
+    ({ ticket, tail } = parseShipArgs(argv.filter((a) => a !== "--").slice(1)));
     if (!ticket) fail(`usage: ship <KEY> [<KEY> …] [--model <m>] [note]`);
-  } else if (ticketless) {
-    ticket = TICKET_KEY.test(normalizedArgv[1] ?? "") ? normalizedArgv[1] : "";
-    tail = normalizedArgv.slice(ticket ? 2 : 1);
   } else {
-    ticket = normalizedArgv[1] ?? fail(`usage: ${mode} <TICKET> [--model <m>] [rest…]`);
-    tail = normalizedArgv.slice(2);
+    try { parsed = parseSurfaceArgs(argv.slice(1)); } catch (e) { fail((e as Error).message); }
+    workerWords = [...parsed.words, ...parsed.literal];
+    if (mode === "plan") {
+      const keys = parseKeyList(parsed.words, true).keys;
+      ticket = keys.join("+");
+      workerWords = [...parsed.words.flatMap((word) => parseKeyList([word], true).keys.length ? word.split("+") : [word]), ...parsed.literal];
+      tail = workerWords;
+    } else if (mode === "note") {
+      ticket = "";
+      tail = workerWords;
+    } else {
+      ticket = parsed.words[0] ?? fail(`usage: ${mode} <TICKET> [--split] [--model <m>] [rest…]`);
+      tail = [...parsed.words.slice(1), ...parsed.literal];
+    }
   }
 
   const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
@@ -233,15 +211,7 @@ if (import.meta.filename === process.argv[1]) {
     fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
   const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
 
-  // The model is pulled out of the tail; everything else stays the note.
-  let model: string | undefined;
-  for (let i = 0; i < tail.length; i++) {
-    if (tail[i] === "--model") {
-      model = tail[i + 1] ?? fail("--model needs a value");
-      tail.splice(i, 2);
-      break;
-    }
-  }
+  let model = parsed.model;
   // The launch never inherits the machine's default: the engineer's --model
   // wins, else the passports answer by mode — by org for worklog, by key
   // prefix for every keyed mode. A launch with no key at all (a problem-input
@@ -281,7 +251,7 @@ if (import.meta.filename === process.argv[1]) {
 
   let launch: Launch;
   try {
-    launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand);
+    launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand, parsed.surface, workerWords);
   } catch (e) {
     launch = fail((e as Error).message);
   }
@@ -310,26 +280,8 @@ if (import.meta.filename === process.argv[1]) {
       fail(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
   }
 
-  // `tab` carries the tab id (`w4:t6`); the pane inside it is where the agent goes.
-  // A split answers with the new pane alone, and that pane is what gets taken back
-  // down if anything below throws — the tab it lives in is the main chat's.
-  let paneId: string;
-  let undo: () => void;
-  if (surface === "split") {
-    const { pane } = (herdr([
-      "pane", "split", parentPane, "--direction", "down", "--cwd", cwd,
-      ...env.flatMap((e) => ["--env", e]),
-    ]) as { result: { pane: { pane_id: string } } }).result;
-    paneId = pane.pane_id;
-    undo = () => void herdr(["pane", "close", paneId]);
-  } else {
-    const { tab, root_pane } = (herdr([
-      "tab", "create", "--workspace", parentWorkspace, "--cwd", cwd, "--label", label,
-      ...env.flatMap((e) => ["--env", e]),
-    ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
-    paneId = root_pane.pane_id;
-    undo = () => void herdr(["tab", "close", tab.tab_id]);
-  }
+  const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
+  const { paneId } = opened;
 
   // From here on the pane exists: anything that throws has to take it back down
   // by the id herdr just gave us, or the workspace fills up with empty panes.
@@ -340,11 +292,11 @@ if (import.meta.filename === process.argv[1]) {
     herdr(["agent", "prompt", agentName, prompt]);
   } catch (e) {
     // The failure to report is the launch's, not the cleanup's.
-    try { undo(); } catch {}
+    try { opened.cleanup(); } catch {}
     fail(`${label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
   }
 
   console.log(
-    `${ticket || `/${mode}`} → pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
+    `${ticket || `/${mode}`} → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
   );
 }

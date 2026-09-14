@@ -499,8 +499,8 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
   assert.equal(new Set(names).size, names.length);
 
   // The modes that talk to the engineer stand next to the chat.
-  assert.equal(review.surface, "split");
-  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "split");
+  assert.equal(review.surface, "tab");
+  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "tab");
   assert.equal(resolveLaunch("/root", "worklog", "acme", "").cwd, "/root");
 
   assert.throws(
@@ -561,16 +561,22 @@ test("review without the task folder adopts instead of refusing", () => {
 // the root, prompted with the /plan skill itself — one skill, no worker, the
 // pane's `run` verdict does the same inline work. A key rides in the prompt
 // and the stamp; a problem input carries neither.
-test("plan splits at the root and is prompted with /plan itself", () => {
+test("plan opens at the root and is prompted with /plan itself", () => {
   const keyed = resolveLaunch("/root", "plan", "ACME-3", "note");
-  assert.equal(keyed.surface, "split");
+  assert.equal(keyed.surface, "tab");
   assert.equal(keyed.cwd, "/root");
   assert.equal(keyed.prompt, "/skill:plan ACME-3 note");
   assert.equal(keyed.agentName, "acme-3-plan");
   assert.deepEqual(keyed.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=ACME-3"]);
 
+  const multi = resolveLaunch("/root", "plan", "YM-1+YM-2", "note", undefined, "w1:p1", undefined, "split", ["YM-1", "YM-2", "note"]);
+  assert.equal(multi.surface, "split");
+  assert.equal(multi.label, "YM-1+YM-2 plan");
+  assert.equal(multi.prompt, "/skill:plan YM-1 YM-2 note");
+  assert.deepEqual(multi.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=YM-1+YM-2", "YOKEMATE_PARENT_PANE=w1:p1"]);
+
   const problem = resolveLaunch("/root", "plan", "", "кнопка не жмётся");
-  assert.equal(problem.surface, "split");
+  assert.equal(problem.surface, "tab");
   assert.equal(problem.prompt, "/skill:plan кнопка не жмётся");
   assert.equal(problem.agentName, "plan");
   assert.deepEqual(problem.env, ["YOKEMATE_MODE=plan"]);
@@ -579,9 +585,9 @@ test("plan splits at the root and is prompted with /plan itself", () => {
 // 12c. /note is the read-only conversation: a ticketless split beside the
 // chat, prompted with its worker, the topic riding verbatim. A second /note
 // takes the next name in the series, like a second problem-input plan.
-test("note splits at the root with the topic in the worker prompt", () => {
+test("note opens at the root with the topic in the worker prompt", () => {
   const note = resolveLaunch("/root", "note", "", "итоги ресёрча");
-  assert.equal(note.surface, "split");
+  assert.equal(note.surface, "tab");
   assert.equal(note.cwd, "/root");
   assert.equal(note.prompt, "/skill:note-worker итоги ресёрча");
   assert.equal(note.agentName, "note");
