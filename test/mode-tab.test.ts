@@ -22,7 +22,7 @@ function fixture() {
   const root = mkdtempSync(join(import.meta.dirname, "fixtures", "mode-entry-"));
   cpSync(join(import.meta.dirname, "..", "src"), join(root, "src"), { recursive: true });
   cpSync(join(import.meta.dirname, "..", "package.json"), join(root, "package.json"));
-  for (const path of ["bin", ".pi", "home", "clone", "work/YM-1", "home/knowledge/org/repo/ai/YM-2-stand"])
+  for (const path of ["node_modules/.bin", ".pi", "home", "clone", "work/YM-1", "home/knowledge/org/repo/ai/YM-2-stand"])
     mkdirSync(join(root, path), { recursive: true });
   writeFileSync(join(root, "home/knowledge/org/repo/ai/YM-2-stand/YM-2-stand-plan.md"), "# YM-2\n");
   writeFileSync(join(root, "home/pool.json"), JSON.stringify({ plan: "test/pool", note: "test/pool", research: "test/pool" }));
@@ -33,7 +33,7 @@ function fixture() {
     .run(join(root, "clone"), JSON.stringify(Object.fromEntries(modes.map((mode) => [mode, "test/passport"]))));
   db.close();
   const journal = join(root, "journal.jsonl");
-  writeFileSync(join(root, "bin/herdr"), `#!${process.execPath}
+  writeFileSync(join(root, "node_modules/.bin/herdr"), `#!${process.execPath}
 import fs from "node:fs";
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.JOURNAL, JSON.stringify(args) + "\\n");
@@ -46,13 +46,13 @@ if (args[0] === "tab" && args[1] === "create") result = { tab: { tab_id: "${ids.
 if (args[0] === "pane" && args[1] === "split") result = { pane: { pane_id: "${ids.split}" } };
 console.log(JSON.stringify({ result }));
 `, { mode: 0o755 });
-  writeFileSync(join(root, "bin/pi"), `#!${process.execPath}
+  writeFileSync(join(root, "node_modules/.bin/pi"), `#!${process.execPath}
 import fs from "node:fs";
 fs.appendFileSync(process.env.JOURNAL, JSON.stringify(["pi", ...process.argv.slice(2)]) + "\\n");
 console.log("provider model context max-out thinking images\\ntest pool 1 1 yes yes\\ntest passport 1 1 yes yes\\ntest explicit 1 1 yes yes");
 `, { mode: 0o755 });
   const env = {
-    PATH: `${join(root, "bin")}:${process.env.PATH ?? ""}`, HOME: root,
+    PATH: `${join(root, "node_modules/.bin")}:${process.env.PATH ?? ""}`, HOME: root,
     HERDR_ENV: "1", HERDR_PANE_ID: ids.parent, HERDR_WORKSPACE_ID: "w-fixture", JOURNAL: journal,
     XDG_RUNTIME_DIR: root,
   };
