@@ -19,7 +19,7 @@ import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
 import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
 import { decide } from "../src/mode-guard.ts";
-import { parseShipArgs } from "../src/ship-args.ts";
+import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
 import { resolveGuardPolicy } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
@@ -591,6 +591,15 @@ test("note splits at the root with the topic in the worker prompt", () => {
 });
 
 test("ship argument parser preserves launcher semantics", () => {
+  for (const [words, joined, expected] of [
+    [["YM-199", "YM-198", "YM-197"], false, { keys: ["YM-199", "YM-198", "YM-197"], tail: [] }],
+    [["YM-199", "note", "YM-198", "--model", "terra", "later"], false, { keys: ["YM-199", "YM-198"], tail: ["note", "--model", "terra", "later"] }],
+    [["YM-199", "--model", "terra", "YM-198"], false, { keys: ["YM-199"], tail: ["--model", "terra", "YM-198"] }],
+    [["YM-199", "YM-199"], false, { keys: ["YM-199", "YM-199"], tail: [] }],
+    [["note", "--model", "terra"], false, { keys: [], tail: ["note", "--model", "terra"] }],
+    [["YM-199+YM-198"], true, { keys: ["YM-199", "YM-198"], tail: [] }],
+    [["YM-199+YM-198"], false, { keys: [], tail: ["YM-199+YM-198"] }],
+  ] as const) assert.deepEqual(parseKeyList(words, joined), expected);
   assert.deepEqual(parseShipArgs(["YM-199", "YM-198", "YM-197"]), {
     ticket: "YM-199+YM-198+YM-197",
     tail: [],
@@ -641,17 +650,19 @@ test("ship prompt preserves single and batch arguments through where", async () 
       { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
     );
 
-  for (const keys of [["YM-197"], ["YM-199", "YM-198", "YM-197"]]) {
+  for (const keys of [["YM-197"], ["YM-199", "YM-198"], ["YM-199", "YM-198", "YM-197"]]) {
     const stamp = keys.join("+");
     const expanded = promptTemplates.expandPromptTemplate(`/ship ${keys.join(" ")}`, templates);
     const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
     assert.match(expanded, /subagent.*coordinator/);
+    assert.match(expanded, /tickets: \[ordered engineer keys\]/);
     assert.ok(where);
     const whereArgs = where.split(/\s+/).slice(3);
     const main = runWhere(whereArgs, {});
     assert.equal(main.status, 0, main.stderr);
     assert.equal(main.stdout.trim(), "launch");
     assert.deepEqual(whereArgs, keys);
+    assert.deepEqual(parseKeyList(whereArgs).keys, keys);
 
     const own = runWhere(whereArgs, { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
     assert.equal(own.status, 0, own.stderr);
@@ -701,7 +712,26 @@ test("ship prompt preserves single and batch arguments through where", async () 
   );
 });
 
-test("do prompt preserves its key through where", async () => {
+test("plan prompt preserves several keys", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({
+    cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts", "plan.md")], includeDefaults: false,
+  });
+  for (const keys of [["YM-1"], ["YM-1", "YM-2"]]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/plan ${keys.join(" ")}`, templates);
+    assert.ok(expanded.includes(`Ticket or problem: ${keys.join(" ")}`));
+    assert.ok(expanded.includes(".pi/skills/plan/SKILL.md"));
+  }
+  const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
+  assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
+  assert.ok(skill.includes("pnpm where plan [KEY …]"));
+});
+
+test("do prompt preserves its keys through where", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
@@ -715,14 +745,48 @@ test("do prompt preserves its key through where", async () => {
   });
   const expanded = promptTemplates.expandPromptTemplate("/do YM-1", templates);
   const where = expanded.match(/pnpm where do(?: [^`\n]*)?/)?.[0];
-  assert.match(expanded, /subagent.*coordinator: \{ mode: "do", tickets: \["YM-1"\] \}/);
+  assert.match(expanded, /subagent.*coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
   assert.match(expanded, /Do not pass top-level `agent` or `task`/);
   assert.match(expanded, /Omit `plan` and `model` unless their literal values appear in the entered command/);
   assert.match(expanded, /Never use words from these instructions as parameter values/);
   assert.match(expanded, /Entered command: `\/do YM-1`/);
   const explicit = promptTemplates.expandPromptTemplate("/do YM-1 --plan /tmp/explicit-plan.md --model test/explicit-model", templates);
   assert.match(explicit, /Entered command: `\/do YM-1 --plan \/tmp\/explicit-plan\.md --model test\/explicit-model`/);
-  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \["YM-1"\] \}/);
+  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
+  const runWhere = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "do", ...args],
+    { cwd: root, env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  const malformed = promptTemplates.expandPromptTemplate("/do YM-1 not-a-key YM-2", templates);
+  const malformedArgs = malformed.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/);
+  const usage = runWhere(malformedArgs);
+  assert.equal(usage.status, 1);
+  assert.match(usage.stderr, /unexpected not-a-key/);
+  assert.ok(malformed.includes("**usage: … unexpected WORD**"));
+  assert.ok(malformed.includes("Do not discard malformed candidates from the eventual tool request."));
+  const remainingKeys = parseKeyList(malformedArgs).keys;
+  assert.deepEqual(remainingKeys, ["YM-1", "YM-2"]);
+  const recovered = runWhere(remainingKeys);
+  assert.equal(recovered.status, 0);
+  assert.equal(recovered.stdout.trim(), "launch");
+  const stampedRecovery = runWhere(remainingKeys, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" });
+  assert.equal(stampedRecovery.status, 1);
+  assert.match(stampedRecovery.stdout, /^refuse:/);
+  for (const command of ["/do YM-1 на gpt-6-astra", "/do YM-1 запусти на gpt-6-astra, задача сложная", "/do YM-1 --model gpt-6-astra", "/do YM-1 --plan /tmp/explicit-plan.md"]) {
+    const named = promptTemplates.expandPromptTemplate(command, templates);
+    assert.ok(named.includes(`Entered command: \`${command}\``));
+    assert.ok(named.includes("first separate that value and its surrounding instruction words from the ticket candidates"));
+    assert.ok(named.includes("Never interpret these model/plan instructions as malformed keys."));
+    const normalizedWhere = named.match(/check `([^`]+)`/)![1];
+    assert.equal(normalizedWhere, "pnpm where do YM-1");
+    const namedLaunch = runWhere(normalizedWhere.split(/\s+/).slice(3));
+    assert.equal(namedLaunch.status, 0);
+    assert.equal(namedLaunch.stdout.trim(), "launch");
+  }
+  const batch = promptTemplates.expandPromptTemplate("/do YM-1 YM-2", templates);
+  assert.match(batch, /pnpm where do YM-1 YM-2/);
+  assert.match(batch, /Entered command: `\/do YM-1 YM-2`/);
+  assert.match(batch, /tickets: \[ordered engineer keys\]/);
+  assert.deepEqual(parseKeyList(batch.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/)).keys, ["YM-1", "YM-2"]);
   assert.ok(where);
   const args = where.split(/\s+/).slice(3);
   const run = (env: Record<string, string>) => spawnSync(
@@ -791,7 +855,28 @@ test("a ticketless mode takes the first free name in its series", () => {
 // pane, the pane does the work. Only the env stamp tells them apart — cwd
 // cannot, because review, ship and worklog run from the root the main chat already
 // sits in.
-test("a mode skill knows whether to launch the pane or do the work", () => {
+test("a mode skill knows whether to launch the pane or do the work", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const run = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", ...args],
+    { cwd: join(import.meta.dirname, ".."), env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  for (const mode of ["do", "plan"]) {
+    const launch = run([mode, "YM-1", "YM-2"]);
+    assert.equal(launch.status, 0, launch.stderr);
+    assert.equal(launch.stdout.trim(), "launch");
+    const refused = run([mode, "YM-1", "YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stdout, /^refuse: /);
+    const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+    assert.equal(own.status, 0);
+    assert.equal(own.stdout.trim(), "run");
+  }
+  const invalid = run(["do", "YM-1", "not-a-key"]);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /usage: where do .*not-a-key/);
+  const problem = run(["plan", "fix", "the", "problem"], { YOKEMATE_MODE: "plan" });
+  assert.equal(problem.status, 0);
+  assert.equal(problem.stdout.trim(), "run");
   // Main chat: nobody stamped it — with or without a key.
   assert.deepEqual(decide({}, "review", "ACME-342"), { kind: "launch" });
   assert.deepEqual(decide({}, "plan"), { kind: "launch" });
