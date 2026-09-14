@@ -8,14 +8,14 @@ import { openDb } from "../src/db.ts";
 const modes = ["plan", "review", "worklog", "note", "research"] as const;
 type Mode = typeof modes[number];
 const inputs: Record<Mode, string[]> = {
-  plan: ["YM-1", "YM-2"], review: ["YM-1"], worklog: ["org"], note: ["topic"], research: ["--topic", "topic"],
+  plan: ["YM-1"], review: ["YM-1"], worklog: ["org"], note: ["topic"], research: ["--topic", "topic"],
 };
 const prompts: Record<Mode, string> = {
-  plan: "/skill:plan YM-1 YM-2", review: "/skill:review-worker YM-1", worklog: "/skill:worklog-worker org",
+  plan: "/skill:plan YM-1", review: "/skill:review-worker YM-1", worklog: "/skill:worklog-worker org",
   note: "/skill:note-worker topic", research: "/skill:research-worker topic",
 };
-const stamps: Partial<Record<Mode, string>> = { plan: "YM-1+YM-2", review: "YM-1", worklog: "org" };
-const names: Record<Mode, string> = { plan: "ym-1-ym-2-plan", review: "ym-1-review", worklog: "org-worklog", note: "note", research: "research" };
+const stamps: Partial<Record<Mode, string>> = { plan: "YM-1", review: "YM-1", worklog: "org" };
+const names: Record<Mode, string> = { plan: "ym-1-plan", review: "ym-1-review", worklog: "org-worklog", note: "note", research: "research" };
 const ids = { tab: "w-fixture:t-created", tabPane: "w-fixture:p-tab-created", split: "w-fixture:p-split-created", parent: "w-fixture:p-parent" };
 
 function fixture() {
@@ -31,25 +31,29 @@ function fixture() {
   const db = openDb(join(root, "yokemate.db"));
   db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model,mode_models) VALUES ('org','repo',?,'github','YM','test/default',?)")
     .run(join(root, "clone"), JSON.stringify(Object.fromEntries(modes.map((mode) => [mode, "test/passport"]))));
+  db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model,mode_models) VALUES ('second','repo',?,'github','ACME','test/default',?)")
+    .run(join(root, "clone"), JSON.stringify({ plan: "test/second" }));
   db.close();
   const journal = join(root, "journal.jsonl");
   writeFileSync(join(root, "node_modules/.bin/herdr"), `#!${process.execPath}
 import fs from "node:fs";
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.JOURNAL, JSON.stringify(args) + "\\n");
-if ((args[0] === "agent" && args[1] === process.env.FAIL_AT) || (args[1] === "close" && process.env.FAIL_CLEANUP)) {
+if ((args[0] === "agent" && args[1] === process.env.FAIL_AT && (!process.env.FAIL_AGENT || args[2] === process.env.FAIL_AGENT)) || (args[1] === "close" && process.env.FAIL_CLEANUP)) {
   console.error("injected-" + args[1] + "-failure"); process.exit(1);
 }
+const created = fs.readFileSync(process.env.JOURNAL, "utf8").trim().split("\\n").map(JSON.parse).filter(c => c[1] === "create" || c[1] === "split").length;
+const suffix = created > 1 ? "-" + created : "";
 let result = {};
 if (args[0] === "agent" && args[1] === "list") result = { agents: JSON.parse(process.env.AGENTS || "[]") };
-if (args[0] === "tab" && args[1] === "create") result = { tab: { tab_id: "${ids.tab}" }, root_pane: { pane_id: "${ids.tabPane}" } };
-if (args[0] === "pane" && args[1] === "split") result = { pane: { pane_id: "${ids.split}" } };
+if (args[0] === "tab" && args[1] === "create") result = { tab: { tab_id: "${ids.tab}" + suffix }, root_pane: { pane_id: "${ids.tabPane}" + suffix } };
+if (args[0] === "pane" && args[1] === "split") result = { pane: { pane_id: "${ids.split}" + suffix } };
 console.log(JSON.stringify({ result }));
 `, { mode: 0o755 });
   writeFileSync(join(root, "node_modules/.bin/pi"), `#!${process.execPath}
 import fs from "node:fs";
 fs.appendFileSync(process.env.JOURNAL, JSON.stringify(["pi", ...process.argv.slice(2)]) + "\\n");
-console.log("provider model context max-out thinking images\\ntest pool 1 1 yes yes\\ntest passport 1 1 yes yes\\ntest explicit 1 1 yes yes");
+console.log("provider model context max-out thinking images\\ntest pool 1 1 yes yes\\ntest passport 1 1 yes yes\\ntest explicit 1 1 yes yes\\ntest second 1 1 yes yes");
 `, { mode: 0o755 });
   const env = {
     PATH: `${join(root, "node_modules/.bin")}:${process.env.PATH ?? ""}`, HOME: root,
@@ -114,7 +118,7 @@ for (const mode of modes) {
           assert.equal(out.calls.some((c) => c[1] === "close"), false);
           assert.ok(out.stdout.includes(variant === "split" ? `→ pane ${ids.split}` : `→ tab ${ids.tab}, pane ${ids.tabPane}`));
           if (mode === "plan") {
-            const where = spawnSync("pnpm", ["where", "plan", "YM-1", "YM-2"], { cwd: f.root, env: { ...f.env, ...stampEnv }, encoding: "utf8" });
+            const where = spawnSync("pnpm", ["where", "plan", "YM-1"], { cwd: f.root, env: { ...f.env, ...stampEnv }, encoding: "utf8" });
             assert.equal(where.status, 0, where.stderr);
             assert.match(where.stdout, /\nrun\s*$/);
           }
@@ -244,3 +248,112 @@ test("plan worker keeps literal ticket words out of ownership and ticket inputs"
     assert.match(skill, /never planning keys or launch controls/);
   } finally { f.cleanup(); }
 });
+
+for (const entry of ["node", "package"]) {
+  for (const split of [false, true]) {
+    test(`${entry} plan ${split ? "split" : "tab"}: each key owns its surface, model and literal context`, () => {
+      const f = fixture();
+      try {
+        const plain = f.run("plan", [...(split ? ["--split"] : []), "YM-1", "YM-2"], {}, entry);
+        assert.equal(plain.status, 0, plain.stderr);
+        assert.equal(plain.calls.filter(c => c[1] === "create" || c[1] === "split").length, 2);
+        assert.deepEqual(plain.calls.filter(c => c[1] === "prompt").map(c => c[3]), ["/skill:plan YM-1", "/skill:plan YM-2"]);
+        for (const explicit of [false, true]) {
+          const keys = ["YM-1", "ACME-2"];
+          const literal = ["YM-99", "--split", "--model", "literal"];
+          const out = f.run("plan", [...(split ? ["--split"] : []), ...keys,
+            ...(explicit ? ["--model", "test/explicit"] : []), "--", ...literal], {}, entry);
+          assert.equal(out.status, 0, out.stderr);
+          const surfaces = out.calls.filter(c => c[1] === "create" || c[1] === "split");
+          const starts = out.calls.filter(c => c[1] === "start");
+          const prompts = out.calls.filter(c => c[1] === "prompt");
+          assert.equal(surfaces.length, 2);
+          assert.equal(starts.length, 2);
+          assert.equal(prompts.length, 2);
+          keys.forEach((key, index) => {
+            const surface = surfaces[index]!;
+            const suffix = index ? "-2" : "";
+            const pane = (split ? ids.split : ids.tabPane) + suffix;
+            assert.deepEqual(surface.slice(0, 2), split ? ["pane", "split"] : ["tab", "create"]);
+            if (split) assert.equal(surface[2], ids.parent);
+            else {
+              assert.equal(value(surface, "--workspace"), "w-fixture");
+              assert.equal(value(surface, "--label"), `${key} plan`);
+            }
+            assert.equal(value(surface, "--cwd"), f.root);
+            const env = Object.fromEntries(surface.flatMap((word, i) => word === "--env" ? [surface[i + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
+            assert.equal(env.YOKEMATE_TICKET, key);
+            assert.equal(env.YOKEMATE_MODE, "plan");
+            assert.equal(env.YOKEMATE_ROLE, "coordinator");
+            assert.equal(env.YOKEMATE_PARENT_PANE, ids.parent);
+            assert.deepEqual(JSON.parse(env.YOKEMATE_PLAN_LITERAL!), literal);
+            assert.equal(starts[index]![2], `${key.toLowerCase()}-plan`);
+            assert.equal(value(starts[index]!, "--pane"), pane);
+            assert.equal(value(starts[index]!, "-n"), `${key} plan`);
+            assert.equal(value(starts[index]!, "--model"), explicit ? "test/explicit" : index ? "test/second" : "test/passport");
+            assert.deepEqual(prompts[index], ["agent", "prompt", `${key.toLowerCase()}-plan`, `/skill:plan ${key} ${literal.join(" ")}`]);
+            const where = spawnSync("pnpm", ["where", "plan", key], { cwd: f.root, env: { ...f.env, ...env }, encoding: "utf8" });
+            assert.equal(where.status, 0, where.stderr);
+            assert.match(where.stdout, /\nrun\s*$/);
+            assert.ok(out.stdout.includes(`${key} → ${split ? "" : `tab ${ids.tab + suffix}, `}pane ${pane}`));
+          });
+          assert.equal(out.calls.some(c => c[1] === "close"), false);
+          assert.doesNotMatch(JSON.stringify(out.calls), /YM-1\+ACME-2|skill:plan YM-1 ACME-2/);
+        }
+      } finally { f.cleanup(); }
+    });
+
+    for (const failure of ["duplicate", "model", "start", "prompt"]) {
+      for (const failedIndex of [0, 1]) {
+        test(`${entry} plan ${split ? "split" : "tab"}: ${failure} at ${failedIndex} leaves sibling alive`, () => {
+          const f = fixture();
+          try {
+            const keys = ["YM-1", "YM-2"];
+            const failedKey = failure === "model" ? "OTHER-1" : keys[failedIndex]!;
+            keys[failedIndex] = failedKey;
+            const sibling = keys[1 - failedIndex]!;
+            const extra: Record<string, string> = failure === "duplicate" ? { AGENTS: JSON.stringify([{ name: `${failedKey.toLowerCase()}-plan`, pane_id: "w-fixture:p-neighbor" }]) }
+              : failure === "model" ? {} : { FAIL_AT: failure, FAIL_AGENT: `${failedKey.toLowerCase()}-plan`, FAIL_CLEANUP: "1" };
+            const out = f.run("plan", [...(split ? ["--split"] : []), ...keys], extra, entry);
+            assert.equal(out.status, 1);
+            assert.match(out.stderr, failure === "duplicate" ? new RegExp(`${failedKey} plan already runs in pane w-fixture:p-neighbor — go to it, or close it and launch again`)
+              : failure === "model" ? /OTHER-1.*no passport/ : new RegExp(`${failedKey} plan:.*injected-${failure}-failure`));
+            assert.doesNotMatch(out.stderr, /injected-close-failure/);
+            assert.match(out.stdout, new RegExp(`${sibling} →`));
+            const creates = out.calls.filter(c => c[1] === "create" || c[1] === "split");
+            const preflight = failure === "duplicate" || failure === "model";
+            assert.equal(creates.length, preflight ? 1 : 2);
+            assert.ok(out.calls.some(c => c[1] === "prompt" && c[2] === `${sibling.toLowerCase()}-plan`));
+            const suffix = failedIndex ? "-2" : "";
+            assert.deepEqual(out.calls.filter(c => c[1] === "close"), preflight ? [] : [split ? ["pane", "close", ids.split + suffix] : ["tab", "close", ids.tab + suffix]]);
+            assert.equal(out.calls.some(c => c[1] === "prompt" && c[2] === `${failedKey.toLowerCase()}-plan`), failure === "prompt");
+          } finally { f.cleanup(); }
+        });
+      }
+    }
+  }
+}
+
+for (const entry of ["node", "package"]) {
+  test(`${entry} plan: problem and mixed input stay in one conversational surface`, () => {
+    const f = fixture();
+    try {
+      for (const split of [[], ["--split"]]) {
+        for (const words of [["fix", "problem"], ["YM-1", "fix", "YM-2"], ["YM-1", "note"]]) {
+          const out = f.run("plan", [...split, ...words, "--", "YM-99"], {}, entry);
+          assert.equal(out.status, 0, out.stderr);
+          const surfaces = out.calls.filter(c => c[1] === "create" || c[1] === "split");
+          assert.equal(surfaces.length, 1);
+          assert.equal(out.calls.find(c => c[1] === "prompt")![3], `/skill:plan ${words.join(" ")} YM-99`);
+          const key = words[0] === "YM-1" ? "YM-1" : "";
+          assert.equal(surfaces[0]!.includes(`YOKEMATE_TICKET=${key}`), Boolean(key));
+          assert.equal(value(out.calls.find(c => c[1] === "start")!, "--model"), key ? "test/passport" : "test/pool");
+          const where = spawnSync("pnpm", ["where", "plan", key], { cwd: f.root,
+            env: { ...f.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: key }, encoding: "utf8" });
+          assert.equal(where.status, 0, where.stderr);
+          assert.match(where.stdout, /\nrun\s*$/);
+        }
+      }
+    } finally { f.cleanup(); }
+  });
+}

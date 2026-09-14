@@ -24,6 +24,16 @@ export const TICKETLESS: readonly string[] = ["plan", "note", "research"];
 
 import { openModeSurface, parseSurfaceArgs, type Surface, type SurfaceArgs } from "./mode-surface.ts";
 
+export function resolvePlanTargets(parsed: SurfaceArgs): { ticket: string; workerWords: string[] }[] {
+  const { keys, tail } = parseKeyList(parsed.words, true);
+  if (keys.length && !tail.length)
+    return keys.map((ticket) => ({ ticket, workerWords: [ticket, ...parsed.literal] }));
+  return [{
+    ticket: keys[0] ?? "",
+    workerWords: [...parsed.words.flatMap((word) => parseKeyList([word], true).keys.length ? word.split("+") : [word]), ...parsed.literal],
+  }];
+}
+
 export interface Launch {
   cwd: string;
   label: string;
@@ -168,9 +178,7 @@ if (import.meta.filename === process.argv[1]) {
     try { parsed = parseSurfaceArgs(argv.slice(1)); } catch (e) { fail((e as Error).message); }
     workerWords = [...parsed.words, ...parsed.literal];
     if (mode === "plan") {
-      const keys = parseKeyList(parsed.words, true).keys;
-      ticket = keys.join("+");
-      workerWords = [...parsed.words.flatMap((word) => parseKeyList([word], true).keys.length ? word.split("+") : [word]), ...parsed.literal];
+      ({ ticket, workerWords } = resolvePlanTargets(parsed)[0]!);
       tail = workerWords;
     } else if (mode === "note") {
       ticket = "";
@@ -209,96 +217,79 @@ if (import.meta.filename === process.argv[1]) {
     fail("no HERDR_PANE_ID — a mode is launched from the chat's own pane");
   const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
 
-  let model = parsed.model;
-  // The launch never inherits the machine's default: the engineer's --model
-  // wins, else the passports answer by mode — by org for worklog, by key
-  // prefix for every keyed mode. A launch with no key at all (a problem-input
-  // plan, a note) has no passport to ask: home/pool.json answers, and a gap
-  // there is a refusal, not a literal (YM-159).
-  if (!model) {
+  const targets = mode === "plan" ? resolvePlanTargets(parsed) : [{ ticket, workerWords }];
+  for (const { ticket, workerWords } of targets) {
     try {
-      if (!ticket) {
-        model = poolModel(dataRoot(ROOT), mode);
-      } else {
-        const db = openDb(join(ROOT, "yokemate.db"));
-        model =
-          mode === "worklog"
-            ? modelForOrg(db, ticket, mode)
-            : modelForTicket(db, ticket.split("+")[0], mode);
+      let model = parsed.model;
+      if (!model) {
+        try {
+          if (!ticket) {
+            model = poolModel(dataRoot(ROOT), mode);
+          } else {
+            const db = openDb(join(ROOT, "yokemate.db"));
+            try {
+              model = mode === "worklog" ? modelForOrg(db, ticket, mode) : modelForTicket(db, ticket, mode);
+            } finally { db.close(); }
+          }
+        } catch (e) {
+          throw new Error(`${ticket || `/${mode}`}: ${(e as Error).message}`);
+        }
       }
+
+      let stand: StandFacts | undefined;
+      if (mode === "review") {
+        const folder = existsSync(join(ROOT, "work", ticket));
+        stand = { folder, plan: folder || Boolean(findPlan(dataRoot(ROOT), ticket)) };
+      } else if (mode === "ship") {
+        for (const key of ticket.split("+")) {
+          const taskFolder = join(ROOT, "work", key);
+          if (!existsSync(taskFolder)) throw new Error(`no task folder ${taskFolder} — /ship runs after /do`);
+        }
+      }
+
+      const launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand, parsed.surface, workerWords);
+      const { cwd, surface } = launch;
+      const duplicateGuard = policy.guards.duplicateMode;
+      const runId = ticket && !duplicateGuard ? randomUUID().replace(/-/g, "").slice(0, 8) : undefined;
+      const prompt = launch.prompt + (runId ? ` Run ID: ${runId}. Include it in your final report.` : "");
+      const env = [
+        ...launch.env, "YOKEMATE_ROLE=coordinator",
+        ...(mode === "plan" && parsed.literal.length ? [`YOKEMATE_PLAN_LITERAL=${JSON.stringify(parsed.literal)}`] : []),
+        ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : []),
+      ];
+      let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;
+      let label = runId ? `${launch.label} [${runId}]` : launch.label;
+
+      const agents = (
+        herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
+      ).result.agents;
+
+      if (!ticket) {
+        agentName = freeAgentName(agentName, agents.map((a) => a.name ?? ""));
+        label = agentName;
+      } else {
+        const running = findRunningAgent(agents, launch.agentName, { mode, ticket, cwd });
+        if (duplicateGuard && running)
+          throw new Error(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
+      }
+
+      const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
+      const { paneId } = opened;
+      try {
+        startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
+        herdr(["agent", "prompt", agentName, prompt]);
+      } catch (e) {
+        try { opened.cleanup(); } catch {}
+        throw new Error(`${label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
+      }
+
+      console.log(
+        `${ticket || `/${mode}`} → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
+      );
     } catch (e) {
-      model = fail((e as Error).message);
+      const message = (e as Error).message;
+      console.error(mode === "plan" && ticket && !message.startsWith(ticket) ? `${ticket}: ${message}` : message);
+      process.exitCode = 1;
     }
   }
-
-  // The folder is checked by its path, not by cwd: the panes sit at the root
-  // while the stand lives in work/<TICKET>. Ship checks every key of its list
-  // and still refuses without a folder; review hands the facts to the launch —
-  // a missing folder with a plan in knowledge becomes an adopt run, not a
-  // refusal (the plan glob is adopt's own helper).
-  let stand: StandFacts | undefined;
-  if (mode === "review") {
-    const folder = existsSync(join(ROOT, "work", ticket));
-    stand = { folder, plan: folder || Boolean(findPlan(dataRoot(ROOT), ticket)) };
-  } else if (mode === "ship") {
-    for (const key of ticket.split("+")) {
-      const taskFolder = join(ROOT, "work", key);
-      if (!existsSync(taskFolder)) fail(`no task folder ${taskFolder} — /ship runs after /do`);
-    }
-  }
-
-  let launch: Launch;
-  try {
-    launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand, parsed.surface, workerWords);
-  } catch (e) {
-    launch = fail((e as Error).message);
-  }
-  const { cwd, surface } = launch;
-  const duplicateGuard = policy.guards.duplicateMode;
-  const runId = ticket && !duplicateGuard ? randomUUID().replace(/-/g, "").slice(0, 8) : undefined;
-  const prompt = launch.prompt + (runId ? ` Run ID: ${runId}. Include it in your final report.` : "");
-  const env = [
-    ...launch.env, "YOKEMATE_ROLE=coordinator",
-    ...(mode === "plan" && parsed.literal.length ? [`YOKEMATE_PLAN_LITERAL=${JSON.stringify(parsed.literal)}`] : []),
-    ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : []),
-  ];
-  let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;
-  let label = runId ? `${launch.label} [${runId}]` : launch.label;
-
-  const agents = (
-    herdr(["agent", "list"]) as { result: { agents: { name?: string; pane_id: string }[] } }
-  ).result.agents;
-
-  // A ticketless launch's name is the bare mode, so the «one agent per mode per
-  // ticket» guard would forbid a second launch outright. It takes the first free
-  // name in the series instead; the guard stays for every keyed launch — a
-  // keyed plan included.
-  if (!ticket) {
-    agentName = freeAgentName(agentName, agents.map((a) => a.name ?? ""));
-    label = agentName;
-  } else {
-    const running = findRunningAgent(agents, launch.agentName, { mode, ticket, cwd });
-    if (duplicateGuard && running)
-      fail(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
-  }
-
-  const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
-  const { paneId } = opened;
-
-  // From here on the pane exists: anything that throws has to take it back down
-  // by the id herdr just gave us, or the workspace fills up with empty panes.
-  try {
-    // Same posture as the task tab: nobody sits at this agent's permission
-    // dialogs while it gathers facts. The engineer joins it to answer questions.
-    startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
-    herdr(["agent", "prompt", agentName, prompt]);
-  } catch (e) {
-    // The failure to report is the launch's, not the cleanup's.
-    try { opened.cleanup(); } catch {}
-    fail(`${label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
-  }
-
-  console.log(
-    `${ticket || `/${mode}`} → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${paneId}, agent "${agentName}", model ${model}, /${mode} in ${cwd}${runId ? `, run ${runId}` : ""}`,
-  );
 }

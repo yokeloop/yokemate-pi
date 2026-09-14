@@ -9,7 +9,7 @@ The first word `$1` must be `plan`; otherwise say «use /<mode> --split» and st
 
 Run `pnpm where plan [KEY …]` before anything else, with every key before the first `--` in `${@:2}` in input order, excluding control values; use no keys for a problem statement.
 
-- `launch` — run `pnpm split plan --split ${@:2}`, return its one output line and stop. The alias control stays before the whole user tail so a user's `--` cannot turn it into text. Pass any explicitly named model before that separator too.
+- `launch` — run `pnpm split plan --split ${@:2}`, return its output lines and stop. The alias control stays before the whole user tail so a user's `--` cannot turn it into text. Pass any explicitly named model before that separator too.
 - `run` — this mode surface already runs plan; say so and stop.
 - `refuse: …` — print the refusal unchanged and stop.
 

@@ -68,7 +68,7 @@ if (import.meta.filename === process.argv[1]) {
       process.exit(1);
     }
   }
-  const ticket = mode === "do" || mode === "plan" ? parsed.keys.join("+") : mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
+  const ticket = mode === "plan" ? parsed.keys.join(" ") : mode === "do" ? parsed.keys.join("+") : mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
   if (!MODES.includes(mode) || (!ticket && !TICKETLESS.includes(mode))) {
     console.error(`usage: where <${MODES.join("|")}> <TICKET>`);
     process.exit(1);

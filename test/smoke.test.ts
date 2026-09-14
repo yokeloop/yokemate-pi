@@ -17,7 +17,8 @@ import {
 } from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
-import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
+import { MODES, freeAgentName, resolveLaunch, resolvePlanTargets } from "../src/mode-tab.ts";
+import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
 import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
 import { resolveGuardPolicy } from "../src/guard-policy.ts";
@@ -569,11 +570,18 @@ test("plan opens at the root and is prompted with /plan itself", () => {
   assert.equal(keyed.agentName, "acme-3-plan");
   assert.deepEqual(keyed.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=ACME-3"]);
 
-  const multi = resolveLaunch("/root", "plan", "YM-1+YM-2", "note", undefined, "w1:p1", undefined, "split", ["YM-1", "YM-2", "note"]);
-  assert.equal(multi.surface, "split");
-  assert.equal(multi.label, "YM-1+YM-2 plan");
-  assert.equal(multi.prompt, "/skill:plan YM-1 YM-2 note");
-  assert.deepEqual(multi.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=YM-1+YM-2", "YOKEMATE_PARENT_PANE=w1:p1"]);
+  const targets = resolvePlanTargets(parseSurfaceArgs(["--split", "YM-1", "YM-2", "--", "note"]));
+  assert.deepEqual(targets, [{ ticket: "YM-1", workerWords: ["YM-1", "note"] }, { ticket: "YM-2", workerWords: ["YM-2", "note"] }]);
+  for (const target of targets) {
+    const launch = resolveLaunch("/root", "plan", target.ticket, "", undefined, "w1:p1", undefined, "split", target.workerWords);
+    assert.equal(launch.surface, "split");
+    assert.equal(launch.label, `${target.ticket} plan`);
+    assert.equal(launch.prompt, `/skill:plan ${target.ticket} note`);
+    assert.deepEqual(launch.env, ["YOKEMATE_MODE=plan", `YOKEMATE_TICKET=${target.ticket}`, "YOKEMATE_PARENT_PANE=w1:p1"]);
+  }
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["fix", "YM-1", "YM-2"])), [{ ticket: "YM-1", workerWords: ["fix", "YM-1", "YM-2"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["problem", "--", "YM-1"])), [{ ticket: "", workerWords: ["problem", "YM-1"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["YM-1+YM-2"])), [{ ticket: "YM-1", workerWords: ["YM-1"] }, { ticket: "YM-2", workerWords: ["YM-2"] }]);
 
   const problem = resolveLaunch("/root", "plan", "", "кнопка не жмётся");
   assert.equal(problem.surface, "tab");
@@ -731,6 +739,9 @@ test("plan prompt preserves several keys", async () => {
     const expanded = promptTemplates.expandPromptTemplate(`/plan ${keys.join(" ")}`, templates);
     assert.ok(expanded.includes(`Ticket or problem: ${keys.join(" ")}`));
     assert.ok(expanded.includes(".pi/skills/plan/SKILL.md"));
+    assert.match(expanded, /one independent tab per key, or one split per key from the same calling pane/);
+    assert.match(expanded, /Each worker receives only its key and uses its own passport model/);
+    assert.match(expanded, /Return every per-key result, including partial refusals/);
   }
   const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
   assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
@@ -873,9 +884,20 @@ test("a mode skill knows whether to launch the pane or do the work", async () =>
     const refused = run([mode, "YM-1", "YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" });
     assert.equal(refused.status, 1);
     assert.match(refused.stdout, /^refuse: /);
-    const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
-    assert.equal(own.status, 0);
-    assert.equal(own.stdout.trim(), "run");
+    if (mode === "do") {
+      const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(own.status, 0);
+      assert.equal(own.stdout.trim(), "run");
+    } else {
+      for (const key of ["YM-1", "YM-2"]) {
+        const own = run([mode, key], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: key });
+        assert.equal(own.status, 0);
+        assert.equal(own.stdout.trim(), "run");
+      }
+      const joined = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(joined.status, 1);
+      assert.match(joined.stdout, /^refuse: /);
+    }
   }
   const invalid = run(["do", "YM-1", "not-a-key"]);
   assert.equal(invalid.status, 1);
@@ -1234,7 +1256,7 @@ test("plan templates launch ordinary input in a tab and preserve explicit split 
     const expanded = promptTemplates.expandPromptTemplate(`/plan ${args}`, templates);
     assert.ok(expanded.includes(`Ticket or problem: ${args}`));
     assert.match(expanded, /pnpm where plan \[KEY …\]/);
-    assert.ok(expanded.includes(`- \`launch\` — run \`pnpm split plan ${args}\` and return its one output line, then stop.`));
+    assert.ok(expanded.includes(`- \`launch\` — run \`pnpm split plan ${args}\` and return its output lines, then stop.`));
     assert.match(expanded, /new tab is the default/);
     assert.match(expanded, /No tracker reads, reconnaissance or planning in the main chat/);
     assert.doesNotMatch(expanded, /continue inline|Inline completion/);
@@ -1248,7 +1270,7 @@ test("plan templates launch ordinary input in a tab and preserve explicit split 
     }
   }
   const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
-  assert.match(skill, /`launch`.*run `pnpm split plan <original arguments>` unchanged and return its one output line, then stop/);
+  assert.match(skill, /`launch`.*run `pnpm split plan <original arguments>` unchanged and return its output lines, then stop/);
   assert.match(skill, /never planning keys or launch controls/);
   assert.match(skill, /send the outcome to the pane the mode was launched from/);
   assert.match(skill, /mode surface \(default tab or explicit split\) is conversational/);
