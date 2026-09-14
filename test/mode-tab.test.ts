@@ -218,3 +218,29 @@ test("preflight refusals and review adopt happen before creating either surface"
     }
   } finally { f.cleanup(); }
 });
+
+test("plan worker keeps literal ticket words out of ownership and ticket inputs", () => {
+  const f = fixture();
+  try {
+    for (const split of [[], ["--split"]]) {
+      for (const keys of [["YM-1"], []]) {
+        const literal = keys.length ? ["YM-2"] : ["YM-1"];
+        const out = f.run("plan", [...split, ...keys, "--", ...literal]);
+        assert.equal(out.status, 0, out.stderr);
+        const surface = out.calls.find((c) => c[1] === "create" || c[1] === "split")!;
+        const stampEnv = Object.fromEntries(surface.flatMap((word, index) => word === "--env" ? [surface[index + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
+        assert.equal(stampEnv.YOKEMATE_TICKET, keys.length ? "YM-1" : undefined);
+        assert.deepEqual(JSON.parse(stampEnv.YOKEMATE_PLAN_LITERAL!), literal);
+        assert.equal(out.calls.find((c) => c[1] === "prompt")![3], `/skill:plan ${[...keys, ...literal].join(" ")}`);
+        const where = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "plan", ...(stampEnv.YOKEMATE_TICKET ? [stampEnv.YOKEMATE_TICKET] : [])],
+          { cwd: f.root, env: { ...f.env, ...stampEnv }, encoding: "utf8" });
+        assert.equal(where.status, 0, where.stderr);
+        assert.equal(where.stdout.trim(), "run");
+      }
+    }
+    const skill = readFileSync(join(import.meta.dirname, "../.pi/skills/plan/SKILL.md"), "utf8");
+    assert.match(skill, /pnpm where plan "\$YOKEMATE_TICKET"/);
+    assert.match(skill, /YOKEMATE_PLAN_LITERAL/);
+    assert.match(skill, /never planning keys or launch controls/);
+  } finally { f.cleanup(); }
+});

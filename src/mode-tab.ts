@@ -257,7 +257,11 @@ if (import.meta.filename === process.argv[1]) {
   const duplicateGuard = policy.guards.duplicateMode;
   const runId = ticket && !duplicateGuard ? randomUUID().replace(/-/g, "").slice(0, 8) : undefined;
   const prompt = launch.prompt + (runId ? ` Run ID: ${runId}. Include it in your final report.` : "");
-  const env = [...launch.env, "YOKEMATE_ROLE=coordinator", ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : [])];
+  const env = [
+    ...launch.env, "YOKEMATE_ROLE=coordinator",
+    ...(mode === "plan" && parsed.literal.length ? [`YOKEMATE_PLAN_LITERAL=${JSON.stringify(parsed.literal)}`] : []),
+    ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : []),
+  ];
   let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;
   let label = runId ? `${launch.label} [${runId}]` : launch.label;
 

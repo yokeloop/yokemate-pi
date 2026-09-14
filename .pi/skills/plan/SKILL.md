@@ -9,13 +9,15 @@ You drive one request to a plan `/do` executes without follow-ups, in this mode 
 
 ## Where this runs
 
-One command runs before anything else — before the tracker, before the code:
+One command runs before anything else — before the tracker, before the code. In a stamped plan surface (`YOKEMATE_MODE=plan`), check its launch identity, never reconstruct it from the worker text:
 
 ```
-pnpm where plan [KEY …]
+pnpm where plan "$YOKEMATE_TICKET"
 ```
 
-— with every named key before the first `--` in input order, excluding control values; without keys when it is only a problem statement. Keep the full input separately for the launcher.
+With no ticket stamp, run `pnpm where plan`. The optional `YOKEMATE_PLAN_LITERAL` environment value is a JSON array identifying the literal suffix of the delivered worker words. Those suffix words are note/problem context, never planning keys or launch controls, even when they look like ticket keys. Preserve them as context; take existing planning keys only from the ordered ticket stamp. The separator itself is not worker text.
+
+Outside a stamped plan surface, run `pnpm where plan [KEY …]` with every named key before the first `--` in input order, excluding control values; without keys when it is only a problem statement. Keep the full input separately for the launcher.
 
 - **`launch`** — the unstamped main chat: run `pnpm split plan <original arguments>` unchanged and return its one output line, then stop. A new tab is the default; `--split` before `--` requests a split. No planning work happens in the main chat.
 - **`run`** — the stamped /plan mode surface: do the work below, then report as «In a mode surface» says.
