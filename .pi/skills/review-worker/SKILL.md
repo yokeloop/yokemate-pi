@@ -9,13 +9,13 @@ You raise the stand for one ticket and walk the engineer through it. The reposit
 
 ## Where this runs
 
-You are the worker: the split raised by `pnpm review` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
+You are the worker: the mode surface raised by `pnpm review` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
 
 ```
 pnpm where review <TICKET>
 ```
 
-- **`run`** — this is the review split. Do the work below.
+- **`run`** — this is the review mode surface. Do the work below.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /review <TICKET>» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
@@ -78,8 +78,8 @@ Either way the report says what was covered and what was not: a stand limitation
 The outcome is already recorded by the `pnpm accept` you ran; the main chat is told after the fact.
 
 1. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — ticket key, and either the rework plan's path or that the ticket is verified. A result of `unreachable: <reason>` → say the report in this pane and stop; the stage is already recorded either way.
-2. Say the same line in this split.
+2. Say the same line in this mode surface.
 
-This split is not closed for you. Say that acceptance is finished and wait: the engineer is standing here, and only the engineer knows it is over.
+This mode surface is not closed for you. Say that acceptance is finished and wait: the engineer is standing here, and only the engineer knows it is over.
 
 You never merge anything. Merging is the engineer's button in GitHub.

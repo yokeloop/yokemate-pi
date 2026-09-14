@@ -1,11 +1,11 @@
 ---
 name: plan
-description: Take a problem or an existing ticket to a plan ready for /do, inline in the chat where it was typed — questions to the engineer in the same feed, code reconnaissance and plan-writing in subagents. Triggered by "/plan <problem>" or "/plan <KEY> [<KEY> …]".
+description: Take a problem or an existing ticket to a plan ready for /do, in a new tab by default, or a split with --split — questions to the engineer in that surface, code reconnaissance and plan-writing in subagents. Triggered by "/plan [--split] <problem>" or "/plan [--split] <KEY> [<KEY> …]".
 ---
 
 # /plan — from problem or ticket to a ready plan
 
-You drive one request to a plan `/do` executes without follow-ups, without leaving this chat: questions to the engineer land in this same feed, code reconnaissance and plan-writing run in the `plan-scout` and `plan-writer` subagents. The plan is the only thing `/do` receives: everything it gets wrong traces back to a line this conversation left soft. Do not stop halfway: a plan with «разберёмся по ходу» in it is not done. Read the effective guard policy from the system context. `workflowApproval=true` preserves every textual confirmation below. When it is false, a fully delegated task continues through planning and worker launch without another permission question; explicit «стоп», «только план», missing facts, scope changes and external authentication remain blockers.
+You drive one request to a plan `/do` executes without follow-ups, in this mode surface: questions to the engineer land in this same feed, code reconnaissance and plan-writing run in the `plan-scout` and `plan-writer` subagents. The plan is the only thing `/do` receives: everything it gets wrong traces back to a line this conversation left soft. Do not stop halfway: a plan with «разберёмся по ходу» in it is not done. Read the effective guard policy from the system context. `workflowApproval=true` preserves every textual confirmation below. When it is false, a fully delegated task continues through planning and worker launch without another permission question; explicit «стоп», «только план», missing facts, scope changes and external authentication remain blockers.
 
 ## Where this runs
 
@@ -15,10 +15,10 @@ One command runs before anything else — before the tracker, before the code:
 pnpm where plan [KEY …]
 ```
 
-— with every named key in input order, without keys when it is only a problem statement.
+— with every named key before the first `--` in input order, excluding control values; without keys when it is only a problem statement. Keep the full input separately for the launcher.
 
-- **`launch`** — the unstamped main chat: work inline right here, as below.
-- **`run`** — a stamped /plan pane, raised by `/split plan`: the same work, here, ended as «In a pane» below says.
+- **`launch`** — the unstamped main chat: run `pnpm split plan <original arguments>` unchanged and return its one output line, then stop. A new tab is the default; `--split` before `--` requests a split. No planning work happens in the main chat.
+- **`run`** — the stamped /plan mode surface: do the work below, then report as «In a mode surface» says.
 - **`refuse: …`** — print that line as it came and stop.
 
 ## Input
@@ -68,15 +68,15 @@ Then take each created ticket through «By ticket» below. The interview already
 1. **Reconnaissance** — read the ticket and its comments from the tracker yourself (`youtrack-<org>` MCP; for a github-project — `gh issue view <номер> -R <owner>/<repo> --comments`) — the subagent has no tracker access — then spawn the `plan-scout` subagent: the ticket's text and comments (or the interview's four fields, which already carry the same), the key, the project, its clone at `projects/<org>/<project>/` and its knowledge at `home/knowledge/<org>/<project>/`. It returns facts with sources, assumptions, and forks with recommendations. The tool returns at once: the scout's report arrives later as a separate message opening with `[subagent plan-scout]`. Until it arrives the chat is free — answer whatever the engineer types and start nothing of this run's next step; on the report, continue with «Questions» below in this same run. A report opening with `[subagent plan-scout failed]` → say it in one line in the feed and stop; re-running the scout is the engineer's word. Not solvable with what is given → report exactly what is missing and stop; no plan gets written around a hole.
 2. **Questions** — close the scout's forks with the engineer, inline, one at a time: the same question shape as the interview above. Start from the forks; a gap becomes a question only when the answer changes the implementation — everything else you close from the code yourself. Order: what blocks the contract between parts first, cosmetics last. When an answer can be found in the code faster than asked — look it up and present it as a fact with the source, not as a question. The engineer's word is input, not a hypothesis: if it diverges from what the code shows, say in one line what else will be needed — then record the decision as given. The engineer's answer ends the question: never re-ask it, never argue it back, never offer the rejected option again in a later question. The plan may only get simpler as the questions go — a question that adds a step is you widening the ticket, and scope is not yours to name. The moment the talk drifts into free-form argument, return to one question at a time. An ADR is the record of a past ticket's decision, not a rule for this one: cite it as context with its date and ticket; never argue it back at the engineer as law. Never a question: extra logs, extra checks, release, versioning, merging — nothing that does not change the solution itself.
 3. **Plan** — spawn the `plan-writer` subagent: the key, the project, the scout's facts and every decision made above. It writes the plan in the shape `PLAN-FORMAT.md` defines to `home/knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` and returns the path. The tool returns at once: the path arrives later in a message opening with `[subagent plan-writer]` — the chat stays answerable meanwhile, and on that message you continue with «Record» below. A report opening with `[subagent plan-writer failed]` → say it in one line in the feed and stop. Read the result: an open question left in it is a defect — send it back with the decisions it missed.
-4. **Record** — `pnpm plan <KEY> <plan-path>`, then retain the key and plan path for the single outcome report after every input key has been processed. When `workflowApproval=true`, say it is ready for `/do`. When it is false and no explicit «только план» limits the request, run `pnpm spawn <KEY>` after the successful record; report its actual run. If an enabled `spawnCaller` or transition guard refuses it, name that specific refusal without asking for a replacement general permission. Inline, no `send_message` — the chat you would report to is the one you are in.
+4. **Record** — `pnpm plan <KEY> <plan-path>`, then retain the key and plan path for the single outcome report after every input key has been processed. When `workflowApproval=true`, say it is ready for `/do`. When it is false and no explicit «только план» limits the request, run `pnpm spawn <KEY>` after the successful record; report its actual run. If an enabled `spawnCaller` or transition guard refuses it, name that specific refusal without asking for a replacement general permission. Report after all input keys as described below.
 
 The four steps above run to their end even when the engineer types into the feed midway: answer what they asked, then take up the same step and say which one you are returning to — «отвечаю и возвращаюсь к шагу 2, вопросы». Only a message aimed at the planning itself — stop, another ticket, a decision changed — replaces the step instead of resuming it. A flow that ends on a stray question leaves no plan, no `planned` row, and nothing in the feed saying so.
 
-## In a pane
+## In a mode surface
 
-The `run` verdict changes only the ending. When every plan of the run is recorded, send the outcome to the pane the mode was launched from as a courtesy: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines: the keys and their plan paths, ready for `/do`. A result of `unreachable: <reason>` → say the report in this pane — the plans are already recorded either way.
+When every plan of the run is recorded, send the outcome to the pane the mode was launched from as a courtesy: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines: the keys and their plan paths, ready for `/do`. A result of `unreachable: <reason>` → say the report in this pane — the plans are already recorded either way.
 
-Then wait: the pane is conversational, and closing it is the engineer's — never yours, and never the main chat's (`close-mode` does not know plan).
+Then wait: the mode surface (default tab or explicit split) is conversational, and closing it is the engineer's — never yours, and never the main chat's (`close-mode` does not know plan).
 
 ## Glossary and ADRs — maintained inline, as decisions crystallize
 

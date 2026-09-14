@@ -9,13 +9,13 @@ Time reaches the tracker from the traces the work left, not from memory. The eng
 
 ## Where this runs
 
-You are the worker: the split raised by `pnpm worklog` is prompted with this skill — the engineer never types it. One command runs before anything else:
+You are the worker: the mode surface raised by `pnpm worklog` is prompted with this skill — the engineer never types it. One command runs before anything else:
 
 ```
 pnpm where worklog <org>
 ```
 
-- **`run`** — this is the worklog split. Do the work below.
+- **`run`** — this is the worklog mode surface. Do the work below.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /worklog <org>» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
@@ -25,7 +25,7 @@ For the period the engineer named:
 
 - `home/journal/YYYY-MM.md` — the outcome lines the commands append («дата тикет запланировано/сделано/принято»; в старых записях — «загрилено») and the narrative entries; the texts for the tracker start here.
 - Commits in the org's clones (`projects/<org>/`) and its task worktrees (`work/<TICKET>/`): `git log --all --since "<from>" --until "<to>"` — the ticket key in the branch or the message says whose commit it is.
-- The calendar for the meetings (Google Calendar). Keep only meetings the engineer took part in; the calendar not reachable from this split, or an event unclear — ask the engineer, do not guess.
+- The calendar for the meetings (Google Calendar). Keep only meetings the engineer took part in; the calendar not reachable from this mode surface, or an event unclear — ask the engineer, do not guess.
 
 ## Layout and confirmation
 
@@ -42,4 +42,4 @@ Confirmed rows one at a time through `log_work` on `youtrack-<org>`: issueId, du
 - The tracker gets time entries and nothing else: no transitions, no comments, no field edits.
 - Clones and worktrees are read-only here.
 - yokemate's own work (`yokeloop`) bills nobody unless the engineer says otherwise.
-- This split is not closed for you: say the period is written and wait — the engineer may name the next one, and only they know the session is over.
+- This mode surface is not closed for you: say the period is written and wait — the engineer may name the next one, and only they know the session is over.

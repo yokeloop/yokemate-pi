@@ -9,7 +9,7 @@ pnpm on-me                                        # тикеты на мне, п
 pnpm add-project <клон> --tracker acme:ACME --model openai-codex/gpt-5.6-terra   # подключить репозиторий
 ```
 
-Дальше в главном чате: `/plan ACME-347` → `/do` → `/review` → `pnpm accept`. Для исследования без тикета есть `/research <project/topic>` — отдельная вкладка.
+Дальше в главном чате: `/plan ACME-347` → `/do` → `/review` → `pnpm accept`. Пять интерактивных режимов — `/plan`, `/review`, `/worklog`, `/note`, `/research` — открывают новый tab по умолчанию. `--split` до первого `--` открывает split: `/plan --split ACME-347`; `/split plan ACME-347` — compatibility alias. `--tab` нет; после `--` параметры становятся буквальным текстом. Панель закрывает инженер. `/do` и `/ship` остаются фоновыми, мерж — только по явному `/ship`. Исследование без тикета `/research <project/topic>` сохраняет отдельное one-edit consent на каждую правку кода.
 
 ## Документы
 

@@ -1193,3 +1193,31 @@ test("a model pattern is checked against the pi catalogue, suffix apart", () => 
   // passports before the first pi session exists.
   assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", () => null), { ok: true, skipped: true });
 });
+
+test("interactive templates preserve surface controls and literal tail with split plan as an alias", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts")], includeDefaults: false });
+  for (const mode of ["plan", "review", "worklog", "note", "research"]) {
+    const args = "--split YM-1 -- --split --model literal";
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} ${args}`, templates);
+    const entry = mode === "plan" ? "split plan" : mode;
+    assert.ok(expanded.includes(`pnpm ${entry} ${args}`), expanded);
+    assert.match(expanded, /tab.*default|default.*tab/);
+  }
+  for (const args of ["YM-1", "YM-1 YM-2 -- --split --model literal"]) {
+    const primary = promptTemplates.expandPromptTemplate(`/plan --split ${args}`, templates);
+    const alias = promptTemplates.expandPromptTemplate(`/split plan ${args}`, templates);
+    const command = `pnpm split plan --split ${args}`;
+    assert.ok(primary.includes(command));
+    assert.ok(alias.includes(command));
+  }
+  for (const mode of ["do", "ship"]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} YM-1`, templates);
+    assert.doesNotMatch(expanded, /tab create|pane split|openModeSurface/);
+    assert.match(expanded, /coordinator/);
+  }
+});
