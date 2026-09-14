@@ -151,7 +151,7 @@ if (import.meta.filename === process.argv[1]) {
       herdr(["agent", "prompt", research.agentName, research.prompt]);
     } catch (e) {
       try { opened.cleanup(); } catch {}
-      fail(`${research.label}: ${(e as Error).message.split("\n")[0]}`);
+      fail(`${research.label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
     }
     console.log(`/research → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${opened.paneId}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
     process.exit(0);

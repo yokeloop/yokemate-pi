@@ -1,0 +1,220 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { openDb } from "../src/db.ts";
+
+const modes = ["plan", "review", "worklog", "note", "research"] as const;
+type Mode = typeof modes[number];
+const inputs: Record<Mode, string[]> = {
+  plan: ["YM-1", "YM-2"], review: ["YM-1"], worklog: ["org"], note: ["topic"], research: ["--topic", "topic"],
+};
+const prompts: Record<Mode, string> = {
+  plan: "/skill:plan YM-1 YM-2", review: "/skill:review-worker YM-1", worklog: "/skill:worklog-worker org",
+  note: "/skill:note-worker topic", research: "/skill:research-worker topic",
+};
+const stamps: Partial<Record<Mode, string>> = { plan: "YM-1+YM-2", review: "YM-1", worklog: "org" };
+const names: Record<Mode, string> = { plan: "ym-1-ym-2-plan", review: "ym-1-review", worklog: "org-worklog", note: "note", research: "research" };
+const ids = { tab: "w-fixture:t-created", tabPane: "w-fixture:p-tab-created", split: "w-fixture:p-split-created", parent: "w-fixture:p-parent" };
+
+function fixture() {
+  const root = mkdtempSync(join(import.meta.dirname, "fixtures", "mode-entry-"));
+  cpSync(join(import.meta.dirname, "..", "src"), join(root, "src"), { recursive: true });
+  cpSync(join(import.meta.dirname, "..", "package.json"), join(root, "package.json"));
+  for (const path of ["bin", ".pi", "home", "clone", "work/YM-1", "home/knowledge/org/repo/ai/YM-2-stand"])
+    mkdirSync(join(root, path), { recursive: true });
+  writeFileSync(join(root, "home/knowledge/org/repo/ai/YM-2-stand/YM-2-stand-plan.md"), "# YM-2\n");
+  writeFileSync(join(root, "home/pool.json"), JSON.stringify({ plan: "test/pool", note: "test/pool", research: "test/pool" }));
+  const policy = (duplicateMode = true) => writeFileSync(join(root, ".pi/settings.json"), JSON.stringify({ guardPolicy: { yolo: false, guards: { duplicateMode, shipConfirmation: true } } }));
+  policy();
+  const db = openDb(join(root, "yokemate.db"));
+  db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model,mode_models) VALUES ('org','repo',?,'github','YM','test/default',?)")
+    .run(join(root, "clone"), JSON.stringify(Object.fromEntries(modes.map((mode) => [mode, "test/passport"]))));
+  db.close();
+  const journal = join(root, "journal.jsonl");
+  writeFileSync(join(root, "bin/herdr"), `#!${process.execPath}
+import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.JOURNAL, JSON.stringify(args) + "\\n");
+if ((args[0] === "agent" && args[1] === process.env.FAIL_AT) || (args[1] === "close" && process.env.FAIL_CLEANUP)) {
+  console.error("injected-" + args[1] + "-failure"); process.exit(1);
+}
+let result = {};
+if (args[0] === "agent" && args[1] === "list") result = { agents: JSON.parse(process.env.AGENTS || "[]") };
+if (args[0] === "tab" && args[1] === "create") result = { tab: { tab_id: "${ids.tab}" }, root_pane: { pane_id: "${ids.tabPane}" } };
+if (args[0] === "pane" && args[1] === "split") result = { pane: { pane_id: "${ids.split}" } };
+console.log(JSON.stringify({ result }));
+`, { mode: 0o755 });
+  writeFileSync(join(root, "bin/pi"), `#!${process.execPath}
+import fs from "node:fs";
+fs.appendFileSync(process.env.JOURNAL, JSON.stringify(["pi", ...process.argv.slice(2)]) + "\\n");
+console.log("provider model context max-out thinking images\\ntest pool 1 1 yes yes\\ntest passport 1 1 yes yes\\ntest explicit 1 1 yes yes");
+`, { mode: 0o755 });
+  const env = {
+    PATH: `${join(root, "bin")}:${process.env.PATH ?? ""}`, HOME: root,
+    HERDR_ENV: "1", HERDR_PANE_ID: ids.parent, HERDR_WORKSPACE_ID: "w-fixture", JOURNAL: journal,
+    XDG_RUNTIME_DIR: root,
+  };
+  function run(mode: string, args: string[], extra: Record<string, string> = {}, entry = "node") {
+    writeFileSync(journal, "");
+    const out = spawnSync(entry === "package" ? "pnpm" : process.execPath,
+      entry === "package" ? (mode === "plan" ? ["split", "plan", ...args] : [mode, ...args])
+        : ["--experimental-strip-types", "--no-warnings", "src/mode-tab.ts", mode, ...args],
+      { cwd: root, env: { ...env, ...extra }, encoding: "utf8", timeout: 20000 });
+    const calls = readFileSync(journal, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+    return { ...out, calls };
+  }
+  return { root, env, run, policy, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+function value(args: string[], option: string): string | undefined {
+  const index = args.indexOf(option);
+  return index < 0 ? undefined : args[index + 1];
+}
+
+for (const mode of modes) {
+  for (const entry of ["node", "package"]) {
+    test(`${entry} ${mode}: default, explicit split and literal separator preserve identity`, () => {
+      const f = fixture();
+      try {
+        for (const variant of ["default", "split", "literal"]) {
+          const args = [...inputs[mode], ...(variant === "split" ? ["--split"] : variant === "literal" ? ["--", "--split"] : [])];
+          const out = f.run(mode, args, {}, entry);
+          assert.equal(out.status, 0, out.stderr);
+          const created = out.calls.filter((c) => c[1] === "create" || c[1] === "split");
+          assert.equal(created.length, 1);
+          const surface = created[0]!;
+          assert.deepEqual(surface.slice(0, 2), variant === "split" ? ["pane", "split"] : ["tab", "create"]);
+          if (variant === "split") assert.equal(surface[2], ids.parent);
+          else assert.equal(value(surface, "--workspace"), "w-fixture");
+          assert.equal(value(surface, "--cwd"), f.root);
+          const stampEnv = Object.fromEntries(surface.flatMap((word, index) => word === "--env" ? [surface[index + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
+          assert.equal(stampEnv.YOKEMATE_MODE, mode);
+          assert.equal(stampEnv.YOKEMATE_TICKET, stamps[mode]);
+          assert.equal(stampEnv.YOKEMATE_PARENT_PANE, ids.parent);
+          const start = out.calls.find((c) => c[0] === "agent" && c[1] === "start")!;
+          assert.equal(value(start, "--pane"), variant === "split" ? ids.split : ids.tabPane);
+          const expectedModel = mode === "note" || mode === "research" ? "test/pool" : "test/passport";
+          assert.equal(value(start, "--model"), expectedModel);
+          assert.equal(value(start, "--skill"), join(f.root, ".pi/skills"));
+          if (mode === "research") {
+            assert.match(stampEnv.YOKEMATE_RESEARCH_ID!, /^[a-f0-9-]{36}$/);
+            assert.equal(start[2], `research-${stampEnv.YOKEMATE_RESEARCH_ID!.replace(/-/g, "").slice(0, 8)}`);
+            assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", expectedModel, "--skill", join(f.root, ".pi/skills"), "--no-extensions", "--no-tools", "-e", join(f.root, "src/research.ts")]);
+            assert.equal(stampEnv.YOKEMATE_RESEARCH_ROOT, f.root);
+            assert.equal(stampEnv.YOKEMATE_RESEARCH_PROJECT, "");
+          } else {
+            assert.equal(start[2], names[mode]);
+            assert.equal(stampEnv.YOKEMATE_ROLE, "coordinator");
+            assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", expectedModel, "--skill", join(f.root, ".pi/skills")]);
+          }
+          const prompt = out.calls.find((c) => c[0] === "agent" && c[1] === "prompt")!;
+          assert.equal(prompt[3], prompts[mode] + (variant === "literal" ? " --split" : ""));
+          assert.equal(out.calls.some((c) => c[1] === "close"), false);
+          assert.ok(out.stdout.includes(variant === "split" ? `→ pane ${ids.split}` : `→ tab ${ids.tab}, pane ${ids.tabPane}`));
+          if (mode === "plan") {
+            const where = spawnSync("pnpm", ["where", "plan", "YM-1", "YM-2"], { cwd: f.root, env: { ...f.env, ...stampEnv }, encoding: "utf8" });
+            assert.equal(where.status, 0, where.stderr);
+            assert.match(where.stdout, /\nrun\s*$/);
+          }
+        }
+      } finally { f.cleanup(); }
+    });
+  }
+
+  test(`${mode}: explicit model is control only before separator on both surfaces`, () => {
+    const f = fixture();
+    try {
+      for (const split of [[], ["--split"]]) {
+        for (const literal of [false, true]) {
+          const out = f.run(mode, [...split, ...inputs[mode], ...(literal ? ["--"] : []), "--model", literal ? "literal" : "test/explicit"]);
+          assert.equal(out.status, 0, out.stderr);
+          const start = out.calls.find((c) => c[1] === "start")!;
+          assert.equal(value(start, "--model"), literal ? (mode === "note" || mode === "research" ? "test/pool" : "test/passport") : "test/explicit");
+          assert.equal(out.calls.find((c) => c[1] === "prompt")![3], prompts[mode] + (literal ? " --model literal" : ""));
+        }
+      }
+    } finally { f.cleanup(); }
+  });
+
+  for (const surface of ["tab", "split"]) {
+    for (const failAt of ["start", "prompt"]) {
+      test(`${mode} ${surface}: ${failAt} failure closes exactly the created surface`, () => {
+        const f = fixture();
+        try {
+          const out = f.run(mode, [...inputs[mode], ...(surface === "split" ? ["--split"] : [])], { FAIL_AT: failAt, FAIL_CLEANUP: "1" });
+          assert.equal(out.status, 1);
+          assert.match(out.stderr, new RegExp(`injected-${failAt}-failure`));
+          assert.doesNotMatch(out.stderr, /injected-close-failure/);
+          assert.deepEqual(out.calls.filter((c) => c[1] === "close"), [surface === "tab" ? ["tab", "close", ids.tab] : ["pane", "close", ids.split]]);
+          assert.equal(out.calls.some((c) => c[1] === "prompt"), failAt === "prompt");
+        } finally { f.cleanup(); }
+      });
+    }
+  }
+}
+
+test("generic duplicate guards and ticketless name series are surface independent", () => {
+  const f = fixture();
+  try {
+    for (const split of [[], ["--split"]]) {
+      for (const mode of ["plan", "review", "worklog"] as const) {
+        const agents = JSON.stringify([{ name: names[mode], pane_id: "w-fixture:p-neighbor" }]);
+        f.policy();
+        const refused = f.run(mode, [...split, ...inputs[mode]], { AGENTS: agents });
+        assert.equal(refused.status, 1);
+        assert.match(refused.stderr, /already runs in pane w-fixture:p-neighbor/);
+        assert.deepEqual(refused.calls, [["agent", "list"]]);
+        f.policy(false);
+        const allowed = f.run(mode, [...split, ...inputs[mode]], { AGENTS: agents });
+        assert.equal(allowed.status, 0, allowed.stderr);
+        const start = allowed.calls.find((c) => c[1] === "start")!;
+        assert.match(start[2]!, new RegExp(`^${names[mode]}-[a-f0-9]{8}$`));
+        const runId = start[2]!.slice(-8);
+        assert.ok(allowed.calls.find((c) => c[1] === "create" || c[1] === "split")!.includes(`YOKEMATE_RUN_ID=${runId}`));
+        assert.ok(allowed.calls.find((c) => c[1] === "prompt")![3]!.endsWith(`Run ID: ${runId}. Include it in your final report.`));
+        assert.ok(start.includes(`${stamps[mode]} ${mode} [${runId}]`));
+      }
+      for (const mode of ["plan", "note"] as const) {
+        for (const guarded of [true, false]) {
+          f.policy(guarded);
+          const out = f.run(mode, [...split, "problem"], { AGENTS: JSON.stringify([{ name: mode }, { name: `${mode}-3` }]) });
+          assert.equal(out.status, 0, out.stderr);
+          assert.equal(out.calls.find((c) => c[1] === "start")![2], `${mode}-2`);
+          assert.equal(value(out.calls.find((c) => c[1] === "start")!, "--model"), "test/pool");
+          const surface = out.calls.find((c) => c[1] === "create" || c[1] === "split")!;
+          assert.equal(surface.some((arg) => arg.startsWith("YOKEMATE_TICKET=")), false);
+          assert.equal(out.calls.find((c) => c[1] === "prompt")![3], `/skill:${mode === "plan" ? "plan" : "note-worker"} problem`);
+        }
+      }
+    }
+  } finally { f.cleanup(); }
+});
+
+test("preflight refusals and review adopt happen before creating either surface", () => {
+  const f = fixture();
+  try {
+    for (const split of [[], ["--split"]]) {
+      const adopt = f.run("review", [...split, "YM-2", "note"]);
+      assert.equal(adopt.status, 0, adopt.stderr);
+      assert.match(adopt.calls.find((c) => c[1] === "prompt")![3]!, /pnpm adopt YM-2.*note$/);
+      for (const [mode, args, error] of [
+        ["review", ["YM-99"], /no task folder/],
+        ["plan", ["OTHER-1"], /no passport/],
+        ["note", ["--model"], /--model needs a value/],
+        ["research", ["--topic", "topic", "--unknown"], /unknown research option/],
+        ["research", ["--topic", "topic", "--model", "test/missing"], /не найдена/],
+      ] as const) {
+        const out = f.run(mode, [...split, ...args]);
+        assert.equal(out.status, 1);
+        assert.match(out.stderr, error);
+        assert.equal(out.calls.some((c) => c[1] === "create" || c[1] === "split"), false);
+      }
+      const project = f.run("research", [...split, "--project", "org/repo", "audit"]);
+      assert.equal(project.status, 0, project.stderr);
+      assert.equal(value(project.calls.find((c) => c[1] === "start")!, "--model"), "test/passport");
+      assert.ok(project.calls.find((c) => c[1] === "create" || c[1] === "split")!.includes("YOKEMATE_RESEARCH_PROJECT=org/repo"));
+    }
+  } finally { f.cleanup(); }
+});
