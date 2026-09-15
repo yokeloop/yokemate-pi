@@ -17,7 +17,8 @@ import {
 } from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
-import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
+import { MODES, freeAgentName, resolveLaunch, resolvePlanTargets } from "../src/mode-tab.ts";
+import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
 import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
 import { resolveGuardPolicy } from "../src/guard-policy.ts";
@@ -499,8 +500,8 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
   assert.equal(new Set(names).size, names.length);
 
   // The modes that talk to the engineer stand next to the chat.
-  assert.equal(review.surface, "split");
-  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "split");
+  assert.equal(review.surface, "tab");
+  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "tab");
   assert.equal(resolveLaunch("/root", "worklog", "acme", "").cwd, "/root");
 
   assert.throws(
@@ -561,16 +562,29 @@ test("review without the task folder adopts instead of refusing", () => {
 // the root, prompted with the /plan skill itself — one skill, no worker, the
 // pane's `run` verdict does the same inline work. A key rides in the prompt
 // and the stamp; a problem input carries neither.
-test("plan splits at the root and is prompted with /plan itself", () => {
+test("plan opens at the root and is prompted with /plan itself", () => {
   const keyed = resolveLaunch("/root", "plan", "ACME-3", "note");
-  assert.equal(keyed.surface, "split");
+  assert.equal(keyed.surface, "tab");
   assert.equal(keyed.cwd, "/root");
   assert.equal(keyed.prompt, "/skill:plan ACME-3 note");
   assert.equal(keyed.agentName, "acme-3-plan");
   assert.deepEqual(keyed.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=ACME-3"]);
 
+  const targets = resolvePlanTargets(parseSurfaceArgs(["--split", "YM-1", "YM-2", "--", "note"]));
+  assert.deepEqual(targets, [{ ticket: "YM-1", workerWords: ["YM-1", "note"] }, { ticket: "YM-2", workerWords: ["YM-2", "note"] }]);
+  for (const target of targets) {
+    const launch = resolveLaunch("/root", "plan", target.ticket, "", undefined, "w1:p1", undefined, "split", target.workerWords);
+    assert.equal(launch.surface, "split");
+    assert.equal(launch.label, `${target.ticket} plan`);
+    assert.equal(launch.prompt, `/skill:plan ${target.ticket} note`);
+    assert.deepEqual(launch.env, ["YOKEMATE_MODE=plan", `YOKEMATE_TICKET=${target.ticket}`, "YOKEMATE_PARENT_PANE=w1:p1"]);
+  }
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["fix", "YM-1", "YM-2"])), [{ ticket: "YM-1", workerWords: ["fix", "YM-1", "YM-2"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["problem", "--", "YM-1"])), [{ ticket: "", workerWords: ["problem", "YM-1"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["YM-1+YM-2"])), [{ ticket: "YM-1", workerWords: ["YM-1"] }, { ticket: "YM-2", workerWords: ["YM-2"] }]);
+
   const problem = resolveLaunch("/root", "plan", "", "кнопка не жмётся");
-  assert.equal(problem.surface, "split");
+  assert.equal(problem.surface, "tab");
   assert.equal(problem.prompt, "/skill:plan кнопка не жмётся");
   assert.equal(problem.agentName, "plan");
   assert.deepEqual(problem.env, ["YOKEMATE_MODE=plan"]);
@@ -579,9 +593,9 @@ test("plan splits at the root and is prompted with /plan itself", () => {
 // 12c. /note is the read-only conversation: a ticketless split beside the
 // chat, prompted with its worker, the topic riding verbatim. A second /note
 // takes the next name in the series, like a second problem-input plan.
-test("note splits at the root with the topic in the worker prompt", () => {
+test("note opens at the root with the topic in the worker prompt", () => {
   const note = resolveLaunch("/root", "note", "", "итоги ресёрча");
-  assert.equal(note.surface, "split");
+  assert.equal(note.surface, "tab");
   assert.equal(note.cwd, "/root");
   assert.equal(note.prompt, "/skill:note-worker итоги ресёрча");
   assert.equal(note.agentName, "note");
@@ -725,6 +739,9 @@ test("plan prompt preserves several keys", async () => {
     const expanded = promptTemplates.expandPromptTemplate(`/plan ${keys.join(" ")}`, templates);
     assert.ok(expanded.includes(`Ticket or problem: ${keys.join(" ")}`));
     assert.ok(expanded.includes(".pi/skills/plan/SKILL.md"));
+    assert.match(expanded, /one independent tab per key, or one split per key from the same calling pane/);
+    assert.match(expanded, /Each worker receives only its key and uses its own passport model/);
+    assert.match(expanded, /Return every per-key result, including partial refusals/);
   }
   const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
   assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
@@ -867,9 +884,20 @@ test("a mode skill knows whether to launch the pane or do the work", async () =>
     const refused = run([mode, "YM-1", "YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" });
     assert.equal(refused.status, 1);
     assert.match(refused.stdout, /^refuse: /);
-    const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
-    assert.equal(own.status, 0);
-    assert.equal(own.stdout.trim(), "run");
+    if (mode === "do") {
+      const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(own.status, 0);
+      assert.equal(own.stdout.trim(), "run");
+    } else {
+      for (const key of ["YM-1", "YM-2"]) {
+        const own = run([mode, key], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: key });
+        assert.equal(own.status, 0);
+        assert.equal(own.stdout.trim(), "run");
+      }
+      const joined = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(joined.status, 1);
+      assert.match(joined.stdout, /^refuse: /);
+    }
   }
   const invalid = run(["do", "YM-1", "not-a-key"]);
   assert.equal(invalid.status, 1);
@@ -1186,4 +1214,67 @@ test("a model pattern is checked against the pi catalogue, suffix apart", () => 
   // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
   // passports before the first pi session exists.
   assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", () => null), { ok: true, skipped: true });
+});
+
+test("interactive templates preserve surface controls and literal tail with split plan as an alias", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts")], includeDefaults: false });
+  for (const mode of ["plan", "review", "worklog", "note", "research"]) {
+    const args = "--split YM-1 -- --split --model literal";
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} ${args}`, templates);
+    const entry = mode === "plan" ? "split plan" : mode;
+    assert.ok(expanded.includes(`pnpm ${entry} ${args}`), expanded);
+    assert.match(expanded, /tab.*default|default.*tab/);
+  }
+  for (const args of ["YM-1", "YM-1 YM-2 -- --split --model literal"]) {
+    const primary = promptTemplates.expandPromptTemplate(`/plan --split ${args}`, templates);
+    const alias = promptTemplates.expandPromptTemplate(`/split plan ${args}`, templates);
+    const command = `pnpm split plan --split ${args}`;
+    assert.ok(primary.includes(command));
+    assert.ok(alias.includes(command));
+  }
+  for (const mode of ["do", "ship"]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} YM-1`, templates);
+    assert.doesNotMatch(expanded, /tab create|pane split|openModeSurface/);
+    assert.match(expanded, /coordinator/);
+  }
+});
+
+
+test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts")], includeDefaults: false });
+  for (const args of ["YM-1", "YM-1 YM-2", "fix the problem", "YM-1 -- --split", "YM-1 -- YM-2 --model literal"]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/plan ${args}`, templates);
+    assert.ok(expanded.includes(`Ticket or problem: ${args}`));
+    assert.match(expanded, /pnpm where plan \[KEY …\]/);
+    assert.ok(expanded.includes(`- \`launch\` — run \`pnpm split plan ${args}\` and return its output lines, then stop.`));
+    assert.match(expanded, /new tab is the default/);
+    assert.match(expanded, /No tracker reads, reconnaissance or planning in the main chat/);
+    assert.doesNotMatch(expanded, /continue inline|Inline completion/);
+  }
+  for (const args of ["YM-1", "YM-1 YM-2 --model test/explicit -- --split --model literal", "fix the problem -- YM-2"]) {
+    const primary = promptTemplates.expandPromptTemplate(`/plan --split ${args}`, templates);
+    const alias = promptTemplates.expandPromptTemplate(`/split plan ${args}`, templates);
+    for (const expanded of [primary, alias]) {
+      assert.ok(expanded.includes(`pnpm split plan --split ${args}`));
+      assert.match(expanded, /tab.*default|default.*tab/);
+    }
+  }
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  assert.match(skill, /`launch`.*run `pnpm split plan <original arguments>` unchanged and return its output lines, then stop/);
+  assert.match(skill, /never planning keys or launch controls/);
+  assert.match(skill, /send the outcome to the pane the mode was launched from/);
+  assert.match(skill, /mode surface \(default tab or explicit split\) is conversational/);
+  assert.match(skill, /plan-scout/);
+  assert.match(skill, /plan-writer/);
+  assert.doesNotMatch(skill, /Inline completion|model of the current main Pi chat/);
 });

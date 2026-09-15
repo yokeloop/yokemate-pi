@@ -1,8 +1,3 @@
-// The herdr calls the orchestrator makes: raise a tab or split a pane, put an
-// agent in it, find it again, close it. Every mode's surface is created here
-// (mode-tab, spawn) and closed here, so the rules about what dies when live in
-// one file.
-
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -40,8 +35,7 @@ export function findOpenTabs(
 
 /**
  * A mode already running is found by its agent's name — the one string that
- * holds whether the mode took a tab of its own (ship, /do) or a split of the
- * main chat's pane (review, worklog). Returns the pane it sits in.
+ * holds on either interactive surface. Returns the pane it sits in.
  */
 export function findRunningAgent(
   agents: { name?: string; pane_id: string }[],
@@ -101,16 +95,6 @@ export function startAgent(
   }
 }
 
-/**
- * Close a tab that has finished — the orchestrator does this for /ship and
- * /do, whose tabs report and have nothing left to say. Returns the id it
- * closed, or undefined when no such tab is open: a tab the engineer already
- * closed by hand is not an error.
- *
- * /review and /worklog are not closed here — they sit in a split of the main
- * chat's pane, and both end in a conversation with the engineer, who is the
- * only one who knows it is over.
- */
 export function closeTab(
   label: string,
   runIdOrRun?: string | ((args: string[]) => unknown),

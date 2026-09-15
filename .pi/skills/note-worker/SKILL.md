@@ -9,13 +9,13 @@ A place to just talk about the pool or a project with a guarantee nothing is tou
 
 ## Where this runs
 
-You are the worker: the split raised by `pnpm note` is prompted with this skill — the engineer never types it. One command runs before anything else:
+You are the worker: the mode surface raised by `pnpm note` is prompted with this skill — the engineer never types it. One command runs before anything else:
 
 ```
 pnpm where note
 ```
 
-- **`run`** — this is the note split. Do the work below.
+- **`run`** — this is the note mode surface. Do the work below.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /note [тема]» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
@@ -37,4 +37,4 @@ The guard holds the mechanism: `write`/`edit` outside `home/notes/`, writing `ba
 
 ## Closing
 
-The split does not close itself: say the note is saved and wait — the engineer may continue the conversation, and only they know it is over. They close the pane, as with worklog.
+The mode surface does not close itself: say the note is saved and wait — the engineer may continue the conversation, and only they know it is over. They close the pane, as with worklog.

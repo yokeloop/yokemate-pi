@@ -3,8 +3,7 @@
 // the mode's own pane was raised and prompted with the same line. The skill
 // must do different things in each case, and cwd cannot tell them apart —
 // `mode-tab.ts` runs review and worklog from the yokemate root, where the
-// main chat already sits. For /plan the `launch` verdict means «work inline
-// here» — the skill interprets it, this guard does not.
+// main chat already sits.
 //
 // The pane is raised with `herdr tab create --env`, so the mode and its ticket
 // are in the environment of everything inside it. The main chat has neither.
@@ -69,7 +68,7 @@ if (import.meta.filename === process.argv[1]) {
       process.exit(1);
     }
   }
-  const ticket = mode === "do" || mode === "plan" ? parsed.keys.join("+") : mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
+  const ticket = mode === "plan" ? parsed.keys.join(" ") : mode === "do" ? parsed.keys.join("+") : mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
   if (!MODES.includes(mode) || (!ticket && !TICKETLESS.includes(mode))) {
     console.error(`usage: where <${MODES.join("|")}> <TICKET>`);
     process.exit(1);
