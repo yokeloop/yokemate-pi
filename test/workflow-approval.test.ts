@@ -67,6 +67,13 @@ test("model extraction is strict and bound to literal current input and known bi
   assert.deepEqual(validateExtraction(value, raw, [binding]), value);
   for (const bad of [{ ...value, extra: true }, { ...value, ticket: "YM-2" }, { ...value, binding: "old" }, { ...value, actions: ["ship"] }, { ...value, evidence: [{ start: 0, end: 4, text: "invented" }] }]) assert.throws(() => validateExtraction(bad, raw, [binding]), /extraction/);
   assert.throws(() => validateExtraction(value, raw, [binding, binding]), /ambiguous/);
+  const implicitRaw = "план согласован, запускай";
+  const implicit = { ...value, evidence: [{ start: 0, end: implicitRaw.length, text: implicitRaw }] };
+  assert.deepEqual(validateExtraction(implicit, implicitRaw, [binding]), implicit);
+  const other = { ...binding, ticket: "YM-2", contentHash: "other" };
+  assert.throws(() => validateExtraction(implicit, implicitRaw, [binding, other]), /ambiguous/);
+  const advance = { kind: "advance-plan-do", ticket: "YM-1", binding: null, actions: ["plan", "do"], evidence: [{ start: 0, end: implicitRaw.length, text: implicitRaw }] };
+  assert.throws(() => validateExtraction(advance, implicitRaw, [binding]), /literal/);
 });
 
 test("recorded plan binding reads exact bytes, canonical scope and contained regular files", () => {

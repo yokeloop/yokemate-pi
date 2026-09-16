@@ -665,15 +665,10 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("workflow approval unavailable: no verified main parent runtime", "error");
 			return { action: "handled" as const };
 		}
-		try {
-			readRuntimeSettings(ENGINE_ROOT);
-		} catch (error) {
-			ctx.ui.notify((error as Error).message, "error");
-			return { action: "handled" as const };
-		}
 		const generation = authority.beginInput(event.text);
 		shipPermits.invalidate();
 		try {
+			readRuntimeSettings(ENGINE_ROOT);
 			const ship = text.match(/^\/ship\s+(.+)$/);
 			if (ship) {
 				const tickets = ship[1]!.split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -16,8 +18,14 @@ test("raw interactive authority flows through real plan CLI and parent control w
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
   const env = { ...process.env };
   const script = process.argv[1];
+  const eventConnections: Socket[] = [];
+  const eventServer = createServer((socket) => eventConnections.push(socket));
   let shutdown: (() => Promise<void>) | undefined;
   try {
+    const eventSocket = join(runtime, "review.sock");
+    eventServer.listen(eventSocket);
+    await once(eventServer, "listening");
+    process.env.WORKFLOW_EVENT_SOCKET = eventSocket;
     delete process.env.YOKEMATE_MODE;
     delete process.env.YOKEMATE_ROLE;
     delete process.env.HERDR_PANE_ID;
@@ -44,7 +52,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []);
     loaded.runtime.appendEntry = () => undefined;
-    loaded.runtime.sendMessage = () => undefined;
+    const reports: unknown[] = [];
+    let reportReady: (() => void) | undefined;
+    loaded.runtime.sendMessage = (message) => { reports.push(message); reportReady?.(); };
     const extension = loaded.extensions[0]!;
     const tool = extension.tools.get("subagent")!.definition;
     let extraction: "none" | "advance-plan-do" | "approve-ready-do" = "none";
@@ -68,6 +78,14 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
     const record = async () => (await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent" } })).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
+    const triggerReview = async () => {
+      if (eventConnections.length === 0) await once(eventServer, "connection");
+      const socket = eventConnections.at(-1)!;
+      const sent = once(socket, "data");
+      socket.write("review");
+      await sent;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    };
     await input("/plan YM-1");
     assert.match(await record(), /plan-only; ready for \/do/);
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
@@ -108,6 +126,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const explicit = await launch();
     const explicitId = (explicit.details as { runId: string }).runId;
     assert.ok(explicitId, output(explicit));
+    const reportsBeforeReview = reports.length;
+    await triggerReview();
+    assert.equal(reports.length, reportsBeforeReview);
     await cancel(explicitId);
     reset();
     extraction = "approve-ready-do";
@@ -115,6 +136,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const approved = await launch();
     const approvedId = (approved.details as { runId: string }).runId;
     assert.ok(approvedId, output(approved));
+    writeFileSync(plan, text + "\ncycle changed");
+    const bindingBlocked = new Promise<void>((resolve) => { reportReady = resolve; });
+    await triggerReview();
+    await bindingBlocked;
+    reportReady = undefined;
+    assert.match(JSON.stringify(reports.at(-1)), /approval (?:scope|content hash) changed/);
     await cancel(approvedId);
     assert.equal(confirms, 0);
     assert.deepEqual(notifications, []);
@@ -122,6 +149,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     db.close();
   } finally {
     await shutdown?.();
+    for (const socket of eventConnections) socket.destroy();
+    await new Promise<void>((resolve) => eventServer.close(() => resolve()));
     process.argv[1] = script;
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);

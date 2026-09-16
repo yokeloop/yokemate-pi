@@ -89,7 +89,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 
 Приоритет: явный `guards.<id>` и workflowApproval сильнее yolo; затем legacy defaults. Все guards и workflowApproval по умолчанию true. Limits: maxParallelTasks=8, maxConcurrency=4, maxDetached=8. Если задан только maxParallelTasks, соседние defaults становятся min(4, parallel) и max(8, parallel). Unknown owned fields, non-boolean policy, non-integer/positive limits, broken/unreadable JSON и несовместимые limits блокируют action с абсолютным source path. Другие Pi-owned root fields не проверяются.
 
-Например, `{"guardPolicy":{"yolo":true,"workflowApproval":true,"guards":{"wait":true}},"subagent":{"maxParallelTasks":2}}` оставляет wait и остановку после плана включёнными при остальных optional guards off. Off убирает ровно один отказ: modeOwnership/spawnCaller не меняют identity/socket/session; caps не убирают accounting; doCompletion off блокирует idle coordinator без synthetic turn, но не даёт ложный success. Scope, auth/data, CAS, ready/CI/independent review/report/outcome и exact ship permit обязательны всегда.
+Например, `{"guardPolicy":{"yolo":true,"workflowApproval":true,"guards":{"wait":true}},"subagent":{"maxParallelTasks":2}}` оставляет wait и остановку после плана включёнными при остальных optional guards off. Off убирает ровно один отказ: modeOwnership/spawnCaller не меняют identity/socket/session; caps не убирают accounting; doCompletion off блокирует idle coordinator без synthetic turn, но не даёт ложный success. Scope, auth/data, CAS, ready/CI/independent review/report/outcome и exact ship permit обязательны всегда. Loaded ship guard повторно выполняет gate перед каждым `gh pr merge` и принимает только единственный `--match-head-commit`, присутствующий в свежем green verdict; эта граница не отключается YOLO.
 
 Обычный `/plan KEY` всегда заканчивается записанным планом — даже при workflowApproval=false. Только явное plan+do в том же raw interactive input создаёт pending parent receipt. После `pnpm plan` parent перечитывает фактическую DB row и regular file: false связывает receipt с content/scope/repositories и запускает один do, true оставляет готовый план и требует нового approval. Нет живого parent — запись плана успешна, auto-do отсутствует; output говорит об этом явно. Плановая pane регистрируется parent-ом и не создаёт authority.
 
@@ -97,7 +97,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 
 YM-219 отдельно исправляет нормализацию main-pane stamp; это не approval mechanism и не часть YM-214.
 
-Matrix cells называют consumer и public regression case; not-applicable означает отсутствие соответствующего действия на поверхности. Исполняемый manifest в `test/runtime-settings-manifest.test.ts` связывает каждую applicable cell с именованным public-entry case и требует варианты on, off и neighbor-still-on.
+Matrix cells называют consumer и public regression case; not-applicable означает отсутствие соответствующего действия на поверхности. Исполняемый manifest в `test/runtime-settings-manifest.test.ts` запускает именованные public-entry adapters, принимает только фактически прошедшие case IDs и требует evidence для каждой applicable cell; сами adapters проверяют on, off и neighbor-still-on.
 
 <!-- runtime-settings-matrix -->
 | setting | typed | tool | cli | pane | ordinary | coordinator |

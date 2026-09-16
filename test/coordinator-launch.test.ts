@@ -27,6 +27,7 @@ test("do preparation resolves exact plan parts and CAS prevents stale running wr
   const dir = root();
   try {
     const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
+    writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { yolo: true } }));
     const prepared = prepareDo(dir, { mode: "do", tickets: ["YM-1"], plan }, {});
     assert.equal(prepared.parts[0]?.repo, "org/repo");
     assert.equal(prepared.model, "test/model");
@@ -147,19 +148,6 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     assert.match((repeated.content[0] as { text: string }).text, /^refused YM-1: .*already runs/);
     const extra = (repeated.details as { runs: { ticket: string; runId: string }[] }).runs;
     assert.deepEqual(extra.map((run) => run.ticket), ["YM-3"]);
-    const settings = join(dir, ".pi", "settings.json");
-    writeFileSync(settings, JSON.stringify({ guardPolicy: { guards: { duplicateDo: false } }, subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } }));
-    await approve("/do YM-1");
-    const capped = await tool.definition.execute("coordinator-cap", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
-    assert.match(JSON.stringify(capped), /Too many detached/);
-    writeFileSync(settings, JSON.stringify({ guardPolicy: { guards: { duplicateDo: false, detachedLimit: false } }, subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } }));
-    await approve("/do YM-1");
-    const concurrent = await tool.definition.execute("coordinator-duplicate-off", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
-    const concurrentId = (concurrent.details as { runId?: string }).runId;
-    assert.ok(concurrentId, JSON.stringify(concurrent));
-    assert.notEqual(concurrentId, runId);
-    await tool.definition.execute("cancel-concurrent", { cancelRun: concurrentId }, undefined, () => undefined, ctx);
-    writeFileSync(settings, "{}");
     for (const run of [...runs.slice(1), ...extra]) await tool.definition.execute("cancel-sibling", { cancelRun: run.runId }, undefined, () => undefined, ctx);
     const pids = JSON.parse(readFileSync(join(dir, "work", "YM-1", "fixture-pids.json"), "utf8")) as number[];
     try {

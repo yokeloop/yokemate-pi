@@ -33,6 +33,13 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     set({ guardPolicy: { guards: { wait: false } } });
     assert.equal(await call("bash", { command: "sleep 1" }), undefined);
     assert.equal((await call("bash", { command: "pnpm dev" }) as { block: boolean }).block, true);
+    set({ guardPolicy: { yolo: true } });
+    process.env.YOKEMATE_MODE = "ship";
+    const merge = await call("bash", { command: `gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}` }) as { block: boolean; reason: string };
+    assert.equal(merge.block, true);
+    assert.match(merge.reason, /ship merge gate refused/);
+    assert.equal(await call("bash", { command: "sleep 1" }), undefined);
+    process.env.YOKEMATE_MODE = "do";
     const context = await before({ type: "before_agent_start", prompt: "task", systemPrompt: "original system" } as never, ctx) as { systemPrompt: string };
     assert.ok(context.systemPrompt.startsWith("original system"));
     assert.ok(context.systemPrompt.includes(file));
@@ -49,6 +56,49 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     Object.assign(process.env, env);
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("typed runtime context renders every applicable setting on off and neighbor", async () => {
+  const { GUARD_IDS, RUNTIME_SETTING_KEYS, RUNTIME_SETTINGS_MATRIX } = await import("../src/guard-policy.ts");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-typed-"));
+  try {
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, ".pi"));
+    const file = join(dir, ".pi", "settings.json");
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, "src", "guards.ts")] });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const before = loader.getExtensions().extensions[0]!.handlers.get("before_agent_start")![0]!;
+    const ctx = { cwd: dir, hasUI: false } as ExtensionContext;
+    const context = async (settings: unknown) => {
+      writeFileSync(file, JSON.stringify(settings));
+      return (await before({ type: "before_agent_start", prompt: "task", systemPrompt: "original" } as never, ctx) as { systemPrompt: string }).systemPrompt;
+    };
+    for (const key of RUNTIME_SETTING_KEYS.filter((key) => RUNTIME_SETTINGS_MATRIX[key].typed !== "not-applicable")) {
+      if (key.startsWith("guards.")) {
+        const guard = key.slice("guards.".length) as typeof GUARD_IDS[number];
+        const neighbor = GUARD_IDS.find((id) => id !== guard)!;
+        const off = await context({ guardPolicy: { guards: { [guard]: false } } });
+        assert.match(off, new RegExp(`disabled=[^.]*\\b${guard}\\b`), `${key}/off`);
+        assert.match(off, new RegExp(`enabled=[^.]*\\b${neighbor}\\b`), `${key}/neighbor`);
+        const on = await context({ guardPolicy: { yolo: true, workflowApproval: true, guards: { [guard]: true } } });
+        assert.match(on, new RegExp(`enabled=[^.]*\\b${guard}\\b`), `${key}/on`);
+        assert.match(on, new RegExp(`disabled=[^.]*\\b${neighbor}\\b`), `${key}/inverse-neighbor`);
+      } else if (key === "guardPolicy.yolo") {
+        assert.match(await context({ guardPolicy: { yolo: true } }), /yolo=true/);
+        assert.match(await context({ guardPolicy: { yolo: false, guards: { wait: false } } }), /yolo=false.*disabled=[^.]*\bwait\b/);
+      } else if (key === "guardPolicy.workflowApproval") {
+        assert.match(await context({ guardPolicy: { workflowApproval: false } }), /workflowApproval=false.*enabled=[^.]*\bwait\b/);
+        assert.match(await context({ guardPolicy: { yolo: true, workflowApproval: true } }), /workflowApproval=true/);
+      } else {
+        const limit = key.slice("subagent.".length);
+        const value = limit === "maxParallelTasks" ? 2 : limit === "maxConcurrency" ? 2 : 9;
+        const settings = limit === "maxConcurrency" ? { subagent: { maxParallelTasks: 3, maxConcurrency: value } } : { subagent: { [limit]: value } };
+        assert.match(await context(settings), new RegExp(`${limit}=${value}`), `${key}/value`);
+        assert.match(await context({}), /maxParallelTasks=8.*maxConcurrency=4.*maxDetached=8/, `${key}/neighbor`);
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("public file and Bash guards disable only their named refusal", async () => {
@@ -78,24 +128,50 @@ test("public file and Bash guards disable only their named refusal", async () =>
       ["homeDelete", "do", "bash", { command: "rm -rf ~/fixture-never-executed" }],
     ] as const;
     process.env.YOKEMATE_MODE = "do";
-    writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
     const yoloCall = (command: string) => hook({ type: "tool_call", toolCallId: "yolo", toolName: "bash", input: { command } } as never, ctx);
-    assert.equal(await yoloCall("sleep 1"), undefined);
-    assert.equal(await yoloCall("pnpm dev"), undefined);
+    for (const role of [undefined, "executor", "coordinator"] as const) {
+      if (role) process.env.YOKEMATE_ROLE = role; else delete process.env.YOKEMATE_ROLE;
+      writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
+      assert.equal(await yoloCall("sleep 1"), undefined);
+      assert.equal(await yoloCall("pnpm dev"), undefined);
+      writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { wait: true } } }));
+      assert.equal((await yoloCall("sleep 1") as { block: boolean }).block, true);
+      assert.equal(await yoloCall("pnpm dev"), undefined);
+    }
+    delete process.env.YOKEMATE_ROLE;
+    const { spawnSync } = await import("node:child_process");
+    writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
+    const yoloCli = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "sleep 1" } }), encoding: "utf8" });
+    assert.equal(yoloCli.stdout.trim(), "");
     writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { wait: true } } }));
-    assert.equal((await yoloCall("sleep 1") as { block: boolean }).block, true);
-    assert.equal(await yoloCall("pnpm dev"), undefined);
+    const selectedCli = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "sleep 1" } }), encoding: "utf8" });
+    assert.match(selectedCli.stdout, /permissionDecision":"deny/);
     for (const [key, mode, toolName, input] of rows) {
       process.env.YOKEMATE_MODE = mode;
       const call = (name = toolName as string, args: Record<string, unknown> = input) => hook({ type: "tool_call", toolCallId: key, toolName: name, input: args } as never, ctx);
+      for (const role of [undefined, "executor", ...(["noteFileWrite", "noteShellWrite"].includes(key) ? [] : ["coordinator"])] as const) {
+        if (role) process.env.YOKEMATE_ROLE = role; else delete process.env.YOKEMATE_ROLE;
+        writeFileSync(file, "{}");
+        assert.equal((await call() as { block: boolean }).block, true, `${key}/${role ?? "pane"}`);
+        writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { [key]: false } } }));
+        assert.equal(await call(), undefined, `${key}/${role ?? "pane"}`);
+        const neighbor = key === "wait" ? { command: "pnpm dev" } : { command: "sleep 1" };
+        assert.equal((await call("bash", neighbor) as { block: boolean }).block, true, `${key}/${role ?? "pane"}/neighbor`);
+        writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { [key]: true }, workflowApproval: true } }));
+        assert.equal((await call() as { block: boolean }).block, true, `${key}/${role ?? "pane"}/explicit-on`);
+      }
+      delete process.env.YOKEMATE_ROLE;
+      const cliEvent = toolName === "bash"
+        ? { tool_name: "Bash", tool_input: input }
+        : { tool_name: toolName === "write" ? "Write" : toolName === "edit" ? "Edit" : "NotebookEdit", tool_input: { file_path: "path" in input ? input.path : input.notebook_path } };
+      const cli = () => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify(cliEvent), encoding: "utf8" }).stdout;
       writeFileSync(file, "{}");
-      assert.equal((await call() as { block: boolean }).block, true, key);
+      assert.match(cli(), /permissionDecision":"deny/, `${key}/cli/on`);
       writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { [key]: false } } }));
-      assert.equal(await call(), undefined, key);
-      const neighbor = key === "wait" ? { command: "pnpm dev" } : { command: "sleep 1" };
-      assert.equal((await call("bash", neighbor) as { block: boolean }).block, true, `${key} neighbor`);
-      writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { [key]: true }, workflowApproval: true } }));
-      assert.equal((await call() as { block: boolean }).block, true, `${key} explicit on`);
+      assert.equal(cli().trim(), "", `${key}/cli/off`);
+      const neighborEvent = { tool_name: "Bash", tool_input: key === "wait" ? { command: "pnpm dev" } : { command: "sleep 1" } };
+      const neighbor = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify(neighborEvent), encoding: "utf8" }).stdout;
+      assert.match(neighbor, /permissionDecision":"deny/, `${key}/cli/neighbor`);
     }
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
@@ -203,6 +279,20 @@ test("loaded completion and report hooks reread only their named settings", asyn
     assert.equal((await report({ type: "tool_call", toolCallId: "report", toolName: "send_message", input: { to: "foreign" } } as never, ctx) as { block: boolean }).block, true);
     writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { reportTarget: false } } }));
     assert.equal(await report({ type: "tool_call", toolCallId: "report", toolName: "send_message", input: { to: "foreign" } } as never, ctx), undefined);
+    const { pathToFileURL } = await import("node:url");
+    const { continueOwnedCoordinator } = await import(`${pathToFileURL(join(dir, "src", "coordinator-rpc.ts")).href}?runtime-events`);
+    let prompts = 0;
+    const blocked: string[] = [];
+    const rpc = { childState: { deliveryFailureReason: () => undefined, settled: () => "nudge" }, request: async () => { prompts++; return {}; } };
+    writeFileSync(file, "{}");
+    continueOwnedCoordinator(rpc as never, { type: "agent_settled" }, (reason: string) => blocked.push(reason));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(prompts, 1);
+    assert.equal(blocked.length, 0);
+    writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { doCompletion: false } } }));
+    continueOwnedCoordinator(rpc as never, { type: "agent_settled" }, (reason: string) => blocked.push(reason));
+    assert.deepEqual(blocked, ["coordinator stopped without outcome"]);
+    assert.equal(prompts, 1);
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
@@ -318,6 +408,196 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
   }
 });
 
+test("live do coordinator keeps single-use approval duplicate policy and detached admission independent", { timeout: 30000 }, async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { openDb } = await import("../src/db.ts");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-do-"));
+  const env = { ...process.env };
+  const script = process.argv[1];
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
+    writeFileSync(join(dir, ".env.local"), "");
+    const settings = join(dir, ".pi", "settings.json");
+    const set = (guards: Record<string, boolean>, maxDetached = 8) => writeFileSync(settings, JSON.stringify({ guardPolicy: { guards }, subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached } }));
+    set({});
+    const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
+    mkdirSync(planDir, { recursive: true });
+    const plan = join(planDir, "plan.md");
+    writeFileSync(plan, "# YM-1 — fixture\n\n## Affected repositories\n- `org/repo` — app\n");
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
+    db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);
+    db.close();
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = () => undefined;
+    loaded.runtime.sendMessage = () => undefined;
+    const extension = loaded.extensions[0]!;
+    const tool = extension.tools.get("subagent")!.definition;
+    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true }, ui: { notify() {}, setWidget() {}, confirm: async () => true } } as unknown as ExtensionContext;
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    const input = extension.handlers.get("input")![0]!;
+    const approve = () => input({ type: "input", source: "interactive", text: "/do YM-1" } as never, ctx);
+    const launch = () => tool.execute("do", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    await approve();
+    const first = await launch();
+    const firstId = (first.details as { runId?: string }).runId;
+    assert.ok(firstId, JSON.stringify(first));
+    await approve();
+    assert.match(JSON.stringify(await launch()), /already runs/);
+    set({ duplicateDo: false });
+    await approve();
+    const second = await launch();
+    const secondId = (second.details as { runId?: string }).runId;
+    assert.ok(secondId, JSON.stringify(second));
+    assert.notEqual(secondId, firstId);
+    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1"], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "main" } });
+    set({});
+    await approve();
+    let cliRefusal: Error & { stdout?: string; stderr?: string } | undefined;
+    try { await cli(); } catch (error) { cliRefusal = error as Error & { stdout?: string; stderr?: string }; }
+    assert.match(`${cliRefusal?.stdout ?? ""}\n${cliRefusal?.stderr ?? ""}\n${cliRefusal?.message ?? ""}`, /already runs/);
+    set({ duplicateDo: false });
+    await approve();
+    const cliAllowed = await cli();
+    const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    for (const { stamp, bypass } of [{ stamp: { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, bypass: { transitionCaller: false } }, { stamp: { YOKEMATE_ROLE: "executor" }, bypass: {} }] as const) {
+      set({ spawnCaller: false, ...bypass });
+      await approve();
+      Object.assign(process.env, stamp);
+      assert.match(JSON.stringify(await launch()), /already runs/);
+      for (const key of Object.keys(stamp)) delete process.env[key];
+      set({ spawnCaller: false, duplicateDo: false, ...bypass });
+      await approve();
+      Object.assign(process.env, stamp);
+      const allowed = await launch();
+      const allowedId = (allowed.details as { runId?: string } | undefined)?.runId;
+      assert.ok(allowedId, JSON.stringify(allowed));
+      for (const key of Object.keys(stamp)) delete process.env[key];
+      await tool.execute("cancel", { cancelRun: allowedId }, undefined, () => undefined, ctx);
+    }
+    set({ duplicateDo: false }, 1);
+    await approve();
+    assert.match(JSON.stringify(await launch()), /Too many detached/);
+    set({ duplicateDo: false, detachedLimit: false }, 1);
+    await approve();
+    const uncapped = await launch();
+    const uncappedId = (uncapped.details as { runId?: string }).runId;
+    assert.ok(uncappedId, JSON.stringify(uncapped));
+    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+  } finally {
+    await shutdown?.();
+    process.argv[1] = script;
+    for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+    Object.assign(process.env, env);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("live ship coordinator keeps permit identity duplicate policy and detached admission independent", { timeout: 30000 }, async () => {
+  const { execFile, execFileSync } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { openDb } = await import("../src/db.ts");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-ship-"));
+  const env = { ...process.env };
+  const script = process.argv[1];
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "agents", "ship-coordinator.md"), "fixture");
+    writeFileSync(join(dir, ".env.local"), "");
+    const settings = join(dir, ".pi", "settings.json");
+    const set = (guards: Record<string, boolean>, maxDetached = 8) => writeFileSync(settings, JSON.stringify({ guardPolicy: { guards: { shipConfirmation: false, ...guards } }, subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached } }));
+    set({});
+    const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
+    mkdirSync(planDir, { recursive: true });
+    const plan = join(planDir, "plan.md");
+    writeFileSync(plan, "# YM-1 — fixture\n\n## Affected repositories\n- `org/repo` — app\n");
+    const worktree = join(dir, "work", "YM-1", "repo");
+    mkdirSync(worktree, { recursive: true });
+    execFileSync("git", ["init", "-b", "YM-1", worktree], { stdio: "pipe" });
+    execFileSync("git", ["-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git"]);
+    const shim = join(dir, "shim");
+    mkdirSync(shim);
+    writeFileSync(join(shim, "gh"), "#!/bin/sh\nprintf 'main\\thttps://github.com/org/repo/pull/1\\n'\n", { mode: 0o755 });
+    process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
+    db.prepare("INSERT INTO work (ticket,url,stage,plan,folder) VALUES ('YM-1','u','accepted',?,?)").run(plan, join(dir, "work", "YM-1"));
+    db.close();
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = () => undefined;
+    loaded.runtime.sendMessage = () => undefined;
+    const extension = loaded.extensions[0]!;
+    const tool = extension.tools.get("subagent")!.definition;
+    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true }, ui: { notify() {}, setWidget() {}, confirm: async () => true } } as unknown as ExtensionContext;
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    const input = extension.handlers.get("input")![0]!;
+    const permit = () => input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
+    const launch = (context = ctx) => tool.execute("ship", { coordinator: { mode: "ship", tickets: ["YM-1"] } }, undefined, () => undefined, context);
+    await permit();
+    const first = await launch();
+    const firstId = (first.details as { runId?: string }).runId;
+    assert.ok(firstId, JSON.stringify(first));
+    await permit();
+    assert.match(JSON.stringify(await launch()), /already runs/);
+    set({ duplicateMode: false });
+    await permit();
+    const second = await launch();
+    const secondId = (second.details as { runId?: string }).runId;
+    assert.ok(secondId, JSON.stringify(second));
+    assert.notEqual(secondId, firstId);
+    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "mode-tab.ts"), "ship", "YM-1"], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "main" } });
+    set({});
+    await permit();
+    let cliRefusal: Error & { stdout?: string; stderr?: string } | undefined;
+    try { await cli(); } catch (error) { cliRefusal = error as Error & { stdout?: string; stderr?: string }; }
+    assert.match(`${cliRefusal?.stdout ?? ""}\n${cliRefusal?.stderr ?? ""}`, /already runs/);
+    set({ duplicateMode: false });
+    await permit();
+    const cliAllowed = await cli();
+    const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    await permit();
+    const foreign = { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext;
+    assert.match(JSON.stringify(await launch(foreign)), /current interactive \/ship/);
+    set({ duplicateMode: false }, 1);
+    await permit();
+    assert.match(JSON.stringify(await launch()), /Too many detached/);
+    set({ duplicateMode: false, detachedLimit: false }, 1);
+    await permit();
+    const uncapped = await launch();
+    const uncappedId = (uncapped.details as { runId?: string }).runId;
+    assert.ok(uncappedId, JSON.stringify(uncapped));
+    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+  } finally {
+    await shutdown?.();
+    process.argv[1] = script;
+    for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+    Object.assign(process.env, env);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("coordinator public admission rereads ship confirmation and never manufactures a permit", async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-coordinator-"));
   const env = { ...process.env };
@@ -342,6 +622,11 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { notify(message: string) { notifications.push(message); }, setWidget() {}, confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
+    assert.deepEqual(await input({ type: "input", source: "interactive", text: "запусти готовый план YM-1" } as never, ctx), { action: "handled" });
+    assert.match(notifications.at(-1) ?? "", /configured model and external authentication/);
+    const malformedRequest = await tool.execute("invalid", { coordinator: { mode: "do", tickets: ["../YM-1"] } }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(malformedRequest), /invalid ticket key/);
     const launch = async (tickets = ["YM-1"]) => (await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
     process.env.YOKEMATE_MODE = "plan";
     process.env.YOKEMATE_TICKET = "YM-1";
@@ -360,7 +645,7 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     assert.deepEqual(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), { action: "handled" });
     assert.match(notifications.at(-1) ?? "", /subagent.maxDetached/);
     set(false);
-    assert.match(await launch(), /no task folder/);
+    assert.match(await launch(), /current interactive \/ship/);
     for (const enabled of [true, false]) {
       set(enabled);
       const before = confirmations;

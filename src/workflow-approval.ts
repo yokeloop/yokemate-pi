@@ -87,7 +87,9 @@ export function validateExtraction(value: unknown, raw: string, bindings: PlanBi
   if (!exactKeys(value, ["kind", "ticket", "binding", "actions", "evidence"]) || !["advance-plan-do", "approve-ready-do", "revoke"].includes(String(value.kind))) return fail("invalid fields or kind");
   if (typeof value.ticket !== "string" || !/^[A-Z][A-Z0-9]*-\d+$/.test(value.ticket)) return fail("invalid ticket");
   const matching = bindings.filter((binding) => binding.ticket === value.ticket);
-  if (!new RegExp(`(?:^|[^A-Z0-9-])${value.ticket}(?:$|[^A-Z0-9-])`).test(raw) && matching.length !== 1) return fail("invented or ambiguous ticket");
+  const literalTicket = new RegExp(`(?:^|[^A-Z0-9-])${value.ticket}(?:$|[^A-Z0-9-])`).test(raw);
+  if ((value.kind === "advance-plan-do" || value.kind === "revoke") && !literalTicket) return fail("ticket must be literal in current input");
+  if (value.kind === "approve-ready-do" && !literalTicket && (bindings.length !== 1 || matching.length !== 1)) return fail("invented or ambiguous ticket");
   if (value.kind === "approve-ready-do" && (matching.length !== 1 || value.binding !== matching[0]!.contentHash)) return fail("stale or ambiguous ready binding");
   if (value.kind !== "approve-ready-do" && value.binding !== null) return fail("unexpected binding");
   const actions = value.kind === "advance-plan-do" ? ["plan", "do"] : value.kind === "approve-ready-do" ? ["do"] : ["stop"];
