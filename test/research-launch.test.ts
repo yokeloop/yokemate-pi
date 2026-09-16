@@ -111,3 +111,19 @@ test("research preserves artifacts and reports to the parent only on explicit re
   assert.doesNotMatch(worker, /After each completed research portion call `send_message`/);
   assert.match(worker, /Stay available afterward; the engineer closes this mode surface/);
 });
+
+test("research issue creation follows literal single or enumerated requests", () => {
+  const worker = readFileSync(join(import.meta.dirname, "..", ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  for (const rule of [
+    "This rule applies to the external creation effect through any available tracker tool, not its name.",
+    "Discussion, analysis, a proposal to create an issue or agreement that it would be useful authorizes only a draft, not an external write.",
+    'An explicit "create issue X" request authorizes exactly one named issue.',
+    'An explicit "create issues" request with an enumeration authorizes exactly the listed items.',
+    "Do not infer extra issues.",
+    "If item boundaries are ambiguous, ask for clarification before the first create.",
+    "Reread each created issue at its returned URL using the existing tools before reporting.",
+    "Report results and partial failures in this research tab; a failed item does not authorize extra items or hide successful ones.",
+    "Each subsequent separate create requires a new explicit request.",
+    "Parent reporting still requires the separate explicit request described below.",
+  ]) assert.ok(worker.includes(rule), rule);
+});
