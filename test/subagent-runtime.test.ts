@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileProvenance } from "../src/subagent-runs.ts";
 import { continueOwnedCoordinator, startCoordinatorRpc, type RpcEvent } from "../src/coordinator-rpc.ts";
+import { runBoundedRuntimeCase, untilAborted } from "./fixtures/bounded-runtime-case.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
@@ -142,7 +143,7 @@ const cases = [
   ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
 
-async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1]): Promise<void> {
+async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1], signal: AbortSignal): Promise<void> {
   const sandbox = mkdtempSync(join(tmpdir(), "ym204-fault-"));
   const cwd = join(sandbox, "cwd");
   const agentDir = join(sandbox, "agent");
@@ -179,7 +180,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       else socket.end("release\n");
     });
   });
-  await new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve));
   let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
   let complete!: () => void;
   const delivered = new Promise<void>((resolve) => { complete = resolve; });
@@ -187,6 +187,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   let failureReason: string | undefined;
   let timeout: NodeJS.Timeout | undefined;
   try {
+    await untilAborted(new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve)), signal);
     rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-204"], model: "ym204-fixture/deterministic:high", cwd, plan: join(folder, "plan.md"), plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
       { runId: `owner-${scenario.replaceAll("_", "-")}`, parentSessionId: "fixture-parent", mode: "do", ticket: "YM-204", project: [], role: "coordinator", cwd, model: "ym204-fixture/deterministic:high" },
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
@@ -200,10 +201,10 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
       { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
-    await rpc.ready;
-    await rpc.request({ type: "prompt", message: "work" });
+    await untilAborted(rpc.ready, signal);
+    await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
-      await childWorking;
+      await untilAborted(childWorking, signal);
       rpc.acceptTerminal();
       await rpc.stop("parent_control_cancel");
       const fs = await import("node:fs");
@@ -219,7 +220,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.ok(child.closeAt);
       return;
     }
-    await Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]);
+    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]), signal);
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
@@ -275,7 +276,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
 }
 
 for (const [scenario, outcome] of cases) {
-  test(`real Pi ${scenario} retains primary outcomes`, { timeout: 30000 }, async () => {
-    await runFaultScenario(scenario, outcome);
-  });
+  test(`real Pi ${scenario} retains primary outcomes`, { timeout: 30000 }, (t) =>
+    runBoundedRuntimeCase(t, (signal) => runFaultScenario(scenario, outcome, signal)));
 }
