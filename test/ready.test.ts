@@ -30,6 +30,8 @@ test("recipeFor maps each lockfile to its frozen install and blocks the rest", (
   try {
     assert.match((recipeFor(dir) as { blocker: string }).blocker, /^no lockfile/);
     writeFileSync(join(dir, "pnpm-lock.yaml"), "");
+    assert.deepEqual(recipeFor(dir), { manager: "pnpm", lockfile: "pnpm-lock.yaml", command: ["pnpm", "install", "--ignore-workspace", "--frozen-lockfile", "--prod=false"] });
+    writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages: []\n");
     assert.deepEqual(recipeFor(dir), { manager: "pnpm", lockfile: "pnpm-lock.yaml", command: ["pnpm", "install", "--frozen-lockfile", "--prod=false"] });
     writeFileSync(join(dir, "package-lock.json"), "");
     assert.match((recipeFor(dir) as { blocker: string }).blocker, /^several lockfiles \(pnpm-lock.yaml, package-lock.json\)/);
@@ -62,7 +64,7 @@ test("the worktree's own environment yields a receipt", () => {
     assert.ok(entry.packages.typescript!.startsWith(join(realpathSync(s.worktree), "node_modules") + "/"));
     assert.equal(entry.head, git(s.worktree, "rev-parse", "HEAD"));
     assert.equal(entry.lockHash, sha256(join(s.worktree, "pnpm-lock.yaml")));
-    assert.equal(entry.command, "pnpm install --frozen-lockfile --prod=false");
+    assert.equal(entry.command, "pnpm install --ignore-workspace --frozen-lockfile --prod=false");
     assert.equal(entry.exit, 0);
     const written = JSON.parse(readFileSync(join(s.root, "work", s.ticket, "ready.json"), "utf8")) as ReadyReceipt;
     assert.deepEqual(written, out.receipt);
@@ -76,7 +78,7 @@ test("a lockfile mismatch blocks with the literal output and no second install",
     let calls = 0;
     const out = ready(s.root, s.ticket, [{ repo: s.repo, worktree: s.worktree }], { run: () => { calls++; return { exit: 1, output: "ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with frozen-lockfile" }; } });
     assert.equal(out.ok, false);
-    assert.equal(out.ok ? "" : out.reason, "org/repo: pnpm install --frozen-lockfile --prod=false exited 1");
+    assert.equal(out.ok ? "" : out.reason, "org/repo: pnpm install --ignore-workspace --frozen-lockfile --prod=false exited 1");
     assert.match(out.ok ? "" : out.output, /ERR_PNPM_OUTDATED_LOCKFILE/);
     assert.equal(calls, 1);
     assert.equal(existsSync(join(s.root, "work", s.ticket, "ready.json")), false);
