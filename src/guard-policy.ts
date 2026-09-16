@@ -166,3 +166,63 @@ export function subagentAdmission(
 export function subagentConcurrency(policy: GuardPolicy, limits: SubagentLimits, taskCount: number): number {
   return policy.guards.parallelConcurrencyLimit ? limits.maxConcurrency : taskCount;
 }
+
+export const RUNTIME_SETTING_KEYS = [
+  "guardPolicy.yolo", "guardPolicy.workflowApproval",
+  ...GUARD_IDS.map((id) => `guards.${id}` as const),
+  "subagent.maxParallelTasks", "subagent.maxConcurrency", "subagent.maxDetached",
+] as const;
+export type RuntimeSettingKey = typeof RUNTIME_SETTING_KEYS[number];
+export const RUNTIME_SETTING_SURFACES = ["typed", "tool", "cli", "pane", "ordinary", "coordinator"] as const;
+export type RuntimeSettingSurface = typeof RUNTIME_SETTING_SURFACES[number];
+type RuntimeSettingCell = "not-applicable" | Readonly<{ consumer: string; regression: string }>;
+type RuntimeSettingRow = Readonly<Record<RuntimeSettingSurface, RuntimeSettingCell>>;
+const NA = "not-applicable";
+const CONSUMERS = {
+  "guardPolicy.yolo": ["guards.before_agent_start", "guards.tool_call", "readRuntimeSettings", "mode-tab.launch", "subagent.execute", "coordinatorChecks"],
+  "guardPolicy.workflowApproval": ["subagent.input", "startCoordinator.do", "plan-ticket.handoff/spawn", "plan-recorded", "DoAuthorityStore.provenance", "startCoordinator.do"],
+  "guards.settingsWrite": [NA, "guards.judge.file", "bash-guard.stdin", "judge.settingsWrite", "judge.settingsWrite", "judge.settingsWrite"],
+  "guards.noteFileWrite": [NA, "guards.judge.file", "bash-guard.stdin", "judge.noteFileWrite", "judge.noteFileWrite", NA],
+  "guards.wait": [NA, "guards.judge.bash", "bash-guard.stdin", "judge.wait", "judge.wait", "judge.wait"],
+  "guards.noteShellWrite": [NA, "guards.judge.bash", "bash-guard.stdin", "judge.noteShellWrite", "judge.noteShellWrite", NA],
+  "guards.codingLaunch": [NA, "guards.judge.bash", "bash-guard.stdin", "judge.codingLaunch", "judge.codingLaunch", "judge.codingLaunch"],
+  "guards.massKill": [NA, "guards.judge.bash", "bash-guard.stdin", "judge.massKill", "judge.massKill", "judge.massKill"],
+  "guards.homeDelete": [NA, "guards.judge.bash", "bash-guard.stdin", "judge.homeDelete", "judge.homeDelete", "judge.homeDelete"],
+  "guards.shipConfirmation": ["subagent.input.ship", "startCoordinator.ship", "mode-tab.ship", "ShipPermitStore.provenance", "ShipPermitStore.provenance", "coordinatorChecks.shipConfirmation"],
+  "guards.doCompletion": [NA, "guards.agent_settled", "report-guard.stopVerdict", "stopVerdict", "coordinator_finish.owner", "continueOwnedCoordinator"],
+  "guards.modeOwnership": ["prompts.where", NA, "mode-guard.decide", "mode-guard.decide", "mode-guard.decide", "mode-guard.decide"],
+  "guards.transitionCaller": ["prompts.transition", NA, "transitions.applyMove", "transitions.checkMove", "transitions.checkMove", "prepareDo/markDoRunning"],
+  "guards.transitionTicket": ["prompts.transition", NA, "transitions.applyMove", "transitions.checkMove", "transitions.checkMove", "prepareDo/markDoRunning"],
+  "guards.transitionSource": ["prompts.transition", NA, "transitions.applyMove", "transitions.checkMove", "transitions.checkMove", "prepareDo/markDoRunning.CAS"],
+  "guards.spawnCaller": ["prompts.do", "startCoordinator.do", "spawn.control", "coordinatorChecks.checkCaller", "coordinatorChecks.checkCaller", "coordinatorChecks.checkCaller"],
+  "guards.stageCaller": [NA, NA, "stage.repair", "stage.repair", "stage.repair", "stage.repair"],
+  "guards.stageForce": [NA, NA, "stage.repair", "stage.repair", "stage.repair", "stage.repair"],
+  "guards.duplicateDo": ["prompts.do", "startCoordinator.do", "spawn.control", "CoordinatorRegistry.reserve.do", "CoordinatorRegistry.reserve.do", "CoordinatorRegistry.reserve.do"],
+  "guards.duplicateMode": ["prompts.plan/review/ship", "startCoordinator.ship", "mode-tab.duplicate", "mode-tab.duplicate", NA, "CoordinatorRegistry.reserve.ship"],
+  "guards.reportTarget": [NA, "bus.tool_call", NA, "inbox.allowTarget", "sendReport.transport", "sendReport.transport"],
+  "guards.projectAgentConfirmation": [NA, "subagent.execute.confirmProjectAgents", NA, "subagent.execute.confirmProjectAgents", "subagent.execute.confirmProjectAgents", "subagent.execute.confirmProjectAgents"],
+  "guards.parallelTaskLimit": ["prompts.subagent", "subagentAdmission.parallel", NA, "subagentAdmission.parallel", "subagentAdmission.parallel", "subagentAdmission.nested"],
+  "guards.parallelConcurrencyLimit": ["prompts.subagent", "subagentConcurrency", NA, "subagentConcurrency", "subagentConcurrency", "subagentConcurrency.nested"],
+  "guards.detachedLimit": ["prompts.subagent", "subagentAdmission/startCoordinator", "spawn/mode-tab.ship", "subagentAdmission/startCoordinator", "subagentAdmission", "coordinatorChecks.checkAdmission"],
+  "subagent.maxParallelTasks": ["prompts.subagent", "subagentAdmission.parallel", NA, "subagentAdmission.parallel", "subagentAdmission.parallel", "subagentAdmission.nested"],
+  "subagent.maxConcurrency": ["prompts.subagent", "subagentConcurrency", NA, "subagentConcurrency", "subagentConcurrency", "subagentConcurrency.nested"],
+  "subagent.maxDetached": ["prompts.subagent", "subagentAdmission/startCoordinator", "spawn/mode-tab.ship", "subagentAdmission/startCoordinator", "subagentAdmission", "coordinatorChecks.checkAdmission"],
+} as const satisfies Record<RuntimeSettingKey, readonly [string, string, string, string, string, string]>;
+
+export const RUNTIME_SETTINGS_MATRIX: Readonly<Record<RuntimeSettingKey, RuntimeSettingRow>> = Object.freeze(Object.fromEntries(
+  RUNTIME_SETTING_KEYS.map((key) => [key, Object.freeze(Object.fromEntries(RUNTIME_SETTING_SURFACES.map((surface, index) => {
+    const consumer = CONSUMERS[key][index];
+    return [surface, consumer === NA ? NA : Object.freeze({ consumer, regression: `${surface}:${key}` })];
+  })))]),
+) as Record<RuntimeSettingKey, RuntimeSettingRow>);
+
+export function formatRuntimeSettingsMatrix(): string {
+  return [
+    `| setting | ${RUNTIME_SETTING_SURFACES.join(" | ")} |`,
+    "|---|---|---|---|---|---|---|",
+    ...RUNTIME_SETTING_KEYS.map((key) => `| \`${key}\` | ${RUNTIME_SETTING_SURFACES.map((surface) => {
+      const cell = RUNTIME_SETTINGS_MATRIX[key][surface];
+      return cell === NA ? NA : `\`${cell.consumer}\` (${cell.regression})`;
+    }).join(" | ")} |`),
+  ].join("\n");
+}

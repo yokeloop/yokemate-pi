@@ -79,3 +79,24 @@ test("runtime settings reread root settings and fail closed on broken or unreada
     assert.throws(() => readRuntimeSettings(root), (error) => error instanceof RuntimeSettingsError && error.message.includes(file));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("runtime setting schema, matrix and documentation have exactly the same keys", async () => {
+  const { RUNTIME_SETTING_KEYS, RUNTIME_SETTINGS_MATRIX, RUNTIME_SETTING_SURFACES, formatRuntimeSettingsMatrix } = await import("../src/guard-policy.ts");
+  const { readFileSync } = await import("node:fs");
+  const expected = ["guardPolicy.yolo", "guardPolicy.workflowApproval", ...GUARD_IDS.map((id) => `guards.${id}`), ...Object.keys(DEFAULT_SUBAGENT_LIMITS).map((id) => `subagent.${id}`)];
+  assert.deepEqual([...RUNTIME_SETTING_KEYS].sort(), expected.sort());
+  assert.deepEqual(Object.keys(RUNTIME_SETTINGS_MATRIX).sort(), expected.sort());
+  for (const key of RUNTIME_SETTING_KEYS) {
+    const row = RUNTIME_SETTINGS_MATRIX[key];
+    assert.deepEqual(Object.keys(row), [...RUNTIME_SETTING_SURFACES]);
+    for (const surface of RUNTIME_SETTING_SURFACES) {
+      const cell = row[surface];
+      if (cell !== "not-applicable") {
+        assert.ok(cell.consumer.length > 0);
+        assert.equal(cell.regression, `${surface}:${key}`);
+      }
+    }
+  }
+  const docs = readFileSync(new URL("../docs/usage.md", import.meta.url), "utf8");
+  assert.equal(docs.split("<!-- runtime-settings-matrix -->\n")[1]?.split("\n<!-- /runtime-settings-matrix -->")[0], formatRuntimeSettingsMatrix());
+});
