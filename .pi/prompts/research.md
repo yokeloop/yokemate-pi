@@ -9,7 +9,7 @@ Open a new tab by default; only `--split` before the first `--` opens a split of
 
 Run `pnpm where research` before anything else.
 
-- `launch` — run `pnpm research $@` and return its one output line, then stop. Preserve argument order and the literal tail; an explicitly named model becomes `--model <m>` before the separator.
+- `launch` — run `pnpm research $@`. Preserve argument order and the literal tail; an explicitly named model becomes `--model <m>` before the separator. On success, return its one output line unchanged. On failure, return the full relevant multiline CLI diagnostics unchanged, including available Pi terminal output and cleanup result; do not reduce it to `Command failed` or ELIFECYCLE. Then stop.
 - `run` — this mode surface already runs research; say so and stop.
 - `refuse: …` — print the refusal unchanged and stop.
 

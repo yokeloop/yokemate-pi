@@ -99,8 +99,8 @@ export function resolveResearchContext(root: string, argv: string[]): ResearchCo
     const candidate = resolveResearchProject(root, args.words[0]!);
     if (candidate) { project = candidate; topicWords = [...args.words.slice(1), ...args.literal]; }
   }
-  const topic = topicWords.join(" ").trim() || (project ? "обзор проекта" : "");
-  if (!topic) throw new Error("usage: research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>");
+  const topic = topicWords.join(" ").trim();
+  if (!topic && !project) throw new Error("usage: research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>");
   const rootData = dataRoot(root);
   const model = args.model ?? (project ? projectModel(root, project) : poolModel(rootData, "research"));
   if (!model)
@@ -132,7 +132,7 @@ export function resolveResearchLaunch(root: string, argv: string[], id = crypto.
     id,
     agentName: `research-${short}`,
     label: `research-${short} ${subject}`,
-    prompt: `/skill:research-worker ${context.topic}`,
+    prompt: context.topic ? `/skill:research-worker ${context.topic}` : "/skill:research-worker",
     env: [
       "YOKEMATE_MODE=research",
       `YOKEMATE_RESEARCH_ID=${id}`,
@@ -146,5 +146,5 @@ export function resolveResearchLaunch(root: string, argv: string[], id = crypto.
 }
 
 export function researchAgentArgs(root: string, model: string): string[] {
-  return ["--model", model, "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-tools", "-e", join(root, "src", "research.ts")];
+  return ["--model", model, "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")];
 }

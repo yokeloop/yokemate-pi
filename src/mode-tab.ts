@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { findPlan } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
-import { findRunningAgent, herdr, startAgent } from "./herdr.ts";
+import { findRunningAgent, formatHerdrError, herdr, herdrRaw, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
 import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
@@ -12,6 +12,11 @@ import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readGuardPolicy } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
+
+function incompleteTerminalCapture(error: unknown): boolean {
+  const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
+  return cause?.code === "ENOBUFS" || /(?:maxBuffer|ENOBUFS)/i.test((error as Error).message);
+}
 
 export const MODES = ["plan", "review", "ship", "worklog", "note", "research"] as const;
 export type Mode = (typeof MODES)[number];
@@ -156,12 +161,26 @@ if (import.meta.filename === process.argv[1]) {
       fail(`${research.label} already runs`);
     const opened = openModeSurface(research.surface, parentPane, parentWorkspace, ROOT, research.label,
       [...research.env, `YOKEMATE_PARENT_PANE=${parentPane}`]);
+    let phase: "start" | "prompt" = "start";
     try {
       startAgent(research.agentName, opened.paneId, research.label, researchAgentArgs(ROOT, research.model));
+      phase = "prompt";
       herdr(["agent", "prompt", research.agentName, research.prompt]);
     } catch (e) {
-      try { opened.cleanup(); } catch {}
-      fail(`${research.label}: ${(e as Error).message.split("\n").slice(0, 2).join(" ")}`);
+      const diagnostics = [`${research.label}: ${phase} failed; ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${opened.paneId}, agent ${research.agentName}`, formatHerdrError(e)];
+      try {
+        const terminal = herdrRaw(["pane", "read", opened.paneId, "--source", "recent-unwrapped", "--lines", "200", "--format", "text", "--raw"], { timeout: 2000, maxBuffer: 64 * 1024 });
+        diagnostics.push(terminal ? `Pi terminal output:\n${terminal}` : "Pi terminal diagnostics were unavailable: pane read returned no output");
+      } catch (capture) {
+        diagnostics.push(`${incompleteTerminalCapture(capture) ? "Pi terminal diagnostics were incomplete; the available tail follows" : "Pi terminal diagnostics were unavailable"}:\n${formatHerdrError(capture)}`);
+      } finally {
+        try {
+          opened.cleanup();
+        } catch (cleanup) {
+          diagnostics.push(`rollback could not close ${opened.tabId ? `tab ${opened.tabId} for ` : ""}pane ${opened.paneId}:\n${formatHerdrError(cleanup)}`);
+        }
+      }
+      fail(diagnostics.join("\n"));
     }
     console.log(`/research → ${opened.tabId ? `tab ${opened.tabId}, ` : ""}pane ${opened.paneId}, agent "${research.agentName}", model ${research.model}, ${research.project ? `${research.project.org}/${research.project.repo}` : research.topic}`);
     process.exit(0);

@@ -105,7 +105,7 @@ for (const mode of modes) {
           if (mode === "research") {
             assert.match(stampEnv.YOKEMATE_RESEARCH_ID!, /^[a-f0-9-]{36}$/);
             assert.equal(start[2], `research-${stampEnv.YOKEMATE_RESEARCH_ID!.replace(/-/g, "").slice(0, 8)}`);
-            assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", expectedModel, "--skill", join(f.root, ".pi/skills"), "--no-extensions", "--no-tools", "-e", join(f.root, "src/research.ts")]);
+            assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", expectedModel, "--skill", join(f.root, ".pi/skills"), "--no-extensions", "--no-builtin-tools", "-e", join(f.root, "src/research.ts")]);
             assert.equal(stampEnv.YOKEMATE_RESEARCH_ROOT, f.root);
             assert.equal(stampEnv.YOKEMATE_RESEARCH_PROJECT, "");
           } else {
@@ -150,7 +150,16 @@ for (const mode of modes) {
           const out = f.run(mode, [...inputs[mode], ...(surface === "split" ? ["--split"] : [])], { FAIL_AT: failAt, FAIL_CLEANUP: "1" });
           assert.equal(out.status, 1);
           assert.match(out.stderr, new RegExp(`injected-${failAt}-failure`));
-          assert.doesNotMatch(out.stderr, /injected-close-failure/);
+          if (mode === "research") {
+            assert.match(out.stderr, /injected-close-failure/);
+            assert.match(out.stderr, /Pi terminal output:/);
+            const captureIndex = out.calls.findIndex((c) => c[0] === "pane" && c[1] === "read");
+            assert.ok(captureIndex >= 0);
+            assert.deepEqual(out.calls[captureIndex], ["pane", "read", surface === "tab" ? ids.tabPane : ids.split, "--source", "recent-unwrapped", "--lines", "200", "--format", "text", "--raw"]);
+            assert.ok(captureIndex < out.calls.findIndex((c) => c[1] === "close"));
+          } else {
+            assert.doesNotMatch(out.stderr, /injected-close-failure/);
+          }
           assert.deepEqual(out.calls.filter((c) => c[1] === "close"), [surface === "tab" ? ["tab", "close", ids.tab] : ["pane", "close", ids.split]]);
           assert.equal(out.calls.some((c) => c[1] === "prompt"), failAt === "prompt");
         } finally { f.cleanup(); }

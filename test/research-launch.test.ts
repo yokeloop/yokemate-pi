@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveResearchContext, resolveResearchLaunch } from "../src/research-launch.ts";
+import { researchAgentArgs, resolveResearchContext, resolveResearchLaunch } from "../src/research-launch.ts";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "research-launch-"));
@@ -17,6 +17,19 @@ function fixture() {
   db.close();
   return { root, clone };
 }
+
+test("research launch keeps the closed extension argv and typed diagnostics template", () => {
+  const root = join(import.meta.dirname, "..");
+  const args = researchAgentArgs(root, "model");
+  assert.deepEqual(args, ["--model", "model", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")]);
+  assert.equal(args.includes("--no-tools"), false);
+  assert.equal(args.includes("--tools"), false);
+  assert.equal(args.filter((arg) => arg === "-e").length, 1);
+  const prompt = readFileSync(join(root, ".pi", "prompts", "research.md"), "utf8");
+  assert.match(prompt, /On success, return its one output line unchanged/);
+  assert.match(prompt, /On failure, return the full relevant multiline CLI diagnostics unchanged/);
+  assert.match(prompt, /pnpm research \$@/);
+});
 
 test("research resolves canonical project aliases and topic without a ticket", () => {
   const { root } = fixture();
@@ -33,6 +46,35 @@ test("research resolves canonical project aliases and topic without a ticket", (
     assert.match(launch.agentName, /^research-12345678$/);
     assert.equal(launch.env.some((v) => v.startsWith("YOKEMATE_TICKET=")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("project-only research waits without a synthetic topic while explicit topics launch immediately", () => {
+  const { root } = fixture();
+  try {
+    for (const args of [["app"], ["--project", "app"], ["--split", "app"], ["--split", "--project", "app"]]) {
+      const context = resolveResearchContext(root, args);
+      assert.equal(context.project?.repo, "app");
+      assert.equal(context.topic, "");
+      assert.equal(resolveResearchLaunch(root, args).prompt, "/skill:research-worker");
+    }
+    assert.equal(resolveResearchLaunch(root, ["app", "audit"]).prompt, "/skill:research-worker audit");
+    for (const args of [[], ["--topic"], ["--topic", " "]]) {
+      assert.throws(() => resolveResearchContext(root, args), /usage: research/);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("research worker waits for the engineer's question before reading or reporting", () => {
+  const root = join(import.meta.dirname, "..");
+  const worker = readFileSync(join(root, ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  assert.match(worker, /Run `pnpm where research` first/);
+  assert.match(worker, /Without a topic, perform only the mandatory mode check above/);
+  assert.match(worker, /confirm that the selected project is connected and wait for the engineer's question/);
+  assert.match(worker, /Until the next message, do not read the clone or knowledge, create artifacts, or call `send_message`/);
+  assert.match(worker, /Use the engineer's next question as the topic and follow the research flow below/);
+  assert.match(worker, /With an explicit topic, start the research flow below immediately/);
+  assert.doesNotMatch(worker, /обзор проекта/);
+  assert.doesNotMatch(readFileSync(join(root, "src", "research-launch.ts"), "utf8"), /обзор проекта/);
 });
 
 test("research shares surface controls without changing topic or security argv", async () => {
@@ -55,6 +97,33 @@ test("research shares surface controls without changing topic or security argv",
     assert.throws(() => parseResearchArgs(["--model"]), /--model needs a value/);
     assert.throws(() => parseResearchArgs(["--project"]), /--project needs/);
     assert.equal(parseResearchArgs(["--project", "--split"]).project, "--split");
-    assert.deepEqual(researchAgentArgs(root, "explicit"), ["--model", "explicit", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-tools", "-e", join(root, "src", "research.ts")]);
+    assert.deepEqual(researchAgentArgs(root, "explicit"), ["--model", "explicit", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("research preserves artifacts and reports to the parent only on explicit request", () => {
+  const worker = readFileSync(join(import.meta.dirname, "..", ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  assert.match(worker, /After each completed research portion, save the artifacts automatically/);
+  assert.match(worker, /Keep the answer and artifact paths in this research tab/);
+  assert.match(worker, /Do not call `send_message` unless the engineer explicitly asks in the current research conversation to report to the main\/parent chat/);
+  assert.match(worker, /An ordinary question, completed answer, saved artifact or created issue is not such a request/);
+  assert.match(worker, /On that explicit request, call `send_message` once without `to`/);
+  assert.doesNotMatch(worker, /After each completed research portion call `send_message`/);
+  assert.match(worker, /Stay available afterward; the engineer closes this mode surface/);
+});
+
+test("research issue creation follows literal single or enumerated requests", () => {
+  const worker = readFileSync(join(import.meta.dirname, "..", ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  for (const rule of [
+    "This rule applies to the external creation effect through any available tracker tool, not its name.",
+    "Discussion, analysis, a proposal to create an issue or agreement that it would be useful authorizes only a draft, not an external write.",
+    'An explicit "create issue X" request authorizes exactly one named issue.',
+    'An explicit "create issues" request with an enumeration authorizes exactly the listed items.',
+    "Do not infer extra issues.",
+    "If item boundaries are ambiguous, ask for clarification before the first create.",
+    "Reread each created issue at its returned URL using the existing tools before reporting.",
+    "Report results and partial failures in this research tab; a failed item does not authorize extra items or hide successful ones.",
+    "Each subsequent separate create requires a new explicit request.",
+    "Parent reporting still requires the separate explicit request described below.",
+  ]) assert.ok(worker.includes(rule), rule);
 });
