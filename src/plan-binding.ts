@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseAffected } from "./adopt.ts";
@@ -11,6 +11,7 @@ const contained = (root: string, path: string) => { const r = relative(root, pat
 
 export function readRecordedPlanBinding(root: string, ticket: string): PlanBinding {
   if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error(`invalid approval ticket ${ticket}`);
+  if (!existsSync(join(root, "yokemate.db"))) throw new Error(`${ticket}: no current recorded plan for approval: ${join(root, "yokemate.db")} is missing`);
   const db = new DatabaseSync(join(root, "yokemate.db"), { readOnly: true });
   let recorded: string | undefined;
   try { recorded = (db.prepare("SELECT plan FROM work WHERE ticket = ?").get(ticket) as { plan?: string } | undefined)?.plan; }

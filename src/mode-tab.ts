@@ -7,7 +7,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, formatHerdrError, herdr, herdrRaw, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
-import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
@@ -292,9 +292,22 @@ if (import.meta.filename === process.argv[1]) {
           throw new Error(`${label} already runs in pane ${running} — go to it, or close it and launch again`);
       }
 
+      let planRunId: string | undefined;
+      if (mode === "plan" && ticket) {
+        try {
+          const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+          if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
+          planRunId = reply.runId;
+          env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
+        } catch (error) { console.error(`${ticket}: no automatic do handoff: ${(error as Error).message}`); }
+      }
       const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
       const { paneId } = opened;
       try {
+        if (planRunId) {
+          const reply = await requestPlanControl(ROOT, "bind-plan", { ticket, runId: planRunId, pane: paneId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+          if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
+        }
         startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
         herdr(["agent", "prompt", agentName, prompt]);
       } catch (e) {

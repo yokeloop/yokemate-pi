@@ -52,6 +52,7 @@ test("failed coordinator starts release duplicate reservations and capacity befo
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "coordinator-start-"));
   const previous = { ...process.env };
   const script = process.argv[1];
+  let shutdown: (() => Promise<void>) | undefined;
   delete process.env.YOKEMATE_MODE;
   delete process.env.YOKEMATE_ROLE;
   try {
@@ -89,15 +90,20 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     const widgets: unknown[] = [];
     const ctx = {
       cwd: dir, mode: "rpc", hasUI: true,
-      ui: { setWidget: (_key: string, lines: unknown) => { widgets.push(lines); } },
+      sessionManager: { getSessionId: () => "fixture-parent" },
+      ui: { notify() {}, setWidget: (_key: string, lines: unknown) => { widgets.push(lines); } },
       modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true },
     } as unknown as ExtensionContext;
+    const extension = loaded.extensions[0]!;
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    const approve = async (text: string) => { for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, { ...ctx, mode: "tui" }); };
     for (let attempt = 0; attempt < 10; attempt++) {
       const result: AgentToolResult<unknown> = await tool.definition.execute(`retry-${attempt}`, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
       assert.equal("isError" in result && result.isError, true);
       const text = result.content[0];
       assert.ok(text?.type === "text");
-      assert.match(text.text, /plan not found:/);
+      assert.match(text.text, /no current recorded plan for approval/);
       assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
     }
     assert.deepEqual(reports, []);
@@ -105,11 +111,19 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "Fixture");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'github', 'YM', 'test/model')").run(join(dir, "clone"));
-    db.close();
-    const plan = join(dir, "recovered-plan.md");
-    writeFileSync(plan, "# YM-1 — recovered\n\n## Affected repositories\n- `org/repo` — app\n");
+    const record = (ticket: string) => {
+      const folder = join(dir, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`);
+      mkdirSync(folder, { recursive: true });
+      const plan = join(folder, "plan.md");
+      writeFileSync(plan, `# ${ticket} — recovered\n\n## Affected repositories\n- \`org/repo\` — app\n`);
+      db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES (?, 'u','planned',?)").run(ticket, plan);
+      return plan;
+    };
+    const plan = record("YM-1");
+    record("YM-2");
+    await approve("/do YM-1 YM-2");
     process.argv[1] = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
-    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"], plan } }, undefined, () => undefined, ctx);
+    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"] } }, undefined, () => undefined, ctx);
     assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
     const { runId } = accepted.details as { runId: string };
     assert.ok(runId);
@@ -125,7 +139,10 @@ test("failed coordinator starts release duplicate reservations and capacity befo
       { ticket: "YM-1", stage: "running" }, { ticket: "YM-2", stage: "running" },
     ]);
     queue.close();
-    const repeated = await tool.definition.execute("repeated", { coordinator: { mode: "do", tickets: ["YM-1", "YM-3"], plan } }, undefined, () => undefined, ctx);
+    record("YM-3");
+    db.close();
+    await approve("/do YM-1 YM-3");
+    const repeated = await tool.definition.execute("repeated", { coordinator: { mode: "do", tickets: ["YM-1", "YM-3"] } }, undefined, () => undefined, ctx);
     assert.equal("isError" in repeated && repeated.isError, false);
     assert.match((repeated.content[0] as { text: string }).text, /^refused YM-1: .*already runs/);
     const extra = (repeated.details as { runs: { ticket: string; runId: string }[] }).runs;
@@ -146,6 +163,7 @@ test("failed coordinator starts release duplicate reservations and capacity befo
       await tool.definition.execute("cleanup", { cancelRun: runId }, undefined, () => undefined, ctx);
     }
   } finally {
+    await shutdown?.();
     process.argv[1] = script;
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);

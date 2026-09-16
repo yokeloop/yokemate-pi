@@ -245,6 +245,7 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
 test("coordinator public admission rereads ship confirmation and never manufactures a permit", async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-coordinator-"));
   const env = { ...process.env };
+  let shutdown: (() => Promise<void>) | undefined;
   try {
     delete process.env.YOKEMATE_MODE;
     delete process.env.YOKEMATE_ROLE;
@@ -261,7 +262,9 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     const input = extension.handlers.get("input")![0]!;
     const tool = extension.tools.get("subagent")!.definition;
     let confirmations = 0;
-    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
+    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { notify() {}, setWidget() {}, confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const launch = async () => (await tool.execute("ship", { coordinator: { mode: "ship", tickets: ["YM-1"] } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
     for (const enabled of [true, false]) {
       set(enabled);
@@ -278,6 +281,7 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     assert.match(JSON.stringify(failed), /subagent.maxDetached/);
     assert.ok(JSON.stringify(failed).includes(file));
   } finally {
+    await shutdown?.();
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
     rmSync(dir, { recursive: true, force: true });

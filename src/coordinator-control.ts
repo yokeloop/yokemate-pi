@@ -6,9 +6,10 @@ import { ensureDir, socketDir } from "./inbox.ts";
 import type { CoordinatorRequest } from "./coordinator-launch.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "status" | "cancel"; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; runId?: string; targetRequestId?: string }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; runId?: string; targetRequestId?: string }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; originId?: string; identity?: unknown }
-export interface ParentControl { launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId: string; identity: unknown }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
+export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "plan-recorded";
+export interface ParentControl { planRecorded?(ticket: string, path: string, origin: ControlOrigin): Promise<{ runId?: string; reason: string }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId: string; identity: unknown }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 export function processStarttime(pid: number): string | undefined {
@@ -62,6 +63,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
+  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; worker?: ControlOrigin }>();
+  const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const origins = new Map<string, ControlOrigin>();
   const paneParents = new Map<string, string | undefined>();
   if (identity.pane) paneParents.set(identity.pane, undefined);
@@ -105,6 +108,37 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         }
         const origin = envelope.originId ? origins.get(envelope.originId) : undefined;
         if (!origin) { reply({ requestId: envelope.requestId, state: "refused", reason: "unknown origin binding" }); continue; }
+        if (!processMatches(origin.pid, origin.starttime)) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin process is no longer live" }); continue; }
+        if (["register-plan", "bind-plan", "plan-started", "plan-recorded"].includes(envelope.operation)) {
+          try {
+            const ticket = envelope.ticket;
+            if (!ticket || !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error("invalid plan handoff ticket");
+            const main = !origin.mode && !origin.role && origin.sessionId === identity.sessionId;
+            if (envelope.operation === "register-plan") {
+              if (!main) throw new Error("only the verified main parent can register a plan run");
+              const runId = randomUUID();
+              planRuns.set(runId, { ticket, launcher: { ...origin } });
+              reply({ requestId: envelope.requestId, state: "accepted", runId });
+            } else {
+              const planRun = envelope.runId ? planRuns.get(envelope.runId) : undefined;
+              if (envelope.operation === "bind-plan") {
+                if (!main || !planRun || planRun.ticket !== ticket || !sameProcess(planRun.launcher, origin) || planRun.pane || !envelope.pane) throw new Error("invalid parent-owned plan pane binding");
+                planRun.pane = envelope.pane;
+                reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
+              } else if (envelope.operation === "plan-started") {
+                if (!planRun || planRun.ticket !== ticket || origin.mode !== "plan" || origin.ticket !== ticket || origin.pane !== planRun.pane || planRun.worker && !sameProcess(planRun.worker, origin)) throw new Error("invalid plan worker identity");
+                planRun.worker = { ...origin };
+                reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
+              } else {
+                if (!main && (!planRun?.worker || planRun.ticket !== ticket || origin.mode !== "plan" || origin.ticket !== ticket || origin.pane !== planRun.pane || origin.sessionId !== planRun.worker.sessionId || !descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime))) throw new Error("plan record is not from its registered live worker");
+                if (!envelope.path || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
+                const outcome = await parent.planRecorded(ticket, envelope.path, origin);
+                reply({ requestId: envelope.requestId, state: "accepted", ...outcome });
+              }
+            }
+          } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
+          continue;
+        }
         if (envelope.operation === "status") {
           const target = envelope.targetRequestId ?? envelope.requestId;
           if (requestOrigins.get(target) !== envelope.originId) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator request" }); continue; }
@@ -168,4 +202,17 @@ export async function requestCoordinator(root: string, request: CoordinatorReque
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation: "launch", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, request }, env);
+}
+
+export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+  const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
+  if (attach.state !== "accepted" || !attach.originId) return attach;
+  return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);
+}
+
+export function currentControlOrigin(root: string, sessionId = process.env.PI_SESSION_ID): ControlOrigin {
+  if (!sessionId) throw new Error("PI_SESSION_ID is required for parent plan handoff");
+  const starttime = processStarttime(process.pid);
+  if (!starttime) throw new Error("cannot read plan origin process starttime");
+  return { sessionId, pid: process.pid, starttime, cwd: root, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE };
 }

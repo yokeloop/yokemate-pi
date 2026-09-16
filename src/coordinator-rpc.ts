@@ -151,7 +151,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
         const commandsValue = isRecord(event.data) ? event.data.commands : undefined;
         const commands = Array.isArray(commandsValue) ? commandsValue.filter(isRecord).map((command) => command.name) : [];
         if (event.success !== true || !commands.includes("yokemate-coordinator-ready") || !commands.includes(`skill:${prepared.mode}-worker`)) fail("coordinator lacks ready command or worker skill");
-        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan, diagnosticRoot: prepared.resourcesPath } })).toString("base64")}` }); }
+        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan, doBinding: prepared.doBinding, diagnosticRoot: prepared.resourcesPath } })).toString("base64")}` }); }
       } else if (event.id === `${identity.runId}:ready`) {
         if (event.success !== true) fail("coordinator ready command was refused");
         else { readyAck = true; send({ id: `${identity.runId}:state`, type: "get_state" }); }

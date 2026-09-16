@@ -14,17 +14,20 @@ export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
 export interface CoordinatorOrigin extends MoveEnv { sessionId?: string; runId?: string; cwd?: string; pane?: string; parentPane?: string }
 export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string }
-export interface PreparedCoordinator { mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
+export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
 
 const KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 const fail = (message: string): never => { throw new Error(message); };
 const inside = (root: string, value: string): boolean => { const r = relative(root, resolve(value)); return r !== "" && !r.startsWith("..") && !r.includes("/../"); };
 
 export function validateCoordinatorRequest(request: CoordinatorRequest): void {
+  if (!request || typeof request !== "object" || Array.isArray(request)) fail("coordinator request must be an object");
+  for (const key of Object.keys(request)) if (!["mode", "tickets", "plan", "model", "note"].includes(key)) fail(`unknown coordinator request field ${key}`);
+  for (const key of ["plan", "model", "note"] as const) if (request[key] !== undefined && (typeof request[key] !== "string" || !request[key]!.trim())) fail(`coordinator ${key} must be a nonempty string`);
   if (request.mode !== "do" && request.mode !== "ship") fail(`unknown coordinator mode ${request.mode}`);
   if (!Array.isArray(request.tickets) || request.tickets.length === 0) fail(`${request.mode} needs at least one ticket`);
   if (new Set(request.tickets).size !== request.tickets.length) fail("ticket list contains duplicates");
-  for (const ticket of request.tickets) if (!KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
+  for (const ticket of request.tickets) if (typeof ticket !== "string" || !KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
   if (request.plan && request.mode !== "do") fail("ship does not accept a plan override");
 }
 
