@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, realpathSync, readFileSync } from "node:fs";
-import { dirname, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 export type ResearchRole = "worker" | "child";
@@ -30,10 +30,14 @@ function within(path: string, root: string): boolean {
   return r === "" || (!r.startsWith(".." + sep) && r !== ".." && !r.includes(".." + sep));
 }
 
+export function resolveResearchRead(target: string | undefined, identity: ResearchIdentity): string {
+  if (target && isAbsolute(target)) return resolve(target);
+  const base = identity.projectPath ? realpathSync(identity.projectPath) : identity.root;
+  return resolve(base, target || ".");
+}
+
 export function canonicalResearchRead(target: string, identity: ResearchIdentity): ResearchVerdict {
   const candidate = resolve(target);
-  let path: string;
-  try { path = realpathSync(candidate); } catch { return { ok: false, reason: `research read target does not exist: ${target}` }; }
   const roots = [
     identity.projectPath,
     resolve(identity.root, "home", "notes"),
@@ -41,9 +45,12 @@ export function canonicalResearchRead(target: string, identity: ResearchIdentity
     resolve(identity.root, "src"),
     resolve(identity.root, ".pi", "skills"),
     resolve(identity.root, "docs"),
-  ].filter((root): root is string => Boolean(root)).map((root) => resolve(root));
-  if (!roots.some((root) => within(path, root))) return { ok: false, reason: "research reads are limited to the selected clone, artifacts, and engine source resources" };
-  if (path.split(sep).some((part) => part === ".git" || /^\.env(?:\.|$)/.test(part) || /(?:credential|secret|token|keyring)/i.test(part))) return { ok: false, reason: "research does not expose credential or runtime identity files" };
+  ].filter((root): root is string => Boolean(root)).map((root) => existsSync(root) ? realpathSync(root) : resolve(root));
+  const details = `target: ${candidate}; allowed roots: ${roots.join(", ")}`;
+  let path: string;
+  try { path = realpathSync(candidate); } catch { return { ok: false, reason: `research read target does not exist or is inaccessible; ${details}` }; }
+  if (!roots.some((root) => within(path, root))) return { ok: false, reason: `research reads are limited to the selected clone, artifacts, and engine source resources; ${details}` };
+  if (path.split(sep).some((part) => part === ".git" || /^\.env(?:\.|$)/.test(part) || /(?:credential|secret|token|keyring)/i.test(part))) return { ok: false, reason: `research does not expose credential or runtime identity files; ${details}` };
   return { ok: true };
 }
 

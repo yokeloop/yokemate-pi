@@ -1,9 +1,9 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createFindTool, createGrepTool, createLsTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createFindToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
 import bus from "./bus.ts";
 import subagent from "../.pi/extensions/subagent/index.ts";
-import { canonicalResearchRead, classifyResearchCall, researchIdentity } from "./research-guard.ts";
+import { canonicalResearchRead, classifyResearchCall, researchIdentity, resolveResearchRead } from "./research-guard.ts";
 import { installResearchMcp, isResearchMcpTool } from "./research-mcp.ts";
 import { executeResearchBash, installResearchTools } from "./research-tools.ts";
 
@@ -24,13 +24,13 @@ function researchRegistrations(pi: ExtensionAPI, names: string[]): string[] {
 
 export default function research(pi: ExtensionAPI): void {
   let ready = false;
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", (event) => {
     const identity = researchIdentity();
     const verdict = classifyResearchCall(identity, event.toolName);
     if (!verdict.ok && !isResearchMcpTool(event.toolName)) return { block: true, reason: verdict.reason };
     if (identity && ["read", "grep", "find", "ls"].includes(event.toolName)) {
       const input = event.input as { path?: unknown };
-      const path = typeof input.path === "string" ? resolve(ctx.cwd, input.path) : ctx.cwd;
+      const path = resolveResearchRead(typeof input.path === "string" ? input.path : undefined, identity);
       const readable = canonicalResearchRead(path, identity);
       if (!readable.ok) return { block: true, reason: readable.reason };
     }
@@ -63,10 +63,20 @@ export default function research(pi: ExtensionAPI): void {
     const mcpError = await mcpLoad;
     if (mcpError) ctx.ui.notify(`research MCP did not load: ${mcpError}`, "error");
     try {
-      pi.registerTool(createReadTool(identity.root) as never);
-      pi.registerTool(createGrepTool(identity.root) as never);
-      pi.registerTool(createFindTool(identity.root) as never);
-      pi.registerTool(createLsTool(identity.root) as never);
+      const readTools: ToolDefinition<any, any>[] = [createReadToolDefinition(identity.root), createGrepToolDefinition(identity.root), createFindToolDefinition(identity.root), createLsToolDefinition(identity.root)];
+      for (const tool of readTools) {
+        pi.registerTool({
+          ...tool,
+          description: `${tool.description} Research relative paths use the selected clone; engine resources require absolute paths.`,
+          execute(id, input, signal, update, context) {
+            const params = input as { path?: string };
+            const path = resolveResearchRead(params.path, identity);
+            const readable = canonicalResearchRead(path, identity);
+            if (!readable.ok) throw new Error(readable.reason);
+            return tool.execute(id, { ...params, path }, signal, update, context);
+          },
+        });
+      }
       installResearchTools(pi);
       const active = researchRegistrations(pi, requiredTools);
       const optional = pi.getAllTools()
