@@ -32,7 +32,7 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
-import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { CoordinatorRegistry, ShipPermitStore, coordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
@@ -40,7 +40,7 @@ import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
-import { ENGINE_ROOT, readRuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
+import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -652,9 +652,9 @@ export default function (pi: ExtensionAPI) {
 			if (tickets.length) shipPermits.observeInteractiveShip(tickets, (ctx as any).sessionManager?.getSessionId?.() ?? "main");
 		} else shipPermits.invalidate();
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const checks = legacyCoordinatorChecks(readRuntimeSettings(ENGINE_ROOT).limits.maxDetached);
+		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
@@ -662,8 +662,6 @@ export default function (pi: ExtensionAPI) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
-		const duplicate = checks.checkDuplicate(request.mode, coordinators.active().filter((active) => active.request.tickets.some((ticket) => request.tickets.includes(ticket))));
-		if (duplicate) throw new Error(duplicate);
 		const admission = checks.checkAdmission(activeUnits);
 		if (admission) throw new Error(admission);
 		activeUnits += 1;
@@ -673,7 +671,7 @@ export default function (pi: ExtensionAPI) {
 		let cleanupReservation: ((reason: string) => Promise<void>) | undefined;
 		const finishCalls = new Set<string>();
 		try {
-			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
+			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode));
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorUnits.add(ownedRun.identity.runId);
@@ -691,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				rpcByRun.delete(ownedRun.identity.runId);
 			})();
-			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
+			const prepared = request.mode === "do" ? prepareDo(root, request, origin, settings) : await prepareShip(root, request);
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
@@ -716,7 +714,10 @@ export default function (pi: ExtensionAPI) {
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
-				if (rpc && !terminalReported) continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
+				if (rpc && !terminalReported) {
+					try { continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason)); }
+					catch (error) { reportBlocked?.((error as Error).message); }
+				}
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
@@ -789,15 +790,15 @@ export default function (pi: ExtensionAPI) {
 			throw error;
 		}
 	};
-	const startCoordinator = async (...[request, ctx, origin]: Parameters<typeof startOneCoordinator>) => {
-		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin);
+	const startCoordinator = async (...[request, ctx, origin, settings = readRuntimeSettings(ENGINE_ROOT)]: Parameters<typeof startOneCoordinator>) => {
+		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin, settings);
 		const content: { type: "text"; text: string }[] = [];
 		const runs: { ticket: string; runId: string }[] = [];
 		let first: Awaited<ReturnType<typeof startOneCoordinator>>["details"] | undefined;
 		for (const part of splitDoRequest(request)) {
 			const ticket = part.tickets[0]!;
 			try {
-				const result = await startOneCoordinator(part, ctx, origin);
+				const result = await startOneCoordinator(part, ctx, origin, settings);
 				content.push(...result.content as { type: "text"; text: string }[]);
 				runs.push({ ticket, runId: result.details.runId });
 				first ??= result.details;
@@ -1004,6 +1005,13 @@ export default function (pi: ExtensionAPI) {
 				try { const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run"); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
+			const agentScope: AgentScope = params.agentScope ?? "project";
+			let settings;
+			try {
+				settings = readRuntimeSettings(ENGINE_ROOT);
+			} catch (e) {
+				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
+			}
 			if (params.coordinator) {
 				const origin = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE as "coordinator" | "executor" | undefined, sessionId, cwd: ctx.cwd };
 				try {
@@ -1017,15 +1025,8 @@ export default function (pi: ExtensionAPI) {
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: [{ type: "text", text: `accepted ${reply.runId}` }], details: { runId: reply.runId, identity: reply.identity } };
 					}
-					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin);
+					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
-			}
-			const agentScope: AgentScope = params.agentScope ?? "project";
-			let settings;
-			try {
-				settings = readRuntimeSettings(ENGINE_ROOT);
-			} catch (e) {
-				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
 			}
 			const { policy } = settings;
 			const dispatchDefaults: DispatchDefaults = {

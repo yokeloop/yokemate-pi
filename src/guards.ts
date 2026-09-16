@@ -23,10 +23,6 @@ import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
 /** A pi tool call in the shape judge() reads; null — not a tool we guard. */
-export function retainedShipLaunch(command: string | undefined): boolean {
-  return Boolean(command && /\bpnpm\s+(?:--silent\s+)?ship\b/.test(command));
-}
-
 export function guardCall(
   toolName: string,
   input: Record<string, unknown>,
@@ -103,7 +99,6 @@ export default function guards(pi: ExtensionAPI) {
       }, settings);
       if (!v) return undefined;
       if (v.decision === "deny") return { block: true, reason: v.reason };
-      if (call.name === "Bash" && retainedShipLaunch(call.input.command)) return undefined;
       // The one ask judge() returns is a ship launch in the main chat. Without
       // a dialog to ask in, it does not go.
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;

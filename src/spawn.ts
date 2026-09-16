@@ -1,3 +1,4 @@
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { resolve } from "node:path";
 import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { splitDoRequest } from "./coordinator-launch.ts";
@@ -17,6 +18,7 @@ for (let index = 0; index < argv.length; index += 1) {
 if (!tickets.length) fail("usage: spawn <TICKET> [<TICKET> …] [--plan <path-to-plan.md>] [--model <m>]");
 const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required to route spawn to its live coordinator parent");
 try {
+  readRuntimeSettings(root);
   const requests = splitDoRequest({ mode: "do", tickets, plan, model });
   const parent = resolveCoordinatorParent(root);
   let accepted = false;

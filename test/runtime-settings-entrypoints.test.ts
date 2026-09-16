@@ -241,3 +241,45 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     rmSync(sockDir, { recursive: true, force: true });
   }
 });
+
+test("coordinator public admission rereads ship confirmation and never manufactures a permit", async () => {
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-coordinator-"));
+  const env = { ...process.env };
+  try {
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    const file = join(dir, ".pi", "settings.json");
+    const set = (shipConfirmation: boolean) => writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { shipConfirmation } } }));
+    set(true);
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const extension = loaded.extensions[0]!;
+    const input = extension.handlers.get("input")![0]!;
+    const tool = extension.tools.get("subagent")!.definition;
+    let confirmations = 0;
+    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
+    const launch = async () => (await tool.execute("ship", { coordinator: { mode: "ship", tickets: ["YM-1"] } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    for (const enabled of [true, false]) {
+      set(enabled);
+      const before = confirmations;
+      assert.match(await launch(), /current interactive \/ship/);
+      assert.equal(confirmations, before);
+      await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
+      assert.match(await launch(), /no task folder/);
+      assert.equal(confirmations, before + Number(enabled));
+      assert.match(await launch(), /current interactive \/ship/);
+    }
+    writeFileSync(file, JSON.stringify({ subagent: { maxDetached: 0 } }));
+    const failed = await tool.execute("bad-do", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(failed), /subagent.maxDetached/);
+    assert.ok(JSON.stringify(failed).includes(file));
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+    Object.assign(process.env, env);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

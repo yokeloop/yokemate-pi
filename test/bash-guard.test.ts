@@ -250,16 +250,16 @@ test("the home rule reads rm's targets with their quotes and everything else as 
 
 // The ship question reads the command outside its quotes as well (YM-160):
 // reading or quoting the launch is ordinary work, only a launch asks.
-test("a quoted ship launch is data, an actual ship launch asks", () => {
+test("ship launches defer permit and optional confirmation to the coordinator backend", () => {
   for (const cmd of ['grep -n "pnpm ship" src/mode-tab.ts', 'echo "pnpm ship ACME-1"']) {
     assert.equal(bash(undefined, cmd), null, cmd);
   }
   for (const cmd of ["pnpm ship ACME-1", "pnpm split ship ACME-1"]) {
-    assert.equal(bash(undefined, cmd)?.decision, "ask", cmd);
+    assert.equal(bash(undefined, cmd), null, cmd);
   }
 });
 
-test("only ship launches ask in the main chat", () => {
+test("launch shell commands leave optional confirmation to the owned backend", () => {
   for (const cmd of [
     "pnpm spawn ACME-1",
     "pnpm review ACME-1 обнови ветку",
@@ -280,7 +280,7 @@ test("only ship launches ask in the main chat", () => {
     "pnpm split ship ACME-1",
     "node --experimental-strip-types src/mode-tab.ts ship ACME-1",
   ]) {
-    assert.equal(bash(undefined, cmd)?.decision, "ask", cmd);
+    assert.equal(bash(undefined, cmd), null, cmd);
   }
   assert.equal(bash("do", "pnpm ship ACME-1"), null);
   assert.equal(bash(undefined, "pnpm test"), null);

@@ -1,3 +1,4 @@
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -242,8 +243,9 @@ export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, r
   const deliveryFailure = rpc.childState.deliveryFailureReason();
   if (deliveryFailure) { reportBlocked(deliveryFailure); return; }
   if (event.type !== "agent_settled") return;
+  const settings = readRuntimeSettings();
   const verdict = rpc.childState.settled();
   if (verdict === "wait") return;
-  if (verdict === "blocked") { reportBlocked("coordinator stopped without outcome"); return; }
+  if (verdict === "blocked" || !settings.policy.guards.doCompletion) { reportBlocked("coordinator stopped without outcome"); return; }
   void rpc.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch(() => reportBlocked("coordinator completion prompt delivery failed"));
 }
