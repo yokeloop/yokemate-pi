@@ -97,7 +97,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> --model <m> [--mod
 
 YM-219 отдельно исправляет нормализацию main-pane stamp; это не approval mechanism и не часть YM-214.
 
-Matrix cells называют consumer и public regression case; not-applicable означает отсутствие соответствующего действия на поверхности.
+Matrix cells называют consumer и public regression case; not-applicable означает отсутствие соответствующего действия на поверхности. Исполняемый manifest в `test/runtime-settings-manifest.test.ts` связывает каждую applicable cell с именованным public-entry case и требует варианты on, off и neighbor-still-on.
 
 <!-- runtime-settings-matrix -->
 | setting | typed | tool | cli | pane | ordinary | coordinator |

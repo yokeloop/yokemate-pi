@@ -92,6 +92,18 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await input("/do YM-1");
     writeFileSync(plan, text + "\nchanged");
     assert.match(output(await launch()), /approval.*changed/);
+    writeFileSync(plan, text);
+    await input("/do YM-1");
+    writeFileSync(plan, text.replace("1. Work", "1. Changed scope"));
+    assert.match(output(await launch()), /approval scope changed/);
+    writeFileSync(plan, text);
+    await input("/do YM-1");
+    writeFileSync(plan, text.replace("org/repo", "org/other"));
+    assert.match(output(await launch()), /approval repositories changed/);
+    writeFileSync(plan, text);
+    await input("/do YM-1");
+    await input("/plan YM-1");
+    assert.match(output(await launch()), /current interactive approval/);
     await input("/do YM-1");
     const explicit = await launch();
     const explicitId = (explicit.details as { runId: string }).runId;

@@ -24,8 +24,12 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     const ctx = { cwd: dir, hasUI: true, ui: { confirm: async () => { throw new Error("unexpected confirmation"); } } } as unknown as ExtensionContext;
     process.env.YOKEMATE_MODE = "do";
     process.env.YOKEMATE_TICKET = "YM-1";
-    const call = (toolName: string, input: Record<string, unknown>) => hook({ type: "tool_call", toolCallId: "fixture", toolName, input } as never, ctx);
+    const call = (toolName: string, input: Record<string, unknown>, context = ctx) => hook({ type: "tool_call", toolCallId: "fixture", toolName, input } as never, context);
     assert.deepEqual(await call("bash", { command: "sleep 1" }), { block: true, reason: "Waiting is forbidden: a finished subagent returns its result as the tool result, and completion comes to the session on its own. Check the condition once, without sleep, and keep working." });
+    const task = join(dir, "work", "YM-1");
+    mkdirSync(join(task, ".pi"), { recursive: true });
+    writeFileSync(join(task, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { guards: { wait: false } } }));
+    assert.equal((await call("bash", { command: "sleep 1" }, { ...ctx, cwd: task } as ExtensionContext) as { block: boolean }).block, true);
     set({ guardPolicy: { guards: { wait: false } } });
     assert.equal(await call("bash", { command: "sleep 1" }), undefined);
     assert.equal((await call("bash", { command: "pnpm dev" }) as { block: boolean }).block, true);
@@ -73,6 +77,14 @@ test("public file and Bash guards disable only their named refusal", async () =>
       ["massKill", "do", "bash", { command: "pkill fixture-never-executed" }],
       ["homeDelete", "do", "bash", { command: "rm -rf ~/fixture-never-executed" }],
     ] as const;
+    process.env.YOKEMATE_MODE = "do";
+    writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
+    const yoloCall = (command: string) => hook({ type: "tool_call", toolCallId: "yolo", toolName: "bash", input: { command } } as never, ctx);
+    assert.equal(await yoloCall("sleep 1"), undefined);
+    assert.equal(await yoloCall("pnpm dev"), undefined);
+    writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { wait: true } } }));
+    assert.equal((await yoloCall("sleep 1") as { block: boolean }).block, true);
+    assert.equal(await yoloCall("pnpm dev"), undefined);
     for (const [key, mode, toolName, input] of rows) {
       process.env.YOKEMATE_MODE = mode;
       const call = (name = toolName as string, args: Record<string, unknown> = input) => hook({ type: "tool_call", toolCallId: key, toolName: name, input: args } as never, ctx);
@@ -109,6 +121,22 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     assert.equal(run("mode-guard.ts", ["do", "YM-1"], stamp).stdout.trim(), "launch");
     const db = openDb(join(dir, "yokemate.db"));
     db.close();
+    const plan = join(dir, "plan.md");
+    writeFileSync(plan, "# YM-1\n\n## Affected repositories\n- `org/repo` — app\n");
+    const review = { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-1" };
+    set({});
+    assert.match(run("plan-ticket.ts", ["YM-1", plan], review).stderr, /not review's move/);
+    set({ guards: { transitionCaller: false } });
+    assert.match(run("plan-ticket.ts", ["YM-1", plan], { ...review, YOKEMATE_TICKET: "YM-2" }).stderr, /stamped YM-2, not YM-1/);
+    set({ guards: { transitionCaller: false, transitionTicket: false } });
+    assert.equal(run("plan-ticket.ts", ["YM-1", plan], { ...review, YOKEMATE_TICKET: "YM-2" }).status, 0);
+    const runningDb = openDb(join(dir, "yokemate.db"));
+    runningDb.prepare("UPDATE work SET stage='running' WHERE ticket='YM-1'").run();
+    runningDb.close();
+    set({});
+    assert.match(run("plan-ticket.ts", ["YM-1", plan], { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }).stderr, /plan moves from/);
+    set({ guards: { transitionSource: false } });
+    assert.equal(run("plan-ticket.ts", ["YM-1", plan], { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }).status, 0);
     set({});
     assert.match(run("stage.ts", ["YM-1", "planned", "--force"], stamp).stderr, /main chat's repair/);
     set({ guards: { stageCaller: false } });
@@ -134,6 +162,52 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     assert.equal(finalDb.prepare("SELECT stage FROM work WHERE ticket = 'YM-1'").get()?.stage, "planned");
     finalDb.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("loaded completion and report hooks reread only their named settings", async () => {
+  const { openDb } = await import("../src/db.ts");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-events-"));
+  const env = { ...process.env };
+  try {
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, ".pi"));
+    const file = join(dir, ".pi", "settings.json");
+    writeFileSync(file, "{}");
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO work (ticket,url,stage) VALUES ('YM-1','u','running')").run();
+    db.close();
+    process.env.YOKEMATE_MODE = "do";
+    process.env.YOKEMATE_TICKET = "YM-1";
+    delete process.env.YOKEMATE_ROLE;
+    const guardLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, "src", "guards.ts")] });
+    await guardLoader.reload();
+    assert.deepEqual(guardLoader.getExtensions().errors, []);
+    const messages: unknown[] = [];
+    guardLoader.getExtensions().runtime.sendMessage = (message, options) => { messages.push({ message, options }); };
+    const extension = guardLoader.getExtensions().extensions[0]!;
+    const ctx = { cwd: dir, hasUI: false } as ExtensionContext;
+    await extension.handlers.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx);
+    assert.match(JSON.stringify(messages), /stage is still running/);
+    writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { doCompletion: false } } }));
+    await extension.handlers.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx);
+    assert.equal(messages.length, 1);
+    const wait = await extension.handlers.get("tool_call")![0]!({ type: "tool_call", toolCallId: "wait", toolName: "bash", input: { command: "sleep 1" } } as never, ctx);
+    assert.equal((wait as { block: boolean }).block, true);
+    const busLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, "src", "bus.ts")] });
+    await busLoader.reload();
+    assert.deepEqual(busLoader.getExtensions().errors, []);
+    const report = busLoader.getExtensions().extensions[0]!.handlers.get("tool_call")![0]!;
+    process.env.YOKEMATE_MODE = "review";
+    process.env.YOKEMATE_PARENT_PANE = "parent";
+    writeFileSync(file, "{}");
+    assert.equal((await report({ type: "tool_call", toolCallId: "report", toolName: "send_message", input: { to: "foreign" } } as never, ctx) as { block: boolean }).block, true);
+    writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { reportTarget: false } } }));
+    assert.equal(await report({ type: "tool_call", toolCallId: "report", toolName: "send_message", input: { to: "foreign" } } as never, ctx), undefined);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+    Object.assign(process.env, env);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("ordinary public dispatch pins its snapshot and independently enforces all caps and opt-in confirmation", { timeout: 15000 }, async () => {
@@ -210,10 +284,11 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     const wide = await dispatch({ tasks: [task, task] });
     await count(5);
     await finish(wide, [3, 4]);
-    set({ parallelTaskLimit: false, detachedLimit: false });
+    set({ parallelTaskLimit: false }, { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 3 });
     const uncapped = await dispatch({ tasks: [task, task, task] });
     await count(6);
     assert.equal(connections.length, 6);
+    await assert.rejects(() => dispatch(task), /Too many detached/);
     connections[5]!.write("finish");
     await count(7);
     connections[6]!.write("finish");
@@ -223,9 +298,10 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     const live = await dispatch(task);
     await count(9);
     await assert.rejects(() => dispatch(task), /Too many detached/);
-    set({}, { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 2 });
+    set({ detachedLimit: false }, { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 });
     const second = await dispatch(task);
     await count(10);
+    await assert.rejects(() => dispatch({ tasks: [task, task] }), /Too many parallel tasks/);
     set({}, { maxDetached: "invalid" });
     assert.match(text((await dispatch(task)).result), /subagent.maxDetached/);
     await finish(live, [8]);
@@ -262,16 +338,37 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     const input = extension.handlers.get("input")![0]!;
     const tool = extension.tools.get("subagent")!.definition;
     let confirmations = 0;
-    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { notify() {}, setWidget() {}, confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
+    const notifications: string[] = [];
+    const ctx = { cwd: dir, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "main" }, ui: { notify(message: string) { notifications.push(message); }, setWidget() {}, confirm: async () => { confirmations++; return true; } } } as unknown as ExtensionContext;
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
-    const launch = async () => (await tool.execute("ship", { coordinator: { mode: "ship", tickets: ["YM-1"] } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    const launch = async (tickets = ["YM-1"]) => (await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    process.env.YOKEMATE_MODE = "plan";
+    process.env.YOKEMATE_TICKET = "YM-1";
+    writeFileSync(file, "{}");
+    const callerOn = await tool.execute("do-caller-on", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(callerOn), /main chat only/);
+    writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { spawnCaller: false } } }));
+    const callerOff = await tool.execute("do-caller-off", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.doesNotMatch(JSON.stringify(callerOff), /main chat only/);
+    assert.match(JSON.stringify(callerOff), /no current recorded plan/);
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_TICKET;
+    set(false);
+    await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
+    writeFileSync(file, JSON.stringify({ subagent: { maxDetached: 0 } }));
+    assert.deepEqual(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), { action: "handled" });
+    assert.match(notifications.at(-1) ?? "", /subagent.maxDetached/);
+    set(false);
+    assert.match(await launch(), /no task folder/);
     for (const enabled of [true, false]) {
       set(enabled);
       const before = confirmations;
       assert.match(await launch(), /current interactive \/ship/);
       assert.equal(confirmations, before);
       await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
+      assert.match(await launch(["YM-2"]), /current interactive \/ship/);
+      assert.equal(confirmations, before);
       assert.match(await launch(), /no task folder/);
       assert.equal(confirmations, before + Number(enabled));
       assert.match(await launch(), /current interactive \/ship/);
