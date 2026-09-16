@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import * as net from "node:net";
 import { join, resolve } from "node:path";
-import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 
 export const TIMEOUT_MS = 2000;
 export const ROOT = resolve(new URL("..", import.meta.url).pathname);
@@ -239,8 +239,9 @@ export function allowTarget(
   env: InboxEnv,
   to: string | undefined,
   mains: string[],
-  policy: GuardPolicy = readGuardPolicy(),
+  settings: RuntimeSettings = readRuntimeSettings(),
 ): { ok: true } | { ok: false; reason: string } {
+  const { policy } = settings;
   if (!policy.guards.reportTarget || !env.YOKEMATE_MODE) return { ok: true };
   if (!to) return { ok: true };
   if (to === parentPane(env) || mains.includes(to)) return { ok: true };

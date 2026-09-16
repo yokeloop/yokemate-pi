@@ -10,7 +10,7 @@ import { modelForOrg, modelForTicket } from "./project-model.ts";
 import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
-import { readGuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 
 function incompleteTerminalCapture(error: unknown): boolean {
@@ -137,6 +137,7 @@ if (import.meta.filename === process.argv[1]) {
     process.exit(1);
   };
 
+  const policy = (() => { try { return readRuntimeSettings(ROOT).policy; } catch (e) { return fail((e as Error).message); } })();
   const argv = process.argv.slice(2);
   const mode = argv[0] as Mode;
   if (!MODES.includes(mode)) fail(`usage: <${MODES.join("|")}> <TICKET> [--model <m>] [rest…]`);
@@ -208,7 +209,6 @@ if (import.meta.filename === process.argv[1]) {
     }
   }
 
-  const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
   if (mode === "ship") {
     let shipModel: string | undefined;
     const modelIndex = tail.indexOf("--model");

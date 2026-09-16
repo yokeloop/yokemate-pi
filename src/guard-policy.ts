@@ -72,16 +72,10 @@ export function resolveGuardPolicy(value: unknown, source = "<settings>"): Guard
   return { source, yolo, workflowApproval: raw.workflowApproval === undefined ? !yolo : raw.workflowApproval as boolean, guards };
 }
 
-export function readGuardPolicy(root = ENGINE_ROOT): GuardPolicy {
-  return readRuntimeSettings(root).policy;
-}
-
-export { RuntimeSettingsError as GuardPolicyError };
-
-export function formatGuardPolicy(policy: GuardPolicy): string {
+export function formatGuardPolicy({ source, policy, limits }: RuntimeSettings): string {
   const enabled = GUARD_IDS.filter((id) => policy.guards[id]).join(", ") || "none";
   const disabled = GUARD_IDS.filter((id) => !policy.guards[id]).join(", ") || "none";
-  return `Guard policy: ${policy.source}; yolo=${policy.yolo}; workflowApproval=${policy.workflowApproval}; enabled=${enabled}; disabled=${disabled}. Immutable boundaries: assigned scope, quality gates, ready-PR reporting, explicit /ship for merge, external authentication, and required data remain mandatory.`;
+  return `Runtime settings: ${source}; maxParallelTasks=${limits.maxParallelTasks}; maxConcurrency=${limits.maxConcurrency}; maxDetached=${limits.maxDetached}; yolo=${policy.yolo}; workflowApproval=${policy.workflowApproval}; enabled=${enabled}; disabled=${disabled}. False settings never widen the current engineer request. Only verified parent interactive input can create initial do or ship authority. Immutable boundaries: assigned scope, quality gates, ready-PR reporting, explicit /ship for merge, external authentication, and required data remain mandatory.`;
 }
 
 export interface SubagentLimits {
@@ -91,23 +85,6 @@ export interface SubagentLimits {
 }
 
 export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
-
-export function resolveSubagentLimits(value: unknown): SubagentLimits | null {
-  if (!isObject(value)) return null;
-  const parallel = value.maxParallelTasks ?? DEFAULT_SUBAGENT_LIMITS.maxParallelTasks;
-  const candidate: SubagentLimits = {
-    maxParallelTasks: parallel as number,
-    maxConcurrency: (value.maxConcurrency ?? Math.min(DEFAULT_SUBAGENT_LIMITS.maxConcurrency, parallel as number)) as number,
-    maxDetached: (value.maxDetached ?? Math.max(DEFAULT_SUBAGENT_LIMITS.maxDetached, parallel as number)) as number,
-  };
-  if (Object.values(candidate).some((v) => !Number.isInteger(v) || v < 1)) return null;
-  if (candidate.maxConcurrency > candidate.maxParallelTasks || candidate.maxDetached < candidate.maxParallelTasks) return null;
-  return candidate;
-}
-
-export function readSubagentLimits(root = ENGINE_ROOT): SubagentLimits {
-  return readRuntimeSettings(root).limits;
-}
 
 export interface RuntimeSettings {
   readonly source: string;
@@ -149,8 +126,7 @@ export function readRuntimeSettings(root = ENGINE_ROOT): RuntimeSettings {
 }
 
 export function subagentAdmission(
-  policy: GuardPolicy,
-  limits: SubagentLimits,
+  { policy, limits }: RuntimeSettings,
   mode: "single" | "parallel" | "chain",
   requested: number,
   activeUnits: number,
@@ -163,7 +139,7 @@ export function subagentAdmission(
   return null;
 }
 
-export function subagentConcurrency(policy: GuardPolicy, limits: SubagentLimits, taskCount: number): number {
+export function subagentConcurrency({ policy, limits }: RuntimeSettings, taskCount: number): number {
   return policy.guards.parallelConcurrencyLimit ? limits.maxConcurrency : taskCount;
 }
 

@@ -40,67 +40,9 @@ import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
-import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
+import { ENGINE_ROOT, readRuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
-
-interface Limits {
-	maxParallelTasks: number;
-	maxConcurrency: number;
-	maxDetached: number;
-}
-
-const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
-
-const limitsByCwd = new Map<string, Limits>();
-
-
-function validateLimits(limits: Limits): string | undefined {
-	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
-		const value = limits[key];
-		if (!Number.isInteger(value) || value < 1) return `${key} must be an integer >= 1, got ${JSON.stringify(value)}`;
-	}
-	if (limits.maxConcurrency > limits.maxParallelTasks)
-		return `maxConcurrency (${limits.maxConcurrency}) must be <= maxParallelTasks (${limits.maxParallelTasks})`;
-	if (limits.maxDetached < limits.maxParallelTasks)
-		return `maxDetached (${limits.maxDetached}) must be >= maxParallelTasks (${limits.maxParallelTasks})`;
-	return undefined;
-}
-
-// Лимиты сцеплены друг с другом, поэтому набор из настроек либо принимается
-// целиком, либо отбрасывается целиком: половина от инженера, половина из кода
-// дала бы комбинацию, которой никто не выбирал.
-function loadLimits(cwd: string): Limits {
-	const cached = limitsByCwd.get(cwd);
-	if (cached) return cached;
-
-	let limits = DEFAULT_LIMITS;
-	const file = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
-	try {
-		if (fs.existsSync(file)) {
-			const raw = JSON.parse(fs.readFileSync(file, "utf-8"))?.subagent;
-			if (raw && typeof raw === "object") {
-				// Умолчание подгоняется под названное соседнее поле: инженер,
-				// написавший один только maxParallelTasks, назвал число, а не
-				// повод отказать себе умолчанием из кода.
-				const maxParallelTasks = raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks;
-				const candidate: Limits = {
-					maxParallelTasks,
-					maxConcurrency: raw.maxConcurrency ?? Math.min(DEFAULT_LIMITS.maxConcurrency, maxParallelTasks),
-					maxDetached: raw.maxDetached ?? Math.max(DEFAULT_LIMITS.maxDetached, maxParallelTasks),
-				};
-				const problem = validateLimits(candidate);
-				if (problem) console.error(`[subagent] ignoring subagent limits in ${file}: ${problem}`);
-				else limits = candidate;
-			}
-		}
-	} catch (e) {
-		console.error(`[subagent] could not read subagent limits in ${file}: ${(e as Error)?.message || String(e)}`);
-	}
-
-	limitsByCwd.set(cwd, limits);
-	return limits;
-}
 
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
@@ -712,7 +654,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const checks = legacyCoordinatorChecks(loadLimits(root).maxDetached);
+		const checks = legacyCoordinatorChecks(readRuntimeSettings(ENGINE_ROOT).limits.maxDetached);
 		validateCoordinatorRequest(request);
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
@@ -1079,13 +1021,13 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			const agentScope: AgentScope = params.agentScope ?? "project";
-			let policy;
+			let settings;
 			try {
-				policy = readGuardPolicy(ENGINE_ROOT);
+				settings = readRuntimeSettings(ENGINE_ROOT);
 			} catch (e) {
 				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
 			}
-			const limits = readSubagentLimits(ENGINE_ROOT);
+			const { policy } = settings;
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -1145,7 +1087,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
 				const units = mode === "chain" ? 1 : tasks.length;
-				const admission = subagentAdmission(policy, limits, mode, units, activeUnits);
+				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
 				for (const { identity } of ack.children) {
@@ -1172,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
 							}
 							sendReport(runs!.batch(toolCallId, "chain")!);
 						} else {
-							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
+							await mapWithConcurrencyLimit(tasks, subagentConcurrency(settings, tasks.length), async (task, i) => {
 								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
 								settleResult(result, true);
 							});

@@ -12,7 +12,7 @@
 
 import { join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
-import { GuardPolicyError, readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -191,8 +191,9 @@ export function judge(
   toolName: string,
   input: { command?: string; file_path?: string; notebook_path?: string },
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
-  policy: GuardPolicy = readGuardPolicy(),
+  settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
+  const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
   const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
@@ -315,7 +316,7 @@ if (import.meta.filename === process.argv[1]) {
           }),
         );
     } catch (e) {
-      if (e instanceof GuardPolicyError)
+      if (e instanceof RuntimeSettingsError)
         console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: e.message } }));
     }
     process.exit(0);

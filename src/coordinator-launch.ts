@@ -7,6 +7,7 @@ import { findPlan, parseAffected, type PlanPart } from "./adopt.ts";
 import { modelForTicket } from "./project-model.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 
 export type CoordinatorMode = "do" | "ship";
@@ -61,14 +62,11 @@ function partsForPlan(root: string, ticket: string, plan: string): PreparedPart[
 
 function settings(root: string, folder: string): void {
   mkdirSync(join(folder, ".pi"), { recursive: true });
-  let subagent: unknown;
-  try { subagent = JSON.parse(readFileSync(join(root, ".pi", "settings.json"), "utf8"))?.subagent; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  writeFileSync(join(folder, ".pi", "settings.json"), JSON.stringify({ extensions: [join(root, "src", "guards.ts"), join(root, "src", "bus.ts"), join(root, ".pi", "extensions", "subagent", "index.ts")], ...(subagent === undefined ? {} : { subagent }) }, null, 2));
+  writeFileSync(join(folder, ".pi", "settings.json"), JSON.stringify({ extensions: [join(root, "src", "guards.ts"), join(root, "src", "bus.ts"), join(root, ".pi", "extensions", "subagent", "index.ts")] }, null, 2));
   linkTeammates(join(root, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 }
 
-export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin): PreparedCoordinator {
+export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root)): PreparedCoordinator {
   validateCoordinatorRequest(request);
   if (request.mode !== "do" || request.tickets.length !== 1) fail("prepareDo needs exactly one do ticket");
   const ticket = request.tickets[0]!;
@@ -79,7 +77,7 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   if (existsSync(folder) && lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
   const db = openDb(join(root, "yokemate.db"));
   const expected = ((db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: From } | undefined)?.stage ?? "absent") as From;
-  const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan) });
+  const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan), settings: snapshot });
   if (!preflight.ok) fail(preflight.refuse);
   const parts = partsForPlan(root, ticket, plan);
   const model = request.model ?? modelForTicket(db, ticket, "do");
@@ -90,13 +88,14 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
 }
 
 export function markDoRunning(root: string, prepared: PreparedCoordinator, origin: CoordinatorOrigin): void {
+  const settings = readRuntimeSettings(root);
   if (prepared.mode !== "do" || !prepared.plan || !prepared.expected) fail("prepared do request is incomplete");
   const ticket = prepared.tickets[0]!;
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "spawn", origin, ticket, () => {
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES (?, ?, 'running') ON CONFLICT (ticket) DO UPDATE SET stage = 'running'").run(ticket, ticketUrl(db, ticket));
     db.prepare("UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(prepared.cwd, prepared.plan!, ticket);
-  }, { allowFresh: true, expected: prepared.expected });
+  }, { allowFresh: true, expected: prepared.expected, settings });
   if (!out.ok) fail(out.refuse);
 }
 

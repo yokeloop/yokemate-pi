@@ -6,12 +6,11 @@ import { test } from "node:test";
 import {
   DEFAULT_SUBAGENT_LIMITS,
   GUARD_IDS,
-  GuardPolicyError,
+  RuntimeSettingsError,
   formatGuardPolicy,
-  readGuardPolicy,
-  readSubagentLimits,
+  readRuntimeSettings,
+  resolveRuntimeSettings,
   resolveGuardPolicy,
-  resolveSubagentLimits,
   subagentAdmission,
   subagentConcurrency,
 } from "../src/guard-policy.ts";
@@ -24,7 +23,7 @@ function root(settings?: unknown): string {
 }
 
 test("guard policy retains every legacy default and YOLO switches every guard", () => {
-  const legacy = readGuardPolicy(root());
+  const legacy = readRuntimeSettings(root()).policy;
   assert.equal(legacy.yolo, false);
   assert.equal(Object.keys(legacy.guards).length, GUARD_IDS.length);
   for (const id of GUARD_IDS) assert.equal(legacy.guards[id], true, id);
@@ -36,22 +35,22 @@ test("guard policy retains every legacy default and YOLO switches every guard", 
 
 test("policy validates only its own block and rereads settings", () => {
   const dir = root({ guardPolicy: { yolo: false, guards: { wait: false } }, extensions: ["x"] });
-  assert.equal(readGuardPolicy(dir).guards.wait, false);
+  assert.equal(readRuntimeSettings(dir).policy.guards.wait, false);
   writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { yolo: true, guards: { wait: true } } }));
-  assert.equal(readGuardPolicy(dir).guards.wait, true);
+  assert.equal(readRuntimeSettings(dir).policy.guards.wait, true);
   for (const value of ["false", null, [], 1])
-    assert.throws(() => resolveGuardPolicy({ guards: { wait: value } }), GuardPolicyError);
+    assert.throws(() => resolveGuardPolicy({ guards: { wait: value } }), RuntimeSettingsError);
   assert.throws(() => resolveGuardPolicy({ nope: true }), /guardPolicy.nope/);
   assert.throws(() => resolveGuardPolicy({ guards: { nope: true } }), /guardPolicy.guards.nope/);
-  assert.match(formatGuardPolicy(readGuardPolicy(dir)), /Immutable boundaries/);
+  assert.match(formatGuardPolicy(readRuntimeSettings(dir)), /Immutable boundaries/);
 });
 
 test("subagent limits share defaults, validation, and independent caps", () => {
-  assert.deepEqual(readSubagentLimits(root()), DEFAULT_SUBAGENT_LIMITS);
-  assert.equal(resolveSubagentLimits({ maxParallelTasks: 9 })?.maxDetached, 9);
-  assert.equal(resolveSubagentLimits({ maxConcurrency: 9 }), null);
-  const policy = resolveGuardPolicy({ yolo: true, guards: { parallelTaskLimit: true } });
-  assert.match(subagentAdmission(policy, DEFAULT_SUBAGENT_LIMITS, "parallel", 9, 0) ?? "", /Too many parallel/);
-  assert.equal(subagentAdmission(resolveGuardPolicy({ yolo: true }), DEFAULT_SUBAGENT_LIMITS, "parallel", 9, 99), null);
-  assert.equal(subagentConcurrency(resolveGuardPolicy({ yolo: true }), DEFAULT_SUBAGENT_LIMITS, 9), 9);
+  assert.deepEqual(readRuntimeSettings(root()).limits, DEFAULT_SUBAGENT_LIMITS);
+  assert.equal(resolveRuntimeSettings({ subagent: { maxParallelTasks: 9 } }).limits.maxDetached, 9);
+  assert.throws(() => resolveRuntimeSettings({ subagent: { maxConcurrency: 9 } }), /subagent.maxConcurrency/);
+  const settings = resolveRuntimeSettings({ guardPolicy: { yolo: true, guards: { parallelTaskLimit: true } } });
+  assert.match(subagentAdmission(settings, "parallel", 9, 0) ?? "", /Too many parallel/);
+  assert.equal(subagentAdmission(resolveRuntimeSettings({ guardPolicy: { yolo: true } }), "parallel", 9, 99), null);
+  assert.equal(subagentConcurrency(resolveRuntimeSettings({ guardPolicy: { yolo: true } }), 9), 9);
 });

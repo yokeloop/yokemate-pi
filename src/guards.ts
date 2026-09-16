@@ -15,7 +15,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
-import { GuardPolicyError, formatGuardPolicy, readGuardPolicy, resolveGuardPolicy } from "./guard-policy.ts";
+import { RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRuntimeSettings } from "./guard-policy.ts";
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
@@ -92,6 +92,7 @@ export default function guards(pi: ExtensionAPI) {
       }
     }
     try {
+      const settings = readRuntimeSettings(ROOT);
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {
@@ -99,7 +100,7 @@ export default function guards(pi: ExtensionAPI) {
         dataRoot: dataRootOf(ROOT),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
-      });
+      }, settings);
       if (!v) return undefined;
       if (v.decision === "deny") return { block: true, reason: v.reason };
       if (call.name === "Bash" && retainedShipLaunch(call.input.command)) return undefined;
@@ -108,7 +109,7 @@ export default function guards(pi: ExtensionAPI) {
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
-      if (e instanceof GuardPolicyError) return { block: true, reason: e.message };
+      if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
       return undefined;
     }
   });
@@ -126,13 +127,16 @@ export default function guards(pi: ExtensionAPI) {
   let lastVerdict: string | null = null;
 
   pi.on("agent_settled", () => {
-    if (process.env.YOKEMATE_ROLE === "executor") return;
+    let malformed = false;
     let reason: string | null = null;
     try {
-      reason = stopVerdict(process.env, readStage);
+      const settings = readRuntimeSettings(ROOT);
+      if (process.env.YOKEMATE_ROLE === "executor") return;
+      reason = stopVerdict(process.env, readStage, settings);
     } catch (e) {
-      if (e instanceof GuardPolicyError) {
-        reason = stopVerdict(process.env, readStage, resolveGuardPolicy(undefined));
+      if (e instanceof RuntimeSettingsError) {
+        malformed = true;
+        reason = stopVerdict(process.env, readStage, resolveRuntimeSettings(undefined));
         pi.sendMessage({ customType: "yokemate-guard-policy", content: e.message, display: true }, { deliverAs: "followUp", triggerTurn: false });
       } else return;
     }
@@ -142,7 +146,7 @@ export default function guards(pi: ExtensionAPI) {
     if (!delivery) return;
     pi.sendMessage(
       { customType: "yokemate-stop-guard", content: delivery.content, display: true },
-      { deliverAs: "followUp", triggerTurn: delivery.triggerTurn },
+      { deliverAs: "followUp", triggerTurn: !malformed && delivery.triggerTurn },
     );
   });
 
@@ -193,18 +197,19 @@ export default function guards(pi: ExtensionAPI) {
 
   // The result's message lands in the turn's messages — pi's counterpart of
   // Claude's additionalContext on SessionStart.
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (event) => {
     let policyContext: string;
     try {
-      policyContext = formatGuardPolicy(readGuardPolicy(ROOT));
+      policyContext = formatGuardPolicy(readRuntimeSettings(ROOT));
     } catch (e) {
-      policyContext = `Guard policy error: ${(e as Error).message}. Optional action guards fail closed; immutable boundaries remain mandatory.`;
+      policyContext = `Guard policy error: ${(e as Error).message}. Optional settings were not read; immutable boundaries remain mandatory.`;
     }
-    if (!digestPending) return { systemPrompt: policyContext };
+    const systemPrompt = `${event.systemPrompt}\n\n${policyContext}`;
+    if (!digestPending) return { systemPrompt };
     digestPending = false;
     await pulled;
     return {
-      systemPrompt: policyContext,
+      systemPrompt,
       message: {
         customType: "yokemate-warmup",
         content: `Warmup — состояние пула на старте сессии\n\n${buildDigest(ROOT, dataRootOf(ROOT))}`,

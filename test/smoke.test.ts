@@ -21,7 +21,7 @@ import { MODES, freeAgentName, resolveLaunch, resolvePlanTargets } from "../src/
 import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
 import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
-import { resolveGuardPolicy } from "../src/guard-policy.ts";
+import { resolveRuntimeSettings } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
 import { closeTab, findOpenTab, findRunningAgent, startAgent } from "../src/herdr.ts";
@@ -715,7 +715,7 @@ test("ship prompt preserves single and batch arguments through where", async () 
   assert.equal(withoutKeys.status, 1);
   assert.match(withoutKeys.stderr, /usage: where/);
 
-  const policyOff = resolveGuardPolicy({ yolo: false, guards: { modeOwnership: false } });
+  const policyOff = resolveRuntimeSettings({ guardPolicy: { yolo: false, guards: { modeOwnership: false } } });
   assert.deepEqual(
     decide({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-199" }, "ship", "YM-199", policyOff),
     { kind: "launch" },
