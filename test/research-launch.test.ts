@@ -47,3 +47,32 @@ test("research resolves canonical project aliases and topic without a ticket", (
     assert.equal(launch.env.some((v) => v.startsWith("YOKEMATE_TICKET=")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("project-only research waits without a synthetic topic while explicit topics launch immediately", () => {
+  const { root } = fixture();
+  try {
+    for (const args of [["app"], ["--project", "app"]]) {
+      const context = resolveResearchContext(root, args);
+      assert.equal(context.project?.repo, "app");
+      assert.equal(context.topic, "");
+      assert.equal(resolveResearchLaunch(root, args).prompt, "/skill:research-worker");
+    }
+    assert.equal(resolveResearchLaunch(root, ["app", "audit"]).prompt, "/skill:research-worker audit");
+    for (const args of [[], ["--topic"], ["--topic", " "]]) {
+      assert.throws(() => resolveResearchContext(root, args), /usage: research/);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("research worker waits for the engineer's question before reading or reporting", () => {
+  const root = join(import.meta.dirname, "..");
+  const worker = readFileSync(join(root, ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  assert.match(worker, /Run `pnpm where research` first/);
+  assert.match(worker, /Without a topic, perform only the mandatory mode check above/);
+  assert.match(worker, /confirm that the selected project is connected and wait for the engineer's question/);
+  assert.match(worker, /Until the next message, do not read the clone or knowledge, create artifacts, or call `send_message`/);
+  assert.match(worker, /Use the engineer's next question as the topic and follow the research flow below/);
+  assert.match(worker, /With an explicit topic, start the research flow below immediately/);
+  assert.doesNotMatch(worker, /обзор проекта/);
+  assert.doesNotMatch(readFileSync(join(root, "src", "research-launch.ts"), "utf8"), /обзор проекта/);
+});
