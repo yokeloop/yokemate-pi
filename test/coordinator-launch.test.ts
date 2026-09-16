@@ -245,6 +245,10 @@ test("ship preparation keeps the ordered batch", async () => {
     assert.deepEqual(prepared.tickets, ["B-1", "A-1"]);
     assert.deepEqual(Object.keys(prepared.plans), ["B-1", "A-1"]);
     assert.deepEqual(prepared.parts.map((part) => part.branch), ["B-1", "A-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.pr), [
+      "https://github.com/org/repo/pull/B-1",
+      "https://github.com/org/repo/pull/A-1",
+    ]);
     assert.equal(prepared.model, "model-b");
     assert.match(prepared.prompt, /^\/skill:ship-worker B-1\+A-1\./);
     assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["A-1", "B-1"] })).model, "model-a");
