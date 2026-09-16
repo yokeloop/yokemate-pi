@@ -9,19 +9,21 @@ You raise the stand for one ticket and walk the engineer through it. The reposit
 
 ## Where this runs
 
-You are the worker: the split raised by `pnpm review` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
+You are the worker: the mode surface raised by `pnpm review` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:
 
 ```
 pnpm where review <TICKET>
 ```
 
-- **`run`** — this is the review split. Do the work below.
+- **`run`** — this is the review mode surface. Do the work below.
 - **`launch`** — this is the main chat: the work does not happen here. Answer «type /review <TICKET>» and stop.
 - **`refuse: …`** — print that line as it came and stop.
 
 ## 1. Raise the stand
 
 No `work/<TICKET>/` on this machine — run `pnpm adopt <TICKET>` first: it rebuilds the stand and the review row from observable facts (the plan in `home/knowledge/`, the `<TICKET>` branches, the open PRs). If adopt fails, print its line to the engineer exactly as it came and stop — it is transfer diagnostics (a plan not pushed from the dev machine, a missing PR), and it cannot be fixed from this pane. After adopt the order below is unchanged: fetch, the behind-base check, the stand recipes.
+
+After adopt — and when the folder was already there — `pnpm ready <TICKET>` from the yokemate-pi instance root, before the stand is raised: adopt restores the worktrees and the row, not the runtime. A `ready` blocker is printed to the engineer as it came, and the stand is not raised.
 
 Read the parts and their roles from the plan (and `part.role` in the orchestrator's report if given).
 
@@ -48,6 +50,7 @@ Print the proof block — every line is a checked fact, not trust:
     builds against linked lib        ✓/✗
     → http://localhost:<port>
   versions agree: lib declares X, app asks ^X
+  <repo>   ready receipt for <sha>  ✓/✗
 ```
 
 Any ✗ — fix the stand first; the engineer's time starts when the block is green.
@@ -75,8 +78,8 @@ Either way the report says what was covered and what was not: a stand limitation
 The outcome is already recorded by the `pnpm accept` you ran; the main chat is told after the fact.
 
 1. The report goes to the pane the mode was launched from: one `send_message` call, the report as `text` — the address is derived, `to` is not passed. It is a few lines — ticket key, and either the rework plan's path or that the ticket is verified. A result of `unreachable: <reason>` → say the report in this pane and stop; the stage is already recorded either way.
-2. Say the same line in this split.
+2. Say the same line in this mode surface.
 
-This split is not closed for you. Say that acceptance is finished and wait: the engineer is standing here, and only the engineer knows it is over.
+This mode surface is not closed for you. Say that acceptance is finished and wait: the engineer is standing here, and only the engineer knows it is over.
 
 You never merge anything. Merging is the engineer's button in GitHub.

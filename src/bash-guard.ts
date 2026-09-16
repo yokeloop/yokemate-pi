@@ -161,7 +161,7 @@ const NOTE_WRITE = [
   /\bsed\b[^|;&\n]*\s-(-in-place|[a-zA-Z]*i)/,
   /\bgit\b[^|;&\n]*\s(add|commit|push|checkout|restore|reset|stash|clean|merge|rebase)\b/,
   /\bgh\s+(pr|issue|release|repo)\s+(create|edit|close|reopen|merge|delete|comment|review|lock|unlock|ready|update-branch|transfer|rename|archive|sync|set-default)\b/,
-  /(^|[;&|(]\s*)pnpm\s+(run\s+)?(spawn|plan|stage|accept|drop|record-report|ship|adopt|close-mode|add-project|set-model|import-projects|pr-link)\b/,
+  /(^|[;&|(]\s*)pnpm\s+(run\s+)?(spawn|plan|stage|accept|drop|record-report|ship|adopt|ready|close-mode|add-project|set-model|import-projects|pr-link)\b/,
   /\bgh\s+gist\s+create\b[^|;&\n]*--public\b/,
 ];
 

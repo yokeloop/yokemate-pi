@@ -48,7 +48,10 @@ export default function research(pi: ExtensionAPI): void {
   });
   bus(pi);
   subagent(pi);
-  void installResearchMcp(pi).catch(() => undefined);
+  const mcpLoad = installResearchMcp(pi).then(
+    () => null,
+    (error: unknown) => (error instanceof Error ? error.message : String(error)),
+  );
   pi.on("session_start", async (_event, ctx) => {
     ready = false;
     pi.setActiveTools([]);
@@ -57,6 +60,8 @@ export default function research(pi: ExtensionAPI): void {
       ctx.ui.notify("research identity is invalid; no tools were enabled", "error");
       return;
     }
+    const mcpError = await mcpLoad;
+    if (mcpError) ctx.ui.notify(`research MCP did not load: ${mcpError}`, "error");
     try {
       pi.registerTool(createReadTool(identity.root) as never);
       pi.registerTool(createGrepTool(identity.root) as never);

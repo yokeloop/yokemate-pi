@@ -10,6 +10,7 @@ test("herdr preserves raw streams, status, signal, and subprocess cause", () => 
   const cause = new Error("ENOENT");
   assert.throws(() => runHerdr(["pane", "read", "p"], {}, spawn({ status: 1, stdout: Buffer.from("out\n"), stderr: Buffer.from("err\n"), error: cause })), (error: Error) => {
     assert.match(error.message, /ENOENT/);
+    assert.match(error.message, /err\n/);
     assert.match(formatHerdrError(error), /out\n/);
     assert.match(formatHerdrError(error), /err\n/);
     assert.equal(error.cause, cause);

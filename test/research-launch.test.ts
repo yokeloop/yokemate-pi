@@ -51,7 +51,7 @@ test("research resolves canonical project aliases and topic without a ticket", (
 test("project-only research waits without a synthetic topic while explicit topics launch immediately", () => {
   const { root } = fixture();
   try {
-    for (const args of [["app"], ["--project", "app"]]) {
+    for (const args of [["app"], ["--project", "app"], ["--split", "app"], ["--split", "--project", "app"]]) {
       const context = resolveResearchContext(root, args);
       assert.equal(context.project?.repo, "app");
       assert.equal(context.topic, "");
@@ -75,4 +75,28 @@ test("research worker waits for the engineer's question before reading or report
   assert.match(worker, /With an explicit topic, start the research flow below immediately/);
   assert.doesNotMatch(worker, /обзор проекта/);
   assert.doesNotMatch(readFileSync(join(root, "src", "research-launch.ts"), "utf8"), /обзор проекта/);
+});
+
+test("research shares surface controls without changing topic or security argv", async () => {
+  const { parseResearchArgs, researchAgentArgs } = await import("../src/research-launch.ts");
+  const { root } = fixture();
+  try {
+    assert.equal(resolveResearchLaunch(root, ["--topic", "audit"]).surface, "tab");
+    const split = resolveResearchLaunch(root, ["--split", "app", "--model", "explicit", "audit"]);
+    assert.equal(split.surface, "split");
+    assert.equal(split.model, "explicit");
+    assert.equal(split.prompt, "/skill:research-worker audit");
+    for (const tail of [["--split"], ["--model", "x"], ["--project", "app", "--topic", "--"], ["app"]]) {
+      const launch = resolveResearchLaunch(root, ["--", ...tail]);
+      assert.equal(launch.surface, "tab");
+      assert.equal(launch.model, "pool");
+      assert.equal(launch.project, null);
+      assert.equal(launch.topic, tail.join(" "));
+    }
+    assert.throws(() => parseResearchArgs(["--unknown"]), /unknown research option --unknown/);
+    assert.throws(() => parseResearchArgs(["--model"]), /--model needs a value/);
+    assert.throws(() => parseResearchArgs(["--project"]), /--project needs/);
+    assert.equal(parseResearchArgs(["--project", "--split"]).project, "--split");
+    assert.deepEqual(researchAgentArgs(root, "explicit"), ["--model", "explicit", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { dataRoot } from "./data-root.ts";
 import { type ModeModels, rowModel } from "./project-model.ts";
 import { poolModel } from "./pool.ts";
+import { parseSurfaceArgs, type Surface, type SurfaceArgs } from "./mode-surface.ts";
 
 export interface ResearchProject {
   org: string;
@@ -15,6 +16,7 @@ export interface ResearchProject {
 }
 
 export interface ResearchContext {
+  surface: Surface;
   project: ResearchProject | null;
   topic: string;
   knowledgeDir: string | null;
@@ -24,36 +26,28 @@ export interface ResearchContext {
 
 type ProjectRow = ResearchProject & { model: string | null; mode_models: string | null };
 
-export interface ResearchArgs {
+export interface ResearchArgs extends SurfaceArgs {
   project?: string;
-  model?: string;
   forceTopic: boolean;
-  words: string[];
 }
 
 export function parseResearchArgs(argv: string[]): ResearchArgs {
+  const parsed = parseSurfaceArgs(argv, ["--project"]);
   let project: string | undefined;
-  let model: string | undefined;
   let forceTopic = false;
   const words: string[] = [];
-  let positional = false;
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    if (arg === "--") { positional = true; continue; }
-    if (!positional && arg === "--project") {
-      project = argv[++i] ?? (() => { throw new Error("--project needs org/repo, repo, or KEY"); })();
+  for (let i = 0; i < parsed.words.length; i++) {
+    const arg = parsed.words[i]!;
+    if (arg === "--project") {
+      project = parsed.words[++i] ?? (() => { throw new Error("--project needs org/repo, repo, or KEY"); })();
       continue;
     }
-    if (!positional && arg === "--model") {
-      model = argv[++i] ?? (() => { throw new Error("--model needs a value"); })();
-      continue;
-    }
-    if (!positional && arg === "--topic") { forceTopic = true; continue; }
-    if (!positional && arg.startsWith("--")) throw new Error(`unknown research option ${arg}`);
+    if (arg === "--topic") { forceTopic = true; continue; }
+    if (arg.startsWith("--")) throw new Error(`unknown research option ${arg}`);
     words.push(arg);
   }
-  if (words.length === 0 && !project) throw new Error("usage: research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>");
-  return { project, model, forceTopic, words };
+  if (words.length === 0 && parsed.literal.length === 0 && !project) throw new Error("usage: research [--split] [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>");
+  return { ...parsed, project, forceTopic, words };
 }
 
 function rows(root: string): ProjectRow[] {
@@ -99,11 +93,11 @@ function projectModel(root: string, p: ResearchProject): string | null {
 export function resolveResearchContext(root: string, argv: string[]): ResearchContext {
   const args = parseResearchArgs(argv);
   let project: ResearchProject | null = null;
-  let topicWords = args.words;
+  let topicWords = [...args.words, ...args.literal];
   if (args.project) project = resolveResearchProject(root, args.project, true);
   else if (!args.forceTopic && args.words.length) {
     const candidate = resolveResearchProject(root, args.words[0]!);
-    if (candidate) { project = candidate; topicWords = args.words.slice(1); }
+    if (candidate) { project = candidate; topicWords = [...args.words.slice(1), ...args.literal]; }
   }
   const topic = topicWords.join(" ").trim();
   if (!topic && !project) throw new Error("usage: research [--project <org/repo|repo|KEY>] [--model <m>] [--topic] <text…>");
@@ -112,6 +106,7 @@ export function resolveResearchContext(root: string, argv: string[]): ResearchCo
   if (!model)
     throw new Error(`no research model for ${project!.org}/${project!.repo} — pass --model or set research=<pattern> on its passport`);
   return {
+    surface: args.surface,
     project,
     topic,
     knowledgeDir: project ? join(rootData, "knowledge", project.org, project.repo) : null,

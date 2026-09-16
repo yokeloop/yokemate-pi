@@ -1,21 +1,16 @@
 ---
-description: Raise a mode in an explicit split of the main chat's pane — today only /plan, for parallel plannings on a big screen. Triggered by "/split plan <arguments>". Never runs on its own initiative.
-argument-hint: "<mode> [arguments]"
+description: Compatibility alias for /plan --split only. Triggered by "/split plan <arguments>".
+argument-hint: "plan [arguments]"
 ---
 
-# /split — launcher prefix
+# /split — compatibility launcher
 
-You raise an explicit split and stop. The first word, `$1`, names the mode; the only mode with a split is plan — anything else gets one line, «сплит есть только у plan», and you stand down. The work runs in the pane as `plan`, prompted at the split's creation — nothing in this file describes the work: no repository, no tracker, no questions here.
+The first word `$1` must be `plan`; otherwise say «use /<mode> --split» and stop. This alias supports no other modes. Prefer `/plan --split`.
 
-One command runs before anything else:
+Run `pnpm where plan [KEY …]` before anything else, with every key before the first `--` in `${@:2}` in input order, excluding control values; use no keys for a problem statement.
 
-```
-pnpm where plan [KEY]
-```
+- `launch` — run `pnpm split plan --split ${@:2}`, return its output lines and stop. The alias control stays before the whole user tail so a user's `--` cannot turn it into text. Pass any explicitly named model before that separator too.
+- `run` — this mode surface already runs plan; say so and stop.
+- `refuse: …` — print the refusal unchanged and stop.
 
-— with the key when `${@:2}` starts with one (`ACME-342`), without one when it is a problem statement.
-
-- **`launch`** — this is the main chat. Raise the split beside this chat and stop:
-  `pnpm split plan [--model <m>] ${@:2}` — the whole tail travels as it came, key or problem statement, including the paths of any screenshots attached; pass `--model` when the engineer named a model in their command. Answer with the one line it printed (`… → pane w4:pK`) and nothing more. The pane is conversational — the engineer closes it themselves when the talk is done.
-- **`run`** — this pane already runs plan; say so and stop.
-- **`refuse: …`** — print that line as it came and stop.
+The same launcher defaults to a tab without `--split`. The engineer closes the conversational surface. No planning work runs in this launcher.

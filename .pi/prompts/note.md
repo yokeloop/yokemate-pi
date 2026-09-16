@@ -1,17 +1,16 @@
 ---
-description: Read-only conversation about the pool or a project, ending in a note saved to home/notes/ on the engineer's word. Triggered by "/note [тема]".
-argument-hint: "[тема]"
+description: Read-only conversation about the pool or a project, ending in a note saved to home/notes/ on the engineer's word. Triggered by "/note [--split] [тема]".
+argument-hint: "[--split] [тема]"
 ---
 
 # /note — launcher
 
-You raise the note split and stop. The work runs there as `note-worker`, prompted at the split's creation — the engineer never types it, and nothing in this file describes the work. One command runs before anything else:
+Open a new tab by default; only `--split` before the first `--` opens a split of the calling pane. The work runs there as `note-worker`; the engineer closes the conversational mode surface.
 
-```
-pnpm where note
-```
+Run `pnpm where note` before anything else.
 
-- **`launch`** — this is the main chat. Raise the split beside this chat and stop:
-  `pnpm note [--model <m>] $@` — pass `--model` when the engineer named a model in their command. Answer with the one line it printed (`/note → pane w4:pK`) and nothing more — no research, no files.
-- **`run`** — this pane already runs note; say so and stop — the conversation happens here.
-- **`refuse: …`** — print that line as it came and stop.
+- `launch` — run `pnpm note $@` and return its one output line, then stop. Preserve argument order and the literal tail; an explicitly named model becomes `--model <m>` before the separator.
+- `run` — this mode surface already runs note; say so and stop.
+- `refuse: …` — print the refusal unchanged and stop.
+
+The launcher does no worker work, reads no tickets and edits no files.

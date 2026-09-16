@@ -17,9 +17,10 @@ import {
 } from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
-import { MODES, freeAgentName, resolveLaunch } from "../src/mode-tab.ts";
+import { MODES, freeAgentName, resolveLaunch, resolvePlanTargets } from "../src/mode-tab.ts";
+import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
-import { parseShipArgs } from "../src/ship-args.ts";
+import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
 import { resolveGuardPolicy } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
@@ -499,8 +500,8 @@ test("mode launch resolves cwd, surface, agent name and prompt", () => {
   assert.equal(new Set(names).size, names.length);
 
   // The modes that talk to the engineer stand next to the chat.
-  assert.equal(review.surface, "split");
-  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "split");
+  assert.equal(review.surface, "tab");
+  assert.equal(resolveLaunch("/root", "worklog", "acme", "").surface, "tab");
   assert.equal(resolveLaunch("/root", "worklog", "acme", "").cwd, "/root");
 
   assert.throws(
@@ -561,16 +562,29 @@ test("review without the task folder adopts instead of refusing", () => {
 // the root, prompted with the /plan skill itself — one skill, no worker, the
 // pane's `run` verdict does the same inline work. A key rides in the prompt
 // and the stamp; a problem input carries neither.
-test("plan splits at the root and is prompted with /plan itself", () => {
+test("plan opens at the root and is prompted with /plan itself", () => {
   const keyed = resolveLaunch("/root", "plan", "ACME-3", "note");
-  assert.equal(keyed.surface, "split");
+  assert.equal(keyed.surface, "tab");
   assert.equal(keyed.cwd, "/root");
   assert.equal(keyed.prompt, "/skill:plan ACME-3 note");
   assert.equal(keyed.agentName, "acme-3-plan");
   assert.deepEqual(keyed.env, ["YOKEMATE_MODE=plan", "YOKEMATE_TICKET=ACME-3"]);
 
+  const targets = resolvePlanTargets(parseSurfaceArgs(["--split", "YM-1", "YM-2", "--", "note"]));
+  assert.deepEqual(targets, [{ ticket: "YM-1", workerWords: ["YM-1", "note"] }, { ticket: "YM-2", workerWords: ["YM-2", "note"] }]);
+  for (const target of targets) {
+    const launch = resolveLaunch("/root", "plan", target.ticket, "", undefined, "w1:p1", undefined, "split", target.workerWords);
+    assert.equal(launch.surface, "split");
+    assert.equal(launch.label, `${target.ticket} plan`);
+    assert.equal(launch.prompt, `/skill:plan ${target.ticket} note`);
+    assert.deepEqual(launch.env, ["YOKEMATE_MODE=plan", `YOKEMATE_TICKET=${target.ticket}`, "YOKEMATE_PARENT_PANE=w1:p1"]);
+  }
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["fix", "YM-1", "YM-2"])), [{ ticket: "YM-1", workerWords: ["fix", "YM-1", "YM-2"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["problem", "--", "YM-1"])), [{ ticket: "", workerWords: ["problem", "YM-1"] }]);
+  assert.deepEqual(resolvePlanTargets(parseSurfaceArgs(["YM-1+YM-2"])), [{ ticket: "YM-1", workerWords: ["YM-1"] }, { ticket: "YM-2", workerWords: ["YM-2"] }]);
+
   const problem = resolveLaunch("/root", "plan", "", "кнопка не жмётся");
-  assert.equal(problem.surface, "split");
+  assert.equal(problem.surface, "tab");
   assert.equal(problem.prompt, "/skill:plan кнопка не жмётся");
   assert.equal(problem.agentName, "plan");
   assert.deepEqual(problem.env, ["YOKEMATE_MODE=plan"]);
@@ -579,9 +593,9 @@ test("plan splits at the root and is prompted with /plan itself", () => {
 // 12c. /note is the read-only conversation: a ticketless split beside the
 // chat, prompted with its worker, the topic riding verbatim. A second /note
 // takes the next name in the series, like a second problem-input plan.
-test("note splits at the root with the topic in the worker prompt", () => {
+test("note opens at the root with the topic in the worker prompt", () => {
   const note = resolveLaunch("/root", "note", "", "итоги ресёрча");
-  assert.equal(note.surface, "split");
+  assert.equal(note.surface, "tab");
   assert.equal(note.cwd, "/root");
   assert.equal(note.prompt, "/skill:note-worker итоги ресёрча");
   assert.equal(note.agentName, "note");
@@ -591,6 +605,15 @@ test("note splits at the root with the topic in the worker prompt", () => {
 });
 
 test("ship argument parser preserves launcher semantics", () => {
+  for (const [words, joined, expected] of [
+    [["YM-199", "YM-198", "YM-197"], false, { keys: ["YM-199", "YM-198", "YM-197"], tail: [] }],
+    [["YM-199", "note", "YM-198", "--model", "terra", "later"], false, { keys: ["YM-199", "YM-198"], tail: ["note", "--model", "terra", "later"] }],
+    [["YM-199", "--model", "terra", "YM-198"], false, { keys: ["YM-199"], tail: ["--model", "terra", "YM-198"] }],
+    [["YM-199", "YM-199"], false, { keys: ["YM-199", "YM-199"], tail: [] }],
+    [["note", "--model", "terra"], false, { keys: [], tail: ["note", "--model", "terra"] }],
+    [["YM-199+YM-198"], true, { keys: ["YM-199", "YM-198"], tail: [] }],
+    [["YM-199+YM-198"], false, { keys: [], tail: ["YM-199+YM-198"] }],
+  ] as const) assert.deepEqual(parseKeyList(words, joined), expected);
   assert.deepEqual(parseShipArgs(["YM-199", "YM-198", "YM-197"]), {
     ticket: "YM-199+YM-198+YM-197",
     tail: [],
@@ -641,17 +664,19 @@ test("ship prompt preserves single and batch arguments through where", async () 
       { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
     );
 
-  for (const keys of [["YM-197"], ["YM-199", "YM-198", "YM-197"]]) {
+  for (const keys of [["YM-197"], ["YM-199", "YM-198"], ["YM-199", "YM-198", "YM-197"]]) {
     const stamp = keys.join("+");
     const expanded = promptTemplates.expandPromptTemplate(`/ship ${keys.join(" ")}`, templates);
     const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
     assert.match(expanded, /subagent.*coordinator/);
+    assert.match(expanded, /tickets: \[ordered engineer keys\]/);
     assert.ok(where);
     const whereArgs = where.split(/\s+/).slice(3);
     const main = runWhere(whereArgs, {});
     assert.equal(main.status, 0, main.stderr);
     assert.equal(main.stdout.trim(), "launch");
     assert.deepEqual(whereArgs, keys);
+    assert.deepEqual(parseKeyList(whereArgs).keys, keys);
 
     const own = runWhere(whereArgs, { YOKEMATE_MODE: "ship", YOKEMATE_TICKET: stamp });
     assert.equal(own.status, 0, own.stderr);
@@ -701,7 +726,29 @@ test("ship prompt preserves single and batch arguments through where", async () 
   );
 });
 
-test("do prompt preserves its key through where", async () => {
+test("plan prompt preserves several keys", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({
+    cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts", "plan.md")], includeDefaults: false,
+  });
+  for (const keys of [["YM-1"], ["YM-1", "YM-2"]]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/plan ${keys.join(" ")}`, templates);
+    assert.ok(expanded.includes(`Ticket or problem: ${keys.join(" ")}`));
+    assert.ok(expanded.includes(".pi/skills/plan/SKILL.md"));
+    assert.match(expanded, /one independent tab per key, or one split per key from the same calling pane/);
+    assert.match(expanded, /Each worker receives only its key and uses its own passport model/);
+    assert.match(expanded, /Return every per-key result, including partial refusals/);
+  }
+  const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
+  assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
+  assert.ok(skill.includes("pnpm where plan [KEY …]"));
+});
+
+test("do prompt preserves its keys through where", async () => {
   const { spawnSync } = await import("node:child_process");
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
@@ -713,9 +760,50 @@ test("do prompt preserves its key through where", async () => {
     promptPaths: [join(root, ".pi", "prompts", "do.md")],
     includeDefaults: false,
   });
-  const expanded = promptTemplates.expandPromptTemplate("/do YM-203", templates);
+  const expanded = promptTemplates.expandPromptTemplate("/do YM-1", templates);
   const where = expanded.match(/pnpm where do(?: [^`\n]*)?/)?.[0];
-  assert.match(expanded, /subagent.*coordinator/);
+  assert.match(expanded, /subagent.*coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
+  assert.match(expanded, /Do not pass top-level `agent` or `task`/);
+  assert.match(expanded, /Omit `plan` and `model` unless their literal values appear in the entered command/);
+  assert.match(expanded, /Never use words from these instructions as parameter values/);
+  assert.match(expanded, /Entered command: `\/do YM-1`/);
+  const explicit = promptTemplates.expandPromptTemplate("/do YM-1 --plan /tmp/explicit-plan.md --model test/explicit-model", templates);
+  assert.match(explicit, /Entered command: `\/do YM-1 --plan \/tmp\/explicit-plan\.md --model test\/explicit-model`/);
+  assert.match(explicit, /coordinator: \{ mode: "do", tickets: \[ordered engineer keys\] \}/);
+  const runWhere = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "do", ...args],
+    { cwd: root, env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  const malformed = promptTemplates.expandPromptTemplate("/do YM-1 not-a-key YM-2", templates);
+  const malformedArgs = malformed.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/);
+  const usage = runWhere(malformedArgs);
+  assert.equal(usage.status, 1);
+  assert.match(usage.stderr, /unexpected not-a-key/);
+  assert.ok(malformed.includes("**usage: … unexpected WORD**"));
+  assert.ok(malformed.includes("Do not discard malformed candidates from the eventual tool request."));
+  const remainingKeys = parseKeyList(malformedArgs).keys;
+  assert.deepEqual(remainingKeys, ["YM-1", "YM-2"]);
+  const recovered = runWhere(remainingKeys);
+  assert.equal(recovered.status, 0);
+  assert.equal(recovered.stdout.trim(), "launch");
+  const stampedRecovery = runWhere(remainingKeys, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" });
+  assert.equal(stampedRecovery.status, 1);
+  assert.match(stampedRecovery.stdout, /^refuse:/);
+  for (const command of ["/do YM-1 на gpt-6-astra", "/do YM-1 запусти на gpt-6-astra, задача сложная", "/do YM-1 --model gpt-6-astra", "/do YM-1 --plan /tmp/explicit-plan.md"]) {
+    const named = promptTemplates.expandPromptTemplate(command, templates);
+    assert.ok(named.includes(`Entered command: \`${command}\``));
+    assert.ok(named.includes("first separate that value and its surrounding instruction words from the ticket candidates"));
+    assert.ok(named.includes("Never interpret these model/plan instructions as malformed keys."));
+    const normalizedWhere = named.match(/check `([^`]+)`/)![1];
+    assert.equal(normalizedWhere, "pnpm where do YM-1");
+    const namedLaunch = runWhere(normalizedWhere.split(/\s+/).slice(3));
+    assert.equal(namedLaunch.status, 0);
+    assert.equal(namedLaunch.stdout.trim(), "launch");
+  }
+  const batch = promptTemplates.expandPromptTemplate("/do YM-1 YM-2", templates);
+  assert.match(batch, /pnpm where do YM-1 YM-2/);
+  assert.match(batch, /Entered command: `\/do YM-1 YM-2`/);
+  assert.match(batch, /tickets: \[ordered engineer keys\]/);
+  assert.deepEqual(parseKeyList(batch.match(/pnpm where do ([^`\n]*)/)![1].split(/\s+/)).keys, ["YM-1", "YM-2"]);
   assert.ok(where);
   const args = where.split(/\s+/).slice(3);
   const run = (env: Record<string, string>) => spawnSync(
@@ -724,10 +812,24 @@ test("do prompt preserves its key through where", async () => {
     { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "", ...env }, encoding: "utf8" },
   );
   assert.equal(run({}).stdout.trim(), "launch");
-  assert.equal(run({ YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-203" }).stdout.trim(), "run");
-  const refused = run({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-203" });
+  assert.equal(run({ YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" }).stdout.trim(), "run");
+  const refused = run({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-1" });
   assert.equal(refused.status, 1);
   assert.match(refused.stdout, /^refuse: /);
+});
+
+test("record-report without arguments refuses before any effect", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = join(import.meta.dirname, "..");
+  const before = fs.existsSync(join(root, "work")) ? fs.readdirSync(join(root, "work")) : null;
+  const out = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/record-report.ts"],
+    { cwd: root, env: { PATH: process.env.PATH ?? "" }, encoding: "utf8" },
+  );
+  assert.equal(out.status, 1);
+  assert.match(out.stderr, /usage: record-report/);
+  assert.deepEqual(fs.existsSync(join(root, "work")) ? fs.readdirSync(join(root, "work")) : null, before);
 });
 
 test("spawn and mode-tab refuse without a pane id, before any effect", async () => {
@@ -770,7 +872,39 @@ test("a ticketless mode takes the first free name in its series", () => {
 // pane, the pane does the work. Only the env stamp tells them apart — cwd
 // cannot, because review, ship and worklog run from the root the main chat already
 // sits in.
-test("a mode skill knows whether to launch the pane or do the work", () => {
+test("a mode skill knows whether to launch the pane or do the work", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const run = (args: string[], env: Record<string, string> = {}) => spawnSync(process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", ...args],
+    { cwd: join(import.meta.dirname, ".."), env: { PATH: process.env.PATH ?? "", ...env }, encoding: "utf8" });
+  for (const mode of ["do", "plan"]) {
+    const launch = run([mode, "YM-1", "YM-2"]);
+    assert.equal(launch.status, 0, launch.stderr);
+    assert.equal(launch.stdout.trim(), "launch");
+    const refused = run([mode, "YM-1", "YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stdout, /^refuse: /);
+    if (mode === "do") {
+      const own = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(own.status, 0);
+      assert.equal(own.stdout.trim(), "run");
+    } else {
+      for (const key of ["YM-1", "YM-2"]) {
+        const own = run([mode, key], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: key });
+        assert.equal(own.status, 0);
+        assert.equal(own.stdout.trim(), "run");
+      }
+      const joined = run([mode, "YM-1+YM-2"], { YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1+YM-2" });
+      assert.equal(joined.status, 1);
+      assert.match(joined.stdout, /^refuse: /);
+    }
+  }
+  const invalid = run(["do", "YM-1", "not-a-key"]);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /usage: where do .*not-a-key/);
+  const problem = run(["plan", "fix", "the", "problem"], { YOKEMATE_MODE: "plan" });
+  assert.equal(problem.status, 0);
+  assert.equal(problem.stdout.trim(), "run");
   // Main chat: nobody stamped it — with or without a key.
   assert.deepEqual(decide({}, "review", "ACME-342"), { kind: "launch" });
   assert.deepEqual(decide({}, "plan"), { kind: "launch" });
@@ -1080,4 +1214,67 @@ test("a model pattern is checked against the pi catalogue, suffix apart", () => 
   // No pi on the machine is a warning, not a refusal: bootstrap.sh imports
   // passports before the first pi session exists.
   assert.deepEqual(checkModel("openai-codex/gpt-5.6-terra", () => null), { ok: true, skipped: true });
+});
+
+test("interactive templates preserve surface controls and literal tail with split plan as an alias", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts")], includeDefaults: false });
+  for (const mode of ["plan", "review", "worklog", "note", "research"]) {
+    const args = "--split YM-1 -- --split --model literal";
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} ${args}`, templates);
+    const entry = mode === "plan" ? "split plan" : mode;
+    assert.ok(expanded.includes(`pnpm ${entry} ${args}`), expanded);
+    assert.match(expanded, /tab.*default|default.*tab/);
+  }
+  for (const args of ["YM-1", "YM-1 YM-2 -- --split --model literal"]) {
+    const primary = promptTemplates.expandPromptTemplate(`/plan --split ${args}`, templates);
+    const alias = promptTemplates.expandPromptTemplate(`/split plan ${args}`, templates);
+    const command = `pnpm split plan --split ${args}`;
+    assert.ok(primary.includes(command));
+    assert.ok(alias.includes(command));
+  }
+  for (const mode of ["do", "ship"]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/${mode} YM-1`, templates);
+    assert.doesNotMatch(expanded, /tab create|pane split|openModeSurface/);
+    assert.match(expanded, /coordinator/);
+  }
+});
+
+
+test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(
+    new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href,
+  );
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"),
+    promptPaths: [join(root, ".pi", "prompts")], includeDefaults: false });
+  for (const args of ["YM-1", "YM-1 YM-2", "fix the problem", "YM-1 -- --split", "YM-1 -- YM-2 --model literal"]) {
+    const expanded = promptTemplates.expandPromptTemplate(`/plan ${args}`, templates);
+    assert.ok(expanded.includes(`Ticket or problem: ${args}`));
+    assert.match(expanded, /pnpm where plan \[KEY …\]/);
+    assert.ok(expanded.includes(`- \`launch\` — run \`pnpm split plan ${args}\` and return its output lines, then stop.`));
+    assert.match(expanded, /new tab is the default/);
+    assert.match(expanded, /No tracker reads, reconnaissance or planning in the main chat/);
+    assert.doesNotMatch(expanded, /continue inline|Inline completion/);
+  }
+  for (const args of ["YM-1", "YM-1 YM-2 --model test/explicit -- --split --model literal", "fix the problem -- YM-2"]) {
+    const primary = promptTemplates.expandPromptTemplate(`/plan --split ${args}`, templates);
+    const alias = promptTemplates.expandPromptTemplate(`/split plan ${args}`, templates);
+    for (const expanded of [primary, alias]) {
+      assert.ok(expanded.includes(`pnpm split plan --split ${args}`));
+      assert.match(expanded, /tab.*default|default.*tab/);
+    }
+  }
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  assert.match(skill, /`launch`.*run `pnpm split plan <original arguments>` unchanged and return its output lines, then stop/);
+  assert.match(skill, /never planning keys or launch controls/);
+  assert.match(skill, /send the outcome to the pane the mode was launched from/);
+  assert.match(skill, /mode surface \(default tab or explicit split\) is conversational/);
+  assert.match(skill, /plan-scout/);
+  assert.match(skill, /plan-writer/);
+  assert.doesNotMatch(skill, /Inline completion|model of the current main Pi chat/);
 });

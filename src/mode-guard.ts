@@ -3,18 +3,17 @@
 // the mode's own pane was raised and prompted with the same line. The skill
 // must do different things in each case, and cwd cannot tell them apart —
 // `mode-tab.ts` runs review and worklog from the yokemate root, where the
-// main chat already sits. For /plan the `launch` verdict means «work inline
-// here» — the skill interprets it, this guard does not.
+// main chat already sits.
 //
 // The pane is raised with `herdr tab create --env`, so the mode and its ticket
 // are in the environment of everything inside it. The main chat has neither.
 //
 // Usage: pnpm where <mode> <TICKET>   → prints `launch`, `run`, or `refuse: …`
-//        pnpm where ship <KEY> [<KEY> …]|<KEY1+KEY2>
-//        pnpm where plan [KEY]        → /plan can run before a ticket exists
+//        pnpm where do|ship <KEY> [<KEY> …]|<KEY1+KEY2>
+//        pnpm where plan [KEY …]        → /plan can run before a ticket exists
 
 import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
-import { parseShipArgs } from "./ship-args.ts";
+import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
 
@@ -56,7 +55,20 @@ export function decide(env: ModeEnv, mode: Mode, ticket?: string, policy: GuardP
 if (import.meta.filename === process.argv[1]) {
   const argv = process.argv.slice(2).filter((a) => a !== "--");
   const mode = argv[0] as Mode;
-  const ticket = mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
+  const parsed = parseKeyList(argv.slice(1), true);
+  if (mode === "do") {
+    for (let index = 0; index < parsed.tail.length; index += 1) {
+      const word = parsed.tail[index];
+      if ((word === "--plan" || word === "--model") && parsed.tail[index + 1]) { index += 1; continue; }
+      console.error(`usage: where do <KEY> [<KEY> …] — unexpected ${word}`);
+      process.exit(1);
+    }
+    if (!parsed.keys.length) {
+      console.error("usage: where do <KEY> [<KEY> …]");
+      process.exit(1);
+    }
+  }
+  const ticket = mode === "plan" ? parsed.keys.join(" ") : mode === "do" ? parsed.keys.join("+") : mode === "ship" ? parseShipArgs(argv.slice(1), true).ticket : argv[1];
   if (!MODES.includes(mode) || (!ticket && !TICKETLESS.includes(mode))) {
     console.error(`usage: where <${MODES.join("|")}> <TICKET>`);
     process.exit(1);

@@ -1,9 +1,9 @@
 const TICKET_KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 
-export function parseShipArgs(
+export function parseKeyList(
   words: readonly string[],
   allowJoinedStamp = false,
-): { ticket: string; tail: string[] } {
+): { keys: string[]; tail: string[] } {
   const stop = words.indexOf("--model");
   const head = stop === -1 ? words : words.slice(0, stop);
   const keys: string[] = [];
@@ -21,7 +21,12 @@ export function parseShipArgs(
     tail.push(word);
   }
   return {
-    ticket: keys.join("+"),
+    keys,
     tail: [...tail, ...(stop === -1 ? [] : words.slice(stop))],
   };
+}
+
+export function parseShipArgs(words: readonly string[], allowJoinedStamp = false): { ticket: string; tail: string[] } {
+  const { keys, tail } = parseKeyList(words, allowJoinedStamp);
+  return { ticket: keys.join("+"), tail };
 }

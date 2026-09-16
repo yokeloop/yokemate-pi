@@ -30,7 +30,7 @@ function text(value: string | Buffer | null | undefined): string {
 }
 
 function capturedError(message: string, capture: HerdrCapture): Error & HerdrCapture {
-  const error = Object.assign(new Error(message), capture);
+  const error = Object.assign(new Error(capture.stderr ? `${message}\n${capture.stderr}` : message), capture);
   if (capture.error) error.cause = capture.error;
   return error;
 }
@@ -67,8 +67,9 @@ export function herdr(args: string[], execute?: HerdrSpawn): unknown {
 export function formatHerdrError(error: unknown): string {
   const value = error as Error & Partial<HerdrCapture> & { cause?: unknown };
   const parts = [value.message || String(error)];
-  if (value.cause instanceof Error && !parts.some((part) => part.includes(value.cause!.message)))
-    parts.push(`herdr capture cause: ${value.cause.message}`);
+  const cause = value.cause;
+  if (cause instanceof Error && !parts.some((part) => part.includes(cause.message)))
+    parts.push(`herdr capture cause: ${cause.message}`);
   for (const [label, output] of [["herdr stdout", value.stdout], ["herdr stderr", value.stderr]] as const) {
     if (output && !parts.some((part) => part.includes(output))) parts.push(`${label}:\n${output}`);
   }

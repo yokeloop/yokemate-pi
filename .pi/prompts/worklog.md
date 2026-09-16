@@ -1,17 +1,16 @@
 ---
-description: Log the engineer's hours into an organization's YouTrack for any period they name in the conversation — a day, a week, a month. Hours are proposed from the traces (journal, commits, calendar) and written only as the engineer confirms them. Triggered by "/worklog <org> [note]" — runs in a split beside the main chat.
-argument-hint: "<org> [note]"
+description: Log the engineer's hours into an organization's YouTrack for any period they name in the conversation — a day, a week, a month. Hours are proposed from the traces (journal, commits, calendar) and written only as the engineer confirms them. Triggered by "/worklog [--split] <org> [note]" — runs in a split beside the main chat.
+argument-hint: "[--split] <org> [note]"
 ---
 
 # /worklog — launcher
 
-You raise the worklog split and stop. The work runs there as `worklog-worker`, prompted at the split's creation — the engineer never types it, and nothing in this file describes the work. One command runs before anything else:
+Open a new tab by default; only `--split` before the first `--` opens a split of the calling pane. The work runs there as `worklog-worker`; the engineer closes the conversational mode surface.
 
-```
-pnpm where worklog $1
-```
+Before anything else run `pnpm where worklog <org>`, using the first ordinary word before `--`, not a control or its value. Preserve the full input separately.
 
-- **`launch`** — this is the main chat. Raise the split beside this chat and stop:
-  `pnpm worklog $1 [--model <m>] ${@:2}`. Answer with the one line it printed and nothing more.
-- **`run`** — this pane already runs worklog for this org; say so and stop.
-- **`refuse: …`** — print that line as it came and stop.
+- `launch` — run `pnpm worklog $@` and return its one output line, then stop. Preserve argument order and the literal tail; an explicitly named model becomes `--model <m>` before the separator.
+- `run` — this mode surface already runs worklog; say so and stop.
+- `refuse: …` — print the refusal unchanged and stop.
+
+The launcher does no worker work, reads no tickets and edits no files.
