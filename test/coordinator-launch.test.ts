@@ -40,10 +40,27 @@ test("do preparation preserves an explicit model without a thinking setting", ()
   const dir = root();
   try {
     const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
+    writeFileSync(join(dir, "home", "pool.json"), "not json");
     const prepared = prepareDo(dir, { mode: "do", tickets: ["YM-1"], plan, model: "test/model:high" }, {});
     assert.equal(prepared.model, "test/model:high");
     const settings = JSON.parse(readFileSync(join(prepared.cwd, ".pi", "settings.json"), "utf8"));
     assert.equal("thinkingLevel" in settings, false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("do preparation falls back to pool only when the tracker key has no passports", () => {
+  const dir = root();
+  try {
+    const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
+    writeFileSync(join(dir, "home", "pool.json"), '{"do":"pool-do"}');
+    assert.equal(prepareDo(dir, { mode: "do", tickets: ["OTHER-1"], plan }, {}).model, "pool-do");
+
+    writeFileSync(join(dir, "home", "pool.json"), "not json");
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("UPDATE project SET mode_models = '{\"do\":\"passport-do\"}' WHERE tracker_key = 'YM'").run();
+    assert.equal(prepareDo(dir, { mode: "do", tickets: ["YM-2"], plan }, {}).model, "passport-do");
+    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','other', ?, 'x', 'YM', 'other-model')").run(join(dir, "other"));
+    assert.throws(() => prepareDo(dir, { mode: "do", tickets: ["YM-3"], plan }, {}), /disagree on the do model/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -204,25 +221,33 @@ test("ship preparation keeps the ordered batch", async () => {
   const dir = root();
   const previousPath = process.env.PATH;
   try {
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo-a', ?, 'x', 'A', 'model-a')").run(join(dir, "clone-a"));
+    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo-b', ?, 'x', 'B', 'model-b')").run(join(dir, "clone-b"));
     const shim = join(dir, "shim");
     mkdirSync(shim);
-    writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf "main\\thttps://github.com/org/repo/pull/%s\\n" "${3#YM-}"\n', { mode: 0o755 });
-    for (const ticket of ["YM-1", "YM-2"]) {
-      const folder = join(dir, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`);
+    writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf "main\\thttps://github.com/org/repo/pull/%s\\n" "$3"\n', { mode: 0o755 });
+    for (const [ticket, repo] of [["A-1", "repo-a"], ["B-1", "repo-b"], ["C-1", "repo-a"]]) {
+      const folder = join(dir, "home", "knowledge", "org", repo, "ai", `${ticket}-work`);
       mkdirSync(folder, { recursive: true });
-      writeFileSync(join(folder, `${ticket}-work-plan.md`), `# ${ticket}\n\n## Affected repositories\n- \`org/repo\` — app\n`);
-      const worktree = join(dir, "work", ticket, "repo");
+      writeFileSync(join(folder, `${ticket}-work-plan.md`), `# ${ticket}\n\n## Affected repositories\n- \`org/${repo}\` — app\n`);
+      const worktree = join(dir, "work", ticket, repo);
       mkdirSync(worktree, { recursive: true });
       execFileSync("git", ["init", "-b", ticket, worktree], { stdio: "pipe" });
-      execFileSync("git", ["-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git"]);
+      execFileSync("git", ["-C", worktree, "remote", "add", "origin", `https://github.com/org/${repo}.git`]);
     }
     process.env.PATH = `${shim}:${previousPath ?? ""}`;
-    const prepared = await prepareShip(dir, { mode: "ship", tickets: ["YM-2", "YM-1"] });
-    assert.deepEqual(prepared.tickets, ["YM-2", "YM-1"]);
-    assert.deepEqual(Object.keys(prepared.plans), ["YM-2", "YM-1"]);
-    assert.deepEqual(prepared.parts.map((part) => part.branch), ["YM-2", "YM-1"]);
-    assert.deepEqual(prepared.parts.map((part) => part.pr), ["https://github.com/org/repo/pull/2", "https://github.com/org/repo/pull/1"]);
-    assert.match(prepared.prompt, /^\/skill:ship-worker YM-2\+YM-1\./);
+    writeFileSync(join(dir, "home", "pool.json"), '{"ship":"pool-ship"}');
+    assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["C-1"] })).model, "pool-ship");
+    writeFileSync(join(dir, "home", "pool.json"), "not json");
+    assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["C-1"], model: "explicit" })).model, "explicit");
+    const prepared = await prepareShip(dir, { mode: "ship", tickets: ["B-1", "A-1"] });
+    assert.deepEqual(prepared.tickets, ["B-1", "A-1"]);
+    assert.deepEqual(Object.keys(prepared.plans), ["B-1", "A-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.branch), ["B-1", "A-1"]);
+    assert.equal(prepared.model, "model-b");
+    assert.match(prepared.prompt, /^\/skill:ship-worker B-1\+A-1\./);
+    assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["A-1", "B-1"] })).model, "model-a");
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     rmSync(dir, { recursive: true, force: true });
