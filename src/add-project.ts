@@ -4,15 +4,16 @@
 // Everything else is derived. No interactivity (R6.3) — flags only.
 //
 // Usage:
-//   pnpm add-project <path-to-clone> --tracker acme:ACME --model openai-codex/gpt-5.6-terra
+//   pnpm add-project <path-to-clone> --tracker acme:ACME
+//     [--model openai-codex/gpt-5.6-terra]
 //     [--model review=openai-codex/gpt-5.6-luna] [--figma figma-acme]
 //     [--figma-file <url>] [--subsystem "Страница подписки"]
-//   pnpm add-project <path-to-clone> --tracker github:DEMO --model openai-codex/gpt-5.6-terra
+//   pnpm add-project <path-to-clone> --tracker github:DEMO [--model openai-codex/gpt-5.6-terra]
 //
-// `--model` is required: the model every launch for this project's tickets
-// runs on (YM-84). It repeats as `--model <mode>=<pattern>` to name the model
-// of one panel mode — plan, review, do, ship, worklog, note — and that
-// override beats the project default for that mode alone (YM-159).
+// A scalar `--model` sets the project default. Without one, pool.do supplies
+// the concrete value written to the passport and manifest. Repeated
+// `--model <mode>=<pattern>` values override that default for one of plan,
+// review, do, ship, worklog, note or research (YM-159).
 
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync } from "node:fs";
@@ -21,6 +22,7 @@ import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { assertModel } from "./pi-model.ts";
 import { parseModelToken, serializeModeModels, type ModeModels } from "./project-model.ts";
+import { poolModel } from "./pool.ts";
 import { writeManifest } from "./manifest.ts";
 import { validGithubPrefix } from "./github.ts";
 import { trackers } from "./trackers.ts";
@@ -74,18 +76,20 @@ for (let i = 0; i < argv.length; i++) {
 const clonePath =
   pos[0] ??
   fail(
-    "usage: add-project <path-to-clone> --tracker <name:KEY> --model <m> " +
+    "usage: add-project <path-to-clone> --tracker <name:KEY> [--model <m>] " +
       "[--model <mode>=<m> …] [--figma <mcp>]",
   );
 const [trackerName, trackerKey] = (trackerArg ?? "").split(":");
 if (!trackerName || !trackerKey)
   fail("--tracker is required as <name:KEY>, e.g. --tracker acme:ACME");
-if (!model)
-  fail(
-    "--model is required — the model every launch for this project runs on, " +
-      "e.g. --model openai-codex/gpt-5.6-terra" +
-      "; a per-mode override rides on a second --model, e.g. --model review=openai-codex/gpt-5.6-luna",
-  );
+const ROOT = resolve(new URL("..", import.meta.url).pathname);
+if (model === undefined) {
+  try {
+    model = poolModel(dataRoot(ROOT), "do");
+  } catch (e) {
+    model = fail((e as Error).message);
+  }
+}
 assertModel(model);
 for (const m of Object.values(modeModels)) assertModel(m);
 const github = trackerName === "github";
@@ -137,7 +141,6 @@ if (!m) fail(`cannot parse org/repo from remote "${remote}"`);
 const org = m[1].toLowerCase();
 const repo = m[2];
 
-const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const db = openDb(join(ROOT, "yokemate.db"));
 if (github) {
   const taken = db
