@@ -16,3 +16,5 @@ Run `pnpm where plan [KEY …]` first, with every key before the first `--` in i
 No tracker reads, reconnaissance or planning in the main chat. The engineer closes the conversational surface.
 
 An explicit `/plan KEY1 KEY2` opens one independent tab per key, or one split per key from the same calling pane with `--split`; `/split plan` is the alias of that explicit-split path. Each worker receives only its key and uses its own passport model. Explicit `--model` and literal tail apply to each worker. Return every per-key result, including partial refusals; successful siblings stay open. Single-key and problem/mixed input keep one surface.
+
+A plain `/plan KEY` is always plan-only, including when workflowApproval is false. Only a parent-owned explicit advance plan+do receipt can continue through the verified plan-recorded handoff; true always stops after the ready plan. The model never launches do to imitate the handoff.

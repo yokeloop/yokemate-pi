@@ -7,6 +7,8 @@ description: Internal — raised by pnpm review, not typed by the engineer. Acce
 
 You raise the stand for one ticket and walk the engineer through it. The repositories are in `work/<TICKET>/`, in the right branches — nothing is copied; when the folder is missing, `pnpm adopt` rebuilds it (step 1). Your pane sits at the yokemate root; the stand lives in `work/<TICKET>/` and you reach it by path.
 
+The engine-root runtime settings remove only their named optional refusals; they never widen this ticket's scope. Initial do authority belongs to the verified interactive parent, not to this worker or its tool arguments. Owned implement → independent review → fix → re-check continues within the same active cycle and unchanged recorded plan; a changed plan or scope requires new explicit approval.
+
 ## Where this runs
 
 You are the worker: the mode surface raised by `pnpm review` is prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:

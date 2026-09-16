@@ -100,3 +100,15 @@ test("runtime setting schema, matrix and documentation have exactly the same key
   const docs = readFileSync(new URL("../docs/usage.md", import.meta.url), "utf8");
   assert.equal(docs.split("<!-- runtime-settings-matrix -->\n")[1]?.split("\n<!-- /runtime-settings-matrix -->")[0], formatRuntimeSettingsMatrix());
 });
+
+test("plan and launch instructions cannot create authority from policy or tool arguments", async () => {
+  const { readFileSync } = await import("node:fs");
+  const skill = readFileSync(new URL("../.pi/skills/plan/SKILL.md", import.meta.url), "utf8");
+  assert.match(skill, /plain `\/plan KEY` is always plan-only/);
+  assert.doesNotMatch(skill, /run `pnpm spawn <KEY>` after/);
+  for (const mode of ["plan", "do", "ship"]) {
+    const prompt = readFileSync(new URL(`../.pi/prompts/${mode}.md`, import.meta.url), "utf8");
+    assert.match(prompt, /parent-owned/);
+    assert.doesNotMatch(prompt, /coordinator:\s*\{[^}]*\b(?:permit|authority|receipt|continuation)\s*:/);
+  }
+});
