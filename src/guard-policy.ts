@@ -37,12 +37,12 @@ export interface GuardPolicy {
   guards: Record<GuardId, boolean>;
 }
 
-export class GuardPolicyError extends Error {
+export class RuntimeSettingsError extends Error {
   readonly path: string;
   constructor(path: string, reason: string) {
-    super(`guard policy in ${path}: ${reason}`);
+    super(`runtime settings in ${path}: ${reason}`);
     this.path = path;
-    this.name = "GuardPolicyError";
+    this.name = "RuntimeSettingsError";
   }
 }
 
@@ -50,21 +50,21 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 export function resolveGuardPolicy(value: unknown, source = "<settings>"): GuardPolicy {
-  if (value !== undefined && !isObject(value)) throw new GuardPolicyError(source, "guardPolicy must be an object");
+  if (value !== undefined && !isObject(value)) throw new RuntimeSettingsError(source, "guardPolicy must be an object");
   const raw = (value ?? {}) as Record<string, unknown>;
   for (const key of Object.keys(raw))
     if (key !== "yolo" && key !== "workflowApproval" && key !== "guards")
-      throw new GuardPolicyError(source, `unknown field guardPolicy.${key}`);
+      throw new RuntimeSettingsError(source, `unknown field guardPolicy.${key}`);
   for (const key of ["yolo", "workflowApproval"] as const)
     if (raw[key] !== undefined && typeof raw[key] !== "boolean")
-      throw new GuardPolicyError(source, `guardPolicy.${key} must be boolean`);
+      throw new RuntimeSettingsError(source, `guardPolicy.${key} must be boolean`);
   if (raw.guards !== undefined && !isObject(raw.guards))
-    throw new GuardPolicyError(source, "guardPolicy.guards must be an object");
+    throw new RuntimeSettingsError(source, "guardPolicy.guards must be an object");
   const overrides = (raw.guards ?? {}) as Record<string, unknown>;
   for (const [key, v] of Object.entries(overrides)) {
     if (!(GUARD_IDS as readonly string[]).includes(key))
-      throw new GuardPolicyError(source, `unknown field guardPolicy.guards.${key}`);
-    if (typeof v !== "boolean") throw new GuardPolicyError(source, `guardPolicy.guards.${key} must be boolean`);
+      throw new RuntimeSettingsError(source, `unknown field guardPolicy.guards.${key}`);
+    if (typeof v !== "boolean") throw new RuntimeSettingsError(source, `guardPolicy.guards.${key} must be boolean`);
   }
   const yolo = raw.yolo === true;
   const fallback = !yolo;
@@ -73,17 +73,10 @@ export function resolveGuardPolicy(value: unknown, source = "<settings>"): Guard
 }
 
 export function readGuardPolicy(root = ENGINE_ROOT): GuardPolicy {
-  const source = resolve(root, ".pi", "settings.json");
-  let settings: unknown;
-  try {
-    settings = JSON.parse(readFileSync(source, "utf8"));
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return resolveGuardPolicy(undefined, source);
-    throw new GuardPolicyError(source, (e as Error).message);
-  }
-  if (!isObject(settings)) throw new GuardPolicyError(source, "settings root must be an object");
-  return resolveGuardPolicy(settings.guardPolicy, source);
+  return readRuntimeSettings(root).policy;
 }
+
+export { RuntimeSettingsError as GuardPolicyError };
 
 export function formatGuardPolicy(policy: GuardPolicy): string {
   const enabled = GUARD_IDS.filter((id) => policy.guards[id]).join(", ") || "none";
@@ -113,13 +106,46 @@ export function resolveSubagentLimits(value: unknown): SubagentLimits | null {
 }
 
 export function readSubagentLimits(root = ENGINE_ROOT): SubagentLimits {
-  const source = resolve(root, ".pi", "settings.json");
-  try {
-    const settings = JSON.parse(readFileSync(source, "utf8"));
-    return resolveSubagentLimits(isObject(settings) ? settings.subagent : undefined) ?? DEFAULT_SUBAGENT_LIMITS;
-  } catch {
-    return DEFAULT_SUBAGENT_LIMITS;
+  return readRuntimeSettings(root).limits;
+}
+
+export interface RuntimeSettings {
+  readonly source: string;
+  readonly policy: GuardPolicy;
+  readonly limits: SubagentLimits;
+}
+
+export function resolveRuntimeSettings(value: unknown, source = resolve(ENGINE_ROOT, ".pi", "settings.json")): RuntimeSettings {
+  source = resolve(source);
+  if (value !== undefined && !isObject(value)) throw new RuntimeSettingsError(source, "settings root must be an object");
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const policy = resolveGuardPolicy(raw.guardPolicy, source);
+  if (raw.subagent !== undefined && !isObject(raw.subagent)) throw new RuntimeSettingsError(source, "subagent must be an object");
+  const block = (raw.subagent ?? {}) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(block)) {
+    if (!Object.hasOwn(DEFAULT_SUBAGENT_LIMITS, key)) throw new RuntimeSettingsError(source, `unknown field subagent.${key}`);
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1)
+      throw new RuntimeSettingsError(source, `subagent.${key} must be an integer >= 1`);
   }
+  const parallel = block.maxParallelTasks as number | undefined ?? DEFAULT_SUBAGENT_LIMITS.maxParallelTasks;
+  const limits: SubagentLimits = {
+    maxParallelTasks: parallel,
+    maxConcurrency: block.maxConcurrency as number | undefined ?? Math.min(4, parallel),
+    maxDetached: block.maxDetached as number | undefined ?? Math.max(8, parallel),
+  };
+  if (limits.maxConcurrency > parallel) throw new RuntimeSettingsError(source, "subagent.maxConcurrency must be <= subagent.maxParallelTasks");
+  if (limits.maxDetached < parallel) throw new RuntimeSettingsError(source, "subagent.maxDetached must be >= subagent.maxParallelTasks");
+  return { source, policy, limits };
+}
+
+export function readRuntimeSettings(root = ENGINE_ROOT): RuntimeSettings {
+  const source = resolve(root, ".pi", "settings.json");
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(source, "utf8")); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new RuntimeSettingsError(source, (error as Error).message);
+  }
+  return resolveRuntimeSettings(value, source);
 }
 
 export function subagentAdmission(
