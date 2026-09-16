@@ -100,3 +100,14 @@ test("research shares surface controls without changing topic or security argv",
     assert.deepEqual(researchAgentArgs(root, "explicit"), ["--model", "explicit", "--skill", join(root, ".pi", "skills"), "--no-extensions", "--no-builtin-tools", "-e", join(root, "src", "research.ts")]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("research preserves artifacts and reports to the parent only on explicit request", () => {
+  const worker = readFileSync(join(import.meta.dirname, "..", ".pi", "skills", "research-worker", "SKILL.md"), "utf8");
+  assert.match(worker, /After each completed research portion, save the artifacts automatically/);
+  assert.match(worker, /Keep the answer and artifact paths in this research tab/);
+  assert.match(worker, /Do not call `send_message` unless the engineer explicitly asks in the current research conversation to report to the main\/parent chat/);
+  assert.match(worker, /An ordinary question, completed answer, saved artifact or created issue is not such a request/);
+  assert.match(worker, /On that explicit request, call `send_message` once without `to`/);
+  assert.doesNotMatch(worker, /After each completed research portion call `send_message`/);
+  assert.match(worker, /Stay available afterward; the engineer closes this mode surface/);
+});

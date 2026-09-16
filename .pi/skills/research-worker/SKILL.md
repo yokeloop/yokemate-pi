@@ -1,6 +1,6 @@
 ---
 name: research-worker
-description: Internal research mode surface worker. Read project and web sources, preserve artifacts, and report to the parent without ticket lifecycle.
+description: Independent research conversation. Read project and web sources, preserve artifacts, and report to the parent only on explicit request without ticket lifecycle.
 ---
 
 # Research worker
@@ -21,4 +21,4 @@ Creating an issue happens only on the engineer's request, and its returned URL i
 
 For a code change, prepare one concrete edit then call edit/write. It always needs the TUI's single-edit consent, including YOLO. A child without UI returns a proposed diff for the parent; it never writes code.
 
-After each completed research portion call `send_message` without `to`, with topic, project, launch id, artifact paths, source URLs, issue URLs and checks. Stay available afterward; the engineer closes this mode surface.
+After each completed research portion, save the artifacts automatically. Keep the answer and artifact paths in this research tab. Do not call `send_message` unless the engineer explicitly asks in the current research conversation to report to the main/parent chat. An ordinary question, completed answer, saved artifact or created issue is not such a request. On that explicit request, call `send_message` once without `to`, with topic, project, launch id, artifact paths, source URLs, issue URLs and checks. Stay available afterward; the engineer closes this mode surface.
