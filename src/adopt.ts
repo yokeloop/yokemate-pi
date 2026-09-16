@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, globSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { openDb } from "./db.ts";
 import { syncPull } from "./git-sync.ts";
 import { ticketUrl } from "./ticket-url.ts";
@@ -102,6 +103,7 @@ export function adopt(
   env: MoveEnv,
   deps: Partial<AdoptDeps> = {},
 ): AdoptOutcome {
+  const settings = readRuntimeSettings(root);
   (deps.pull ?? syncPull)(dataRoot);
 
   const planPath = findPlan(dataRoot, key);
@@ -119,7 +121,7 @@ export function adopt(
   const current: From =
     (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(key) as { stage: From } | undefined)
       ?.stage ?? "absent";
-  const pre = checkMove("adopt", env, key, current);
+  const pre = checkMove("adopt", env, key, current, { settings });
   if (!pre.ok) throw new Error(pre.refuse);
 
   const folder = join(root, "work", key);
@@ -191,7 +193,7 @@ export function adopt(
     db.prepare("DELETE FROM part WHERE work_id = ?").run(work.id);
     const ins = db.prepare("INSERT INTO part (work_id, repo, role, branch, pr) VALUES (?, ?, ?, ?, ?)");
     for (const p of parts) ins.run(work.id, p.repo, p.role, key, p.pr);
-  }, { expected: current });
+  }, { expected: current, settings });
   if (!out.ok) throw new Error(out.refuse);
   return { repeat: out.repeat, planPath, parts };
 }

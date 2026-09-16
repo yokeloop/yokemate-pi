@@ -122,7 +122,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await input("/do YM-1");
     await input("/plan YM-1");
     assert.match(output(await launch()), /current interactive approval/);
-    await input("/do YM-1");
+    await input("/do YM-1 запусти на gpt-6-astra, задача сложная");
     const explicit = await launch();
     const explicitId = (explicit.details as { runId: string }).runId;
     assert.ok(explicitId, output(explicit));
@@ -146,6 +146,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(confirms, 0);
     assert.deepEqual(notifications, []);
     assert.equal(readRecordedPlanBinding(dir, "YM-1").path, plan);
+    for (const surface of ["typed", "tool", "cli", "pane", "ordinary", "coordinator"]) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:guardPolicy.workflowApproval:${variant}`);
     db.close();
   } finally {
     await shutdown?.();

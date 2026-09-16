@@ -92,16 +92,22 @@ export default function guards(pi: ExtensionAPI) {
       const settings = readRuntimeSettings(ROOT);
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
-      if (process.env.YOKEMATE_MODE === "ship" && call.name === "Bash" && /(?:^|[;&|]\s*)gh\s+pr\s+merge(?:\s|$)/m.test(call.input.command ?? "")) {
-        const matches = [...(call.input.command ?? "").matchAll(/--match-head-commit(?:=|\s+)([0-9a-f]{40})(?:\s|$)/g)];
-        const tickets = (process.env.YOKEMATE_TICKET ?? "").split("+").filter(Boolean);
-        if (matches.length !== 1 || tickets.length === 0) return { block: true, reason: "ship merge requires one --match-head-commit from a fresh passed gate" };
-        const head = matches[0]![1]!;
-        const verdicts = tickets.map((ticket) => ({ ticket, verdict: gate(ROOT, ticket) }));
-        const passed = verdicts.find(({ verdict }) => verdict.ok && Object.values(verdict.heads).includes(head));
-        if (!passed) {
-          const reason = verdicts.map(({ ticket, verdict }) => `${ticket}: ${verdict.ok ? `gate heads do not include ${head}` : verdict.reason}`).join("; ");
-          return { block: true, reason: `ship merge gate refused: ${reason}` };
+      if (process.env.YOKEMATE_MODE === "ship" && call.name === "Bash") {
+        const command = call.input.command ?? "";
+        const merges = [...command.matchAll(/\bgh\s+pr\s+merge(?:\s|$)/g)];
+        if (merges.length) {
+          const tickets = (process.env.YOKEMATE_TICKET ?? "").split("+").filter(Boolean);
+          const heads = merges.map((merge, index) => [...command.slice(merge.index, merges[index + 1]?.index ?? command.length).matchAll(/--match-head-commit(?:=|\s+)([0-9a-f]{40})(?:\s|$)/g)]);
+          if (tickets.length === 0 || heads.some((matches) => matches.length !== 1)) return { block: true, reason: "each ship merge requires exactly one --match-head-commit from a fresh passed gate" };
+          const verdicts = tickets.map((ticket) => ({ ticket, verdict: gate(ROOT, ticket) }));
+          for (const matches of heads) {
+            const head = matches[0]![1]!;
+            const passed = verdicts.find(({ verdict }) => verdict.ok && Object.values(verdict.heads).includes(head));
+            if (!passed) {
+              const reason = verdicts.map(({ ticket, verdict }) => `${ticket}: ${verdict.ok ? `gate heads do not include ${head}` : verdict.reason}`).join("; ");
+              return { block: true, reason: `ship merge gate refused: ${reason}` };
+            }
+          }
         }
       }
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {

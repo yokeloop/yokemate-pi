@@ -687,8 +687,14 @@ export default function (pi: ExtensionAPI) {
 						const value = words[++index];
 						if (!value) throw new Error(`${word} needs a value`);
 						if (word === "--plan") plan = value;
-					} else if (/^[A-Z][A-Z0-9]*-\d+$/.test(word)) tickets.push(word);
-					else throw new Error(`do approval: unexpected input ${word}`);
+						continue;
+					}
+					if (word.startsWith("--plan=")) { plan = word.slice("--plan=".length); continue; }
+					if (word.startsWith("--model=")) continue;
+					for (const ticket of word.match(/(?:^|[^A-Z0-9-])([A-Z][A-Z0-9]*-\d+)(?=$|[^A-Z0-9-])/g) ?? []) {
+						const match = /([A-Z][A-Z0-9]*-\d+)/.exec(ticket);
+						if (match) tickets.push(match[1]!);
+					}
 				}
 				if (!tickets.length || new Set(tickets).size !== tickets.length) throw new Error("do approval needs distinct ordered tickets");
 				const bindings = tickets.map((ticket) => readRecordedPlanBinding(ENGINE_ROOT, ticket));

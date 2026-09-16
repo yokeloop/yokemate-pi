@@ -17,6 +17,7 @@ import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
 import { join, resolve } from "node:path";
 
@@ -39,6 +40,7 @@ export function recordReport(
   env: MoveEnv,
   deps: Partial<{ gather: typeof gatherGateFacts; push: typeof syncPush }> = {},
 ): { repeat: boolean } {
+  const settings = readRuntimeSettings(root);
   const verdict = verifyGate((deps.gather ?? gatherGateFacts)(root, ticket, parts.map((p) => ({ repo: p.repo, selector: p.pr }))));
   if (!verdict.ok) throw new Error(verdict.reason);
   const db = openDb(join(root, "yokemate.db"));
@@ -53,7 +55,7 @@ export function recordReport(
     db.prepare(
       `UPDATE work SET stage = 'review', pr = ?, updated_at = datetime('now') WHERE id = ?`,
     ).run(parts.map((p) => p.pr).join(" "), work.id);
-  });
+  }, { settings });
   if (!out.ok) throw new Error(out.refuse);
   const data = dataRoot(root);
   logMove(data, ticket, "сделано", parts.map((p) => prLabel(p.pr)).join(", "));

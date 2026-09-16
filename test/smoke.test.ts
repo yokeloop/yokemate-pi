@@ -234,6 +234,18 @@ test("acceptance keeps the folder in both outcomes", async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test("accept refuses malformed settings before reading or changing the work row", async () => {
+  const { accept } = await import("../src/accept.ts");
+  const root = join(process.env.TMPDIR ?? "/tmp", `yokemate-test-accept-settings-${process.pid}`);
+  fs.mkdirSync(join(root, ".pi"), { recursive: true });
+  fs.writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { workflowApproval: "bad" } }));
+  const db = memDb();
+  insertWork(db, "ACME-10", { stage: "review" });
+  assert.throws(() => accept(db, root, "ACME-10"), /guardPolicy.workflowApproval/);
+  assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='ACME-10'").get()!.stage, "review");
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 // 7a. The row's exit lives in accept itself, not in a later sync: a clean pass
 // deletes it at once, and running accept again on the gone row is a no-op.
 test("accept removes the row at once, a repeat is a no-op", async () => {

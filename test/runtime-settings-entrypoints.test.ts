@@ -5,6 +5,9 @@ import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const root = join(import.meta.dirname, "..");
+const runtimeCases = (keys: readonly string[], surfaces: readonly string[]) => {
+  for (const key of keys) for (const surface of surfaces) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:${key}:${variant}`);
+};
 
 test("public guard hook rereads one strict snapshot before any tool and preserves system context", async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-settings-"));
@@ -38,6 +41,15 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     const merge = await call("bash", { command: `gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}` }) as { block: boolean; reason: string };
     assert.equal(merge.block, true);
     assert.match(merge.reason, /ship merge gate refused/);
+    for (const command of [
+      `command gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}`,
+      `sh -c 'gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}'`,
+      `gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}; gh pr merge https://example.invalid/pull/2`,
+    ]) {
+      const wrapped = await call("bash", { command }) as { block: boolean; reason: string };
+      assert.equal(wrapped.block, true);
+      assert.match(wrapped.reason, /ship merge/);
+    }
     assert.equal(await call("bash", { command: "sleep 1" }), undefined);
     process.env.YOKEMATE_MODE = "do";
     const context = await before({ type: "before_agent_start", prompt: "task", systemPrompt: "original system" } as never, ctx) as { systemPrompt: string };
@@ -97,6 +109,7 @@ test("typed runtime context renders every applicable setting on off and neighbor
         assert.match(await context(settings), new RegExp(`${limit}=${value}`), `${key}/value`);
         assert.match(await context({}), /maxParallelTasks=8.*maxConcurrency=4.*maxDetached=8/, `${key}/neighbor`);
       }
+      runtimeCases([key], ["typed"]);
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -146,6 +159,7 @@ test("public file and Bash guards disable only their named refusal", async () =>
     writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true, guards: { wait: true } } }));
     const selectedCli = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "sleep 1" } }), encoding: "utf8" });
     assert.match(selectedCli.stdout, /permissionDecision":"deny/);
+    runtimeCases(["guardPolicy.yolo"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
     for (const [key, mode, toolName, input] of rows) {
       process.env.YOKEMATE_MODE = mode;
       const call = (name = toolName as string, args: Record<string, unknown> = input) => hook({ type: "tool_call", toolCallId: key, toolName: name, input: args } as never, ctx);
@@ -172,6 +186,7 @@ test("public file and Bash guards disable only their named refusal", async () =>
       const neighborEvent = { tool_name: "Bash", tool_input: key === "wait" ? { command: "pnpm dev" } : { command: "sleep 1" } };
       const neighbor = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify(neighborEvent), encoding: "utf8" }).stdout;
       assert.match(neighbor, /permissionDecision":"deny/, `${key}/cli/neighbor`);
+      runtimeCases([`guards.${key}`], ["tool", "cli", "pane", "ordinary", ...(["noteFileWrite", "noteShellWrite"].includes(key) ? [] : ["coordinator"])]);
     }
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
@@ -237,6 +252,8 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     const finalDb = openDb(join(dir, "yokemate.db"));
     assert.equal(finalDb.prepare("SELECT stage FROM work WHERE ticket = 'YM-1'").get()?.stage, "planned");
     finalDb.close();
+    runtimeCases(["guards.modeOwnership", "guards.transitionCaller", "guards.transitionTicket", "guards.transitionSource"], ["cli", "pane", "ordinary", "coordinator"]);
+    runtimeCases(["guards.stageCaller", "guards.stageForce"], ["cli", "pane", "ordinary", "coordinator"]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -293,6 +310,8 @@ test("loaded completion and report hooks reread only their named settings", asyn
     continueOwnedCoordinator(rpc as never, { type: "agent_settled" }, (reason: string) => blocked.push(reason));
     assert.deepEqual(blocked, ["coordinator stopped without outcome"]);
     assert.equal(prompts, 1);
+    runtimeCases(["guards.doCompletion"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
+    runtimeCases(["guards.reportTarget"], ["tool", "pane", "ordinary", "coordinator"]);
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
@@ -396,6 +415,8 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     assert.match(text((await dispatch(task)).result), /subagent.maxDetached/);
     await finish(live, [8]);
     await finish(second, [9]);
+    runtimeCases(["guards.projectAgentConfirmation", "guards.parallelTaskLimit", "guards.parallelConcurrencyLimit", "subagent.maxParallelTasks", "subagent.maxConcurrency"], ["tool", "pane", "ordinary", "coordinator"]);
+    runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["tool", "pane", "ordinary"]);
   } finally {
     for (const connection of connections) connection.destroy();
     await shutdown?.();
@@ -496,6 +517,8 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
     for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    runtimeCases(["guards.duplicateDo"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
+    runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["cli", "coordinator"]);
   } finally {
     await shutdown?.();
     process.argv[1] = script;
@@ -589,6 +612,8 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
     for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    runtimeCases(["guards.duplicateMode"], ["tool", "cli", "coordinator"]);
+    runtimeCases(["guards.shipConfirmation"], ["cli"]);
   } finally {
     await shutdown?.();
     process.argv[1] = script;
@@ -662,6 +687,8 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     const failed = await tool.execute("bad-do", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(failed), /subagent.maxDetached/);
     assert.ok(JSON.stringify(failed).includes(file));
+    runtimeCases(["guards.shipConfirmation"], ["tool", "pane", "ordinary", "coordinator"]);
+    runtimeCases(["guards.spawnCaller"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
   } finally {
     await shutdown?.();
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];

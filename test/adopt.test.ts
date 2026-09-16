@@ -231,3 +231,26 @@ test("a broken remote is reported as a failed fetch, not a missing branch", () =
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("adopt refuses malformed settings before pull and pins one snapshot through the move", () => {
+  const first = setupRoot();
+  try {
+    mkdirSync(join(first.root, ".pi"), { recursive: true });
+    writeFileSync(join(first.root, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { yolo: "bad" } }));
+    let pulls = 0;
+    assert.throws(() => adopt(first.root, join(first.root, "home"), "YM-9", {}, { pull: () => { pulls++; }, listPrs: () => ["https://github.com/t/r/pull/7"] }), /guardPolicy.yolo/);
+    assert.equal(pulls, 0);
+  } finally { rmSync(first.root, { recursive: true, force: true }); }
+
+  const second = setupRoot();
+  try {
+    mkdirSync(join(second.root, ".pi"), { recursive: true });
+    const settings = join(second.root, ".pi", "settings.json");
+    writeFileSync(settings, JSON.stringify({ guardPolicy: { guards: { transitionSource: false } } }));
+    const db = openDb(join(second.root, "yokemate.db"));
+    db.prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-9', 'ticket:YM-9', 'planned')").run();
+    const out = adopt(second.root, join(second.root, "home"), "YM-9", {}, { pull: () => writeFileSync(settings, "{}"), listPrs: () => ["https://github.com/t/r/pull/7"] });
+    assert.equal(out.repeat, false);
+    assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='YM-9'").get()!.stage, "review");
+  } finally { rmSync(second.root, { recursive: true, force: true }); }
+});

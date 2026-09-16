@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { recordReport } from "../src/record-report.ts";
@@ -47,6 +47,19 @@ test("record-report refuses when the base moved past the head", () => refused((s
   git(s.clone, "commit", "-m", "later");
   git(s.clone, "push", "origin", "main");
 }, /is not in the PR head/));
+
+test("record-report refuses malformed settings before gathering gate facts", () => {
+  const s = stand();
+  try {
+    running(s);
+    mkdirSync(join(s.root, ".pi"), { recursive: true });
+    writeFileSync(join(s.root, ".pi", "settings.json"), JSON.stringify({ subagent: { maxDetached: 0 } }));
+    let gathered = 0;
+    assert.throws(() => recordReport(s.root, "YM-9", [part], env, { gather: (() => { gathered++; throw new Error("unexpected gate gather"); }) as never, push: () => undefined }), /subagent.maxDetached/);
+    assert.equal(gathered, 0);
+    untouched(s);
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
+});
 
 test("record-report records a green gate", async () => {
   const s = stand();
