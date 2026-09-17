@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readGuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 import {
   allowTarget,
   bindInbox,
@@ -88,7 +88,7 @@ export default function bus(pi: ExtensionAPI) {
     const mains = scanMains(dir, ownPane(process.env), ROOT).map((c) => c.pane);
     let v;
     try {
-      v = allowTarget(process.env, to, mains, readGuardPolicy(ROOT));
+      v = allowTarget(process.env, to, mains, readRuntimeSettings(ROOT));
     } catch (e) {
       return { block: true, reason: (e as Error).message };
     }

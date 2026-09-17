@@ -12,6 +12,7 @@ import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
 
 export interface AcceptOptions {
@@ -25,6 +26,7 @@ export function accept(
   opts: AcceptOptions = {},
   env: MoveEnv = {},
 ) {
+  const settings = readRuntimeSettings(root);
   const row = db.prepare("SELECT folder FROM work WHERE ticket = ?").get(ticket) as
     | { folder: string | null }
     | undefined;
@@ -36,7 +38,7 @@ export function accept(
       db.prepare(
         `UPDATE work SET stage = 'planned', plan = ?, updated_at = datetime('now') WHERE ticket = ?`,
       ).run(planAbs, ticket);
-    });
+    }, { settings });
     if (!out.ok) throw new Error(out.refuse);
     return { outcome: "rework" as const, folder: row?.folder ?? null };
   }
@@ -50,7 +52,7 @@ export function accept(
     db.prepare(
       `UPDATE work SET stage = 'accepted', updated_at = datetime('now') WHERE ticket = ?`,
     ).run(ticket);
-  });
+  }, { settings });
   if (!out.ok) throw new Error(out.refuse);
   db.prepare("DELETE FROM work WHERE ticket = ?").run(ticket);
   const folder = row.folder ?? join(root, "work", ticket);

@@ -1,37 +1,35 @@
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { randomUUID } from "node:crypto";
 import type { CoordinatorMode, CoordinatorOrigin, CoordinatorRequest, PreparedCoordinator } from "./coordinator-launch.ts";
 
 export interface RuntimeIdentity { runId: string; parentRunId?: string; parentSessionId: string; mode: CoordinatorMode; ticket: string; project: string[]; role: "coordinator" | "executor"; cwd: string; model: string }
 export type RuntimeState = "preparing" | "starting" | "active" | "finishing" | "done" | "blocked";
 export interface CoordinatorRun { identity: RuntimeIdentity; request: CoordinatorRequest; origin: CoordinatorOrigin; state: RuntimeState; process?: { kill(signal?: NodeJS.Signals): boolean }; requestId?: string; prepared?: PreparedCoordinator; reason?: string }
-export interface CoordinatorLaunchChecks { checkCaller(origin: CoordinatorOrigin, request: CoordinatorRequest): string | undefined; checkDuplicate(mode: CoordinatorMode, activeRuns: CoordinatorRun[]): string | undefined; checkAdmission(activeUnits: number): string | undefined; needsShipConfirmation(origin: CoordinatorOrigin): boolean }
+export interface CoordinatorLaunchChecks { checkCaller(origin: CoordinatorOrigin, request: CoordinatorRequest): string | undefined; rejectDuplicate(mode: CoordinatorMode): boolean; checkAdmission(activeUnits: number): string | undefined; needsShipConfirmation(origin: CoordinatorOrigin): boolean }
 
 export const IDLE_NUDGE_LIMIT = 3;
 export type IdleVerdict = "wait" | "nudge" | "blocked";
-export function idleVerdict(state: { nudges: number; hasChildren: boolean }, limit = IDLE_NUDGE_LIMIT): IdleVerdict {
+export function idleVerdict(state: { nudges: number; hasChildren: boolean }, limit = IDLE_NUDGE_LIMIT, settings: RuntimeSettings = readRuntimeSettings()): IdleVerdict {
   if (state.hasChildren) return "wait";
-  return state.nudges < limit ? "nudge" : "blocked";
+  return settings.policy.guards.doCompletion && state.nudges < limit ? "nudge" : "blocked";
 }
 
-export const legacyCoordinatorChecks = (maxDetached = 8): CoordinatorLaunchChecks => ({
+export const coordinatorChecks = ({ policy, limits }: RuntimeSettings): CoordinatorLaunchChecks => ({
   checkCaller(origin, request) {
-    if (request.mode === "do" && origin.YOKEMATE_MODE && origin.YOKEMATE_MODE !== "plan") return `spawn runs in the main chat only — this pane is stamped ${origin.YOKEMATE_MODE}`;
+    if (request.mode === "do" && policy.guards.spawnCaller && (origin.YOKEMATE_MODE || origin.YOKEMATE_ROLE)) return `spawn runs in the main chat only — this pane is stamped ${origin.YOKEMATE_MODE ?? origin.YOKEMATE_ROLE}`;
     return undefined;
   },
-  checkDuplicate(mode, runs) {
-    const active = runs.find((run) => run.identity.mode === mode && ["preparing", "starting", "active", "finishing"].includes(run.state));
-    return active ? `${active.identity.ticket} already runs as ${active.identity.runId}, cwd ${active.identity.cwd}, model ${active.identity.model}` : undefined;
-  },
-  checkAdmission(activeUnits) { return activeUnits >= maxDetached ? `Too many detached agents already running (${activeUnits}/${maxDetached})` : undefined; },
-  needsShipConfirmation() { return true; },
+  rejectDuplicate(mode) { return mode === "do" ? policy.guards.duplicateDo : policy.guards.duplicateMode; },
+  checkAdmission(activeUnits) { return policy.guards.detachedLimit && activeUnits >= limits.maxDetached ? `Too many detached agents already running (${activeUnits}/${limits.maxDetached})` : undefined; },
+  needsShipConfirmation() { return policy.guards.shipConfirmation; },
 });
 
 export class CoordinatorRegistry {
   private readonly runs = new Map<string, CoordinatorRun>();
   private readonly keyIndex = new Map<string, Set<string>>();
-  reserve(request: CoordinatorRequest, origin: CoordinatorOrigin, parentSessionId: string, model: string, cwd: string, projects: string[], duplicate = true): CoordinatorRun {
+  reserve(request: CoordinatorRequest, origin: CoordinatorOrigin, parentSessionId: string, model: string, cwd: string, projects: string[], rejectDuplicate: boolean): CoordinatorRun {
     const keys = request.tickets.map((ticket) => `${request.mode}:${ticket}`);
-    if (duplicate) {
+    if (rejectDuplicate) {
       const existing = keys.flatMap((key) => [...(this.keyIndex.get(key) ?? [])]).map((id) => this.runs.get(id)).find((run) => run && !["done", "blocked"].includes(run.state));
       if (existing) throw new Error(`${existing.identity.ticket} already runs as ${existing.identity.runId}, cwd ${existing.identity.cwd}, model ${existing.identity.model}`);
     }

@@ -15,18 +15,15 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
-import { GuardPolicyError, formatGuardPolicy, readGuardPolicy, resolveGuardPolicy } from "./guard-policy.ts";
+import { RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRuntimeSettings } from "./guard-policy.ts";
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
+import { gate } from "./gate.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
 /** A pi tool call in the shape judge() reads; null — not a tool we guard. */
-export function retainedShipLaunch(command: string | undefined): boolean {
-  return Boolean(command && /\bpnpm\s+(?:--silent\s+)?ship\b/.test(command));
-}
-
 export function guardCall(
   toolName: string,
   input: Record<string, unknown>,
@@ -92,23 +89,41 @@ export default function guards(pi: ExtensionAPI) {
       }
     }
     try {
+      const settings = readRuntimeSettings(ROOT);
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
+      if (process.env.YOKEMATE_MODE === "ship" && call.name === "Bash") {
+        const command = call.input.command ?? "";
+        const merges = [...command.matchAll(/\bgh\s+pr\s+merge(?:\s|$)/g)];
+        if (merges.length) {
+          const tickets = (process.env.YOKEMATE_TICKET ?? "").split("+").filter(Boolean);
+          const heads = merges.map((merge, index) => [...command.slice(merge.index, merges[index + 1]?.index ?? command.length).matchAll(/--match-head-commit(?:=|\s+)([0-9a-f]{40})(?:\s|$)/g)]);
+          if (tickets.length === 0 || heads.some((matches) => matches.length !== 1)) return { block: true, reason: "each ship merge requires exactly one --match-head-commit from a fresh passed gate" };
+          const verdicts = tickets.map((ticket) => ({ ticket, verdict: gate(ROOT, ticket) }));
+          for (const matches of heads) {
+            const head = matches[0]![1]!;
+            const passed = verdicts.find(({ verdict }) => verdict.ok && Object.values(verdict.heads).includes(head));
+            if (!passed) {
+              const reason = verdicts.map(({ ticket, verdict }) => `${ticket}: ${verdict.ok ? `gate heads do not include ${head}` : verdict.reason}`).join("; ");
+              return { block: true, reason: `ship merge gate refused: ${reason}` };
+            }
+          }
+        }
+      }
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {
         root: ROOT,
         dataRoot: dataRootOf(ROOT),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
-      });
+      }, settings);
       if (!v) return undefined;
       if (v.decision === "deny") return { block: true, reason: v.reason };
-      if (call.name === "Bash" && retainedShipLaunch(call.input.command)) return undefined;
       // The one ask judge() returns is a ship launch in the main chat. Without
       // a dialog to ask in, it does not go.
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
-      if (e instanceof GuardPolicyError) return { block: true, reason: e.message };
+      if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
       return undefined;
     }
   });
@@ -126,13 +141,16 @@ export default function guards(pi: ExtensionAPI) {
   let lastVerdict: string | null = null;
 
   pi.on("agent_settled", () => {
-    if (process.env.YOKEMATE_ROLE === "executor") return;
+    let malformed = false;
     let reason: string | null = null;
     try {
-      reason = stopVerdict(process.env, readStage);
+      const settings = readRuntimeSettings(ROOT);
+      if (process.env.YOKEMATE_ROLE === "executor") return;
+      reason = stopVerdict(process.env, readStage, settings);
     } catch (e) {
-      if (e instanceof GuardPolicyError) {
-        reason = stopVerdict(process.env, readStage, resolveGuardPolicy(undefined));
+      if (e instanceof RuntimeSettingsError) {
+        malformed = true;
+        reason = stopVerdict(process.env, readStage, resolveRuntimeSettings(undefined));
         pi.sendMessage({ customType: "yokemate-guard-policy", content: e.message, display: true }, { deliverAs: "followUp", triggerTurn: false });
       } else return;
     }
@@ -142,7 +160,7 @@ export default function guards(pi: ExtensionAPI) {
     if (!delivery) return;
     pi.sendMessage(
       { customType: "yokemate-stop-guard", content: delivery.content, display: true },
-      { deliverAs: "followUp", triggerTurn: delivery.triggerTurn },
+      { deliverAs: "followUp", triggerTurn: !malformed && delivery.triggerTurn },
     );
   });
 
@@ -193,18 +211,19 @@ export default function guards(pi: ExtensionAPI) {
 
   // The result's message lands in the turn's messages — pi's counterpart of
   // Claude's additionalContext on SessionStart.
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (event) => {
     let policyContext: string;
     try {
-      policyContext = formatGuardPolicy(readGuardPolicy(ROOT));
+      policyContext = formatGuardPolicy(readRuntimeSettings(ROOT));
     } catch (e) {
-      policyContext = `Guard policy error: ${(e as Error).message}. Optional action guards fail closed; immutable boundaries remain mandatory.`;
+      policyContext = `Guard policy error: ${(e as Error).message}. Optional settings were not read; immutable boundaries remain mandatory.`;
     }
-    if (!digestPending) return { systemPrompt: policyContext };
+    const systemPrompt = `${event.systemPrompt}\n\n${policyContext}`;
+    if (!digestPending) return { systemPrompt };
     digestPending = false;
     await pulled;
     return {
-      systemPrompt: policyContext,
+      systemPrompt,
       message: {
         customType: "yokemate-warmup",
         content: `Warmup — состояние пула на старте сессии\n\n${buildDigest(ROOT, dataRootOf(ROOT))}`,

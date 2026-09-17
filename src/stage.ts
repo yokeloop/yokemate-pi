@@ -19,7 +19,7 @@ import { openDb, STAGES, type Stage } from "./db.ts";
 import { logMove } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type From, type MoveEnv } from "./transitions.ts";
-import { readGuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings } from "./guard-policy.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const DATA = dataRoot(ROOT);
@@ -39,7 +39,7 @@ const planAbs = rest[2] ? resolve(rest[2]) : undefined;
 if (planAbs && !existsSync(planAbs)) fail(`plan not found: ${planAbs}`);
 
 const env = process.env as MoveEnv;
-const policy = (() => { try { return readGuardPolicy(ROOT); } catch (e) { return fail((e as Error).message); } })();
+const settings = (() => { try { return readRuntimeSettings(ROOT); } catch (e) { return fail((e as Error).message); } })();
 const db = openDb(join(ROOT, "yokemate.db"));
 
 // A move without a path leaves the recorded plan alone: not every stage comes
@@ -67,7 +67,7 @@ function write(prev: From): void {
 
 if (stage === "scouted") {
   if (force) fail("--force does not apply to scouted — it is a legal move, let the checks run");
-  const out = applyMove(db, "stage", env, ticket, write);
+  const out = applyMove(db, "stage", env, ticket, write, { settings });
   if (!out.ok) fail(out.refuse);
   logMove(DATA, ticket, "разведано", planAbs ? `план ${basename(planAbs, ".md")}` : "");
   console.log(
@@ -78,9 +78,9 @@ if (stage === "scouted") {
 } else {
   // Repair path: unstamped and explicit, loud in the output, silent in the
   // journal — the journal records results, not fixes.
-  if (policy.guards.stageCaller && env.YOKEMATE_MODE)
+  if (settings.policy.guards.stageCaller && env.YOKEMATE_MODE)
     fail(`${stage} is the main chat's repair — a mode records its result through its own command`);
-  if (policy.guards.stageForce && !force) fail(`moving to ${stage} by hand is a repair — add --force`);
+  if (settings.policy.guards.stageForce && !force) fail(`moving to ${stage} by hand is a repair — add --force`);
   db.exec("BEGIN IMMEDIATE");
   try {
     const prev =

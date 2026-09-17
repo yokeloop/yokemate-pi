@@ -12,7 +12,7 @@
 
 import { join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
-import { GuardPolicyError, readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -168,14 +168,6 @@ const NOTE_WRITE = [
 const HOME_PATH = /(~\/|\$HOME\/|\/home\/[a-z_][a-z0-9_-]*\/)/;
 const DOWNLOADS = /(~|\$HOME|\/home\/[a-z_][a-z0-9_-]*)\/Downloads\//;
 
-// Only a ship launch asks — the one irreversible run: it merges PRs. The other
-// modes end in a plan, a PR or a conversation and pass without a dialog. Only
-// an actual launch matches: pnpm at a command position (split ship included —
-// the split script carries no baked mode), or node executing mode-tab.ts with
-// ship. Reading, grepping or editing these files is ordinary work and passes.
-const SHIP_LAUNCH =
-  /(^|[;&|(]\s*)([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|\S*)\s+)*pnpm\s+(run\s+)?(ship\b|split\s+(--\s+)*ship\b)|\bnode\s[^|;&]*\bsrc\/mode-tab\.ts\s+(--\s+)*ship\b/;
-
 function inYokemateTree(cmd: string, own?: { root: string; home?: string }): boolean {
   if (!own) return false;
   const variants = [own.root + "/"];
@@ -191,8 +183,9 @@ export function judge(
   toolName: string,
   input: { command?: string; file_path?: string; notebook_path?: string },
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
-  policy: GuardPolicy = readGuardPolicy(),
+  settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
+  const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
   const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
@@ -279,12 +272,6 @@ export function judge(
         "Your writable world is the task worktrees and knowledge/…/ai/. The engineer's home directory is not ours to change (~/Downloads on the engineer's word is the one exception).",
     };
 
-  if (policy.guards.shipConfirmation && !paneled && SHIP_LAUNCH.test(unquoted))
-    return {
-      decision: "ask",
-      reason: "Ship merges — the one launch there is no way back from. Confirm this run is on the engineer's word.",
-    };
-
   return null;
 }
 
@@ -315,7 +302,7 @@ if (import.meta.filename === process.argv[1]) {
           }),
         );
     } catch (e) {
-      if (e instanceof GuardPolicyError)
+      if (e instanceof RuntimeSettingsError)
         console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: e.message } }));
     }
     process.exit(0);

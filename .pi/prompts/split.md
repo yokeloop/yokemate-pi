@@ -14,3 +14,5 @@ Run `pnpm where plan [KEY …]` before anything else, with every key before the 
 - `refuse: …` — print the refusal unchanged and stop.
 
 The same launcher defaults to a tab without `--split`. The engineer closes the conversational surface. No planning work runs in this launcher.
+
+A parent-owned advance receipt can continue only through the verified plan record handoff. Plain `/plan` and `/split plan` remain plan-only at either workflowApproval value; the pane cannot mint do authority.

@@ -202,6 +202,7 @@ test("generic duplicate guards and ticketless name series are surface independen
         }
       }
     }
+    for (const surface of ["cli", "pane"]) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:guards.duplicateMode:${variant}`);
   } finally { f.cleanup(); }
 });
 

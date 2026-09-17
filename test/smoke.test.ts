@@ -21,7 +21,7 @@ import { MODES, freeAgentName, resolveLaunch, resolveModeModel, resolvePlanTarge
 import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
 import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
-import { resolveGuardPolicy } from "../src/guard-policy.ts";
+import { resolveRuntimeSettings } from "../src/guard-policy.ts";
 import { linkTeammates } from "../src/teammates.ts";
 import { logMove } from "../src/move-log.ts";
 import { closeTab, findOpenTab, findRunningAgent, startAgent } from "../src/herdr.ts";
@@ -232,6 +232,18 @@ test("acceptance keeps the folder in both outcomes", async () => {
   assert.ok(s2.plan.endsWith("rework.md"));
 
   rmSync(root, { recursive: true, force: true });
+});
+
+test("accept refuses malformed settings before reading or changing the work row", async () => {
+  const { accept } = await import("../src/accept.ts");
+  const root = join(process.env.TMPDIR ?? "/tmp", `yokemate-test-accept-settings-${process.pid}`);
+  fs.mkdirSync(join(root, ".pi"), { recursive: true });
+  fs.writeFileSync(join(root, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { workflowApproval: "bad" } }));
+  const db = memDb();
+  insertWork(db, "ACME-10", { stage: "review" });
+  assert.throws(() => accept(db, root, "ACME-10"), /guardPolicy.workflowApproval/);
+  assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='ACME-10'").get()!.stage, "review");
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 // 7a. The row's exit lives in accept itself, not in a later sync: a clean pass
@@ -750,7 +762,7 @@ test("ship prompt preserves single and batch arguments through where", async () 
   assert.equal(withoutKeys.status, 1);
   assert.match(withoutKeys.stderr, /usage: where/);
 
-  const policyOff = resolveGuardPolicy({ yolo: false, guards: { modeOwnership: false } });
+  const policyOff = resolveRuntimeSettings({ guardPolicy: { yolo: false, guards: { modeOwnership: false } } });
   assert.deepEqual(
     decide({ YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-199" }, "ship", "YM-199", policyOff),
     { kind: "launch" },

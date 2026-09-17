@@ -9,7 +9,7 @@
 // and pass through, and the review pane sits at the yokemate root besides.
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { RuntimeSettingsError, resolveRuntimeSettings, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 
 export interface GuardEnv {
   YOKEMATE_MODE?: string;
@@ -21,8 +21,9 @@ export interface GuardEnv {
 export function stopVerdict(
   env: GuardEnv,
   readStage: (ticket: string) => string | undefined,
-  policy: GuardPolicy = readGuardPolicy(),
+  settings: RuntimeSettings = readRuntimeSettings(),
 ): string | null {
+  const { policy } = settings;
   if (env.YOKEMATE_ROLE === "coordinator" || !policy.guards.doCompletion || env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
   const stage = readStage(env.YOKEMATE_TICKET);
   if (stage === "review" || stage === "accepted") return null;
@@ -37,6 +38,7 @@ if (import.meta.filename === process.argv[1]) {
   const ROOT = resolve(new URL("..", import.meta.url).pathname);
   let reason: string | null = null;
   try {
+    const settings = readRuntimeSettings(ROOT);
     // Raw read-only handle, not openDb: a hook runs no DDL.
     const db = new DatabaseSync(join(ROOT, "yokemate.db"), { readOnly: true });
     reason = stopVerdict(process.env, (ticket) =>
@@ -45,9 +47,10 @@ if (import.meta.filename === process.argv[1]) {
           | { stage: string }
           | undefined
       )?.stage,
+      settings,
     );
-  } catch {
-    reason = null; // cannot read the DB → allow; see the header
+  } catch (error) {
+    reason = error instanceof RuntimeSettingsError ? `${error.message}. ${stopVerdict(process.env, () => undefined, resolveRuntimeSettings(undefined)) ?? "Optional settings were not read."}` : null;
   }
   if (reason) console.log(JSON.stringify({ decision: "block", reason }));
   process.exit(0);

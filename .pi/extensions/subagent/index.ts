@@ -12,6 +12,9 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
+import { DatabaseSync } from "node:sqlite";
+import { readRecordedPlanBinding, assertPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
+import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
@@ -32,75 +35,17 @@ import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visib
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
-import { CoordinatorRegistry, ShipPermitStore, legacyCoordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
+import { CoordinatorRegistry, ShipPermitStore, coordinatorChecks, type CoordinatorRun } from "../../../src/coordinator-runtime.ts";
 import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
-import { ENGINE_ROOT, readGuardPolicy, readSubagentLimits, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
+import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
-
-interface Limits {
-	maxParallelTasks: number;
-	maxConcurrency: number;
-	maxDetached: number;
-}
-
-const DEFAULT_LIMITS: Limits = { maxParallelTasks: 8, maxConcurrency: 4, maxDetached: 8 };
-
-const limitsByCwd = new Map<string, Limits>();
-
-
-function validateLimits(limits: Limits): string | undefined {
-	for (const key of ["maxParallelTasks", "maxConcurrency", "maxDetached"] as const) {
-		const value = limits[key];
-		if (!Number.isInteger(value) || value < 1) return `${key} must be an integer >= 1, got ${JSON.stringify(value)}`;
-	}
-	if (limits.maxConcurrency > limits.maxParallelTasks)
-		return `maxConcurrency (${limits.maxConcurrency}) must be <= maxParallelTasks (${limits.maxParallelTasks})`;
-	if (limits.maxDetached < limits.maxParallelTasks)
-		return `maxDetached (${limits.maxDetached}) must be >= maxParallelTasks (${limits.maxParallelTasks})`;
-	return undefined;
-}
-
-// Лимиты сцеплены друг с другом, поэтому набор из настроек либо принимается
-// целиком, либо отбрасывается целиком: половина от инженера, половина из кода
-// дала бы комбинацию, которой никто не выбирал.
-function loadLimits(cwd: string): Limits {
-	const cached = limitsByCwd.get(cwd);
-	if (cached) return cached;
-
-	let limits = DEFAULT_LIMITS;
-	const file = path.join(cwd, CONFIG_DIR_NAME, "settings.json");
-	try {
-		if (fs.existsSync(file)) {
-			const raw = JSON.parse(fs.readFileSync(file, "utf-8"))?.subagent;
-			if (raw && typeof raw === "object") {
-				// Умолчание подгоняется под названное соседнее поле: инженер,
-				// написавший один только maxParallelTasks, назвал число, а не
-				// повод отказать себе умолчанием из кода.
-				const maxParallelTasks = raw.maxParallelTasks ?? DEFAULT_LIMITS.maxParallelTasks;
-				const candidate: Limits = {
-					maxParallelTasks,
-					maxConcurrency: raw.maxConcurrency ?? Math.min(DEFAULT_LIMITS.maxConcurrency, maxParallelTasks),
-					maxDetached: raw.maxDetached ?? Math.max(DEFAULT_LIMITS.maxDetached, maxParallelTasks),
-				};
-				const problem = validateLimits(candidate);
-				if (problem) console.error(`[subagent] ignoring subagent limits in ${file}: ${problem}`);
-				else limits = candidate;
-			}
-		}
-	} catch (e) {
-		console.error(`[subagent] could not read subagent limits in ${file}: ${(e as Error)?.message || String(e)}`);
-	}
-
-	limitsByCwd.set(cwd, limits);
-	return limits;
-}
 
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
@@ -678,9 +623,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const shipPermits = new ShipPermitStore();
+	let authority: DoAuthorityStore | undefined;
+	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
 		if (coordinatorUnits.delete(runId)) activeUnits -= 1;
+		authority?.finish(runId);
 	};
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
@@ -700,19 +648,98 @@ export default function (pi: ExtensionAPI) {
 		rpcByRun.delete(runId);
 		return run;
 	};
+	const revokeAuthority = async () => {
+		shipPermits.invalidate();
+		for (const runId of authority?.revoke() ?? []) await cancelCoordinator(runId, "parent_cancel_run");
+	};
+	pi.on("session_before_switch", revokeAuthority);
+	pi.on("session_before_fork", revokeAuthority);
+	pi.on("session_before_tree", revokeAuthority);
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
-	pi.on("input", (event, ctx) => {
+	pi.on("input", async (event, ctx) => {
+		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const text = event.text.trim();
-		const match = event.source === "interactive" ? text.match(/^\/ship\s+(.+)$/) : undefined;
-		if (match && !process.env.YOKEMATE_MODE) {
-			const tickets = match[1].split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
-			if (tickets.length) shipPermits.observeInteractiveShip(tickets, (ctx as any).sessionManager?.getSessionId?.() ?? "main");
-		} else shipPermits.invalidate();
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!controlIdentity || controlIdentity.sessionId !== sessionId || !authority) {
+			ctx.ui.notify("workflow approval unavailable: no verified main parent runtime", "error");
+			return { action: "handled" as const };
+		}
+		const generation = authority.beginInput(event.text);
+		shipPermits.invalidate();
+		try {
+			readRuntimeSettings(ENGINE_ROOT);
+			const ship = text.match(/^\/ship\s+(.+)$/);
+			if (ship) {
+				const tickets = ship[1]!.split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
+				if (tickets.length) shipPermits.observeInteractiveShip(tickets, sessionId);
+				return;
+			}
+			if (/^\/(?:plan|split)(?:\s|$)/.test(text)) return;
+			const exact = text.match(/^\/do\s+(.+)$/);
+			if (exact) {
+				const words = exact[1]!.split(/\s+/);
+				const tickets: string[] = [];
+				let plan: string | undefined;
+				for (let index = 0; index < words.length; index++) {
+					const word = words[index]!;
+					if (word === "--model" || word === "--plan") {
+						const value = words[++index];
+						if (!value) throw new Error(`${word} needs a value`);
+						if (word === "--plan") plan = value;
+						continue;
+					}
+					if (word.startsWith("--plan=")) { plan = word.slice("--plan=".length); continue; }
+					if (word.startsWith("--model=")) continue;
+					for (const ticket of word.match(/(?:^|[^A-Z0-9-])([A-Z][A-Z0-9]*-\d+)(?=$|[^A-Z0-9-])/g) ?? []) {
+						const match = /([A-Z][A-Z0-9]*-\d+)/.exec(ticket);
+						if (match) tickets.push(match[1]!);
+					}
+				}
+				if (!tickets.length || new Set(tickets).size !== tickets.length) throw new Error("do approval needs distinct ordered tickets");
+				const bindings = tickets.map((ticket) => readRecordedPlanBinding(ENGINE_ROOT, ticket));
+				for (const binding of bindings) if (plan && fs.realpathSync(path.resolve(ctx.cwd, plan)) !== binding.path) throw new Error("do approval --plan differs from the current recorded plan");
+				for (const binding of bindings) authority.approve("exact-do", binding.ticket, binding, generation);
+				return;
+			}
+			if (text.startsWith("/")) return;
+			if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("workflow extraction requires a configured model and external authentication");
+			const bindings: PlanBinding[] = [];
+			if (fs.existsSync(path.join(ENGINE_ROOT, "yokemate.db"))) {
+				const db = new DatabaseSync(path.join(ENGINE_ROOT, "yokemate.db"), { readOnly: true });
+				try {
+					for (const row of db.prepare("SELECT ticket FROM work WHERE plan IS NOT NULL ORDER BY ticket").all()) {
+						try { bindings.push(readRecordedPlanBinding(ENGINE_ROOT, String(row.ticket))); } catch {}
+					}
+				} finally { db.close(); }
+			}
+			const controller = new AbortController();
+			let timer: NodeJS.Timeout | undefined;
+			try {
+				const message = await Promise.race([
+					ctx.modelRegistry.complete(ctx.model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, bindings }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 1024 }),
+					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("workflow extraction timed out")); }, 15000); }),
+				]);
+				authority.assertGeneration(generation);
+				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("workflow extraction did not return a clean no-tools result");
+				const extraction = validateExtraction(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, bindings);
+				if (extraction.kind === "revoke") {
+					for (const runId of authority.revoke(extraction.ticket)) await cancelCoordinator(runId, "parent_cancel_run");
+				} else if (extraction.kind === "advance-plan-do") authority.approve("advance-plan-do", extraction.ticket, undefined, generation);
+				else if (extraction.kind === "approve-ready-do") {
+					const binding = readRecordedPlanBinding(ENGINE_ROOT, extraction.ticket);
+					if (binding.contentHash !== extraction.binding) throw new Error("workflow extraction ready binding changed");
+					authority.approve("post-plan-approval", extraction.ticket, binding, generation);
+				}
+			} finally { clearTimeout(timer); controller.abort(); }
+		} catch (error) {
+			ctx.ui.notify((error as Error).message, "error");
+			return { action: "handled" as const };
+		}
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const checks = legacyCoordinatorChecks(loadLimits(root).maxDetached);
+		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
@@ -720,8 +747,13 @@ export default function (pi: ExtensionAPI) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
-		const duplicate = checks.checkDuplicate(request.mode, coordinators.active().filter((active) => active.request.tickets.some((ticket) => request.tickets.includes(ticket))));
-		if (duplicate) throw new Error(duplicate);
+		let doBinding: PlanBinding | undefined;
+		if (request.mode === "do") {
+			if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
+			doBinding = readRecordedPlanBinding(root, request.tickets[0]!);
+			if (request.plan && fs.realpathSync(path.resolve(origin.cwd ?? root, request.plan)) !== doBinding.path) throw new Error("do approval --plan differs from the recorded binding");
+			authority.check(request.tickets[0]!, doBinding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+		}
 		const admission = checks.checkAdmission(activeUnits);
 		if (admission) throw new Error(admission);
 		activeUnits += 1;
@@ -731,10 +763,11 @@ export default function (pi: ExtensionAPI) {
 		let cleanupReservation: ((reason: string) => Promise<void>) | undefined;
 		const finishCalls = new Set<string>();
 		try {
-			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, []);
+			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode));
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorUnits.add(ownedRun.identity.runId);
+			if (doBinding) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
 			let cleanup: Promise<void> | undefined;
 			cleanupReservation = (reason) => cleanup ??= (async () => {
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
@@ -749,7 +782,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				rpcByRun.delete(ownedRun.identity.runId);
 			})();
-			const prepared = request.mode === "do" ? prepareDo(root, request, origin) : await prepareShip(root, request);
+			const prepared = request.mode === "do" ? prepareDo(root, request, origin, settings) : await prepareShip(root, request);
+			if (ownedRun.state === "blocked") throw new Error("coordinator was cancelled during preparation");
+			if (doBinding) { authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!)); prepared.doBinding = doBinding; }
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
@@ -774,7 +809,13 @@ export default function (pi: ExtensionAPI) {
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
 			if (request.mode === "do") markDoRunning(root, prepared, origin);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
-				if (rpc && !terminalReported) continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
+				if (rpc && !terminalReported) {
+					try {
+						if (doBinding && (event.type === "agent_settled" || event.type === "tool_execution_start")) authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!));
+						continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
+					}
+					catch (error) { reportBlocked?.((error as Error).message); }
+				}
 				if (event.type === "tool_execution_start" && event.toolName === "coordinator_finish" && typeof event.toolCallId === "string") { finishCalls.add(event.toolCallId); return; }
 				const result = event.type === "tool_execution_end" ? (event.result as { details?: { kind?: string; runId?: string; outcome?: "done" | "blocked"; summary?: string; reason?: string } } | undefined) : undefined;
 				if (event.type !== "tool_execution_end" || event.toolName !== "coordinator_finish" || event.isError || typeof event.toolCallId !== "string" || !finishCalls.delete(event.toolCallId) || result?.details?.kind !== "yokemate-coordinator-outcome" || result.details.runId !== ownedRun.identity.runId || !result.details.outcome || terminalReported) return;
@@ -847,15 +888,15 @@ export default function (pi: ExtensionAPI) {
 			throw error;
 		}
 	};
-	const startCoordinator = async (...[request, ctx, origin]: Parameters<typeof startOneCoordinator>) => {
-		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin);
+	const startCoordinator = async (...[request, ctx, origin, settings = readRuntimeSettings(ENGINE_ROOT)]: Parameters<typeof startOneCoordinator>) => {
+		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin, settings);
 		const content: { type: "text"; text: string }[] = [];
 		const runs: { ticket: string; runId: string }[] = [];
 		let first: Awaited<ReturnType<typeof startOneCoordinator>>["details"] | undefined;
 		for (const part of splitDoRequest(request)) {
 			const ticket = part.tickets[0]!;
 			try {
-				const result = await startOneCoordinator(part, ctx, origin);
+				const result = await startOneCoordinator(part, ctx, origin, settings);
 				content.push(...result.content as { type: "text"; text: string }[]);
 				runs.push({ ticket, runId: result.details.runId });
 				first ??= result.details;
@@ -865,14 +906,32 @@ export default function (pi: ExtensionAPI) {
 		}
 		return { content, details: { ...first, runs }, isError: runs.length === 0 };
 	};
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
+			try {
+				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan worker registration refused");
+			} catch (error) { ctx.ui.notify(`no automatic do handoff: ${(error as Error).message}`, "warning"); }
+		}
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
+		await revokeAuthority();
+		if (controlServer) await new Promise<void>((resolve) => controlServer!.close(() => resolve()));
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
+		authority = new DoAuthorityStore(controlIdentity);
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
+				planRecorded: async (ticket, recordedPath) => {
+					const settings = readRuntimeSettings(ENGINE_ROOT);
+					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
+					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
+					if (!authority!.record(binding, settings.policy.workflowApproval)) return { reason: "plan-only; ready for /do; a new interactive approval is required" };
+					const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+					if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
+					return { runId: result.details.runId, reason: "advance plan+do authority consumed" };
+				},
 				launch: async (request, controlOrigin) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
 					const result = await startCoordinator(request, ctx, origin);
@@ -894,11 +953,15 @@ export default function (pi: ExtensionAPI) {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
 			try {
-				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string; diagnosticRoot?: string } };
+				const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8")) as { identity?: { runId?: string; role?: string; cwd?: string }; prepared?: { cwd?: string; plan?: string; diagnosticRoot?: string; doBinding?: PlanBinding } };
 				const identity = payload.identity;
 				if (!identity || identity.role !== "coordinator" || identity.runId !== process.env.YOKEMATE_RUN_ID || identity.cwd !== ctx.cwd || payload.prepared?.cwd !== ctx.cwd || !ctx.isProjectTrusted()) throw new Error("invalid coordinator ready identity");
 				const commands = pi.getCommands().map((command) => command.name);
 				if (!commands.includes(`skill:${process.env.YOKEMATE_MODE}-worker`)) throw new Error("worker skill unavailable");
+				if (payload.prepared?.doBinding) {
+					assertPlanBinding(payload.prepared.doBinding, readRecordedPlanBinding(ENGINE_ROOT, payload.prepared.doBinding.ticket));
+					ownedBinding = payload.prepared.doBinding;
+				}
 				if (payload.prepared?.plan) {
 					try { snapshots = new RunSnapshots(payload.prepared.diagnosticRoot ?? ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
 				}
@@ -933,6 +996,9 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		authority?.revoke();
+		authority = undefined;
+		shipPermits.invalidate();
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
@@ -1062,6 +1128,17 @@ export default function (pi: ExtensionAPI) {
 				try { const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run"); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
 				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
+			if (ownedBinding) {
+				try { assertPlanBinding(ownedBinding, readRecordedPlanBinding(ENGINE_ROOT, ownedBinding.ticket)); }
+				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+			}
+			const agentScope: AgentScope = params.agentScope ?? "project";
+			let settings;
+			try {
+				settings = readRuntimeSettings(ENGINE_ROOT);
+			} catch (e) {
+				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
+			}
 			if (params.coordinator) {
 				const origin = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE as "coordinator" | "executor" | undefined, sessionId, cwd: ctx.cwd };
 				try {
@@ -1075,17 +1152,10 @@ export default function (pi: ExtensionAPI) {
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: [{ type: "text", text: `accepted ${reply.runId}` }], details: { runId: reply.runId, identity: reply.identity } };
 					}
-					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin);
+					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
-			const agentScope: AgentScope = params.agentScope ?? "project";
-			let policy;
-			try {
-				policy = readGuardPolicy(ENGINE_ROOT);
-			} catch (e) {
-				return { content: [{ type: "text", text: (e as Error).message }], details: { mode: "single", agentScope, projectAgentsDir: null, results: [] }, isError: true };
-			}
-			const limits = readSubagentLimits(ENGINE_ROOT);
+			const { policy } = settings;
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -1145,7 +1215,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
 				const units = mode === "chain" ? 1 : tasks.length;
-				const admission = subagentAdmission(policy, limits, mode, units, activeUnits);
+				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
 				for (const { identity } of ack.children) {
@@ -1172,7 +1242,7 @@ export default function (pi: ExtensionAPI) {
 							}
 							sendReport(runs!.batch(toolCallId, "chain")!);
 						} else {
-							await mapWithConcurrencyLimit(tasks, subagentConcurrency(policy, limits, tasks.length), async (task, i) => {
+							await mapWithConcurrencyLimit(tasks, subagentConcurrency(settings, tasks.length), async (task, i) => {
 								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
 								settleResult(result, true);
 							});

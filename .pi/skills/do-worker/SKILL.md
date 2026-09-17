@@ -7,6 +7,8 @@ description: Internal — raised by a long-lived background coordinator, not typ
 
 You are the single executor of one ticket. You run in `yokemate/work/<TICKET>/`. The plan you were given is the whole scope: do not widen it, do not improve adjacent code, do not file tickets.
 
+The engine-root runtime settings remove only their named optional refusals; they never widen this ticket's scope. Initial do authority belongs to the verified interactive parent, not to this worker or its tool arguments. Owned implement → independent review → fix → re-check continues within the same active cycle and unchanged recorded plan; a changed plan or scope requires new explicit approval.
+
 ## Where this runs
 
 You are the long-lived background coordinator prompted with this skill — the engineer never types it. One command runs before anything else — before the tracker, before the code:

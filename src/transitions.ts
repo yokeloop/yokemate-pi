@@ -12,7 +12,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import type { Stage } from "./db.ts";
-import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 
 export type Via = "stage" | "plan" | "spawn" | "record-report" | "accept" | "accept-rework" | "adopt";
 
@@ -78,10 +78,10 @@ export function checkMove(
   env: MoveEnv,
   ticket: string,
   current: From,
-  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {},
+  opts: { allowFresh?: boolean; expected?: From; settings?: RuntimeSettings } = {},
 ): Verdict {
   const rule = RULES[via];
-  const policy = opts.policy ?? readGuardPolicy();
+  const { policy } = opts.settings ?? readRuntimeSettings();
   if (opts.expected !== undefined && current !== opts.expected)
     return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${current} before ${via}` };
   const mode = env.YOKEMATE_MODE;
@@ -116,8 +116,9 @@ export function applyMove(
   env: MoveEnv,
   ticket: string,
   write: (prev: From) => void,
-  opts: { allowFresh?: boolean; expected?: From; policy?: GuardPolicy } = {}
+  opts: { allowFresh?: boolean; expected?: From; settings?: RuntimeSettings } = {}
 ): MoveOutcome {
+  const settings = opts.settings ?? readRuntimeSettings();
   db.exec("BEGIN IMMEDIATE");
   try {
     const row = db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as
@@ -128,7 +129,7 @@ export function applyMove(
       db.exec("ROLLBACK");
       return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${prev}` };
     }
-    const v = checkMove(via, env, ticket, prev, opts);
+    const v = checkMove(via, env, ticket, prev, { ...opts, settings });
     if (!v.ok) {
       db.exec("ROLLBACK");
       return v;

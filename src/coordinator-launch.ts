@@ -8,23 +8,27 @@ import { modelForTicket } from "./project-model.ts";
 import { poolModel } from "./pool.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 
 export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
 export interface CoordinatorOrigin extends MoveEnv { sessionId?: string; runId?: string; cwd?: string; pane?: string; parentPane?: string }
 export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string }
-export interface PreparedCoordinator { mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
+export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
 
 const KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 const fail = (message: string): never => { throw new Error(message); };
 const inside = (root: string, value: string): boolean => { const r = relative(root, resolve(value)); return r !== "" && !r.startsWith("..") && !r.includes("/../"); };
 
 export function validateCoordinatorRequest(request: CoordinatorRequest): void {
+  if (!request || typeof request !== "object" || Array.isArray(request)) fail("coordinator request must be an object");
+  for (const key of Object.keys(request)) if (!["mode", "tickets", "plan", "model", "note"].includes(key)) fail(`unknown coordinator request field ${key}`);
+  for (const key of ["plan", "model", "note"] as const) if (request[key] !== undefined && (typeof request[key] !== "string" || !request[key]!.trim())) fail(`coordinator ${key} must be a nonempty string`);
   if (request.mode !== "do" && request.mode !== "ship") fail(`unknown coordinator mode ${request.mode}`);
   if (!Array.isArray(request.tickets) || request.tickets.length === 0) fail(`${request.mode} needs at least one ticket`);
   if (new Set(request.tickets).size !== request.tickets.length) fail("ticket list contains duplicates");
-  for (const ticket of request.tickets) if (!KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
+  for (const ticket of request.tickets) if (typeof ticket !== "string" || !KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
   if (request.plan && request.mode !== "do") fail("ship does not accept a plan override");
 }
 
@@ -62,14 +66,11 @@ function partsForPlan(root: string, ticket: string, plan: string): PreparedPart[
 
 function settings(root: string, folder: string): void {
   mkdirSync(join(folder, ".pi"), { recursive: true });
-  let subagent: unknown;
-  try { subagent = JSON.parse(readFileSync(join(root, ".pi", "settings.json"), "utf8"))?.subagent; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  writeFileSync(join(folder, ".pi", "settings.json"), JSON.stringify({ extensions: [join(root, "src", "guards.ts"), join(root, "src", "bus.ts"), join(root, ".pi", "extensions", "subagent", "index.ts")], ...(subagent === undefined ? {} : { subagent }) }, null, 2));
+  writeFileSync(join(folder, ".pi", "settings.json"), JSON.stringify({ extensions: [join(root, "src", "guards.ts"), join(root, "src", "bus.ts"), join(root, ".pi", "extensions", "subagent", "index.ts")] }, null, 2));
   linkTeammates(join(root, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 }
 
-export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin): PreparedCoordinator {
+export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root)): PreparedCoordinator {
   validateCoordinatorRequest(request);
   if (request.mode !== "do" || request.tickets.length !== 1) fail("prepareDo needs exactly one do ticket");
   const ticket = request.tickets[0]!;
@@ -80,7 +81,7 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   if (existsSync(folder) && lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
   const db = openDb(join(root, "yokemate.db"));
   const expected = ((db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: From } | undefined)?.stage ?? "absent") as From;
-  const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan) });
+  const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan), settings: snapshot });
   if (!preflight.ok) fail(preflight.refuse);
   const parts = partsForPlan(root, ticket, plan);
   const model = request.model ?? modelForTicket(db, ticket, "do") ?? poolModel(dataRoot(root), "do");
@@ -91,13 +92,14 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
 }
 
 export function markDoRunning(root: string, prepared: PreparedCoordinator, origin: CoordinatorOrigin): void {
+  const settings = readRuntimeSettings(root);
   if (prepared.mode !== "do" || !prepared.plan || !prepared.expected) fail("prepared do request is incomplete");
   const ticket = prepared.tickets[0]!;
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "spawn", origin, ticket, () => {
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES (?, ?, 'running') ON CONFLICT (ticket) DO UPDATE SET stage = 'running'").run(ticket, ticketUrl(db, ticket));
     db.prepare("UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(prepared.cwd, prepared.plan!, ticket);
-  }, { allowFresh: true, expected: prepared.expected });
+  }, { allowFresh: true, expected: prepared.expected, settings });
   if (!out.ok) fail(out.refuse);
 }
 

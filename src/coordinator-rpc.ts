@@ -1,3 +1,4 @@
+import { readRuntimeSettings } from "./guard-policy.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -150,7 +151,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
         const commandsValue = isRecord(event.data) ? event.data.commands : undefined;
         const commands = Array.isArray(commandsValue) ? commandsValue.filter(isRecord).map((command) => command.name) : [];
         if (event.success !== true || !commands.includes("yokemate-coordinator-ready") || !commands.includes(`skill:${prepared.mode}-worker`)) fail("coordinator lacks ready command or worker skill");
-        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan, diagnosticRoot: prepared.resourcesPath } })).toString("base64")}` }); }
+        else { commandsAck = true; send({ id: `${identity.runId}:ready`, type: "prompt", message: `/yokemate-coordinator-ready ${Buffer.from(JSON.stringify({ identity, prepared: { mode: prepared.mode, tickets: prepared.tickets, cwd: prepared.cwd, model: prepared.model, plan: prepared.plan, doBinding: prepared.doBinding, diagnosticRoot: prepared.resourcesPath } })).toString("base64")}` }); }
       } else if (event.id === `${identity.runId}:ready`) {
         if (event.success !== true) fail("coordinator ready command was refused");
         else { readyAck = true; send({ id: `${identity.runId}:state`, type: "get_state" }); }
@@ -242,8 +243,9 @@ export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, r
   const deliveryFailure = rpc.childState.deliveryFailureReason();
   if (deliveryFailure) { reportBlocked(deliveryFailure); return; }
   if (event.type !== "agent_settled") return;
+  const settings = readRuntimeSettings();
   const verdict = rpc.childState.settled();
   if (verdict === "wait") return;
-  if (verdict === "blocked") { reportBlocked("coordinator stopped without outcome"); return; }
+  if (verdict === "blocked" || !settings.policy.guards.doCompletion) { reportBlocked("coordinator stopped without outcome"); return; }
   void rpc.request({ type: "prompt", message: "Continue the pipeline or call coordinator_finish with a verified outcome.", streamingBehavior: "followUp" }).catch(() => reportBlocked("coordinator completion prompt delivery failed"));
 }

@@ -12,7 +12,7 @@
 //        pnpm where do|ship <KEY> [<KEY> …]|<KEY1+KEY2>
 //        pnpm where plan [KEY …]        → /plan can run before a ticket exists
 
-import { readGuardPolicy, type GuardPolicy } from "./guard-policy.ts";
+import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
@@ -37,7 +37,8 @@ export interface ModeEnv {
  * of another ticket or another mode: doing the work there would write one
  * ticket's plan while wearing another ticket's name.
  */
-export function decide(env: ModeEnv, mode: Mode, ticket?: string, policy: GuardPolicy = readGuardPolicy()): Decision {
+export function decide(env: ModeEnv, mode: Mode, ticket?: string, settings: RuntimeSettings = readRuntimeSettings()): Decision {
+  const { policy } = settings;
   const here = env.YOKEMATE_MODE;
   if (!here) return { kind: "launch" };
   // A ticketless mode matches on the mode alone — both sides carry no key.
@@ -73,7 +74,9 @@ if (import.meta.filename === process.argv[1]) {
     console.error(`usage: where <${MODES.join("|")}> <TICKET>`);
     process.exit(1);
   }
-  const d = decide(process.env as ModeEnv, mode, ticket);
+  let d: Decision;
+  try { d = decide(process.env as ModeEnv, mode, ticket); }
+  catch (error) { console.error((error as Error).message); process.exit(1); }
   console.log(d.kind === "refuse" ? `refuse: ${d.reason}` : d.kind);
   process.exit(d.kind === "refuse" ? 1 : 0);
 }
