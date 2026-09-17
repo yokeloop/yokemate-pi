@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
 import { ChildRuns, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
 const headSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -148,7 +149,9 @@ test("aggregate framing budgets account for escaped content and details without 
     const envelope = runs.batch("maximum")!;
     assert.deepEqual(envelope.results, results);
     const delivery = deliveryFor(envelope);
-    const record = JSON.stringify({ type: "message_end", message: { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } } });
+    const admissions = new Map(ack.children.map(({ identity }, ordinal) => [identity.runId, { startedAt: 0, taskExcerpt: `${ordinal} ${character.repeat(200)}`, ordinal: ordinal + 1 }]));
+    const display = buildReportDisplay(envelope, admissions, 10_000, { state: "available", reportPath: `/private/${character.repeat(100)}/report.txt`, diagnosticsPath: `/private/${character.repeat(100)}/diagnostics.json`, reportBytes: 1024, reportHash: "f".repeat(64), retentionDays: 7 });
+    const record = JSON.stringify({ type: "message_end", message: { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } } });
     assert.ok(Buffer.byteLength(record) < 1024 * 1024);
     const observation = new JsonlObservation();
     observation.write(Buffer.from(record + "\n"));

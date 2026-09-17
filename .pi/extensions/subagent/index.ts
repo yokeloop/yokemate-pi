@@ -32,6 +32,8 @@ import {
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
+import { buildCoordinatorDisplay, buildReportDisplay, subagentReportRenderer, type ReportAdmissionDisplay, type ReportDiagnosticFacts, type SubagentReportDisplayV1 } from "../../../src/subagent-report.ts";
+import { coordinatorArtifactId, SubagentReportStore } from "../../../src/subagent-report-store.ts";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest, type CoordinatorRequest } from "../../../src/coordinator-launch.ts";
@@ -523,7 +525,8 @@ async function runSingleAgent(
 		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
 		refreshObservation();
 		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
-		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.metadata.usage = { ...currentResult.usage };
+		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), retainedBytes: Buffer.byteLength(currentResult.envelope.payload), retainedHash: sha256(currentResult.envelope.payload), truncated: currentResult.envelope.payload !== observation.finalText, verdict: currentResult.envelope.reviewVerdict };
 		diagnostic.save(true);
 		return currentResult;
 	} finally {
@@ -587,11 +590,35 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
+	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
 	let snapshots: RunSnapshots | undefined;
 	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
+	const reportAdmissions = new Map<string, ReportAdmissionDisplay>();
+	const reportSettledAt = new Map<string, number>();
+	const reportDisplays = new Map<string, SubagentReportDisplayV1>();
+	const reportArchives = new Map<string, { facts: Record<string, unknown> }>();
+	const coordinatorAdmissions = new Map<string, { startedAt: number; taskExcerpt: string }>();
 	const sentBatches = new Set<string>();
 	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
+	const diagnosticFacts = (runId: string): ReportDiagnosticFacts => {
+		const metadata = diagnostics.get(runId)?.metadata ?? {};
+		return {
+			cancellationInitiator: typeof metadata.cancellationInitiator === "string" ? metadata.cancellationInitiator : undefined,
+			spawnError: metadata.spawnError as ReportDiagnosticFacts["spawnError"],
+			stream: metadata.stream as ReportDiagnosticFacts["stream"],
+		};
+	};
+	const archiveFacts = (envelope: ReportEnvelope, delivery: ReportDelivery): Record<string, unknown> => ({
+		identity: envelope.kind === "result" ? envelope.identity : { ownerRunId: envelope.ownerRunId, ownerSessionId: envelope.ownerSessionId, batchId: envelope.batchId, runIds: envelope.results.map((result) => result.identity.runId) },
+		delivery: { ...delivery },
+		children: (envelope.kind === "result" ? [envelope] : envelope.results).map((result) => ({ identity: result.identity, actualTaskHash: result.actualTaskHash, processOutcome: result.processOutcome, exitCode: result.exitCode, signal: result.signal, stopReason: result.stopReason, payloadOutcome: result.payloadOutcome, reviewVerdict: result.reviewVerdict, outputLimit: result.outputLimit, metadata: diagnostics.get(result.identity.runId)?.metadata ?? { processDiagnostics: "unavailable" } })),
+	});
+	const updateReportArchive = (deliveryId: string): void => {
+		const retained = reportArchives.get(deliveryId);
+		if (retained) reportStore.updateDiagnostics(deliveryId, retained.facts);
+	};
 	let childSequence = 0;
 	const emitChildState = () => {
 		if (!runs) return;
@@ -615,6 +642,11 @@ export default function (pi: ExtensionAPI) {
 						diagnostic.save(true);
 					}
 				}
+				const retained = reportArchives.get(delivery.deliveryId);
+				if (retained) retained.facts = archiveFacts(envelope, delivery);
+				updateReportArchive(delivery.deliveryId);
+				reportArchives.delete(delivery.deliveryId);
+				reportDisplays.delete(delivery.deliveryId);
 				changed = true;
 			}
 		}
@@ -657,6 +689,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_before_tree", revokeAuthority);
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
+	const sendCoordinatorTerminal = (run: CoordinatorRun, outcome: "done" | "blocked", summary: string, reason: string | undefined, verification: unknown, rpcDiagnostic?: Record<string, unknown>, awaitLateDiagnostics = false): void => {
+		const canonical = `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${outcome}: ${outcome === "blocked" && summary === "coordinator stopped" ? reason : summary}`;
+		const artifactId = coordinatorArtifactId(run.identity.parentSessionId, run.identity.runId);
+		const facts: Record<string, unknown> = { identity: run.identity, terminal: { outcome, summary, reason, verification }, process: rpcDiagnostic ?? { state: "unavailable" } };
+		const stored = reportStore.writeReport(artifactId, canonical, facts);
+		reportArchives.set(artifactId, { facts });
+		const admission = coordinatorAdmissions.get(run.identity.runId);
+		const display = buildCoordinatorDisplay(admission, Date.now(), outcome, summary, reason, stored.archive);
+		coordinatorAdmissions.delete(run.identity.runId);
+		if (!awaitLateDiagnostics) reportArchives.delete(artifactId);
+		pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome, verification, display } }, { deliverAs: "followUp", triggerTurn: true });
+	};
 	pi.on("input", async (event, ctx) => {
 		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const text = event.text.trim();
@@ -766,6 +810,7 @@ export default function (pi: ExtensionAPI) {
 			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode));
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
+			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: taskExcerpt(request.tickets.join("+")) });
 			coordinatorUnits.add(ownedRun.identity.runId);
 			if (doBinding) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
 			let cleanup: Promise<void> | undefined;
@@ -800,7 +845,7 @@ export default function (pi: ExtensionAPI) {
 				releaseCoordinatorUnit(ownedRun.identity.runId);
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.verificationCount("blocked", reason) ?? 1);
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
-				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
+				sendCoordinatorTerminal(blocked, "blocked", "coordinator stopped", reason, verification, rpc?.diagnosticSnapshot(), rpc?.process.exitCode === null);
 				untrackRunning(rpc?.process);
 				void rpc?.stop();
 				rpcByRun.delete(ownedRun.identity.runId);
@@ -834,7 +879,7 @@ export default function (pi: ExtensionAPI) {
 				coordinators.finalize(ownedRun.identity.runId, proposal.outcome, proposal.reason);
 				releaseCoordinatorUnit(ownedRun.identity.runId);
 				pi.appendEntry("yokemate-coordinator-run", { identity: ownedRun.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
-				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${ownedRun.identity.mode} ${ownedRun.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: ownedRun.identity.runId, mode: ownedRun.identity.mode, tickets: ownedRun.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+				sendCoordinatorTerminal(ownedRun, proposal.outcome, proposal.summary, proposal.reason, verification, rpc?.diagnosticSnapshot(), rpc?.process.exitCode === null);
 				untrackRunning(rpc?.process);
 				void rpcByRun.get(ownedRun.identity.runId)?.stop(); rpcByRun.delete(ownedRun.identity.runId);
 			}, onUiRequest: (event, reply) => {
@@ -869,6 +914,13 @@ export default function (pi: ExtensionAPI) {
 						else reply({ type: "extension_ui_response", id, value });
 					} catch { reply({ type: "extension_ui_response", id, cancelled: true }); }
 				}).catch(() => {});
+			}, onDiagnostic: (snapshot, completed) => {
+				const artifactId = coordinatorArtifactId(ownedRun.identity.parentSessionId, ownedRun.identity.runId);
+				const retained = reportArchives.get(artifactId);
+				if (!retained) return;
+				retained.facts = { ...retained.facts, process: snapshot };
+				reportStore.updateDiagnostics(artifactId, retained.facts);
+				if (completed) reportArchives.delete(artifactId);
 			}, onBlocked: reportBlocked });
 			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
@@ -878,6 +930,8 @@ export default function (pi: ExtensionAPI) {
 			const heading = plan ? fs.readFileSync(plan, "utf8").split(/\r?\n/, 1)[0]! : "";
 			const prefix = `# ${tickets[0]} — `;
 			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
+			const admissionDisplay = coordinatorAdmissions.get(ownedRun.identity.runId);
+			if (admissionDisplay) admissionDisplay.taskExcerpt = taskExcerpt(excerpt || tickets.join("+"));
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
@@ -1039,10 +1093,19 @@ export default function (pi: ExtensionAPI) {
 	const sendReport = (envelope: ReportEnvelope): void => {
 		const { delivery } = registerDelivery(envelope);
 		if (delivery.state !== "pending") return;
+		const canonical = reportContent(envelope, delivery);
+		const factsByRun = new Map((envelope.kind === "result" ? [envelope] : envelope.results).map((result) => [result.identity.runId, diagnosticFacts(result.identity.runId)]));
+		const settledAt = Math.max(...delivery.runIds.map((runId) => reportSettledAt.get(runId) ?? Date.now()));
+		const facts = archiveFacts(envelope, delivery);
+		const stored = reportStore.writeReport(delivery.deliveryId, canonical, facts);
+		reportArchives.set(delivery.deliveryId, { facts });
+		const diagnosticCode = delivery.runIds.map((runId) => diagnostics.get(runId)?.metadata.displayDiagnostic).find((value): value is string => typeof value === "string");
+		const display = reportDisplays.get(delivery.deliveryId) ?? buildReportDisplay(envelope, reportAdmissions, settledAt, stored.archive, factsByRun, diagnosticCode);
+		reportDisplays.set(delivery.deliveryId, display);
 		emitChildState();
 		if (shuttingDown) delivery.state = "delivery_unknown";
 		else try {
-			pi.sendMessage({ customType: "subagent-report", content: reportContent(envelope, delivery), display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } }, { deliverAs: "followUp", triggerTurn: true });
+			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true });
 			if (delivery.state === "pending") delivery.state = "enqueued";
 		} catch { delivery.state = "delivery_failed"; }
 		for (const runId of delivery.runIds) {
@@ -1054,6 +1117,9 @@ export default function (pi: ExtensionAPI) {
 				diagnostic.save(true);
 			}
 		}
+		const retained = reportArchives.get(delivery.deliveryId);
+		if (retained) retained.facts = archiveFacts(envelope, delivery);
+		updateReportArchive(delivery.deliveryId);
 		emitChildState();
 	};
 	const settleBatch = (batchId: string): void => {
@@ -1062,9 +1128,15 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.add(batchId);
 		sendReport(batch);
 		batches.delete(batchId);
+		for (const result of batch.results) {
+			reportAdmissions.delete(result.identity.runId);
+			reportSettledAt.delete(result.identity.runId);
+		}
+		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
 	};
 	const settleResult = (result: ResultEnvelope, report: boolean) => {
 		if (!runs?.settle(result)) return;
+		reportSettledAt.set(result.identity.runId, Date.now());
 		if (report) registerDelivery(result);
 		const batch = runs.batch(result.identity.batchId);
 		if (batch) {
@@ -1101,7 +1173,7 @@ export default function (pi: ExtensionAPI) {
 			finishingCoordinatorRunId = runId;
 			coordinators.finalize(runId, params.outcome, params.reason);
 			pi.appendEntry("yokemate-coordinator-run", { identity: run.identity, state: params.outcome, verification, summary: params.summary, reason: params.reason });
-			pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${run.identity.mode} ${run.identity.ticket}] ${params.outcome}: ${params.summary}`, display: true, details: { runId, mode: run.identity.mode, tickets: run.request.tickets, outcome: params.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
+			sendCoordinatorTerminal(run, params.outcome, params.summary, params.reason, verification, rpcByRun.get(runId)?.diagnosticSnapshot(), rpcByRun.get(runId)?.process.exitCode === null);
 			untrackRunning(rpcByRun.get(runId)?.process);
 			void rpcByRun.get(runId)?.stop();
 			rpcByRun.delete(runId);
@@ -1199,7 +1271,9 @@ export default function (pi: ExtensionAPI) {
 					output = getFinalOutput(result.messages);
 					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
 					const diagnostic = diagnostics.get(identity.runId)!;
-					diagnostic.metadata.payload = { ...(diagnostic.metadata.payload as Record<string, unknown>), outcome: envelope.payloadOutcome, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
+					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
+					const originalPayload = diagnostic.metadata.payload as Record<string, unknown>;
+					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes: Buffer.byteLength(envelope.payload), retainedHash: sha256(envelope.payload), truncated: originalPayload.bytes !== Buffer.byteLength(envelope.payload) || originalPayload.hash !== sha256(envelope.payload), verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
 					const diagnostic = diagnostics.get(identity.runId);
@@ -1218,8 +1292,10 @@ export default function (pi: ExtensionAPI) {
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
-				for (const { identity } of ack.children) {
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date().toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
+				const admittedAt = Date.now();
+				for (const [index, { identity }] of ack.children.entries()) {
+					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: taskExcerpt(tasks[index]!.task), ordinal: index + 1 });
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
 					diagnostics.set(identity.runId, diagnostic);
 					diagnostic.save(false);
@@ -1251,7 +1327,7 @@ export default function (pi: ExtensionAPI) {
 					} finally { activeUnits -= units; }
 				};
 				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
-				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack } };
+				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack, display: { version: 1, members: ack.children.map(({ identity }) => ({ taskExcerpt: reportAdmissions.get(identity.runId)?.taskExcerpt ?? "" })) } } };
 			};
 
 			if (modeCount !== 1) {
