@@ -85,10 +85,19 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
   const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
   let records = 0;
   let prepares = 0;
+  let releaseDelayed: (() => void) | undefined;
+  let markDelayedStarted: (() => void) | undefined;
+  const delayedStarted = new Promise<void>((resolve) => { markDelayedStarted = resolve; });
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
-    publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }),
+    publishPlanScout: async (_ticket, acceptanceId) => {
+      if (acceptanceId === 12) {
+        markDelayedStarted!();
+        await new Promise<void>((resolve) => { releaseDelayed = resolve; });
+      }
+      return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) };
+    },
     preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepares++; assert.equal(acceptanceId, 11); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, target: "fixture", revision: "b".repeat(64) }; },
     planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(recordId, 7); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
@@ -109,6 +118,14 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11 }, worker, target, env)).state, "accepted");
     assert.equal((await prepare()).state, "accepted");
     assert.equal((await requestPlanControl(root, "reject-plan-scout", payload, worker, target, env)).state, "accepted");
+    assert.equal((await prepare()).state, "refused");
+    const delayed = requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
+    await delayedStarted;
+    assert.equal((await requestPlanControl(root, "reject-plan-scout", payload, worker, target, env)).state, "accepted");
+    releaseDelayed!();
+    const superseded = await delayed;
+    assert.equal(superseded.publication, "pending");
+    assert.equal(superseded.reason, "scout superseded");
     assert.equal((await prepare()).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-recorded", { ...handoff, runId: "foreign" }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");

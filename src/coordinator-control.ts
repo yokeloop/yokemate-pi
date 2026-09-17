@@ -63,9 +63,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
-  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; worker?: ControlOrigin; scoutAcceptance?: number }>();
+  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; worker?: ControlOrigin; scoutAcceptance?: number; scoutGeneration?: number }>();
   const problemPackages = new Map<string, Set<string>>();
   const scoutAcceptances = new Map<string, number>();
+  const scoutGenerations = new Map<string, number>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const processKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pid}\u0000${origin.starttime}\u0000${origin.pane ?? ""}`;
   const origins = new Map<string, ControlOrigin>();
@@ -140,7 +141,14 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 const scoutKey = `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
                 if (envelope.operation === "publish-plan-scout") {
                   if (!Number.isSafeInteger(envelope.acceptanceId) || !parent.publishPlanScout) throw new Error("plan scout publication is unavailable");
+                  const generation = planRun ? (planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1) : (scoutGenerations.get(scoutKey) ?? 0) + 1;
+                  if (!planRun) scoutGenerations.set(scoutKey, generation);
                   const outcome = await parent.publishPlanScout(ticket, envelope.acceptanceId!, origin);
+                  const currentGeneration = planRun ? planRun.scoutGeneration : scoutGenerations.get(scoutKey);
+                  if (currentGeneration !== generation) {
+                    reply({ requestId: envelope.requestId, state: "accepted", acceptanceId: envelope.acceptanceId, ...outcome, publication: "pending", reason: "scout superseded" });
+                    continue;
+                  }
                   if (planRun) planRun.scoutAcceptance = envelope.acceptanceId;
                   else scoutAcceptances.set(scoutKey, envelope.acceptanceId!);
                   if (problemWorker) {
@@ -150,8 +158,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   }
                   reply({ requestId: envelope.requestId, state: "accepted", acceptanceId: envelope.acceptanceId, ...outcome });
                 } else if (envelope.operation === "reject-plan-scout") {
-                  if (planRun) planRun.scoutAcceptance = undefined;
-                  else scoutAcceptances.delete(scoutKey);
+                  if (planRun) {
+                    planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1;
+                    planRun.scoutAcceptance = undefined;
+                  } else {
+                    scoutGenerations.set(scoutKey, (scoutGenerations.get(scoutKey) ?? 0) + 1);
+                    scoutAcceptances.delete(scoutKey);
+                  }
                   reply({ requestId: envelope.requestId, state: "accepted", reason: "scout rejected" });
                 } else if (envelope.operation === "prepare-plan-publication") {
                   const acceptanceId = planRun?.scoutAcceptance ?? scoutAcceptances.get(scoutKey);
