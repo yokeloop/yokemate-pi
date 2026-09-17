@@ -1,8 +1,7 @@
-// The model every launch runs on comes from the project passports and nowhere
-// else: an explicit --model in the engineer's command overrides it, and the
-// machine's own default never leaks in (YM-84). A ticket resolves through its
-// key prefix, worklog through the org column; both refuse loudly when the
-// passports cannot answer.
+// Project passports are the first configuration answer after an explicit
+// --model: a ticket resolves through its key prefix and worklog through the org
+// column. An empty set returns null so the caller can use its pool fallback;
+// existing passports with a broken answer still refuse loudly.
 //
 // The model is resolved per panel mode: a passport carries one default for the
 // project and, over it, a map of per-mode overrides (YM-159). The resolution
@@ -68,12 +67,12 @@ export function rowModel(row: PassportRow, mode: Mode): string | null {
 }
 
 /** ACME-347 + этап → модель, на которой сходятся все паспорта ключа ACME. */
-export function modelForTicket(db: DatabaseSync, ticket: string, mode: Mode): string {
+export function modelForTicket(db: DatabaseSync, ticket: string, mode: Mode): string | null {
   const key = ticket.split("-")[0];
   const rows = db
     .prepare("SELECT model, mode_models FROM project WHERE tracker_key = ?")
     .all(key) as unknown as PassportRow[];
-  if (rows.length === 0) throw new Error(`no passport with key ${key} — pnpm add-project first`);
+  if (rows.length === 0) return null;
   const models = [...new Set(rows.map((r) => rowModel(r, mode)))];
   if (models.length > 1 || models[0] === null)
     throw new Error(
@@ -84,12 +83,11 @@ export function modelForTicket(db: DatabaseSync, ticket: string, mode: Mode): st
 }
 
 /** acme + этап → модель, на которой сходятся все паспорта организации. */
-export function modelForOrg(db: DatabaseSync, org: string, mode: Mode): string {
+export function modelForOrg(db: DatabaseSync, org: string, mode: Mode): string | null {
   const rows = db
     .prepare("SELECT model, mode_models FROM project WHERE org = ?")
     .all(org) as unknown as PassportRow[];
-  if (rows.length === 0)
-    throw new Error(`no passports of org ${org} — pass --model in the command, or pnpm add-project first`);
+  if (rows.length === 0) return null;
   const models = [...new Set(rows.map((r) => rowModel(r, mode)))];
   if (models.length > 1 || models[0] === null)
     throw new Error(

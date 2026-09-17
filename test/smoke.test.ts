@@ -17,7 +17,7 @@ import {
 } from "../src/project-model.ts";
 import { syncWork, type TicketState } from "../src/sync.ts";
 import { fetchAll, fetchIssue, PAGE, ticketStates, valueNames, type RawIssue } from "../src/youtrack.ts";
-import { MODES, freeAgentName, resolveLaunch, resolvePlanTargets } from "../src/mode-tab.ts";
+import { MODES, freeAgentName, resolveLaunch, resolveModeModel, resolvePlanTargets } from "../src/mode-tab.ts";
 import { parseSurfaceArgs } from "../src/mode-surface.ts";
 import { decide } from "../src/mode-guard.ts";
 import { parseKeyList, parseShipArgs } from "../src/ship-args.ts";
@@ -404,11 +404,10 @@ test("a per-mode model round-trips through the column and its command token", ()
   assert.deepEqual(parseModeModels(null), {});
 });
 
-// 9b. Every launch's model resolves through the passports: one distinct value
-// per tracker key (or org for worklog) answers, anything else refuses loudly —
-// no default ever fills the gap. The value is resolved per passport row before
-// the rows are deduplicated: the mode's override is what has to agree, not the
-// column it was read from.
+// 9b. Existing passports answer with one distinct value per tracker key (or
+// org for worklog); an absent set returns null so the caller can ask the pool.
+// The value is resolved per passport row before the rows are deduplicated: the
+// mode's override is what has to agree, not the column it was read from.
 test("model resolves per tracker key and org, refusing gaps and disagreement", () => {
   const db = memDb();
   const ins = db.prepare(
@@ -430,7 +429,7 @@ test("model resolves per tracker key and org, refusing gaps and disagreement", (
   assert.equal(modelForTicket(db, "ACME-347", "do"), "opus");
   assert.equal(modelForTicket(db, "ACME-347", "review"), "luna");
   assert.throws(() => modelForTicket(db, "AEU-1", "do"), /AEU/);
-  assert.throws(() => modelForTicket(db, "NOPE-1", "do"), /NOPE/);
+  assert.equal(modelForTicket(db, "NOPE-1", "do"), null);
 
   // The override answers where the defaults would have refused …
   assert.equal(modelForTicket(db, "DIS-1", "plan"), "astra");
@@ -442,7 +441,43 @@ test("model resolves per tracker key and org, refusing gaps and disagreement", (
   assert.equal(modelForOrg(db, "acme", "worklog"), "opus");
   assert.equal(modelForOrg(db, "acme", "review"), "luna");
   assert.throws(() => modelForOrg(db, "acme-eu", "worklog"), /acme-eu/);
-  assert.throws(() => modelForOrg(db, "ghost", "worklog"), /ghost/);
+  assert.equal(modelForOrg(db, "ghost", "worklog"), null);
+
+  const legacy = new DatabaseSync(":memory:");
+  legacy.exec("CREATE TABLE project (tracker_key TEXT, org TEXT, model TEXT, mode_models TEXT)");
+  legacy.prepare("INSERT INTO project VALUES ('OLD', 'old', NULL, NULL)").run();
+  assert.throws(() => modelForTicket(legacy, "OLD-1", "do"), /disagree on the do model \(NULL\)/);
+  assert.throws(() => modelForOrg(legacy, "old", "worklog"), /disagree on the worklog model \(NULL\)/);
+});
+
+test("foreground mode model resolution falls back only for an empty passport set", () => {
+  const data = fs.mkdtempSync(join(tmpdir(), "mode-model-"));
+  const db = new DatabaseSync(":memory:");
+  db.exec("CREATE TABLE project (tracker_key TEXT, org TEXT, model TEXT, mode_models TEXT)");
+  const ins = db.prepare("INSERT INTO project VALUES (?, ?, ?, ?)");
+  ins.run("KEY", "org", "default", '{"review":"override"}');
+  ins.run("FIRST", "first", "first-model", null);
+  ins.run("SECOND", "second", "second-model", null);
+  ins.run("DIS", "dis", "one", null);
+  ins.run("DIS", "dis", "two", null);
+  ins.run("NULL", "null-org", null, null);
+  try {
+    fs.writeFileSync(join(data, "pool.json"), '{"review":"pool-review","worklog":"pool-worklog"}');
+    assert.equal(resolveModeModel(db, data, "review", "MISSING-1"), "pool-review");
+    assert.equal(resolveModeModel(db, data, "worklog", "missing-org"), "pool-worklog");
+
+    fs.writeFileSync(join(data, "pool.json"), "not json");
+    assert.equal(resolveModeModel(db, data, "review", "KEY-1"), "override");
+    assert.equal(resolveModeModel(db, data, "do", "KEY-1"), "default");
+    assert.equal(resolveModeModel(db, data, "review", "FIRST-1+SECOND-2"), "first-model");
+
+    fs.rmSync(join(data, "pool.json"));
+    assert.throws(() => resolveModeModel(db, data, "do", "DIS-1"), /disagree on the do model/);
+    assert.throws(() => resolveModeModel(db, data, "worklog", "null-org"), /disagree on the worklog model \(NULL\)/);
+  } finally {
+    db.close();
+    fs.rmSync(data, { recursive: true, force: true });
+  }
 });
 
 // 10. Subsystem groups a tracker key's repositories in `on-me`, single or multi

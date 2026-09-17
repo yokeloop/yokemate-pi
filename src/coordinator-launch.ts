@@ -5,6 +5,7 @@ import { openDb } from "./db.ts";
 import { dataRoot } from "./data-root.ts";
 import { findPlan, parseAffected, type PlanPart } from "./adopt.ts";
 import { modelForTicket } from "./project-model.ts";
+import { poolModel } from "./pool.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
@@ -83,7 +84,7 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan), settings: snapshot });
   if (!preflight.ok) fail(preflight.refuse);
   const parts = partsForPlan(root, ticket, plan);
-  const model = request.model ?? modelForTicket(db, ticket, "do");
+  const model = request.model ?? modelForTicket(db, ticket, "do") ?? poolModel(dataRoot(root), "do");
   mkdirSync(folder, { recursive: true });
   settings(root, folder);
   const passports = parts.map((p) => `- ${p.repo}: clone at ${p.path}${p.figmaMcp ? `, Figma MCP ${p.figmaMcp}` : ""}${p.figmaUrl ? `, design file ${p.figmaUrl}` : ""}`).join("\n");
@@ -124,6 +125,6 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
       parts.push({ ...part, pr: base[1], base: base[0], path: gitCwd, figmaUrl: part.figmaUrl, figmaMcp: part.figmaMcp, remote } as PreparedPart);
     }
   }
-  const model = request.model ?? modelForTicket(db, request.tickets[0]!, "ship");
+  const model = request.model ?? modelForTicket(db, request.tickets[0]!, "ship") ?? poolModel(dataRoot(root), "ship");
   return { mode: "ship", tickets: [...request.tickets], model, cwd: root, plans, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:ship-worker ${request.tickets.join("+")}${request.note ? ` ${request.note}` : ""}. Work only in the listed task worktrees and call coordinator_finish with the verified outcome.` };
 }

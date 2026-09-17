@@ -211,8 +211,8 @@ if [ ! -d "$YOKEMATE_DIR/home/.git" ]; then
 fi
 
 if [ -d "$YOKEMATE_DIR/home/.git" ] && [ ! -f "$YOKEMATE_DIR/home/pool.json" ]; then
-  manual+=("home/pool.json: /plan on a problem and /note take their model from it —
-       create it as {\"plan\": \"<pattern>\", \"note\": \"<pattern>\"}")
+  manual+=("home/pool.json: final model fallback and pool.do default for add-project —
+       create it as {\"plan\":\"<pattern>\",\"review\":\"<pattern>\",\"do\":\"<pattern>\",\"ship\":\"<pattern>\",\"worklog\":\"<pattern>\",\"note\":\"<pattern>\",\"research\":\"<pattern>\"}")
 fi
 
 gh auth status >/dev/null 2>&1 || manual+=("gh auth login")

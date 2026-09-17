@@ -1,10 +1,9 @@
-// The model of a launch that has no ticket. `/plan <проблема>` and `/note
-// <тема>` carry no key, so no passport can be asked — and the machine's own
-// default is never inherited (YM-84). The answer lives in home/pool.json, in
-// the engineer's own repository next to projects.json, so it reaches a new
-// machine by the same git clone the passports do.
+// The final model source after an explicit choice and matching passports.
+// Ticketless launches ask it immediately; keyed launches ask it only when no
+// passport matches. The answer lives in home/pool.json beside projects.json,
+// so it reaches a new machine with the same personal-data clone.
 //
-// No branch here falls back to a literal: a missing file or a missing mode is
+// No branch here falls back to a literal: a missing file or requested mode is
 // a loud refusal naming what to write (YM-159).
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,9 +21,10 @@ export function readPool(dataRoot: string): Partial<Record<Mode, string>> {
   try {
     raw = readFileSync(path, "utf8");
   } catch {
+    const shape = JSON.stringify(Object.fromEntries(MODES.map((mode) => [mode, "<pattern>"])));
     throw new Error(
-      `no pool.json in ${dataRoot} — a launch without a ticket takes its model from there: ` +
-        `create it as {"plan": "<pattern>", "note": "<pattern>", "research": "<pattern>"}, or pass --model in the command`,
+      `no pool.json in ${dataRoot} — the final model fallback lives there: ` +
+        `create it as ${shape}, or pass --model in the command`,
     );
   }
   let parsed: unknown;
@@ -46,7 +46,7 @@ export function readPool(dataRoot: string): Partial<Record<Mode, string>> {
   return out;
 }
 
-/** Модель безтикетного запуска этого мода. Кидает, называя, что дописать. */
+/** Последняя модель для этого мода. Кидает, называя, что дописать. */
 export function poolModel(dataRoot: string, mode: Mode): string {
   const model = readPool(dataRoot)[mode];
   if (!model)

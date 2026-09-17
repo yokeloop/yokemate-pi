@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { findPlan } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
@@ -12,6 +13,7 @@ import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
+import type { Mode as ModelMode } from "./mode-guard.ts";
 
 function incompleteTerminalCapture(error: unknown): boolean {
   const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
@@ -55,6 +57,18 @@ export interface Launch {
 export interface StandFacts {
   folder: boolean;
   plan: boolean;
+}
+
+export function resolveModeModel(
+  db: DatabaseSync,
+  rootData: string,
+  mode: ModelMode,
+  ticket: string,
+): string {
+  if (!ticket) return poolModel(rootData, mode);
+  return (mode === "worklog"
+    ? modelForOrg(db, ticket, mode)
+    : modelForTicket(db, ticket.split("+")[0], mode)) ?? poolModel(rootData, mode);
 }
 
 /**
@@ -247,7 +261,7 @@ if (import.meta.filename === process.argv[1]) {
           } else {
             const db = openDb(join(ROOT, "yokemate.db"));
             try {
-              model = mode === "worklog" ? modelForOrg(db, ticket, mode) : modelForTicket(db, ticket, mode);
+              model = resolveModeModel(db, dataRoot(ROOT), mode, ticket);
             } finally { db.close(); }
           }
         } catch (e) {
