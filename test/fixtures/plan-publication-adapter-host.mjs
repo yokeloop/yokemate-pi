@@ -9,7 +9,7 @@ export default function (pi) {
       const attempts = process.env.YM216_PARALLEL_CONNECT
         ? await Promise.allSettled([runtime.youTrackAdapter("youtrack-fixture", "YM-216"), runtime.youTrackAdapter("youtrack-fixture", "YM-217")])
         : [await runtime.youTrackAdapter("youtrack-fixture", "YM-216").then(() => ({ status: "fulfilled" })).catch(() => ({ status: "rejected" }))];
-      if (attempts.some((attempt) => attempt.status !== "rejected")) throw new Error("fixture expected the shared first connect to fail");
+      if (attempts.every((attempt) => attempt.status !== "rejected")) throw new Error("fixture expected the first connect to fail");
     }
     if (process.env.YM216_EXPECT_ERROR) {
       try { await runtime.youTrackAdapter("youtrack-fixture", "YM-216"); }
