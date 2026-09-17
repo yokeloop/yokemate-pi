@@ -50,6 +50,38 @@ test("GitHub adapter paginates to an empty page and posts through body-file stdi
   assert.equal(post.input, "Unicode 🙂 body");
 });
 
+test("GitHub executable fixture paginates, accepts Unicode stdin and exposes stable remote facts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "publication-gh-"));
+  const prior = { ...process.env };
+  try {
+    const bin = join(root, "bin");
+    const clone = join(root, "clone");
+    const state = join(root, "state.json");
+    const log = join(root, "log.json");
+    mkdirSync(bin);
+    mkdirSync(clone);
+    symlinkSync(join(import.meta.dirname, "fixtures/plan-publication-gh.mjs"), join(bin, "gh"));
+    writeFileSync(state, JSON.stringify(Array.from({ length: 101 }, (_, index) => ({ id: index + 1, body: `comment-${index + 1}`, html_url: `https://github.com/o/r/issues/2#issuecomment-${index + 1}` }))));
+    writeFileSync(log, "[]");
+    Object.assign(process.env, { PATH: `${bin}:${prior.PATH ?? ""}`, YM216_GH_STATE: state, YM216_GH_LOG: log });
+    const adapter = githubPublicationAdapter({ owner: "o", repo: "r", issueNumber: 2, clonePath: clone });
+    assert.equal((await adapter.list()).length, 101);
+    await adapter.add("Unicode 🙂 publication");
+    const comments = await adapter.list();
+    assert.equal(comments.length, 102);
+    assert.equal(comments.at(-1)?.text, "Unicode 🙂 publication");
+    const calls = JSON.parse(readFileSync(log, "utf8")) as { args: string[]; body?: string }[];
+    const post = calls.find((call) => call.args[0] === "issue")!;
+    assert.deepEqual(post.args, ["issue", "comment", "2", "--repo", "o/r", "--body-file", "-"]);
+    assert.equal(post.body, "Unicode 🙂 publication");
+    assert.ok(calls.filter((call) => call.args[0] === "api").length >= 6);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
+    Object.assign(process.env, prior);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("private YouTrack bridge uses the real pinned adapter, exact schemas and pagination", { timeout: 30000 }, async () => {
   const source = join(import.meta.dirname, "..");
   const root = mkdtempSync(join(tmpdir(), "publication-mcp-"));

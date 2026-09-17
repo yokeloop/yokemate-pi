@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { acceptPublication, markSuccessfulRecord, publicationFor, readPublicationArtifact } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, markSuccessfulRecord, planRecordById, publicationFor, readPublicationArtifact } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
 const plan = (ticket = "YM-1", repo = "org/repo") => `# ${ticket} — fixture
@@ -72,13 +72,24 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     assert.equal(readFileSync(first.artifact_path).toString(), firstBytes.toString());
     assert.equal(statSync(first.artifact_path).mode & 0o777, 0o600);
     const planBytes = Buffer.from(plan());
-    const planRow = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "plan", bytes: planBytes, runId: "plan", planPath: "/plan", scopeHash: "scope", scoutPublication: first.id });
+    const planRow = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "plan", bytes: planBytes, runId: "plan" });
+    assert.equal(planRow.plan_path, null);
+    const firstRecord = acceptPlanRecord(db, { ticket: "YM-1", publicationId: planRow.id, planPath: "/plan", contentHash: planRow.content_hash, scopeHash: "scope", scoutPublication: first.id });
     db.exec("BEGIN IMMEDIATE");
-    markSuccessfulRecord(db, planRow.id, first.id);
+    markSuccessfulRecord(db, firstRecord.id);
     db.exec("ROLLBACK");
-    assert.equal(publicationFor(db, target, "YM-1", "plan", sha256(planBytes))?.successful_record, 0);
-    markSuccessfulRecord(db, planRow.id, second.id);
-    assert.equal(publicationFor(db, target, "YM-1", "plan", sha256(planBytes))?.scout_publication, second.id);
+    assert.equal(planRecordById(db, firstRecord.id)?.successful_record, 0);
+    assert.equal(publicationFor(db, target, "YM-1", "plan", sha256(planBytes))?.plan_path, null);
+    markSuccessfulRecord(db, firstRecord.id);
+    assert.equal(publicationFor(db, target, "YM-1", "plan", sha256(planBytes))?.plan_path, "/plan");
+    const repeatedDocument = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "plan", bytes: planBytes, runId: "new-plan-run", planPath: "/other-plan", scopeHash: "scope" });
+    assert.equal(repeatedDocument.id, planRow.id);
+    assert.equal(repeatedDocument.plan_path, "/plan", "document framing is immutable");
+    const secondRecord = acceptPlanRecord(db, { ticket: "YM-1", publicationId: planRow.id, planPath: "/other-plan", contentHash: planRow.content_hash, scopeHash: "scope", scoutPublication: second.id });
+    assert.equal(planRecordById(db, firstRecord.id)?.successful_record, 1, "pre-CAS intent must not alter the current record");
+    assert.equal(planRecordById(db, firstRecord.id)?.scout_publication, first.id);
+    assert.equal(planRecordById(db, secondRecord.id)?.successful_record, 0);
+    assert.equal(planRecordById(db, secondRecord.id)?.scout_publication, second.id);
     writeFileSync(first.artifact_path, "tampered");
     assert.throws(() => readPublicationArtifact(root, first), /artifact_invalid/);
     chmodSync(join(root, ".pi", "plan-publications"), 0o700);

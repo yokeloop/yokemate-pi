@@ -41,6 +41,39 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
   }
 });
 
+test("ticketless problem workers can continue only tickets admitted by their accepted scout", async () => {
+  const { requestPlanControl } = await import("../src/coordinator-control.ts");
+  const root = mkdtempSync(join(tmpdir(), "problem-plan-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "problem-plan-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+  let prepares = 0;
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    publishPlanScout: async (ticket, publicationId) => ({ reason: `${ticket}/${publicationId}`, publication: "complete", target: "fixture", revision: "a".repeat(64) }),
+    preparePlanPublication: async () => { prepares++; return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, target: "fixture", revision: "b".repeat(64) }; },
+  }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const runtimeDir = socketDir(env, process.getuid!());
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "problem.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: null }));
+    const worker = { ...main, sessionId: "problem-session", mode: "plan", role: "coordinator", pane: "problem", parentPane: "main" };
+    const prepare = (ticket: string) => requestPlanControl(root, "prepare-plan-publication", { ticket, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
+    assert.equal((await prepare("YM-1")).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", publicationId: 1 }, worker, target, env)).state, "accepted");
+    assert.equal((await prepare("YM-1")).state, "accepted");
+    assert.equal((await prepare("YM-2")).state, "refused");
+    assert.equal(prepares, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("plan handoff is bound to the registered pane run and its live worker session", async () => {
   const { requestPlanControl } = await import("../src/coordinator-control.ts");
   const root = mkdtempSync(join(tmpdir(), "plan-control-"));
@@ -52,7 +85,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
-    planRecorded: async (ticket, path, publicationId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(publicationId, 7); return { reason: "recorded" }; },
+    planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(recordId, 7); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -62,7 +95,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const payload = { ticket: "YM-1", runId: register.runId };
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
     writeFileSync(join(socketDir(env, process.getuid!()), "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
-    const handoff = { ...payload, path: "/recorded.md", publicationId: 7 };
+    const handoff = { ...payload, path: "/recorded.md", recordId: 7 };
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");

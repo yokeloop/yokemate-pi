@@ -32,26 +32,39 @@ export function normalizeScoutMarkdown(value: string): Buffer {
 }
 
 function secretValue(value: string): boolean {
-  const clean = value.trim().replace(/^['"]|['"]$/g, "");
+  let clean = value.trim().replace(/[,;]\s*$/, "").trim();
+  if ((clean.startsWith('"') && clean.endsWith('"')) || (clean.startsWith("'") && clean.endsWith("'"))) clean = clean.slice(1, -1).trim();
   return clean.length > 0 && !placeholder.test(clean);
+}
+
+function rejectSecretValues(text: string, pattern: RegExp): void {
+  for (const match of text.matchAll(pattern)) if (secretValue(match[1]!)) throw new PublicationFailure("unsafe_document");
 }
 
 export function assertPublishable(bytes: Buffer): void {
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new PublicationFailure("unsafe_document"); }
-  const blocked = [
-    /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/i,
-    /^(?:Authorization|Proxy-Authorization)\s*:\s*(?:Bearer|Basic)\s+\S+/im,
-    /^(?:Cookie|Set-Cookie)\s*:\s*\S+/im,
-    /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|perm:[A-Za-z0-9_-]{16,})\b/,
-    /https?:\/\/[^\s/@:]+:[^\s/@]+@/i,
-    /[?&](?:access_token|refresh_token|api_key|apikey|token|password|secret|client_secret)=([^&#\s]+)/i,
-  ];
-  if (blocked.some((pattern) => pattern.test(text))) throw new PublicationFailure("unsafe_document");
-  const assignment = /^\s*(?:export\s+)?(?:token|api_key|apikey|password|secret|client_secret|access_token|refresh_token)\s*[:=]\s*(.+?)\s*$/gim;
-  for (const match of text.matchAll(assignment)) if (secretValue(match[1]!)) throw new PublicationFailure("unsafe_document");
   if (!text.trim()) throw new PublicationFailure("unsafe_document");
+  const unconditional = [
+    /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/i,
+    /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|perm:[A-Za-z0-9_-]{16,})\b/,
+  ];
+  if (unconditional.some((pattern) => pattern.test(text))) throw new PublicationFailure("unsafe_document");
+  rejectSecretValues(text, /^(?:Authorization|Proxy-Authorization)\s*:\s*(?:Bearer|Basic)\s+([^\s]+)\s*$/gim);
+  for (const match of text.matchAll(/^(?:Cookie|Set-Cookie)\s*:\s*(.+?)\s*$/gim)) {
+    const header = match[1]!.trim();
+    if (placeholder.test(header)) continue;
+    for (const item of header.split(";")) {
+      const equals = item.indexOf("=");
+      if (equals < 0 || secretValue(item.slice(equals + 1))) throw new PublicationFailure("unsafe_document");
+    }
+  }
+  rejectSecretValues(text, /https?:\/\/[^\s/@:]+:([^\s/@]+)@/gim);
+  rejectSecretValues(text, /[?&](?:access_token|refresh_token|api_key|apikey|token|password|secret|client_secret)=([^&#\s]+)/gim);
+  rejectSecretValues(text, /["'](?:token|api_key|apikey|password|secret|client_secret|access_token|refresh_token)["']\s*:\s*((?:"[^"]*")|(?:'[^']*'))/gim);
+  const assignment = /^\s*(?:(?:export\s+)?(?:const|let|var)\s+|[-*]\s*)?["']?(?:token|api_key|apikey|password|secret|client_secret|access_token|refresh_token)["']?\s*[:=]\s*(.+?)\s*$/gim;
+  rejectSecretValues(text, assignment);
 }
 
 function marker(input: PublicationFrameInput, part: number, total: number, fragment: Buffer): string {

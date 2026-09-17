@@ -46,7 +46,7 @@ import { researchChildLaunch, researchIdentity } from "../../../src/research-gua
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 import { openDb } from "../../../src/db.ts";
 import { resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPublication, latestScout, markPublicationResult, markSuccessfulRecord, publicationById, readPublicationArtifact, recordPublicationBlock, writePublicationArtifact } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, latestScout, markPublicationResult, planRecordById, publicationById, readPublicationArtifact, recordPublicationBlock, writePublicationArtifact } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
@@ -996,7 +996,7 @@ export default function (pi: ExtensionAPI) {
 					let row;
 					try {
 						row = publicationById(db, publicationId);
-						if (!row || row.ticket !== ticket || row.kind !== "scout" || row.owner_session_id !== origin.sessionId) throw new Error("accepted scout identity does not match its live plan worker");
+						if (!row || row.ticket !== ticket || row.kind !== "scout" || row.owner_session_id !== origin.sessionId || row.owner_run_id !== origin.sessionId || !row.batch_id || !row.task_hash) throw new Error("accepted scout identity does not match its live plan worker");
 					} finally { db.close(); }
 					const result = await publishAccepted(publicationId);
 					return { reason: result.complete ? "scout publication complete" : result.error ?? "unavailable", publication: result.complete ? "complete" as const : "pending" as const, target: result.target, revision: row.content_hash };
@@ -1015,21 +1015,27 @@ export default function (pi: ExtensionAPI) {
 					if (!scoutResult.complete) throw new Error(`${target.visibleTarget}: scout publication pending: ${scoutResult.error ?? "unavailable"}`);
 					const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let plan;
-					try { plan = acceptPublication(state, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket, kind: "plan", bytes: snapshot.bytes, runId: origin.sessionId, planPath: snapshot.path, scopeHash: snapshot.scopeHash, scoutPublication: scout.id }); }
-					finally { state.close(); }
-					return { reason: "publication prepared", publicationId: plan.id, snapshotPath: plan.artifact_path, scoutPublication: scout.id, target: target.visibleTarget, revision: plan.content_hash };
+					let record;
+					try {
+						plan = acceptPublication(state, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket, kind: "plan", bytes: snapshot.bytes, runId: origin.sessionId });
+						record = acceptPlanRecord(state, { ticket, publicationId: plan.id, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, scoutPublication: scout.id });
+					} finally { state.close(); }
+					return { reason: "publication prepared", publicationId: plan.id, recordId: record.id, snapshotPath: plan.artifact_path, scoutPublication: scout.id, target: target.visibleTarget, revision: plan.content_hash };
 				},
-				planRecorded: async (ticket, recordedPath, publicationId) => {
+				planRecorded: async (ticket, recordedPath, recordId) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let row;
+					let record;
 					let scout;
 					try {
-						row = publicationById(db, publicationId);
-						if (!row || row.ticket !== ticket || row.kind !== "plan" || !row.successful_record || row.plan_path !== binding.path || row.content_hash !== binding.contentHash || row.scope_hash !== binding.scopeHash || !row.scout_publication) throw new Error("binding_changed");
-						scout = publicationById(db, row.scout_publication);
+						record = planRecordById(db, recordId);
+						if (!record || record.ticket !== ticket || !record.successful_record || record.plan_path !== binding.path || record.content_hash !== binding.contentHash || record.scope_hash !== binding.scopeHash) throw new Error("binding_changed");
+						row = publicationById(db, record.publication_id);
+						if (!row || row.ticket !== ticket || row.kind !== "plan" || row.content_hash !== binding.contentHash) throw new Error("binding_changed");
+						scout = publicationById(db, record.scout_publication);
 						if (!scout || scout.kind !== "scout" || scout.ticket !== ticket) throw new Error("binding_changed");
 					} finally { db.close(); }
 					const scoutResult = await publishAccepted(scout.id);

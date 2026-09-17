@@ -39,7 +39,27 @@ export interface PublicationIdentityInput {
   child?: ChildIdentity;
   planPath?: string;
   scopeHash?: string;
-  scoutPublication?: number;
+}
+
+export interface PlanRecordRow {
+  id: number;
+  ticket: string;
+  publication_id: number;
+  plan_path: string;
+  content_hash: string;
+  scope_hash: string;
+  scout_publication: number;
+  successful_record: 0 | 1;
+  side_effects_started: 0 | 1;
+}
+
+export interface PlanRecordInput {
+  ticket: string;
+  publicationId: number;
+  planPath: string;
+  contentHash: string;
+  scopeHash: string;
+  scoutPublication: number;
 }
 
 const contained = (root: string, candidate: string): boolean => {
@@ -91,13 +111,12 @@ export function acceptPublication(db: DatabaseSync, root: string, input: Publica
   const contentHash = sha256(input.bytes);
   const artifact = writePublicationArtifact(root, input.ticket, input.kind, contentHash, input.bytes);
   db.prepare(`INSERT INTO plan_publication
-    (target,target_hash,ticket,kind,content_hash,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,scout_publication)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(target,ticket,kind,content_hash) DO UPDATE SET
-      scout_publication=COALESCE(excluded.scout_publication,plan_publication.scout_publication), updated_at=datetime('now')`).run(
+    (target,target_hash,ticket,kind,content_hash,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(target,ticket,kind,content_hash) DO NOTHING`).run(
     input.target, input.targetHash, input.ticket, input.kind, contentHash, artifact, input.bytes.length, input.runId,
     input.child?.ownerRunId ?? null, input.child?.ownerSessionId ?? null, input.child?.batchId ?? null, input.child?.taskHash ?? null,
-    input.planPath ?? null, input.scopeHash ?? null, input.scoutPublication ?? null,
+    input.planPath ?? null, input.scopeHash ?? null,
   );
   return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=?").get(input.target, input.ticket, input.kind, contentHash) as unknown as PublicationRow;
 }
@@ -141,11 +160,36 @@ export function markPublicationResult(db: DatabaseSync, rowId: number, result: {
   else db.prepare("UPDATE work SET next=? WHERE ticket=?").run(`${prefix} ${result.error ?? "unavailable"}`, row.ticket);
 }
 
-export function markSuccessfulRecord(db: DatabaseSync, publicationId: number, scoutPublication: number): void {
-  db.prepare("UPDATE plan_publication SET successful_record=1,scout_publication=?,updated_at=datetime('now') WHERE id=? AND kind='plan'").run(scoutPublication, publicationId);
+export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): PlanRecordRow {
+  db.prepare(`INSERT INTO plan_record
+    (ticket,publication_id,plan_path,content_hash,scope_hash,scout_publication)
+    VALUES (?,?,?,?,?,?) ON CONFLICT(ticket,publication_id,plan_path,content_hash,scope_hash,scout_publication) DO NOTHING`).run(
+    input.ticket, input.publicationId, input.planPath, input.contentHash, input.scopeHash, input.scoutPublication,
+  );
+  return db.prepare(`SELECT * FROM plan_record
+    WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=?`).get(
+    input.ticket, input.publicationId, input.planPath, input.contentHash, input.scopeHash, input.scoutPublication,
+  ) as unknown as PlanRecordRow;
 }
 
-export function markSideEffectsStarted(db: DatabaseSync, publicationId: number): boolean {
-  const changed = db.prepare("UPDATE plan_publication SET side_effects_started=1,updated_at=datetime('now') WHERE id=? AND side_effects_started=0").run(publicationId).changes;
+export function planRecordById(db: DatabaseSync, id: number): PlanRecordRow | undefined {
+  return db.prepare("SELECT * FROM plan_record WHERE id=?").get(id) as unknown as PlanRecordRow | undefined;
+}
+
+export function currentPlanRecord(db: DatabaseSync, ticket: string): PlanRecordRow | undefined {
+  return db.prepare("SELECT * FROM plan_record WHERE ticket=? AND successful_record=1 ORDER BY id DESC LIMIT 1").get(ticket) as unknown as PlanRecordRow | undefined;
+}
+
+export function markSuccessfulRecord(db: DatabaseSync, recordId: number): void {
+  db.prepare("UPDATE plan_record SET successful_record=1,updated_at=datetime('now') WHERE id=?").run(recordId);
+  db.prepare(`UPDATE plan_publication SET
+    plan_path=(SELECT plan_path FROM plan_record WHERE id=?),
+    scope_hash=(SELECT scope_hash FROM plan_record WHERE id=?),
+    updated_at=datetime('now')
+    WHERE id=(SELECT publication_id FROM plan_record WHERE id=?) AND kind='plan' AND plan_path IS NULL AND scope_hash IS NULL`).run(recordId, recordId, recordId);
+}
+
+export function markSideEffectsStarted(db: DatabaseSync, recordId: number): boolean {
+  const changed = db.prepare("UPDATE plan_record SET side_effects_started=1,updated_at=datetime('now') WHERE id=? AND successful_record=1 AND side_effects_started=0").run(recordId).changes;
   return changed === 1;
 }

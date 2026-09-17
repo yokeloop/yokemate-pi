@@ -58,6 +58,7 @@ test("credential sentinels block the whole document before the first post and pl
   const sentinels = [
     "-----BEGIN PRIVATE KEY-----", "Authorization: Bearer abcdef", "Cookie: session=abcdef",
     "github_pat_abcdefghijklmnopqrstuvwxyz", "https://user:password@example.test/path", "https://example.test/?access_token=value", "client_secret = literal-value",
+    "const token = \"literal-secret-value\"", "- token: literal-secret-value", "{\"password\":\"literal-secret-value\"}",
   ];
   for (const sentinel of sentinels) {
     const text = `# Safe beginning\n${"x".repeat(30_000)}\n${sentinel}`;
@@ -67,6 +68,6 @@ test("credential sentinels block the whole document before the first post and pl
     assert.equal(result.error, "unsafe_document", sentinel);
     assert.equal(posts, 0, sentinel);
   }
-  assert.doesNotThrow(() => assertPublishable(Buffer.from("token = ${TOKEN}\npassword: <example>\nsecret=[REDACTED]")));
+  assert.doesNotThrow(() => assertPublishable(Buffer.from("token = ${TOKEN}\npassword: <example>\nsecret=[REDACTED]\nAuthorization: Bearer <TOKEN>\nhttps://example.test/?token=${TOKEN}\nCookie: session=${SESSION}")));
   assert.throws(() => assertPublishable(Buffer.from("password=literal")), (error: unknown) => error instanceof PublicationFailure && error.code === "unsafe_document");
 });
