@@ -51,7 +51,7 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     process.env.YOKEMATE_MODE = "ship";
     const merge = await call("bash", { command: `gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}` }) as { block: boolean; reason: string };
     assert.equal(merge.block, true);
-    assert.match(merge.reason, /not serialized/);
+    assert.match(merge.reason, /parent coordinator/);
     for (const command of [
       `command gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}`,
       `sh -c 'gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}'`,

@@ -1,9 +1,9 @@
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
-import { commitExact, pushWithRetryAsync, type ExactSyncResult } from "./git-sync.ts";
+import { commitExact, gitMutationLockPath, pushWithRetryAsync, type ExactSyncResult } from "./git-sync.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { logMoveDetailed } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
@@ -11,15 +11,7 @@ import { applyMove, type MoveEnv } from "./transitions.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
 
-function ownGitDir(root: string): string | undefined {
-  if (!existsSync(join(root, ".git"))) return;
-  try {
-    const value = execFileSync("git", ["-C", root, "rev-parse", "--git-common-dir"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-    return realpathSync(isAbsolute(value) ? value : resolve(root, value));
-  } catch { return; }
-}
-
-export function recordLockPath(root: string): string { return join(ownGitDir(root) ?? root, "yokemate-plan-record.lock"); }
+export function recordLockPath(root: string): string { return gitMutationLockPath(root); }
 
 export function recordPlanCore(root: string, ticket: string, planPath: string, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
   const data = dataRoot(root);

@@ -376,6 +376,20 @@ test("note pane bash blacklist cuts writes and passes reads", () => {
   assert.equal(bash("do", "gh pr merge 5 --match-head-commit abc"), null);
 });
 
+test("ship merge authority rejects every direct CLI and API entry", () => {
+  for (const cmd of [
+    "gh pr merge 5 --merge --match-head-commit abc",
+    "gh pr merge 5 --auto",
+    "gh api --method PUT repos/o/r/pulls/5/merge -f merge_method=squash",
+    "gh api --method PUT 'repos/o/r/pulls/5/merge' -f merge_method=squash",
+    "curl -X PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "pnpm ship-merge YM-1 https://github.com/o/r/pull/5 --merge",
+    "node src/ship-merge.ts YM-1 https://github.com/o/r/pull/5 --merge",
+  ]) assert.match(bash("ship", cmd)?.reason ?? "", /parent coordinator/);
+  assert.equal(bash("ship", "git merge origin/main"), null);
+  assert.equal(bash("ship", "git push origin YM-1"), null);
+});
+
 test("settings edits are fenced by mode", () => {
   // Only the session's own configs are fenced: the instance root's settings
   // and the ticket's task-folder settings. A settings.json committed inside a

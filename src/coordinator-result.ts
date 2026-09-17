@@ -9,7 +9,8 @@ import type { ReadyEntry, ReadyReceipt } from "./ready.ts";
 import { requiredJobs, type RequiredJob } from "./required-checks.ts";
 
 export interface CoordinatorOutcome { outcome: "done" | "blocked"; summary: string; reason?: string; passedTickets?: string[] }
-export interface OutcomeVerification { ok: boolean; reason?: string; parts?: string[]; merged?: string[]; remaining?: string[] }
+export interface ShipPartOutcome { repo: string; pr: string; head?: string; state: "merged" | "remaining" | "unknown"; reason?: string }
+export interface OutcomeVerification { ok: boolean; reason?: string; parts?: string[]; merged?: string[]; remaining?: string[]; partFacts?: ShipPartOutcome[] }
 
 function gh(cwd: string, args: string[]): unknown { return JSON.parse(execFileSync("gh", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })); }
 
@@ -100,7 +101,19 @@ export function gatherGateFacts(root: string, ticket: string, parts: { repo: str
 }
 
 export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordinator, outcome: CoordinatorOutcome, pending = 0): OutcomeVerification {
-  if (outcome.outcome === "blocked") return { ok: true, reason: outcome.reason || "blocked", remaining: prepared.tickets.filter((ticket) => existsSync(join(root, "work", ticket))) };
+  if (outcome.outcome === "blocked") {
+    if (prepared.mode !== "ship") return { ok: true, reason: outcome.reason || "blocked", remaining: prepared.tickets.filter((ticket) => existsSync(join(root, "work", ticket))) };
+    const partFacts: ShipPartOutcome[] = prepared.parts.map((part) => {
+      if (!part.pr) return { repo: part.repo, pr: "", state: "unknown", reason: "missing prepared PR" };
+      try {
+        const pr = gh(part.passportPath ?? root, ["pr", "view", part.pr, "--json", "state,mergedAt,headRefName,headRefOid,url"]) as { state: string; mergedAt?: string; headRefName: string; headRefOid?: string; url: string };
+        if (pr.state === "MERGED" && pr.mergedAt && pr.headRefName === part.branch) return { repo: part.repo, pr: pr.url, head: pr.headRefOid, state: "merged" };
+        if (pr.state === "OPEN" && pr.headRefName === part.branch) return { repo: part.repo, pr: pr.url, head: pr.headRefOid, state: "remaining" };
+        return { repo: part.repo, pr: pr.url, head: pr.headRefOid, state: "unknown", reason: `PR is ${pr.state} on ${pr.headRefName}` };
+      } catch (error) { return { repo: part.repo, pr: part.pr, state: "unknown", reason: (error as Error).message }; }
+    });
+    return { ok: true, reason: outcome.reason || "blocked", merged: partFacts.filter((part) => part.state === "merged").map((part) => part.pr), remaining: partFacts.filter((part) => part.state !== "merged").map((part) => part.pr), partFacts };
+  }
   if (pending > 0) return { ok: false, reason: `${pending} child report(s) are pending` };
   try {
     if (prepared.mode === "do") {

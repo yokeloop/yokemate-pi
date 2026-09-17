@@ -48,7 +48,9 @@ export class ListRunRegistry {
     const run: ListRun = { identity, settings: input.settings, entries: identities.map((entry) => ({ ...entry, state: "reserved" })), immediatePublished: false, aggregatePublished: false };
     this.lists.set(identity.listRunId, run);
     const duplicateInput = new Set(input.keys).size !== input.keys.length;
-    const taskLimit = input.settings.policy.guards.parallelTaskLimit ? input.settings.limits.maxParallelTasks : Number.POSITIVE_INFINITY;
+    const fanOutRefusal = input.settings.policy.guards.parallelTaskLimit && input.keys.length > input.settings.limits.maxParallelTasks
+      ? `Too many parallel tasks (${input.keys.length}). Max is ${input.settings.limits.maxParallelTasks}.`
+      : undefined;
     const detachedAvailable = input.settings.policy.guards.detachedLimit
       ? Math.max(0, input.settings.limits.maxDetached - (input.externalActiveUnits ?? 0) - this.reservedCount(identity.listRunId))
       : Number.POSITIVE_INFINITY;
@@ -56,12 +58,12 @@ export class ListRunRegistry {
     for (const entry of run.entries) {
       let reason: string | undefined;
       if (duplicateInput) reason = "ticket list contains duplicates";
+      else if (fanOutRefusal) reason = fanOutRefusal;
       else reason = input.rejectKey?.(entry.key, entry.index);
       if (!reason && input.rejectDuplicate) {
         const active = [...(this.keys.get(`${input.mode}:${entry.key}`) ?? [])].map((id) => this.entry(id)).find((candidate) => candidate && !terminalState(candidate.state));
         if (active) reason = `${entry.key} already runs as ${active.keyRunId}`;
       }
-      if (!reason && accepted >= taskLimit) reason = `Too many parallel tasks (${input.keys.length}). Max is ${input.settings.limits.maxParallelTasks}.`;
       if (!reason && accepted >= detachedAvailable) reason = `Too many detached agents already running (${(input.externalActiveUnits ?? 0) + accepted}/${input.settings.limits.maxDetached}).`;
       if (reason) {
         entry.state = "refused";

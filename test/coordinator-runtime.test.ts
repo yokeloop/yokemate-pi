@@ -89,6 +89,15 @@ test("list reservations precede starts and whole lifetimes share bounded capacit
   assert.deepEqual(registry.aggregate(run.identity.listRunId)?.results.map((entry) => entry.key), ["A-1", "B-1", "C-1"]);
 });
 
+test("parallel task limit refuses the whole fan-out while concurrency only queues", () => {
+  const limited = new ListRunRegistry().admit({ mode: "plan", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 4 } }) });
+  assert.ok(limited.entries.every((entry) => entry.immediate?.state === "refused"));
+  assert.ok(limited.entries.every((entry) => entry.immediate?.reason === "Too many parallel tasks (3). Max is 2."));
+  const concurrencyOnly = new ListRunRegistry().admit({ mode: "plan", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({ guardPolicy: { guards: { parallelTaskLimit: false } }, subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 4 } }) });
+  assert.deepEqual(concurrencyOnly.entries.map((entry) => entry.immediate?.state), ["accepted", "accepted", "accepted"]);
+  assert.deepEqual(concurrencyOnly.entries.map((entry) => entry.immediate?.reservation), ["ready", "queued", "queued"]);
+});
+
 test("list ACK precedes fast terminal and cancel fences late outcomes to one key", async () => {
   const registry = new ListRunRegistry();
   const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 2, maxDetached: 3 } });

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -59,6 +59,32 @@ test("one control request retains every sibling list identity", async () => {
     assert.equal(accepted.listRunId, "list-1");
     assert.equal(accepted.runId, "key-1");
     assert.deepEqual(accepted.results?.map((result) => result.keyRunId), ["key-1", "key-2"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("merge control passes trusted live origin and structured result to the parent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-merge-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-merge-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  let calls = 0;
+  const server = bindCoordinatorControl(root, {
+    async launch() { throw new Error("unexpected launch"); },
+    async merge(runId, request, origin) { calls++; assert.equal(runId, "run-1"); assert.equal(origin.pid, process.pid); return { repo: "org/repo", pr: request.pr, head: request.expectedHead, state: "merged" }; },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, mode: "ship", ticket: "YM-1", role: "coordinator" };
+    const reply = await requestCoordinatorMerge(root, "run-1", { pr: "https://github.com/org/repo/pull/1", expectedHead: "a".repeat(40), method: "merge" }, origin, target, env);
+    assert.equal(reply.state, "accepted");
+    assert.equal(reply.merge?.state, "merged");
+    assert.equal(calls, 1);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

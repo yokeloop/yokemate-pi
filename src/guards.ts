@@ -91,11 +91,6 @@ export default function guards(pi: ExtensionAPI) {
       const settings = readRuntimeSettings(ROOT);
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
-      if (process.env.YOKEMATE_MODE === "ship" && call.name === "Bash") {
-        const command = call.input.command ?? "";
-        const merges = [...command.matchAll(/\bgh\s+pr\s+merge(?:\s|$)/g)];
-        if (merges.length) return { block: true, reason: "direct gh pr merge is not serialized as a ship merge; use pnpm ship-merge <TICKET> <PR-URL> <--merge|--squash|--rebase>" };
-      }
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {
         root: ROOT,
         dataRoot: dataRootOf(ROOT),
@@ -110,6 +105,7 @@ export default function guards(pi: ExtensionAPI) {
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
       if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
+      if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }
   });

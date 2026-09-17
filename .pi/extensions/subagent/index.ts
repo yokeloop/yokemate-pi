@@ -40,7 +40,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -51,7 +51,8 @@ import { openDb } from "../../../src/db.ts";
 import { dataRoot } from "../../../src/data-root.ts";
 import { modelForTicket } from "../../../src/project-model.ts";
 import { poolModel } from "../../../src/pool.ts";
-import { recordPlan as recordPlanFile } from "../../../src/plan-record.ts";
+import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../src/plan-record.ts";
+import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -600,6 +601,7 @@ export default function (pi: ExtensionAPI) {
 	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
 	const sentBatches = new Set<string>();
 	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
+	const listDeliveries = new Map<string, { state: "pending" | "enqueued" | "observed" | "delivery_failed"; customType: string; content: string }>();
 	let childSequence = 0;
 	const emitChildState = () => {
 		if (!runs) return;
@@ -608,7 +610,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event) => {
 		let changed = false;
 		for (const message of event.messages) {
-			if (message.role !== "custom" || message.customType !== "subagent-report") continue;
+			if (message.role !== "custom") continue;
+			if (message.customType === "yokemate-list-key" || message.customType === "yokemate-list-aggregate") {
+				const deliveryId = (message.details as { deliveryId?: string } | undefined)?.deliveryId;
+				const delivery = deliveryId ? listDeliveries.get(deliveryId) : undefined;
+				if (delivery && delivery.state === "enqueued") {
+					delivery.state = "observed";
+					pi.appendEntry("yokemate-list-delivery", { deliveryId, ...delivery });
+				}
+				continue;
+			}
+			if (message.customType !== "subagent-report") continue;
 			for (const { delivery, envelope } of deliveries.values()) {
 				if (delivery.state === "observed" || message.content !== reportContent(envelope, delivery)) continue;
 				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
@@ -631,7 +643,21 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const listRuns = new ListRunRegistry();
-	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => { try { pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true }); } catch {} };
+	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => {
+		const deliveryId = createHash("sha256").update(`${message.customType}\u0000${JSON.stringify(message.details)}`).digest("hex");
+		const delivery = listDeliveries.get(deliveryId) ?? { state: "pending" as const, customType: message.customType, content: message.content };
+		listDeliveries.set(deliveryId, delivery);
+		const persist = () => { try { pi.appendEntry("yokemate-list-delivery", { deliveryId, ...delivery, details: message.details }); } catch (error) { console.error(`[list delivery ${deliveryId}] ${(error as Error).message}`); } };
+		persist();
+		try {
+			pi.sendMessage({ ...message, details: { deliveryId, payload: message.details } }, { deliverAs: "followUp", triggerTurn: true });
+			delivery.state = "enqueued";
+		} catch (error) {
+			delivery.state = "delivery_failed";
+			try { latestCtx?.ui.notify(`list outcome delivery failed ${deliveryId}: ${(error as Error).message}`, "error"); } catch {}
+		}
+		persist();
+	};
 	let listUnits = 0;
 	listRuns.onTerminal((run, entry) => {
 		if (entry.immediate?.state === "accepted") { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
@@ -639,6 +665,8 @@ export default function (pi: ExtensionAPI) {
 		sendListMessage({ customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
 	});
 	listRuns.onAggregate((aggregate) => sendListMessage({ customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
+	const recordingPlans = new Set<string>();
+	const cancelledRecordingPlans = new Set<string>();
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
 	let ownedBinding: PlanBinding | undefined;
@@ -965,17 +993,26 @@ export default function (pi: ExtensionAPI) {
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
-		const completePlanRecord = async (ticket: string, recordedPath: string, planRunId?: string) => {
+		const completePlanRecord = async (ticket: string, recordedPath: string, planRunId?: string, record?: PlanRecordResult) => {
 			const settings = readRuntimeSettings(ENGINE_ROOT);
 			const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
-			const advance = authority!.record(binding, settings.policy.workflowApproval);
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
-			if (found && "run" in found) listRuns.settle(found.run.identity.listRunId, planRunId!, { outcome: "recorded", facts: { plan: binding.path, contentHash: binding.contentHash } });
-			if (!advance) return { reason: "plan-only; ready for /do; a new interactive approval is required" };
-			const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
-			if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
-			return { runId: result.details.runId, reason: "advance plan+do authority consumed" };
+			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
+			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
+			let runId: string | undefined;
+			let reason = "plan-only; ready for /do; a new interactive approval is required";
+			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
+				const advance = authority!.record(binding, settings.policy.workflowApproval);
+				if (advance) {
+					const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+					if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
+					runId = result.details.runId;
+					reason = "advance plan+do authority consumed";
+				}
+			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
+			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts: { plan: binding.path, contentHash: binding.contentHash, sync, handoff: { runId, reason } } })) throw new Error("plan run lost its terminal claim");
+			return { runId, reason, facts: { plan: binding.path, contentHash: binding.contentHash, sync, handoff: { runId, reason } } };
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
@@ -997,6 +1034,12 @@ export default function (pi: ExtensionAPI) {
 								if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
 							});
 							key.active({ ...facts });
+							void herdrAsync(["agent", "wait", facts.agentName, "--until", "done", "--until", "blocked", "--until", "unknown"]).then(async () => {
+								try {
+									const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: key.key, runId: key.keyRunId, outcome: "cancelled", reason: "plan worker process or pane ended before a terminal record" }, currentControlOrigin(ENGINE_ROOT, sessionId), controlIdentity!);
+									if (reply.state !== "accepted" && !/no longer active/.test(reply.reason ?? "")) throw new Error(reply.reason ?? "plan lifecycle settlement refused");
+								} catch (error) { try { ctx.ui.notify(`plan lifecycle: ${(error as Error).message}`, "warning"); } catch {} }
+							}).catch((error) => { try { ctx.ui.notify(`plan lifecycle watch failed: ${(error as Error).message}`, "warning"); } catch {} });
 						});
 						listRuns.publishImmediate(run.identity.listRunId);
 					});
@@ -1007,10 +1050,20 @@ export default function (pi: ExtensionAPI) {
 					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
 				recordPlan: async (ticket, planPath, _origin, planRunId) => {
-					const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath);
-					if (result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
-					if (result.push?.state === "deferred" || result.push?.state === "error") ctx.ui.notify(`git-sync: ${result.push.reason}`, "warning");
-					return completePlanRecord(ticket, result.plan, planRunId);
+					recordingPlans.add(planRunId);
+					try {
+						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath);
+						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
+						if (result.push?.state === "deferred" || result.push?.state === "error") ctx.ui.notify(`git-sync: ${result.push.reason}`, "warning");
+						return await completePlanRecord(ticket, result.plan, planRunId, result);
+					} finally {
+						recordingPlans.delete(planRunId);
+						if (cancelledRecordingPlans.delete(planRunId)) {
+							const found = listRuns.get(planRunId);
+							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
+							if (agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
+						}
+					}
 				},
 				planRecorded: async (ticket, recordedPath, _origin, planRunId) => completePlanRecord(ticket, recordedPath, planRunId),
 				launch: async (request, controlOrigin) => {
@@ -1028,9 +1081,27 @@ export default function (pi: ExtensionAPI) {
 					return list ? { requestId, state: "status", runId: requestId, identity: list, reason: "list" } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
 				cancel: async (runId, _origin) => {
-					const cancelled = listRuns.cancel(runId);
+					const target = listRuns.get(runId);
+					let cancelled = false;
+					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
+					for (const entry of entries) {
+						if (recordingPlans.has(entry.keyRunId)) {
+							cancelledRecordingPlans.add(entry.keyRunId);
+							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
+							cancelled = true;
+						} else cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
+					}
 					if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_control_cancel", cancelled);
 					else if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+				},
+				merge: async (runId, request, mergeOrigin) => {
+					const run = coordinators.get(runId);
+					const rpc = rpcByRun.get(runId);
+					if (!run || run.identity.mode !== "ship" || run.state !== "active" || !run.prepared || !rpc?.process.pid) throw new Error("ship coordinator run is not active");
+					if (mergeOrigin.pid !== rpc.process.pid || mergeOrigin.starttime !== processStarttime(rpc.process.pid)) throw new Error("merge origin is not the owned coordinator process");
+					const parts = run.prepared.parts.filter((part) => part.pr === request.pr);
+					if (parts.length !== 1) throw new Error("merge PR is outside the prepared coordinator scope");
+					return coordinatorMerge({ root: ENGINE_ROOT, runId, ticket: run.identity.ticket, part: parts[0]!, live: () => coordinators.get(runId)?.state === "active" && rpcByRun.get(runId)?.process === rpc.process }, request);
 				},
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
@@ -1171,6 +1242,25 @@ export default function (pi: ExtensionAPI) {
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan finish refused");
 				return { content: [{ type: "text", text: `${params.outcome} recorded` }] };
+			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+		},
+	});
+
+	pi.registerTool({
+		name: "coordinator_merge",
+		label: "Coordinator merge",
+		description: "Request one fresh parent-owned merge attempt for an exact prepared PR.",
+		parameters: Type.Object({ pr: Type.String(), expectedHead: Type.String(), method: StringEnum(["merge", "squash", "rebase"] as const) }),
+		async execute(_id, params): Promise<any> {
+			const runId = process.env.YOKEMATE_RUN_ID;
+			if (!runId || process.env.YOKEMATE_MODE !== "ship" || process.env.YOKEMATE_ROLE !== "coordinator" || ownedReadyRunId !== runId) return { content: [{ type: "text", text: "coordinator_merge is available only to its owned ship coordinator" }], isError: true };
+			try {
+				const target = resolveCoordinatorParent(ENGINE_ROOT);
+				const request = params as CoordinatorMergeRequest;
+				const reply = await requestCoordinatorMerge(ENGINE_ROOT, runId, request, currentControlOrigin(ENGINE_ROOT, process.env.YOKEMATE_PARENT_SESSION_ID), target);
+				if (reply.state !== "accepted" || !reply.merge) throw new Error(reply.reason ?? "merge request was refused");
+				const text = `${reply.merge.repo} ${reply.merge.head} ${reply.merge.state}${reply.merge.reason ? `: ${reply.merge.reason}` : ""}`;
+				return { content: [{ type: "text", text }], details: { kind: "yokemate-coordinator-merge", runId, ...reply.merge }, isError: reply.merge.state !== "merged" };
 			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 		},
 	});
