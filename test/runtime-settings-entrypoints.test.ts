@@ -5,6 +5,17 @@ import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const root = join(import.meta.dirname, "..");
+const coordinatorOriginKeys = ["YOKEMATE_MODE", "YOKEMATE_ROLE", "YOKEMATE_TICKET", "YOKEMATE_PARENT_PANE", "HERDR_PANE_ID"] as const;
+const reviewPaneStamp = {
+  YOKEMATE_MODE: "review",
+  YOKEMATE_ROLE: "coordinator",
+  YOKEMATE_TICKET: "YM-999",
+  YOKEMATE_PARENT_PANE: "fixture-main-pane",
+  HERDR_PANE_ID: "fixture-review-pane",
+};
+const clearCoordinatorOrigin = () => {
+  for (const key of coordinatorOriginKeys) delete process.env[key];
+};
 const runtimeCases = (keys: readonly string[], surfaces: readonly string[]) => {
   for (const key of keys) for (const surface of surfaces) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:${key}:${variant}`);
 };
@@ -438,8 +449,8 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
   const script = process.argv[1];
   let shutdown: (() => Promise<void>) | undefined;
   try {
-    delete process.env.YOKEMATE_MODE;
-    delete process.env.YOKEMATE_ROLE;
+    Object.assign(process.env, reviewPaneStamp);
+    clearCoordinatorOrigin();
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
@@ -537,8 +548,8 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
   const script = process.argv[1];
   let shutdown: (() => Promise<void>) | undefined;
   try {
-    delete process.env.YOKEMATE_MODE;
-    delete process.env.YOKEMATE_ROLE;
+    Object.assign(process.env, reviewPaneStamp);
+    clearCoordinatorOrigin();
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
@@ -628,8 +639,8 @@ test("coordinator public admission rereads ship confirmation and never manufactu
   const env = { ...process.env };
   let shutdown: (() => Promise<void>) | undefined;
   try {
-    delete process.env.YOKEMATE_MODE;
-    delete process.env.YOKEMATE_ROLE;
+    Object.assign(process.env, reviewPaneStamp);
+    clearCoordinatorOrigin();
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
     const file = join(dir, ".pi", "settings.json");
