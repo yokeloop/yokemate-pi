@@ -39,7 +39,7 @@ export function stand(ticket = "YM-9"): Stand {
 
   const plan = join(root, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`, `${ticket}-work-plan.md`);
   mkdirSync(join(plan, ".."), { recursive: true });
-  writeFileSync(plan, `# ${ticket}\n\n## Affected repositories\n- \`org/repo\` — app\n`);
+  writeFileSync(plan, `# ${ticket}\n\n## Goal\nFixture.\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n`);
   const db = openDb(join(root, "yokemate.db"));
   db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'x', 'YM', 'test/model')").run(clone);
 

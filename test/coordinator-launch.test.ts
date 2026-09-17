@@ -17,7 +17,7 @@ function root(): string {
   mkdirSync(join(root, ".pi", "agents", "do"), { recursive: true });
   mkdirSync(join(root, "home", "knowledge", "org", "repo", "ai", "YM-1-work"), { recursive: true });
   writeFileSync(join(root, ".pi", "settings.json"), "{}");
-  writeFileSync(join(root, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md"), "# YM-1\n\n## Affected repositories\n- `org/repo` — app\n");
+  writeFileSync(join(root, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md"), "# YM-1\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
   const db = openDb(join(root, "yokemate.db"));
   db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'x', 'YM', 'test/model')").run(join(root, "clone"));
   return root;
@@ -133,7 +133,7 @@ test("failed coordinator starts release duplicate reservations and capacity befo
       const folder = join(dir, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`);
       mkdirSync(folder, { recursive: true });
       const plan = join(folder, "plan.md");
-      writeFileSync(plan, `# ${ticket} — recovered\n\n## Affected repositories\n- \`org/repo\` — app\n`);
+      writeFileSync(plan, `# ${ticket} — recovered\n\n## Goal\nFixture.\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n`);
       db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES (?, 'u','planned',?)").run(ticket, plan);
       return plan;
     };
@@ -249,7 +249,7 @@ test("ship preparation keeps the ordered batch", async () => {
     for (const [ticket, repo] of [["A-1", "repo-a"], ["B-1", "repo-b"], ["C-1", "repo-a"]]) {
       const folder = join(dir, "home", "knowledge", "org", repo, "ai", `${ticket}-work`);
       mkdirSync(folder, { recursive: true });
-      writeFileSync(join(folder, `${ticket}-work-plan.md`), `# ${ticket}\n\n## Affected repositories\n- \`org/${repo}\` — app\n`);
+      writeFileSync(join(folder, `${ticket}-work-plan.md`), `# ${ticket}\n\n## Goal\nFixture.\n\n## Affected repositories\n- \`org/${repo}\` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n`);
       const worktree = join(dir, "work", ticket, repo);
       mkdirSync(worktree, { recursive: true });
       execFileSync("git", ["init", "-b", ticket, worktree], { stdio: "pipe" });

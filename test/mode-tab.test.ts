@@ -264,6 +264,9 @@ test("plan worker keeps literal ticket words out of ownership and ticket inputs"
     assert.match(skill, /pnpm where plan "\$YOKEMATE_TICKET"/);
     assert.match(skill, /YOKEMATE_PLAN_LITERAL/);
     assert.match(skill, /never planning keys or launch controls/);
+    assert.match(skill, /publication reference says `complete`/);
+    assert.match(skill, /full report is the hash-checked artifact/);
+    assert.match(skill, /locally recorded\/planned with publication pending/);
   } finally { f.cleanup(); }
 });
 

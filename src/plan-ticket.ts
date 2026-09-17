@@ -1,21 +1,14 @@
-// Record that a ticket has a ready plan: stage → planned. The /plan flow runs
-// this itself — a stamped /plan pane carries the mode, with or without a
-// ticket (it can run before one exists), and the unstamped main chat is both
-// the inline /plan and the repair entry. The command checks the stamp, the
-// legal move and the current stage (src/transitions.ts).
-//
-// Usage: pnpm plan ACME-347 home/knowledge/acme/acme-ui-kit/ai/<slug>/<slug>-plan.md
-
 import { currentControlOrigin, requestPlanControl, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
-import { existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
-import { applyMove, type MoveEnv } from "./transitions.ts";
+import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot } from "./plan-binding.ts";
+import { markPublicationResult, markSideEffectsStarted, markSuccessfulRecord, publicationById } from "./plan-publication-state.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const DATA = dataRoot(ROOT);
@@ -28,28 +21,63 @@ function fail(msg: string): never {
 const argv = process.argv.slice(2).filter((a) => a !== "--");
 const ticket = argv[0] ?? fail("usage: plan <TICKET> <path-to-plan.md>");
 const planPath = argv[1] ?? fail("usage: plan <TICKET> <path-to-plan.md>");
-const planAbs = resolve(planPath);
-if (!existsSync(planAbs)) fail(`plan not found: ${planAbs}`);
-
 const settings = readRuntimeSettings(ROOT);
+const preflightDb = openDb(join(ROOT, "yokemate.db"));
+const preflightRow = preflightDb.prepare("SELECT stage FROM work WHERE ticket=?").get(ticket) as { stage: From } | undefined;
+preflightDb.close();
+const preflightMove = checkMove("plan", process.env as MoveEnv, ticket, preflightRow?.stage ?? "absent", { settings });
+if (!preflightMove.ok) fail(preflightMove.refuse);
+let candidate;
+try { candidate = readCandidatePlanSnapshot(ROOT, ticket, planPath); }
+catch (error) { fail((error as Error).message); }
+let prepared;
+try {
+  const reply = await requestPlanControl(ROOT, "prepare-plan-publication", { ticket, path: candidate.path, contentHash: candidate.contentHash, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+  if (reply.state !== "accepted" || !reply.publicationId || !reply.snapshotPath || !reply.scoutPublication || !reply.target || !reply.revision) fail(reply.reason ?? `${ticket}: plan publication preparation refused`);
+  prepared = { publicationId: reply.publicationId, snapshotPath: reply.snapshotPath, scoutPublication: reply.scoutPublication, target: reply.target, revision: reply.revision };
+} catch (error) { fail(`${ticket}: publication pending: ${(error as Error).message}`); }
+
+let afterNetwork;
+try { afterNetwork = readCandidatePlanSnapshot(ROOT, ticket, candidate.path); assertPlanBinding(candidate, afterNetwork); }
+catch { fail(`${ticket}: publication pending in ${prepared.target}: binding_changed`); }
+
 const db = openDb(join(ROOT, "yokemate.db"));
-// The plan names the repositories, and there can be several — the row does not
-// pick one. It records that a plan exists and where it lies.
+const publication = publicationById(db, prepared.publicationId);
+if (!publication || publication.content_hash !== candidate.contentHash || publication.plan_path !== candidate.path || publication.scope_hash !== candidate.scopeHash || publication.scout_publication !== prepared.scoutPublication) fail(`${ticket}: publication pending in ${prepared.target}: binding_changed`);
 const out = applyMove(db, "plan", process.env as MoveEnv, ticket, () => {
   db.prepare(
-    `INSERT INTO work (ticket, url, stage, plan)
-     VALUES (?, ?, 'planned', ?)
+    `INSERT INTO work (ticket, url, stage, plan, next)
+     VALUES (?, ?, 'planned', ?, ?)
      ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan,
-       updated_at = datetime('now')`,
-  ).run(ticket, ticketUrl(db, ticket), planAbs);
+       next = excluded.next, updated_at = datetime('now')`,
+  ).run(ticket, ticketUrl(db, ticket), candidate.path, `plan publication pending: ${publication.target} plan unavailable`);
+  markSuccessfulRecord(db, publication.id, prepared.scoutPublication);
 }, { settings });
-if (!out.ok) fail(out.refuse);
+if (!out.ok) { db.close(); fail(out.refuse); }
+const sideEffects = markSideEffectsStarted(db, publication.id);
+db.close();
 
-logMove(DATA, ticket, "запланировано", `план ${basename(planAbs, ".md")}`);
-syncPush(DATA, `${ticket} план`);
-console.log(`${ticket} → planned${out.repeat ? " (repeat)" : ""}, plan: ${planAbs}`);
+if (sideEffects) {
+  logMove(DATA, ticket, "запланировано", `план ${basename(candidate.path, ".md")}`);
+  syncPush(DATA, `${ticket} план`);
+}
 
 try {
-  const reply = await requestPlanControl(ROOT, "plan-recorded", { ticket, path: planAbs, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
-  console.log(`${ticket}: ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
-} catch (error) { console.log(`${ticket}: plan recorded; no automatic do handoff: ${(error as Error).message}`); }
+  const current = readCandidatePlanSnapshot(ROOT, ticket, candidate.path);
+  assertPlanBinding(candidate, current);
+} catch {
+  const changed = openDb(join(ROOT, "yokemate.db"));
+  try { markPublicationResult(changed, publication.id, { complete: false, error: "binding_changed" }); }
+  finally { changed.close(); }
+  fail(`${ticket} locally planned; publication pending in ${prepared.target}: binding_changed`);
+}
+
+console.log(`${ticket} → locally planned${out.repeat ? " (repeat)" : ""}, plan: ${candidate.path}`);
+try {
+  const reply = await requestPlanControl(ROOT, "plan-recorded", { ticket, path: candidate.path, publicationId: publication.id, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+  if (reply.state !== "accepted") fail(`${ticket} locally planned; publication pending in ${prepared.target}: ${reply.reason ?? "unavailable"}`);
+  if (reply.publication !== "complete") fail(`${ticket} locally planned; publication pending in ${reply.target ?? prepared.target}: ${reply.reason ?? "unavailable"}`);
+  console.log(`${ticket}: scout and plan published to ${reply.target ?? prepared.target}; revision ${reply.revision ?? prepared.revision}; ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
+} catch (error) {
+  fail(`${ticket} locally planned; publication pending in ${prepared.target}: ${(error as Error).message}`);
+}

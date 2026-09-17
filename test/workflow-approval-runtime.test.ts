@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,9 @@ import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { openDb } from "../src/db.ts";
 import { readRecordedPlanBinding } from "../src/plan-binding.ts";
+import { acceptPublication } from "../src/plan-publication-state.ts";
+import { splitPublication } from "../src/plan-publication.ts";
+import { resolvePublicationTarget } from "../src/plan-publication-target.ts";
 
 const source = join(import.meta.dirname, "..");
 
@@ -43,10 +47,27 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const folder = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(folder, { recursive: true });
     const plan = join(folder, "plan.md");
-    const text = "# YM-1 — fixture\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Work\n";
+    const text = "# YM-1 — fixture\n\n## Goal\nExercise authority.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Work\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Production.\n\n## Acceptance\nThe fixture records the plan.\n";
     writeFileSync(plan, text);
+    const clone = join(dir, "clone");
+    mkdirSync(clone);
+    execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe" });
+    execFileSync("git", ["-C", clone, "remote", "add", "origin", "https://github.com/org/repo.git"], { stdio: "pipe" });
+    const commentsFile = join(dir, "comments.json");
+    writeFileSync(commentsFile, "[]");
+    const shim = join(dir, "shim");
+    mkdirSync(shim);
+    writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
+    process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
+    process.env.WORKFLOW_COMMENTS = commentsFile;
     const db = openDb(join(dir, "yokemate.db"));
-    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
+    const target = resolvePublicationTarget(db, "YM-1");
+    assert.equal(target.type, "github");
+    const scoutBytes = Buffer.from("# Scout\n\nFacts and sources.\n");
+    const scout = acceptPublication(db, dir, { target: target.target, targetHash: target.targetHash, ticket: "YM-1", kind: "scout", bytes: scoutBytes, runId: "scout-run" });
+    const scoutParts = splitPublication({ target: target.target, targetHash: target.targetHash, canonicalUrl: target.canonicalUrl, ticket: "YM-1", run: scout.run_id, kind: "scout", hash: scout.content_hash, bytes: scoutBytes });
+    writeFileSync(commentsFile, JSON.stringify(scoutParts.map((part, index) => ({ id: index + 1, body: part.body, html_url: `${target.canonicalUrl}#issuecomment-${index + 1}` }))));
     const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
     await loader.reload();
     const loaded = loader.getExtensions();
@@ -76,7 +97,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-    const record = async () => (await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent" } })).stdout;
+    const record = async () => (await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent" } })).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
     const triggerReview = async () => {
       if (eventConnections.length === 0) await once(eventServer, "connection");
@@ -88,6 +109,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     };
     await input("/plan YM-1");
     assert.match(await record(), /plan-only; ready for \/do/);
+    const firstPublications = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
+    assert.equal(firstPublications.length, 2);
+    assert.match(firstPublications[0]!.body, /YM-1 · scout · revision/);
+    assert.match(firstPublications[1]!.body, /YM-1 · plan · revision/);
+    assert.match(firstPublications[1]!.body, /record: planned \(successful local record\)/);
+    assert.ok(firstPublications[1]!.body.endsWith(text));
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
     assert.match(output(await launch()), /current interactive approval/);
@@ -98,6 +125,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await input("Спланируй YM-1 и затем выполни");
     const auto = await record();
     assert.match(auto, /background run [a-f0-9-]+/);
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, 2);
     const autoId = auto.match(/background run ([a-f0-9-]+)/)![1]!;
     assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), autoId);
     assert.match(output(await launch()), /already consumed/);

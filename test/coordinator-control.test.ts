@@ -52,7 +52,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
-    planRecorded: async (ticket, path) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); return { reason: "recorded" }; },
+    planRecorded: async (ticket, path, publicationId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(publicationId, 7); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -62,7 +62,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const payload = { ticket: "YM-1", runId: register.runId };
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
     writeFileSync(join(socketDir(env, process.getuid!()), "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
-    const handoff = { ...payload, path: "/recorded.md" };
+    const handoff = { ...payload, path: "/recorded.md", publicationId: 7 };
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
