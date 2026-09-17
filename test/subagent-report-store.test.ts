@@ -1,0 +1,109 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import fs from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { coordinatorArtifactId, DIAGNOSTICS_FILE_LIMIT, REPORT_DIRECTORY_LIMIT, REPORT_FILE_LIMIT, REPORT_RETENTION_MS, SubagentReportStore } from "../src/subagent-report-store.ts";
+import { sha256 } from "../src/subagent-runs.ts";
+
+function sandbox() {
+  const root = fs.mkdtempSync(path.join(tmpdir(), "ym217-store-"));
+  const reports = path.join(root, ".pi", "subagent-reports");
+  return { root, reports, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+const id = (value: string) => sha256(value);
+
+test("store preserves canonical bytes, structured diagnostics and private permissions", () => {
+  const box = sandbox();
+  try {
+    const store = new SubagentReportStore(box.reports);
+    const canonical = Buffer.from("Unicode 🙂\r\ncanonical\n", "utf8");
+    const result = store.writeReport(id("one"), canonical, { identity: { runId: "run" }, stream: { events: { message_end: 1 }, parserErrors: 0 }, stderr: { bytes: 12, hash: id("stderr") }, messages: ["private raw sentinel"], finalText: "private raw sentinel", rpcEvents: ["private raw sentinel"] });
+    assert.equal(result.ok, true);
+    const stored = store.readReport(id("one"))!;
+    assert.deepEqual(stored.report, canonical);
+    assert.equal((stored.diagnostics.canonical as any).bytes, canonical.length);
+    assert.equal((stored.diagnostics.canonical as any).hash, sha256(canonical));
+    assert.doesNotMatch(JSON.stringify(stored.diagnostics), /private raw sentinel/);
+    assert.equal((stored.diagnostics.diagnostics as any).stream.events.message_end, 1);
+    assert.equal(fs.statSync(box.reports).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(result.archive.reportPath!).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(result.archive.diagnosticsPath!).mode & 0o777, 0o600);
+  } finally { box.cleanup(); }
+});
+
+test("writes are idempotent, conflicts fail, and diagnostics updates never change canonical", () => {
+  const box = sandbox();
+  try {
+    const store = new SubagentReportStore(box.reports);
+    const key = id("same");
+    assert.equal(store.writeReport(key, "one", { delivery: { state: "pending" } }).ok, true);
+    assert.equal(store.writeReport(key, "one", { delivery: { state: "observed" } }).ok, true);
+    assert.equal(store.writeReport(key, "two", {}).code, "artifact_conflict");
+    assert.equal(store.updateDiagnostics(key, { delivery: { state: "observed" } }).ok, true);
+    const read = store.readReport(key)!;
+    assert.equal(read.report.toString(), "one");
+    assert.equal((read.diagnostics.diagnostics as any).delivery.state, "observed");
+    fs.writeFileSync(read.archive.reportPath!, "tampered");
+    assert.equal(store.readReport(key), undefined);
+  } finally { box.cleanup(); }
+});
+
+test("retention removes expired and oldest artifacts without resurrecting updates", () => {
+  const box = sandbox();
+  let now = Date.parse("2026-01-01T00:00:00.000Z");
+  try {
+    const store = new SubagentReportStore(box.reports, { now: () => now });
+    const expired = id("expired");
+    assert.equal(store.writeReport(expired, "old", {}).ok, true);
+    now += REPORT_RETENTION_MS + 1;
+    assert.equal(store.writeReport(id("fresh"), "fresh", {}).ok, true);
+    assert.equal(store.readReport(expired), undefined);
+    assert.equal(store.updateDiagnostics(expired, {}).archive.state, "expired");
+    for (let index = 0; index < REPORT_DIRECTORY_LIMIT + 1; index++) {
+      now += 1;
+      assert.equal(store.writeReport(id(`rotation-${index}`), `report-${index}`, {}).ok, true);
+    }
+    const directories = fs.readdirSync(box.reports).filter((name) => /^[a-f0-9]{64}$/.test(name));
+    assert.equal(directories.length, REPORT_DIRECTORY_LIMIT);
+    assert.equal(store.readReport(id("fresh")), undefined);
+  } finally { box.cleanup(); }
+});
+
+test("limits, symlinks, unknown objects and live locks fail closed without partial pairs", () => {
+  const box = sandbox();
+  try {
+    const store = new SubagentReportStore(box.reports, { pid: 123, processStarttime: (pid) => pid === 123 ? "self" : pid === 999 ? "live" : undefined });
+    assert.equal(store.writeReport(id("large-report"), Buffer.alloc(REPORT_FILE_LIMIT + 1), {}).code, "storage_limit");
+    assert.equal(store.writeReport(id("large-diagnostics"), "ok", { value: "x".repeat(DIAGNOSTICS_FILE_LIMIT) }).code, "storage_limit");
+    assert.equal(fs.readdirSync(box.reports).filter((name) => name.startsWith(".tmp-")).length, 0);
+    fs.writeFileSync(path.join(box.reports, ".lock"), JSON.stringify({ pid: 999, starttime: "live" }));
+    assert.equal(store.writeReport(id("busy"), "busy", {}).code, "storage_busy");
+    fs.unlinkSync(path.join(box.reports, ".lock"));
+    fs.writeFileSync(path.join(box.reports, "foreign"), "do not delete");
+    assert.equal(store.writeReport(id("foreign-block"), "report", {}).code, "artifact_invalid");
+    assert.equal(fs.readFileSync(path.join(box.reports, "foreign"), "utf8"), "do not delete");
+  } finally { box.cleanup(); }
+
+  const linked = sandbox();
+  const target = fs.mkdtempSync(path.join(tmpdir(), "ym217-target-"));
+  try {
+    fs.mkdirSync(path.dirname(linked.reports), { recursive: true });
+    fs.symlinkSync(target, linked.reports);
+    assert.equal(new SubagentReportStore(linked.reports).writeReport(id("linked"), "report", {}).ok, false);
+  } finally { linked.cleanup(); fs.rmSync(target, { recursive: true, force: true }); }
+});
+
+test("stale lock is recovered only with a provably absent owner and coordinator ids are stable", () => {
+  const box = sandbox();
+  try {
+    fs.mkdirSync(box.reports, { recursive: true });
+    fs.writeFileSync(path.join(box.reports, ".lock"), JSON.stringify({ pid: 99999999, starttime: "gone" }));
+    const store = new SubagentReportStore(box.reports, { pid: 123, processStarttime: (pid) => pid === 123 ? "self" : undefined });
+    assert.equal(store.writeReport(id("after-crash"), "ok", {}).ok, true);
+    assert.equal(fs.existsSync(path.join(box.reports, ".lock")), false);
+    assert.equal(coordinatorArtifactId("parent", "run"), coordinatorArtifactId("parent", "run"));
+    assert.notEqual(coordinatorArtifactId("parent", "run"), coordinatorArtifactId("parent", "other"));
+  } finally { box.cleanup(); }
+});
