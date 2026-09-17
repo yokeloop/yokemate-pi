@@ -8,7 +8,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, formatHerdrError, herdr, herdrRaw, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
-import { currentControlOrigin, requestPlanControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, requestPlanLaunch, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
@@ -251,7 +251,19 @@ if (import.meta.filename === process.argv[1]) {
   const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? parentPane.split(":")[0];
 
   const targets = mode === "plan" ? resolvePlanTargets(parsed) : [{ ticket, workerWords }];
-  for (const { ticket, workerWords } of targets) {
+  const explicitPlanKeys = mode === "plan" ? parseKeyList(parsed.words, true) : { keys: [], tail: [] };
+  let planParent: ReturnType<typeof resolveCoordinatorParent> | undefined;
+  if (mode === "plan" && explicitPlanKeys.keys.length && !explicitPlanKeys.tail.length) try { planParent = resolveCoordinatorParent(ROOT); } catch {}
+  if (mode === "plan" && explicitPlanKeys.keys.length && !explicitPlanKeys.tail.length && planParent) {
+    try {
+      const reply = await requestPlanLaunch(ROOT, { targets, surface: parsed.surface, model: parsed.model, literal: parsed.literal, parentPane, parentWorkspace }, currentControlOrigin(ROOT), planParent);
+      for (const result of reply.results ?? []) {
+        if (result.state === "accepted") console.log(`${result.key} → reserved in plan list ${reply.listRunId}, run ${result.keyRunId}`);
+        else console.error(`${result.key}: ${result.reason ?? "plan launch refused"}`);
+      }
+      if (reply.state !== "accepted" || reply.results?.some((result) => result.state === "refused")) process.exitCode = 1;
+    } catch (error) { fail((error as Error).message); }
+  } else for (const { ticket, workerWords } of targets) {
     try {
       let model = parsed.model;
       if (!model) {
