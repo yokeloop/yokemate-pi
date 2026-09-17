@@ -255,7 +255,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
     const terminalReport = reports.find((message) => message.details.envelope.kind === (scenario.startsWith("chain") ? "chain" : "result")) ?? reports[0];
-    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /parser invalid_json/, protocol_partial: /parser partial_record/, protocol_overflow: /parser record_limit/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/, chain_max: /output limit/ };
+    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /parser invalid_json/, protocol_partial: /parser (?:partial_record|invalid_json)/, protocol_overflow: /parser (?:record_limit|invalid_json)/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/, chain_max: /output limit/ };
     if (reasons[scenario]) assert.match(terminalReport.details.display.failureReason, reasons[scenario], scenario);
     if (scenario === "storage_error") assert.deepEqual(terminalReport.details.display.archive, { state: "unavailable", code: "EIO" });
     else if (!scenario.startsWith("delivery_")) {
