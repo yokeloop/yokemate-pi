@@ -155,12 +155,17 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(blockedScout.publication.state, "blocked");
     assert.equal(blockedScout.publication.error, "unsafe_document");
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
+    await assert.rejects(record, (error: any) => /current accepted scout/.test(String(error.stderr)));
+    assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get(), undefined);
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "protocol_overflow";
     const invalidScout = await runScout("scout-protocol-overflow");
     assert.equal(invalidScout.payloadOutcome, "protocol_error");
     assert.equal(invalidScout.publication, undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
+    const recoveredScout = await runScout("scout-recovery");
+    assert.equal(recoveredScout.publication.state, "complete", JSON.stringify(recoveredScout.publication));
     delete process.env.YOKEMATE_RUN_ID;
     process.argv[1] = workflowChild;
     await input("/plan YM-1");

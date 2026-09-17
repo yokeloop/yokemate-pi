@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationFor, readPublicationArtifact } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationFor, readPublicationArtifact, reserveCanonicalUrl } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
 const plan = (ticket = "YM-1", repo = "org/repo") => `# ${ticket} — fixture
@@ -55,6 +55,30 @@ test("candidate and recorded readers share strict byte, path and section validat
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("canonical reservation prevents concurrent and crash-resume publication to another URL", async () => {
+  const root = mkdtempSync(join(tmpdir(), "publication-canonical-"));
+  try {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    const dbPath = join(root, "yokemate.db");
+    const db = openDb(dbPath);
+    const target = "youtrack-yokeloop:YM-1";
+    const row = acceptPublication(db, root, { target, targetHash: sha256(target), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# scout\n"), runId: "run" });
+    db.close();
+    const posts: string[] = [];
+    const attempt = async (url: string) => {
+      const connection = openDb(dbPath);
+      try { if (reserveCanonicalUrl(connection, row.id, url)) posts.push(url); }
+      finally { connection.close(); }
+    };
+    await Promise.all([attempt("https://tracker.example/issue/YM-1"), attempt("https://other.example/issue/YM-1")]);
+    await attempt("https://other.example/issue/YM-1");
+    assert.deepEqual(posts, ["https://tracker.example/issue/YM-1"]);
+    const reopened = openDb(dbPath);
+    assert.equal(publicationFor(reopened, target, "YM-1", "scout", row.content_hash)?.canonical_url, "https://tracker.example/issue/YM-1");
+    reopened.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("publication ledger keeps immutable identities, revisions and restart-verifiable private artifacts", () => {
   const root = mkdtempSync(join(tmpdir(), "publication-ledger-"));
   try {
@@ -71,6 +95,8 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     assert.equal(first.id, duplicate.id);
     assert.notEqual(firstDelivery.id, restartDelivery.id);
     assert.equal(publicationAcceptanceById(db, restartDelivery.id)?.publication_id, first.id);
+    assert.equal(reserveCanonicalUrl(db, first.id, "https://tracker.example/issue/YM-1"), true);
+    assert.equal(reserveCanonicalUrl(db, first.id, "https://other.example/issue/YM-1"), false);
     markPublicationResult(db, first.id, { complete: false, error: "unavailable", canonicalUrl: "https://tracker.example/issue/YM-1" });
     markPublicationResult(db, first.id, { complete: false, error: "remote_conflict", canonicalUrl: "https://other.example/issue/YM-1" });
     assert.equal(publicationFor(db, target, "YM-1", "scout", sha256(firstBytes))?.canonical_url, "https://tracker.example/issue/YM-1");

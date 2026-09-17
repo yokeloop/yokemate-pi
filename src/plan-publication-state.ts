@@ -178,6 +178,11 @@ export function readPublicationArtifact(root: string, row: PublicationRow): Buff
   return bytes;
 }
 
+export function reserveCanonicalUrl(db: DatabaseSync, rowId: number, canonicalUrl: string): boolean {
+  db.prepare("UPDATE plan_publication SET canonical_url=?,updated_at=datetime('now') WHERE id=? AND canonical_url IS NULL").run(canonicalUrl, rowId);
+  return publicationById(db, rowId)?.canonical_url === canonicalUrl;
+}
+
 export function markPublicationResult(db: DatabaseSync, rowId: number, result: { complete: boolean; error?: PublicationError; canonicalUrl?: string }): void {
   db.prepare("UPDATE plan_publication SET complete=?,error_code=?,canonical_url=COALESCE(canonical_url,?),updated_at=datetime('now') WHERE id=?")
     .run(result.complete ? 1 : 0, result.error ?? null, result.canonicalUrl ?? null, rowId);
