@@ -5,6 +5,9 @@ export default function (pi) {
   const runtime = new PlanPublicationMcp(pi, process.env.YM216_ROOT);
   pi.on("session_start", async (_event, ctx) => {
     runtime.setContext(ctx);
+    if (process.env.YM216_RETRY_CONNECT) {
+      try { await runtime.youTrackAdapter("youtrack-fixture", "YM-216"); } catch {}
+    }
     const { adapter, canonicalUrl } = await runtime.youTrackAdapter("youtrack-fixture", "YM-216");
     const before = await adapter.list();
     await adapter.add("Unicode 🙂 publication");

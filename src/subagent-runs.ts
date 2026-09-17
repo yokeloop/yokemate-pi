@@ -20,7 +20,7 @@ export interface ChildIdentity {
   review?: ReviewRevision;
 }
 export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
-export interface PublicationReference { state: "pending" | "complete" | "blocked"; path?: string; hash?: string; bytes?: number; target?: string; targetHash?: string; publicationId?: number; error?: string }
+export interface PublicationReference { state: "pending" | "complete" | "blocked"; path?: string; hash?: string; bytes?: number; target?: string; targetHash?: string; publicationId?: number; acceptanceId?: number; error?: string }
 export type ProcessOutcome = "exited" | "signaled" | "spawn_error" | "cancelled" | "not_started";
 export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
 export interface ResultEnvelope {

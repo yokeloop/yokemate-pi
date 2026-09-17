@@ -78,6 +78,7 @@ try {
   const reply = await requestPlanControl(ROOT, "plan-recorded", { ticket, path: candidate.path, recordId: record.id, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
   if (reply.state !== "accepted") fail(`${ticket} locally planned; publication pending in ${prepared.target}: ${reply.reason ?? "unavailable"}`);
   if (reply.publication !== "complete") fail(`${ticket} locally planned; publication pending in ${reply.target ?? prepared.target}: ${reply.reason ?? "unavailable"}`);
+  if (reply.handoff === "refused") fail(`${ticket} locally planned; publication complete in ${reply.target ?? prepared.target}; handoff refused: ${reply.reason ?? "unavailable"}`);
   console.log(`${ticket}: scout and plan published to ${reply.target ?? prepared.target}; revision ${reply.revision ?? prepared.revision}; ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
 } catch (error) {
   fail(`${ticket} locally planned; publication pending in ${prepared.target}: ${(error as Error).message}`);

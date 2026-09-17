@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { acceptPlanRecord, acceptPublication, markSuccessfulRecord, planRecordById, publicationFor, readPublicationArtifact } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationFor, readPublicationArtifact } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
 const plan = (ticket = "YM-1", repo = "org/repo") => `# ${ticket} — fixture
@@ -65,8 +65,12 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     const firstBytes = Buffer.from("# scout one\n");
     const first = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "scout", bytes: firstBytes, runId: "run-one" });
     const duplicate = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "scout", bytes: firstBytes, runId: "run-two" });
+    const firstDelivery = acceptPublicationDelivery(db, first.id, { ownerRunId: "owner-one", ownerSessionId: "session-one", batchId: "batch-one", runId: "run-one", agent: "plan-scout", taskHash: "a".repeat(64), cwd: root, ticket: "YM-1" });
+    const restartDelivery = acceptPublicationDelivery(db, duplicate.id, { ownerRunId: "owner-two", ownerSessionId: "session-two", batchId: "batch-two", runId: "run-two", agent: "plan-scout", taskHash: "b".repeat(64), cwd: root, ticket: "YM-1" });
     const second = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "scout", bytes: Buffer.from("# scout two\n"), runId: "run-three" });
     assert.equal(first.id, duplicate.id);
+    assert.notEqual(firstDelivery.id, restartDelivery.id);
+    assert.equal(publicationAcceptanceById(db, restartDelivery.id)?.publication_id, first.id);
     assert.notEqual(first.id, second.id);
     assert.deepEqual(readPublicationArtifact(root, first), firstBytes);
     assert.equal(readFileSync(first.artifact_path).toString(), firstBytes.toString());

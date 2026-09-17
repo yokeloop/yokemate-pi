@@ -90,10 +90,16 @@ class PrivateMcp {
     if (this.initialized) return;
     const ctx = this.context();
     if (!ctx) throw new PublicationFailure("unavailable");
-    for (const handler of this.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
-    this.initialized = true;
-    const connected = await this.invoke({ connect: this.server });
-    if (connected?.details?.server !== this.server || connected?.details?.error) throw safeError(connected?.details);
+    try {
+      for (const handler of this.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+      const connected = await this.invoke({ connect: this.server });
+      if (connected?.details?.server !== this.server || connected?.details?.error) throw safeError(connected?.details);
+      this.initialized = true;
+    } catch (error) {
+      for (const handler of this.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx);
+      this.initialized = false;
+      throw error;
+    }
   }
   private async invoke(params: Record<string, unknown>): Promise<any> {
     const ctx = this.context();

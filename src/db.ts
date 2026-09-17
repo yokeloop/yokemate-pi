@@ -110,6 +110,19 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (target, ticket, kind, content_hash)
     );
 
+    CREATE TABLE IF NOT EXISTS plan_publication_acceptance (
+      id               INTEGER PRIMARY KEY,
+      publication_id   INTEGER NOT NULL REFERENCES plan_publication(id),
+      ticket           TEXT NOT NULL,
+      run_id           TEXT NOT NULL,
+      owner_run_id     TEXT NOT NULL,
+      owner_session_id TEXT NOT NULL,
+      batch_id         TEXT NOT NULL,
+      task_hash        TEXT NOT NULL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (owner_run_id, owner_session_id, batch_id, run_id, task_hash)
+    );
+
     CREATE TABLE IF NOT EXISTS plan_record (
       id                   INTEGER PRIMARY KEY,
       ticket               TEXT NOT NULL,

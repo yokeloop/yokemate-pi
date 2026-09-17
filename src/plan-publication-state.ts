@@ -41,6 +41,17 @@ export interface PublicationIdentityInput {
   scopeHash?: string;
 }
 
+export interface PublicationAcceptanceRow {
+  id: number;
+  publication_id: number;
+  ticket: string;
+  run_id: string;
+  owner_run_id: string;
+  owner_session_id: string;
+  batch_id: string;
+  task_hash: string;
+}
+
 export interface PlanRecordRow {
   id: number;
   ticket: string;
@@ -119,6 +130,23 @@ export function acceptPublication(db: DatabaseSync, root: string, input: Publica
     input.planPath ?? null, input.scopeHash ?? null,
   );
   return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=?").get(input.target, input.ticket, input.kind, contentHash) as unknown as PublicationRow;
+}
+
+export function acceptPublicationDelivery(db: DatabaseSync, publicationId: number, child: ChildIdentity): PublicationAcceptanceRow {
+  if (!child.ticket) throw new Error("artifact_invalid");
+  db.prepare(`INSERT INTO plan_publication_acceptance
+    (publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash)
+    VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_run_id,owner_session_id,batch_id,run_id,task_hash) DO NOTHING`).run(
+    publicationId, child.ticket, child.runId, child.ownerRunId, child.ownerSessionId, child.batchId, child.taskHash,
+  );
+  return db.prepare(`SELECT * FROM plan_publication_acceptance
+    WHERE owner_run_id=? AND owner_session_id=? AND batch_id=? AND run_id=? AND task_hash=?`).get(
+    child.ownerRunId, child.ownerSessionId, child.batchId, child.runId, child.taskHash,
+  ) as unknown as PublicationAcceptanceRow;
+}
+
+export function publicationAcceptanceById(db: DatabaseSync, id: number): PublicationAcceptanceRow | undefined {
+  return db.prepare("SELECT * FROM plan_publication_acceptance WHERE id=?").get(id) as unknown as PublicationAcceptanceRow | undefined;
 }
 
 export function recordPublicationBlock(db: DatabaseSync, ticket: string, runId: string, reason: string): void {

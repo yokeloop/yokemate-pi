@@ -94,8 +94,9 @@ test("private YouTrack bridge uses the real pinned adapter, exact schemas and pa
     mkdirSync(join(root, ".pi"), { recursive: true });
     symlinkSync(join(source, "node_modules"), join(root, "node_modules"), "dir");
     writeFileSync(comments, JSON.stringify(Array.from({ length: 23 }, (_, index) => ({ id: String(index + 1), text: `comment-${index + 1}`, author: "fixture", url: `https://tracker.example/comment/${index + 1}`, createdAt: "2026-01-01" }))));
-    writeFileSync(join(root, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "youtrack-fixture": { command: process.execPath, args: [join(source, "test/fixtures/plan-publication-mcp-server.mjs")], env: { YM216_COMMENTS: comments } } }, settings: {} }));
-    Object.assign(process.env, { YM216_ROOT: root, YM216_RESULT: result, YM216_COMMENTS: comments });
+    const connectMarker = join(root, "connect-failed-once");
+    writeFileSync(join(root, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "youtrack-fixture": { command: process.execPath, args: [join(source, "test/fixtures/plan-publication-mcp-flaky.mjs")], env: { YM216_COMMENTS: comments, YM216_CONNECT_MARKER: connectMarker } } }, settings: {} }));
+    Object.assign(process.env, { YM216_ROOT: root, YM216_RESULT: result, YM216_COMMENTS: comments, YM216_RETRY_CONNECT: "1" });
     const host = join(source, "test/fixtures/plan-publication-adapter-host.mjs");
     const loader = new DefaultResourceLoader({ cwd: root, agentDir: join(root, "agent"), settingsManager: SettingsManager.create(root, join(root, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [host] });
     await loader.reload();

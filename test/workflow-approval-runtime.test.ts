@@ -136,6 +136,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       return reports.slice(before).map((item: any) => item?.details?.envelope).find((envelope: any) => envelope?.kind === "result" && envelope.identity?.agent === "plan-scout" && envelope.identity.batchId === callId);
     };
     const workflowChild = process.argv[1];
+    process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     const scoutEnvelope = await runScout("scout-long");
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
@@ -159,6 +160,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(invalidScout.publication, undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
+    delete process.env.YOKEMATE_RUN_ID;
     process.argv[1] = workflowChild;
     await input("/plan YM-1");
     assert.match(await record(), /plan-only; ready for \/do/);
@@ -176,6 +178,11 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await input("/do YM-1", "interactive", "rpc");
     assert.match(output(await launch()), /current interactive approval/);
     extraction = "advance-plan-do";
+    db.prepare("UPDATE project SET model='missing/model' WHERE tracker_key='YM'").run();
+    await input("Спланируй YM-1 и затем выполни");
+    await assert.rejects(record, (error: any) => /publication complete.*handoff refused.*missing\/model/s.test(String(error.stderr)));
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount + 1);
+    db.prepare("UPDATE project SET model='test/model' WHERE tracker_key='YM'").run();
     await input("Спланируй YM-1 и затем выполни");
     const auto = await record();
     assert.match(auto, /background run [a-f0-9-]+/);

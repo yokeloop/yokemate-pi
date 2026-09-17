@@ -4,6 +4,9 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
+import { PublicationFailure, publishDocument, type RemoteComment } from "../src/plan-publication.ts";
+import { acceptPublication, acceptPublicationDelivery } from "../src/plan-publication-state.ts";
+import { ChildRuns, resultEnvelope, sha256 } from "../src/subagent-runs.ts";
 
 const modes = ["plan", "review", "worklog", "note", "research"] as const;
 type Mode = typeof modes[number];
@@ -267,6 +270,58 @@ test("plan worker keeps literal ticket words out of ownership and ticket inputs"
     assert.match(skill, /publication reference says `complete`/);
     assert.match(skill, /full report is the hash-checked artifact/);
     assert.match(skill, /locally recorded\/planned with publication pending/);
+  } finally { f.cleanup(); }
+});
+
+test("typed multi-key plan publications stay isolated when B completes before A and A resumes", async () => {
+  const f = fixture();
+  try {
+    const launched = f.run("plan", ["YM-1", "YM-2"]);
+    assert.equal(launched.status, 0, launched.stderr);
+    const surfaces = launched.calls.filter((call) => call[1] === "create");
+    const tickets = surfaces.map((surface) => value(surface.filter((word) => word.startsWith("YOKEMATE_TICKET=")), "--env") ?? surface.find((word) => word.startsWith("YOKEMATE_TICKET="))?.split("=")[1]);
+    assert.deepEqual(tickets, ["YM-1", "YM-2"]);
+    const db = openDb(join(f.root, "yokemate.db"));
+    const rows = new Map<string, ReturnType<typeof acceptPublication>>();
+    for (const [index, ticket] of tickets.entries()) {
+      const runs = new ChildRuns(`owner-${ticket}`, `session-${ticket}`, ticket);
+      const task = { agent: "plan-scout", task: `scout ${ticket}` };
+      const identity = runs.admit(`batch-${ticket}`, [task], f.root).children[0]!.identity;
+      const result = resultEnvelope(identity, task.task, { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, `# ${ticket} scout\nsource-${ticket}\n`);
+      assert.equal(runs.settle(result), true);
+      const bytes = Buffer.from(result.payload);
+      const target = `github:org/repo#${index + 1}`;
+      const row = acceptPublication(db, f.root, { target, targetHash: sha256(target), ticket: ticket!, kind: "scout", bytes, runId: identity.runId, child: identity });
+      acceptPublicationDelivery(db, row.id, identity);
+      rows.set(ticket!, row);
+    }
+    const remotes = new Map<string, RemoteComment[]>([["YM-1", []], ["YM-2", []]]);
+    const completion: string[] = [];
+    const publish = async (ticket: string, fail = false) => {
+      const row = rows.get(ticket)!;
+      const bytes = Buffer.from(`# ${ticket} scout\nsource-${ticket}\n`);
+      const remote = remotes.get(ticket)!;
+      const result = await publishDocument(row, bytes, {
+        list: async () => remote,
+        add: async (body) => { if (fail) throw new PublicationFailure("unavailable"); remote.push({ id: `${ticket}-${remote.length + 1}`, text: body }); },
+      }, { canonicalUrl: `https://github.com/org/repo/issues/${ticket.endsWith("1") ? 1 : 2}` });
+      if (result.complete) completion.push(ticket);
+      return result;
+    };
+    assert.equal((await publish("YM-2")).complete, true);
+    assert.equal((await publish("YM-1", true)).error, "unavailable");
+    const restart = new ChildRuns("owner-YM-1-restart", "session-YM-1-restart", "YM-1");
+    const task = { agent: "plan-scout", task: "scout YM-1" };
+    const identity = restart.admit("batch-YM-1-restart", [task], f.root).children[0]!.identity;
+    const duplicate = acceptPublication(db, f.root, { target: "github:org/repo#1", targetHash: sha256("github:org/repo#1"), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# YM-1 scout\nsource-YM-1\n"), runId: identity.runId, child: identity });
+    const acceptance = acceptPublicationDelivery(db, duplicate.id, identity);
+    assert.equal(duplicate.id, rows.get("YM-1")!.id);
+    assert.ok(acceptance.id > 0);
+    assert.equal((await publish("YM-1")).complete, true);
+    assert.deepEqual(completion, ["YM-2", "YM-1"]);
+    assert.equal(remotes.get("YM-1")!.length, 1);
+    assert.equal(remotes.get("YM-2")!.length, 1);
+    db.close();
   } finally { f.cleanup(); }
 });
 

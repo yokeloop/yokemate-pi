@@ -52,7 +52,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
-    publishPlanScout: async (ticket, publicationId) => ({ reason: `${ticket}/${publicationId}`, publication: "complete", target: "fixture", revision: "a".repeat(64) }),
+    publishPlanScout: async (ticket, acceptanceId) => ({ reason: `${ticket}/${acceptanceId}`, publication: "complete", target: "fixture", revision: "a".repeat(64) }),
     preparePlanPublication: async () => { prepares++; return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, target: "fixture", revision: "b".repeat(64) }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
@@ -63,7 +63,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     const worker = { ...main, sessionId: "problem-session", mode: "plan", role: "coordinator", pane: "problem", parentPane: "main" };
     const prepare = (ticket: string) => requestPlanControl(root, "prepare-plan-publication", { ticket, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare("YM-1")).state, "refused");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", publicationId: 1 }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", acceptanceId: 1 }, worker, target, env)).state, "accepted");
     assert.equal((await prepare("YM-1")).state, "accepted");
     assert.equal((await prepare("YM-2")).state, "refused");
     assert.equal(prepares, 1);

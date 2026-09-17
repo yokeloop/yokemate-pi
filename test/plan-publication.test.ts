@@ -54,10 +54,33 @@ test("response loss reconciles before returning and conflicts fail closed", asyn
   assert.equal(blocked.error, "remote_conflict");
 });
 
+test("binding is rechecked after the final remote listing", async () => {
+  const document = row("# Report\nbody\n");
+  const framed = splitPublication(input(document.bytes.toString()));
+  let listings = 0;
+  let changed = false;
+  const result = await publishDocument(document.row, document.bytes, {
+    list: async () => { listings++; if (listings === 2) changed = true; return framed.map((part) => ({ id: String(part.part), text: part.body })); },
+    add: async () => assert.fail("complete remote must not post"),
+  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } });
+  assert.equal(result.error, "binding_changed");
+});
+
+test("classified POST failures survive mandatory response-loss reconciliation", async () => {
+  const document = row("# Report\nbody\n");
+  for (const code of ["auth", "permission", "rate_limit", "size"] as const) {
+    const result = await publishDocument(document.row, document.bytes, {
+      list: async () => [],
+      add: async () => { throw new PublicationFailure(code); },
+    }, { canonicalUrl: input("body").canonicalUrl });
+    assert.equal(result.error, code);
+  }
+});
+
 test("credential sentinels block the whole document before the first post and placeholders remain allowed", async () => {
   const sentinels = [
     "-----BEGIN PRIVATE KEY-----", "Authorization: Bearer abcdef", "Cookie: session=abcdef",
-    "github_pat_abcdefghijklmnopqrstuvwxyz", "https://user:password@example.test/path", "https://example.test/?access_token=value", "client_secret = literal-value",
+    "github_pat_abcdefghijklmnopqrstuvwxyz", "https://user:password@example.test/path", "https://literal-secret@example.test/path", "https://example.test/?access_token=value", "client_secret = literal-value",
     "const token = \"literal-secret-value\"", "- token: literal-secret-value", "{\"password\":\"literal-secret-value\"}",
   ];
   for (const sentinel of sentinels) {
@@ -68,6 +91,6 @@ test("credential sentinels block the whole document before the first post and pl
     assert.equal(result.error, "unsafe_document", sentinel);
     assert.equal(posts, 0, sentinel);
   }
-  assert.doesNotThrow(() => assertPublishable(Buffer.from("token = ${TOKEN}\npassword: <example>\nsecret=[REDACTED]\nAuthorization: Bearer <TOKEN>\nhttps://example.test/?token=${TOKEN}\nCookie: session=${SESSION}")));
+  assert.doesNotThrow(() => assertPublishable(Buffer.from("token = ${TOKEN}\npassword: <example>\nsecret=[REDACTED]\nAuthorization: Bearer <TOKEN>\nhttps://example.test/?token=${TOKEN}\nhttps://${USERINFO}@example.test/path\nCookie: session=${SESSION}")));
   assert.throws(() => assertPublishable(Buffer.from("password=literal")), (error: unknown) => error instanceof PublicationFailure && error.code === "unsafe_document");
 });

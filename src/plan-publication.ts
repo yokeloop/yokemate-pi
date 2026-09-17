@@ -60,7 +60,9 @@ export function assertPublishable(bytes: Buffer): void {
       if (equals < 0 || secretValue(item.slice(equals + 1))) throw new PublicationFailure("unsafe_document");
     }
   }
-  rejectSecretValues(text, /https?:\/\/[^\s/@:]+:([^\s/@]+)@/gim);
+  for (const match of text.matchAll(/https?:\/\/([^\s/@]+)@/gim)) {
+    for (const part of match[1]!.split(":")) if (secretValue(part)) throw new PublicationFailure("unsafe_document");
+  }
   rejectSecretValues(text, /[?&](?:access_token|refresh_token|api_key|apikey|token|password|secret|client_secret)=([^&#\s]+)/gim);
   rejectSecretValues(text, /["'](?:token|api_key|apikey|password|secret|client_secret|access_token|refresh_token)["']\s*:\s*((?:"[^"]*")|(?:'[^']*'))/gim);
   const assignment = /^\s*(?:(?:export\s+)?(?:const|let|var)\s+|[-*]\s*)?["']?(?:token|api_key|apikey|password|secret|client_secret|access_token|refresh_token)["']?\s*[:=]\s*(.+?)\s*$/gim;
@@ -213,16 +215,18 @@ export async function publishDocument(row: PublicationRow, bytes: Buffer, adapte
     for (const part of state.missing) {
       await options.verifyBinding?.();
       try { await adapter.add(part.body); }
-      catch {
+      catch (error) {
+        const code = error instanceof PublicationFailure ? error.code : "unavailable";
         comments = await adapter.list();
         state = reconcilePublication(input, comments);
         if (!state.missing.some((item) => item.part === part.part)) continue;
-        return { complete: false, error: "unavailable", parts: state.parts.length, revision: row.content_hash };
+        return { complete: false, error: code, parts: state.parts.length, revision: row.content_hash };
       }
     }
     await options.verifyBinding?.();
     comments = await adapter.list();
     state = reconcilePublication(input, comments);
+    await options.verifyBinding?.();
     return state.complete
       ? { complete: true, parts: state.parts.length, revision: row.content_hash }
       : { complete: false, error: "incomplete_listing", parts: state.parts.length, revision: row.content_hash };
