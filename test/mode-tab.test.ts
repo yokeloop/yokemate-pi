@@ -212,9 +212,17 @@ test("preflight refusals and review adopt happen before creating either surface"
       const adopt = f.run("review", [...split, "YM-2", "note"]);
       assert.equal(adopt.status, 0, adopt.stderr);
       assert.match(adopt.calls.find((c) => c[1] === "prompt")![3]!, /pnpm adopt YM-2.*note$/);
+      const fallback = f.run("plan", [...split, "OTHER-1"]);
+      assert.equal(fallback.status, 0, fallback.stderr);
+      assert.equal(value(fallback.calls.find((c) => c[1] === "start")!, "--model"), "test/pool");
+      writeFileSync(join(f.root, "home/pool.json"), JSON.stringify({ note: "test/pool", research: "test/pool" }));
+      const missingFallback = f.run("plan", [...split, "OTHER-1"]);
+      assert.equal(missingFallback.status, 1);
+      assert.match(missingFallback.stderr, /OTHER-1.*no plan model/);
+      assert.equal(missingFallback.calls.some((c) => c[1] === "create" || c[1] === "split"), false);
+      writeFileSync(join(f.root, "home/pool.json"), JSON.stringify({ plan: "test/pool", note: "test/pool", research: "test/pool" }));
       for (const [mode, args, error] of [
         ["review", ["YM-99"], /no task folder/],
-        ["plan", ["OTHER-1"], /no passport/],
         ["note", ["--model"], /--model needs a value/],
         ["research", ["--topic", "topic", "--unknown"], /unknown research option/],
         ["research", ["--topic", "topic", "--model", "test/missing"], /не найдена/],
@@ -323,10 +331,12 @@ for (const entry of ["node", "package"]) {
             const sibling = keys[1 - failedIndex]!;
             const extra: Record<string, string> = failure === "duplicate" ? { AGENTS: JSON.stringify([{ name: `${failedKey.toLowerCase()}-plan`, pane_id: "w-fixture:p-neighbor" }]) }
               : failure === "model" ? {} : { FAIL_AT: failure, FAIL_AGENT: `${failedKey.toLowerCase()}-plan`, FAIL_CLEANUP: "1" };
+            if (failure === "model")
+              writeFileSync(join(f.root, "home/pool.json"), JSON.stringify({ note: "test/pool", research: "test/pool" }));
             const out = f.run("plan", [...(split ? ["--split"] : []), ...keys], extra, entry);
             assert.equal(out.status, 1);
             assert.match(out.stderr, failure === "duplicate" ? new RegExp(`${failedKey} plan already runs in pane w-fixture:p-neighbor — go to it, or close it and launch again`)
-              : failure === "model" ? /OTHER-1.*no passport/ : new RegExp(`${failedKey} plan:.*injected-${failure}-failure`));
+              : failure === "model" ? /OTHER-1.*no plan model/ : new RegExp(`${failedKey} plan:.*injected-${failure}-failure`));
             assert.doesNotMatch(out.stderr, /injected-close-failure/);
             assert.match(out.stdout, new RegExp(`${sibling} →`));
             const creates = out.calls.filter(c => c[1] === "create" || c[1] === "split");
