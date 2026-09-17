@@ -100,6 +100,19 @@ export function gatherGateFacts(root: string, ticket: string, parts: { repo: str
   };
 }
 
+export function verifyPreparedShipMerged(root: string, prepared: PreparedCoordinator): OutcomeVerification {
+  const merged: string[] = [];
+  try {
+    for (const part of prepared.parts) {
+      if (!part.pr) return { ok: false, reason: `missing PR snapshot for ${part.repo}` };
+      const pr = gh(part.passportPath ?? root, ["pr", "view", part.pr, "--json", "state,mergedAt,headRefName,url"]) as { state: string; mergedAt?: string; headRefName: string; url: string };
+      if (pr.state !== "MERGED" || !pr.mergedAt || pr.headRefName !== part.branch) return { ok: false, reason: `${part.repo} is not merged` };
+      merged.push(pr.url);
+    }
+    return { ok: true, merged };
+  } catch (error) { return { ok: false, reason: (error as Error).message }; }
+}
+
 export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordinator, outcome: CoordinatorOutcome, pending = 0): OutcomeVerification {
   if (outcome.outcome === "blocked") {
     if (prepared.mode !== "ship") return { ok: true, reason: outcome.reason || "blocked", remaining: prepared.tickets.filter((ticket) => existsSync(join(root, "work", ticket))) };
@@ -131,14 +144,10 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
       if (!verdict.ok) return { ok: false, reason: verdict.reason };
       return { ok: true, parts: rows.map((row) => row.repo) };
     }
-    const merged: string[] = [];
+    const verified = verifyPreparedShipMerged(root, prepared);
+    if (!verified.ok) return verified;
+    const merged = verified.merged ?? [];
     const remaining: string[] = [];
-    for (const part of prepared.parts) {
-      if (!part.pr) return { ok: false, reason: `missing PR snapshot for ${part.repo}` };
-      const pr = gh(root, ["pr", "view", part.pr, "--json", "state,mergedAt,headRefName,url"]) as { state: string; mergedAt?: string; headRefName: string; url: string };
-      if (pr.state !== "MERGED" || !pr.mergedAt || pr.headRefName !== part.branch) return { ok: false, reason: `${part.repo} is not merged` };
-      merged.push(pr.url);
-    }
     for (const ticket of prepared.tickets) if (existsSync(join(root, "work", ticket))) remaining.push(ticket);
     if (remaining.length) return { ok: false, reason: `task folders remain: ${remaining.join(", ")}`, merged, remaining };
     const journalDir = join(dataRoot(root), "journal");

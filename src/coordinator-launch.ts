@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join, resolve, relative } from "node:path";
 import { openDb } from "./db.ts";
@@ -104,6 +104,12 @@ export function markDoRunning(root: string, prepared: PreparedCoordinator, origi
 }
 
 const exec = (file: string, args: string[], cwd: string) => new Promise<string>((resolvePromise, reject) => execFile(file, args, { cwd, encoding: "utf8" }, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolvePromise(stdout)));
+function hasShippedOutcome(root: string, ticket: string): boolean {
+  const journal = join(dataRoot(root), "journal");
+  if (!existsSync(journal)) return false;
+  const pattern = new RegExp(`^\\- \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} ${ticket} отгружено(?:$|:)`, "m");
+  return readdirSync(journal).filter((name) => /^\d{4}-\d{2}\.md$/.test(name)).some((name) => pattern.test(readFileSync(join(journal, name), "utf8")));
+}
 
 export async function prepareShip(root: string, request: CoordinatorRequest): Promise<PreparedCoordinator> {
   validateCoordinatorRequest(request);
@@ -113,17 +119,19 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
   const parts: PreparedPart[] = [];
   for (const ticket of request.tickets) {
     const folder = join(root, "work", ticket);
-    if (!existsSync(folder)) fail(`no task folder ${folder} — /ship runs after /do`);
-    if (lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
+    const recoveringFinalization = !existsSync(folder) && hasShippedOutcome(root, ticket);
+    if (!existsSync(folder) && !recoveringFinalization) fail(`no task folder ${folder} — /ship runs after /do`);
+    if (!recoveringFinalization && lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
     const plan = resolvePlan(root, ticket);
     plans[ticket] = plan;
     for (const part of partsForPlan(root, ticket, plan)) {
       const worktree = join(folder, part.repo.split("/")[1]!);
-      if (!existsSync(worktree)) fail(`no worktree ${worktree} for ${part.repo}`);
-      const gitCwd = worktree;
+      if (!recoveringFinalization && !existsSync(worktree)) fail(`no worktree ${worktree} for ${part.repo}`);
+      const gitCwd = recoveringFinalization ? part.path : worktree;
       const remote = (await exec("git", ["remote", "get-url", "origin"], gitCwd)).trim();
-      const snapshot = JSON.parse(await exec("gh", ["pr", "view", ticket, "--json", "baseRefName,url,headRefOid,headRefName"], gitCwd)) as { baseRefName: string; url: string; headRefOid: string; headRefName: string };
+      const snapshot = JSON.parse(await exec("gh", ["pr", "view", ticket, "--json", "baseRefName,url,headRefOid,headRefName,state,mergedAt"], gitCwd)) as { baseRefName: string; url: string; headRefOid: string; headRefName: string; state: string; mergedAt?: string };
       if (snapshot.headRefName !== ticket) fail(`${part.repo}: PR head is ${snapshot.headRefName}, not ${ticket}`);
+      if (recoveringFinalization && (snapshot.state !== "MERGED" || !snapshot.mergedAt)) fail(`${part.repo}: task folder is absent but PR is not confirmed merged`);
       parts.push({ ...part, pr: snapshot.url, base: snapshot.baseRefName, path: gitCwd, passportPath: part.path, figmaUrl: part.figmaUrl, figmaMcp: part.figmaMcp, remote, observedHead: snapshot.headRefOid });
     }
   }

@@ -39,8 +39,8 @@ import { CoordinatorRegistry, ShipPermitStore, coordinatorChecks, type Coordinat
 import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subagent-widget.ts";
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
-import { verifyCoordinatorOutcome } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
+import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -53,6 +53,7 @@ import { modelForTicket } from "../../../src/project-model.ts";
 import { poolModel } from "../../../src/pool.ts";
 import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../src/plan-record.ts";
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
+import { finalizeShip } from "../../../src/ship-finalize.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -659,13 +660,27 @@ export default function (pi: ExtensionAPI) {
 		persist();
 	};
 	let listUnits = 0;
+	const deferredListDeliveries = new Set<string>();
+	const bufferedListMessages = new Map<string, Array<{ customType: string; content: string; display: boolean; details: unknown }>>();
+	const deliverListMessage = (listRunId: string, message: { customType: string; content: string; display: boolean; details: unknown }) => {
+		if (deferredListDeliveries.has(listRunId)) bufferedListMessages.set(listRunId, [...bufferedListMessages.get(listRunId) ?? [], message]);
+		else sendListMessage(message);
+	};
+	const flushListDelivery = (listRunId: string) => {
+		deferredListDeliveries.delete(listRunId);
+		for (const message of bufferedListMessages.get(listRunId) ?? []) sendListMessage(message);
+		bufferedListMessages.delete(listRunId);
+		listRuns.flushAggregate(listRunId);
+	};
 	listRuns.onTerminal((run, entry) => {
-		if (entry.immediate?.state === "accepted") { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
+		if (entry.immediate?.state === "accepted" && !listRuns.wasLifetimeReleased(entry.keyRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 		if (entry.terminal?.outcome === "cancelled" && typeof entry.immediate?.facts?.agentName === "string") void herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
-		sendListMessage({ customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
+		deliverListMessage(run.identity.listRunId, { customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
 	});
-	listRuns.onAggregate((aggregate) => sendListMessage({ customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
+	listRuns.onAggregate((aggregate) => deliverListMessage(aggregate.listRunId, { customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
 	const recordingPlans = new Set<string>();
+	const lockedRecordingPlans = new Set<string>();
+	const recorderControllers = new Map<string, AbortController>();
 	const cancelledRecordingPlans = new Set<string>();
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
@@ -680,24 +695,50 @@ export default function (pi: ExtensionAPI) {
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
 	const suppressedCancellationReports = new Set<string>();
-	const cancelCoordinator = async (runId: string, reason: "parent_control_cancel" | "parent_cancel_run", suppressReport = false) => {
+	const cancellingCoordinators = new Map<string, Promise<import("../../../src/coordinator-runtime.ts").CoordinatorRun>>();
+	const cancelCoordinator = (runId: string, reason: "parent_control_cancel" | "parent_cancel_run", suppressReport = false) => {
+		const existing = cancellingCoordinators.get(runId);
+		if (existing) return existing;
 		const run = coordinators.get(runId);
-		if (!run) throw new Error(`unknown coordinator run ${runId}`);
-		coordinators.finalize(runId, "blocked", "cancelled");
-		if (suppressReport) suppressedCancellationReports.add(runId);
-		releaseCoordinatorUnit(runId);
-		uiAbortByRun.get(runId)?.abort();
-		uiAbortByRun.delete(runId);
-		const rpc = rpcByRun.get(runId);
-		untrackRunning(rpc?.process);
-		coordinatorChildren.delete(runId);
-		await rpc?.stop(reason);
-		rpcByRun.delete(runId);
-		return run;
+		if (!run) return Promise.reject(new Error(`unknown coordinator run ${runId}`));
+		if (["done", "blocked"].includes(run.state)) return Promise.resolve(run);
+		const operation = (async () => {
+			coordinators.finalize(runId, "blocked", "cancelled");
+			if (suppressReport) suppressedCancellationReports.add(runId);
+			releaseCoordinatorUnit(runId);
+			uiAbortByRun.get(runId)?.abort();
+			uiAbortByRun.delete(runId);
+			const rpc = rpcByRun.get(runId);
+			untrackRunning(rpc?.process);
+			coordinatorChildren.delete(runId);
+			await rpc?.stop(reason);
+			rpcByRun.delete(runId);
+			return run;
+		})();
+		cancellingCoordinators.set(runId, operation);
+		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
+		return operation;
+	};
+	const fenceListRuns = async (reason: string) => {
+		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
+			if (recordingPlans.has(entry.keyRunId)) {
+				cancelledRecordingPlans.add(entry.keyRunId);
+				recorderControllers.get(entry.keyRunId)?.abort();
+				return;
+			}
+			const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
+			listRuns.cancel(entry.keyRunId, reason);
+			if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
+			if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
+		}));
 	};
 	const revokeAuthority = async () => {
 		shipPermits.invalidate();
-		for (const runId of authority?.revoke() ?? []) await cancelCoordinator(runId, "parent_cancel_run");
+		await fenceListRuns("parent runtime changed");
+		for (const runId of authority?.revoke() ?? []) {
+			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run");
+			else listRuns.cancel(runId, "parent runtime changed");
+		}
 	};
 	pi.on("session_before_switch", revokeAuthority);
 	pi.on("session_before_fork", revokeAuthority);
@@ -966,7 +1007,8 @@ export default function (pi: ExtensionAPI) {
 		if (request.mode === "do") for (const entry of accepted) authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
 		listUnits += accepted.length;
 		activeUnits += accepted.length;
-		listRuns.publishImmediate(run.identity.listRunId);
+		deferredListDeliveries.add(run.identity.listRunId);
+		listRuns.publishImmediate(run.identity.listRunId, true);
 		setImmediate(() => {
 			listRuns.start(run.identity.listRunId, async (lane) => {
 				lane.signal.addEventListener("abort", () => { void cancelCoordinator(lane.keyRunId, "parent_cancel_run", true).catch(() => {}); }, { once: true });
@@ -1000,12 +1042,14 @@ export default function (pi: ExtensionAPI) {
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
 			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
+			if (planRunId && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
 			let reason = "plan-only; ready for /do; a new interactive approval is required";
 			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+					if (result.details.listRunId) setImmediate(() => flushListDelivery(result.details.listRunId));
 					if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
 					runId = result.details.runId;
 					reason = "advance plan+do authority consumed";
@@ -1050,14 +1094,24 @@ export default function (pi: ExtensionAPI) {
 					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
 				recordPlan: async (ticket, planPath, _origin, planRunId) => {
+					const controller = new AbortController();
 					recordingPlans.add(planRunId);
+					recorderControllers.set(planRunId, controller);
 					try {
-						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath);
+						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
 						if (result.push?.state === "deferred" || result.push?.state === "error") ctx.ui.notify(`git-sync: ${result.push.reason}`, "warning");
 						return await completePlanRecord(ticket, result.plan, planRunId, result);
+					} catch (error) {
+						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
+							const found = listRuns.get(planRunId);
+							if (found && "run" in found) listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "cancelled", reason: "plan recorder cancelled before lock acquisition" });
+						}
+						throw error;
 					} finally {
 						recordingPlans.delete(planRunId);
+						lockedRecordingPlans.delete(planRunId);
+						recorderControllers.delete(planRunId);
 						if (cancelledRecordingPlans.delete(planRunId)) {
 							const found = listRuns.get(planRunId);
 							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
@@ -1069,10 +1123,8 @@ export default function (pi: ExtensionAPI) {
 				launch: async (request, controlOrigin) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
 					const result = await startCoordinator(request, ctx, origin);
-					if (result.isError) throw new Error((result.content[0] as { text?: string } | undefined)?.text ?? "coordinator launch refused");
 					const details = result.details as { runId?: string; listRunId?: string; results?: import("../../../src/coordinator-control.ts").ControlResult[] };
-					if (!details.runId) throw new Error("coordinator launch did not return a run id");
-					return details;
+					return { ...details, afterAck: () => details.listRunId && flushListDelivery(details.listRunId) };
 				},
 				status: (requestId, _origin) => {
 					const run = coordinators.get(requestId);
@@ -1087,12 +1139,16 @@ export default function (pi: ExtensionAPI) {
 					for (const entry of entries) {
 						if (recordingPlans.has(entry.keyRunId)) {
 							cancelledRecordingPlans.add(entry.keyRunId);
+							recorderControllers.get(entry.keyRunId)?.abort();
 							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 							cancelled = true;
-						} else cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
+						} else {
+							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
+							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
+						}
 					}
-					if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_control_cancel", cancelled);
-					else if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+					if (!target && coordinators.get(runId)) { await cancelCoordinator(runId, "parent_control_cancel", cancelled); cancelled = true; }
+					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
 				},
 				merge: async (runId, request, mergeOrigin) => {
 					const run = coordinators.get(runId);
@@ -1102,6 +1158,15 @@ export default function (pi: ExtensionAPI) {
 					const parts = run.prepared.parts.filter((part) => part.pr === request.pr);
 					if (parts.length !== 1) throw new Error("merge PR is outside the prepared coordinator scope");
 					return coordinatorMerge({ root: ENGINE_ROOT, runId, ticket: run.identity.ticket, part: parts[0]!, live: () => coordinators.get(runId)?.state === "active" && rpcByRun.get(runId)?.process === rpc.process }, request);
+				},
+				finalizeShip: async (runId, finalizeOrigin) => {
+					const run = coordinators.get(runId);
+					const rpc = rpcByRun.get(runId);
+					if (!run || run.identity.mode !== "ship" || run.state !== "active" || !run.prepared || !rpc?.process.pid) throw new Error("ship coordinator run is not active");
+					if (finalizeOrigin.pid !== rpc.process.pid || finalizeOrigin.starttime !== processStarttime(rpc.process.pid)) throw new Error("ship finalization origin is not the owned coordinator process");
+					const merged = verifyPreparedShipMerged(ENGINE_ROOT, run.prepared);
+					if (!merged.ok) throw new Error(merged.reason ?? "not every prepared PR is merged");
+					return finalizeShip(ENGINE_ROOT, run.identity.ticket);
 				},
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
@@ -1153,6 +1218,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		await fenceListRuns("parent session shutdown");
 		authority?.revoke();
 		authority = undefined;
 		shipPermits.invalidate();
@@ -1282,6 +1348,12 @@ export default function (pi: ExtensionAPI) {
 			if (pending.length && !(params.outcome === "blocked" && pending.some((delivery) => delivery.state === "delivery_failed" || delivery.state === "delivery_unknown") && pending.every((delivery) => params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
 			const run = coordinators.get(runId);
 			if (!run) {
+				if (params.outcome === "done" && process.env.YOKEMATE_MODE === "ship") {
+					try {
+						const reply = await requestShipFinalize(ENGINE_ROOT, runId, currentControlOrigin(ENGINE_ROOT, process.env.YOKEMATE_PARENT_SESSION_ID), resolveCoordinatorParent(ENGINE_ROOT));
+						if (reply.state !== "accepted" || !reply.finalization) throw new Error(reply.reason ?? "ship finalization was refused");
+					} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+				}
 				finishingCoordinatorRunId = runId;
 				return { content: [{ type: "text", text: "outcome proposed" }], details: { kind: "yokemate-coordinator-outcome", runId, outcome: params.outcome, summary: params.summary, reason: params.reason, passedTickets: params.passedTickets }, terminate: true };
 			}
@@ -1350,7 +1422,9 @@ export default function (pi: ExtensionAPI) {
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: reply.results?.map((result) => ({ type: "text" as const, text: result.state === "accepted" ? `accepted ${result.keyRunId}, key ${result.key}, reserved` : `refused ${result.key}: ${result.reason}` })) ?? [{ type: "text" as const, text: `accepted ${reply.runId}` }], details: { runId: reply.runId, listRunId: reply.listRunId, identity: reply.identity, results: reply.results } };
 					}
-					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
+					const result = await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
+					if (result.details.listRunId) flushListDelivery(result.details.listRunId);
+					return result;
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			const { policy } = settings;

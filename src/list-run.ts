@@ -32,6 +32,7 @@ export class ListRunRegistry {
   private readonly controllers = new Map<string, AbortController>();
   private readonly starts = new Map<string, (context: KeyRunContext) => Promise<ListTerminal | void>>();
   private readonly buffered = new Map<string, ListTerminal>();
+  private readonly released = new Set<string>();
   private readonly immediateListeners = new Set<Listener>();
   private readonly terminalListeners = new Set<Listener>();
   private readonly aggregateListeners = new Set<(aggregate: ListAggregate) => void>();
@@ -78,7 +79,7 @@ export class ListRunRegistry {
     return run;
   }
 
-  publishImmediate(listRunId: string): ListRun {
+  publishImmediate(listRunId: string, deferAggregate = false): ListRun {
     const run = this.requiredList(listRunId);
     if (run.immediatePublished) return run;
     run.immediatePublished = true;
@@ -87,10 +88,23 @@ export class ListRunRegistry {
       const terminal = this.buffered.get(entry.keyRunId);
       if (terminal) { this.buffered.delete(entry.keyRunId); this.applyTerminal(run, entry, terminal); }
     }
-    this.publishAggregate(run);
+    if (!deferAggregate) this.publishAggregate(run);
     this.pump();
     return run;
   }
+
+  flushAggregate(listRunId: string): void { this.publishAggregate(this.requiredList(listRunId)); }
+
+  releaseLifetime(keyRunId: string): boolean {
+    const found = this.find(keyRunId);
+    if (!found || this.released.has(keyRunId) || !["starting", "active"].includes(found.entry.state)) return false;
+    this.released.add(keyRunId);
+    this.running = Math.max(0, this.running - 1);
+    this.pump();
+    return true;
+  }
+
+  wasLifetimeReleased(keyRunId: string): boolean { return this.released.has(keyRunId); }
 
   start(listRunId: string, start: (context: KeyRunContext) => Promise<ListTerminal | void>): void {
     const run = this.requiredList(listRunId);
@@ -155,7 +169,7 @@ export class ListRunRegistry {
 
   private applyTerminal(run: ListRun, entry: KeyRunEntry, terminal: ListTerminal): boolean {
     if (terminalState(entry.state)) return false;
-    const occupied = entry.state === "starting" || entry.state === "active";
+    const occupied = (entry.state === "starting" || entry.state === "active") && !this.released.has(entry.keyRunId);
     entry.state = terminalToState(terminal.outcome);
     entry.terminal = { ...terminal, facts: terminal.facts && { ...terminal.facts } };
     this.controllers.delete(entry.keyRunId);
@@ -181,7 +195,7 @@ export class ListRunRegistry {
     for (const listener of this.aggregateListeners) listener(aggregate);
   }
 
-  private reservedCount(exceptListRunId?: string): number { return [...this.lists.values()].filter((run) => run.identity.listRunId !== exceptListRunId).flatMap((run) => run.entries).filter((entry) => entry.immediate?.state === "accepted" && !terminalState(entry.state)).length; }
+  private reservedCount(exceptListRunId?: string): number { return [...this.lists.values()].filter((run) => run.identity.listRunId !== exceptListRunId).flatMap((run) => run.entries).filter((entry) => entry.immediate?.state === "accepted" && !terminalState(entry.state) && !this.released.has(entry.keyRunId)).length; }
   private entry(keyRunId: string): KeyRunEntry | undefined { return this.find(keyRunId)?.entry; }
   private find(keyRunId: string): { run: ListRun; entry: KeyRunEntry } | undefined { for (const run of this.lists.values()) { const entry = run.entries.find((candidate) => candidate.keyRunId === keyRunId); if (entry) return { run, entry }; } }
   private requiredList(listRunId: string): ListRun { const run = this.lists.get(listRunId); if (!run) throw new Error(`unknown list run ${listRunId}`); return run; }

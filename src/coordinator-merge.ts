@@ -101,8 +101,11 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
     const verdict = await deps.gate(scope.root, scope.ticket, scope.part);
     if (!verdict.ok) throw new Error(`gate: ${verdict.reason}`);
     if (verdict.heads[scope.part.repo] !== before.headRefOid) throw new Error(`fresh gate head for ${scope.part.repo} is ${verdict.heads[scope.part.repo] ?? "missing"}, PR head is ${before.headRefOid}`);
+    const fresh = await deps.snapshot(scope.part.path, request.pr);
+    if (fresh.url !== request.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.part.base || fresh.headRefName !== scope.ticket || fresh.headRefOid !== before.headRefOid) throw new Error("PR identity, base, state, or head changed after fresh gate");
+    if (verdict.heads[scope.part.repo] !== fresh.headRefOid) throw new Error("fresh PR head no longer matches the gate verdict");
     if (!scope.live()) throw new Error("ship coordinator authority was revoked before merge spawn");
-    const merge = deps.merge(scope.part.path, { ...request, expectedHead: before.headRefOid });
+    const merge = deps.merge(scope.part.path, { ...request, expectedHead: fresh.headRefOid });
     const merged = await merge;
     let after: MergeSnapshot;
     try { after = await deps.snapshot(scope.part.path, request.pr); }

@@ -383,6 +383,8 @@ test("ship merge authority rejects every direct CLI and API entry", () => {
     "gh api --method PUT repos/o/r/pulls/5/merge -f merge_method=squash",
     "gh api --method PUT 'repos/o/r/pulls/5/merge' -f merge_method=squash",
     "curl -X PUT https://api.github.com/repos/o/r/pulls/5/merge",
+    "gh api graphql -f query='mutation { mergePullRequest(input: {}) { pullRequest { id } } }'",
+    "curl https://api.github.com/graphql -d '{\"query\":\"mutation { mergePullRequest(input: {}) { clientMutationId } }\"}'",
     "pnpm ship-merge YM-1 https://github.com/o/r/pull/5 --merge",
     "node src/ship-merge.ts YM-1 https://github.com/o/r/pull/5 --merge",
   ]) assert.match(bash("ship", cmd)?.reason ?? "", /parent coordinator/);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -75,6 +75,7 @@ test("merge control passes trusted live origin and structured result to the pare
   const server = bindCoordinatorControl(root, {
     async launch() { throw new Error("unexpected launch"); },
     async merge(runId, request, origin) { calls++; assert.equal(runId, "run-1"); assert.equal(origin.pid, process.pid); return { repo: "org/repo", pr: request.pr, head: request.expectedHead, state: "merged" }; },
+    async finalizeShip(runId, origin) { calls++; assert.equal(runId, "run-1"); assert.equal(origin.pid, process.pid); return { journal: { line: "shipped", path: "journal/2026-09.md", repeated: false }, localSync: { state: "committed" }, push: { state: "committed" }, cleanup: "removed" }; },
     status(requestId) { return { requestId, state: "status" }; },
     async cancel() {},
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
@@ -84,7 +85,10 @@ test("merge control passes trusted live origin and structured result to the pare
     const reply = await requestCoordinatorMerge(root, "run-1", { pr: "https://github.com/org/repo/pull/1", expectedHead: "a".repeat(40), method: "merge" }, origin, target, env);
     assert.equal(reply.state, "accepted");
     assert.equal(reply.merge?.state, "merged");
-    assert.equal(calls, 1);
+    const finalized = await requestShipFinalize(root, "run-1", origin, target, env);
+    assert.equal(finalized.state, "accepted");
+    assert.equal(finalized.finalization?.cleanup, "removed");
+    assert.equal(calls, 2);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

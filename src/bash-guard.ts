@@ -152,8 +152,8 @@ const LAUNCH = [
 const KILL = [/\b(pkill|killall)\b/, /\bkill\s+(-9\b|-KILL\b|-s\s+(9|KILL)\b)/];
 const SHIP_MERGE_BYPASS = [
   /\bgh\s+pr\s+merge(?:\s|$)/,
-  /\bgh\s+api\b[^|;&\n]*(?:repos\/[^/\s]+\/[^/\s]+\/pulls\/[^/\s]+\/merge|\/pulls\/[^/\s]+\/merge)\b/,
-  /\bcurl\b[^|;&\n]*(?:api\.github\.com|uploads\.github\.com)[^|;&\n]*\/pulls\/[^/\s]+\/merge\b/,
+  /\bgh\s+api\b[^|;&\n]*(?:repos\/[^/\s]+\/[^/\s]+\/pulls\/[^/\s]+\/merge|\/pulls\/[^/\s]+\/merge|mergePullRequest)\b/,
+  /\b(?:curl|wget)\b[^|;&\n]*(?:(?:api\.github\.com|uploads\.github\.com)[^|;&\n]*\/pulls\/[^/\s]+\/merge|mergePullRequest)\b/,
   /\bpnpm\s+(?:run\s+)?ship-merge\b/,
   /\bnode\b[^|;&\n]*\bship-merge(?:\.ts|\.js)?\b/,
 ];

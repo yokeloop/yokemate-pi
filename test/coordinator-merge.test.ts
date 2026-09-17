@@ -58,7 +58,7 @@ test("same repository and base serializes fresh sections while different reposit
 test("ambiguous merge reconciles exact merged state and duplicate attempt is not spawned twice", async () => {
   let merges = 0;
   const request = { pr: snapshot().url, expectedHead: HEAD, method: "squash" as const };
-  const first = await coordinatorMerge(scope(), request, deps([snapshot(), snapshot("repo", "MERGED")], async () => { merges++; return { exit: 1, output: "network lost" }; }));
+  const first = await coordinatorMerge(scope(), request, deps([snapshot(), snapshot(), snapshot("repo", "MERGED")], async () => { merges++; return { exit: 1, output: "network lost" }; }));
   assert.equal(first.state, "merged");
   const repeated = await coordinatorMerge(scope(), request, deps([], async () => { merges++; return { exit: 0, output: "" }; }));
   assert.equal(repeated.state, "merged");
@@ -67,11 +67,18 @@ test("ambiguous merge reconciles exact merged state and duplicate attempt is not
 });
 
 test("open reconciliation is truthful and revocation before spawn refuses", async () => {
-  const open = await coordinatorMerge({ ...scope(), runId: "open-run" }, { pr: snapshot().url, expectedHead: HEAD, method: "merge" }, deps([snapshot(), snapshot()], async () => ({ exit: 1, output: "required check changed" })));
+  const open = await coordinatorMerge({ ...scope(), runId: "open-run" }, { pr: snapshot().url, expectedHead: HEAD, method: "merge" }, deps([snapshot(), snapshot(), snapshot()], async () => ({ exit: 1, output: "required check changed" })));
   assert.deepEqual({ state: open.state, reason: open.reason }, { state: "open", reason: "required check changed" });
   let live = true;
   let spawned = false;
   const revokedDeps: CoordinatorMergeDeps = { snapshot: async () => snapshot("revoked"), gate: async (_root, _ticket, prepared) => { live = false; return { ok: true, heads: { [prepared.repo]: HEAD } }; }, merge: async () => { spawned = true; return { exit: 0, output: "" }; } };
   await assert.rejects(() => coordinatorMerge({ ...scope("revoked", () => live), runId: "revoked-run" }, { pr: snapshot("revoked").url, expectedHead: HEAD, method: "rebase" }, revokedDeps), /revoked before merge spawn/);
+  assert.equal(spawned, false);
+});
+
+test("base drift after the fresh gate refuses before merge spawn", async () => {
+  let spawned = false;
+  const changed = { ...snapshot("base-drift"), baseRefName: "release" };
+  await assert.rejects(() => coordinatorMerge({ ...scope("base-drift"), runId: "base-drift-run" }, { pr: snapshot("base-drift").url, expectedHead: HEAD, method: "merge" }, deps([snapshot("base-drift"), changed], async () => { spawned = true; return { exit: 0, output: "" }; })), /changed after fresh gate/);
   assert.equal(spawned, false);
 });

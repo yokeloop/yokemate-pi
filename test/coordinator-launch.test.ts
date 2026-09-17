@@ -128,13 +128,16 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const approve = async (text: string) => { for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, { ...ctx, mode: "tui" }); };
     for (let attempt = 0; attempt < 10; attempt++) {
-      const result: AgentToolResult<unknown> = await tool.definition.execute(`retry-${attempt}`, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      const callId = `retry-${attempt}`;
+      const result: AgentToolResult<unknown> = await tool.definition.execute(callId, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: callId, result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
       assert.equal("isError" in result && result.isError, true);
       const text = result.content[0];
       assert.ok(text?.type === "text");
       assert.match(text.text, /no current recorded plan for approval/);
       assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
     }
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(reports.length, 10);
     assert.ok(reports.every((report) => (report as { customType?: string }).customType === "yokemate-list-aggregate"));
     reports.length = 0;

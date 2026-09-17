@@ -679,7 +679,11 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     assert.match(notifications.at(-1) ?? "", /configured model and external authentication/);
     const malformedRequest = await tool.execute("invalid", { coordinator: { mode: "do", tickets: ["../YM-1"] } }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(malformedRequest), /invalid ticket key/);
-    const launch = async (tickets = ["YM-1"]) => (await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    const launch = async (tickets = ["YM-1"]) => {
+      const result = await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx);
+      for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: "ship", result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
+      return result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    };
     process.env.YOKEMATE_MODE = "plan";
     process.env.YOKEMATE_TICKET = "YM-1";
     writeFileSync(file, "{}");

@@ -272,10 +272,10 @@ for (const entry of ["node", "package"]) {
     test(`${entry} plan ${split ? "split" : "tab"}: each key owns its surface, model and literal context`, () => {
       const f = fixture();
       try {
-        const plain = f.run("plan", [...(split ? ["--split"] : []), "YM-1", "YM-2"], {}, entry);
+        const plain = f.run("plan", [...(split ? ["--split"] : []), "YM-1", "YM-2", "YM-3"], {}, entry);
         assert.equal(plain.status, 0, plain.stderr);
-        assert.equal(plain.calls.filter(c => c[1] === "create" || c[1] === "split").length, 2);
-        assert.deepEqual(plain.calls.filter(c => c[1] === "prompt").map(c => c[3]), ["/skill:plan YM-1", "/skill:plan YM-2"]);
+        assert.equal(plain.calls.filter(c => c[1] === "create" || c[1] === "split").length, 3);
+        assert.deepEqual(plain.calls.filter(c => c[1] === "prompt").map(c => c[3]), ["/skill:plan YM-1", "/skill:plan YM-2", "/skill:plan YM-3"]);
         for (const explicit of [false, true]) {
           const keys = ["YM-1", "ACME-2"];
           const literal = ["YM-99", "--split", "--model", "literal"];

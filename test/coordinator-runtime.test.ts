@@ -89,6 +89,32 @@ test("list reservations precede starts and whole lifetimes share bounded capacit
   assert.deepEqual(registry.aggregate(run.identity.listRunId)?.results.map((entry) => entry.key), ["A-1", "B-1", "C-1"]);
 });
 
+test("durable plan recording releases its lifetime slot before auto-do admission", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } });
+  const plan = registry.admit({ mode: "plan", keys: ["A-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  registry.publishImmediate(plan.identity.listRunId);
+  registry.start(plan.identity.listRunId, async (context) => { context.active(); return new Promise(() => {}); });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(registry.releaseLifetime(plan.entries[0]!.keyRunId), true);
+  assert.equal(registry.wasLifetimeReleased(plan.entries[0]!.keyRunId), true);
+  const handoff = registry.admit({ mode: "do", keys: ["A-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, externalActiveUnits: 0 });
+  assert.equal(handoff.entries[0]!.immediate?.state, "accepted");
+  assert.equal(registry.settle(plan.identity.listRunId, plan.entries[0]!.keyRunId, { outcome: "done", facts: { handoff: "accepted" } }), true);
+});
+
+test("fully refused list aggregate can be flushed only after its immediate ACK", () => {
+  const registry = new ListRunRegistry();
+  const run = registry.admit({ mode: "ship", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({ subagent: { maxParallelTasks: 1 } }) });
+  const order: string[] = [];
+  registry.onImmediate((_list, entry) => order.push(`ack:${entry.key}`));
+  registry.onAggregate(() => order.push("aggregate"));
+  registry.publishImmediate(run.identity.listRunId, true);
+  assert.deepEqual(order, ["ack:A-1", "ack:B-1"]);
+  registry.flushAggregate(run.identity.listRunId);
+  assert.deepEqual(order, ["ack:A-1", "ack:B-1", "aggregate"]);
+});
+
 test("parallel task limit refuses the whole fan-out while concurrency only queues", () => {
   const limited = new ListRunRegistry().admit({ mode: "plan", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 4 } }) });
   assert.ok(limited.entries.every((entry) => entry.immediate?.state === "refused"));

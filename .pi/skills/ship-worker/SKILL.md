@@ -34,12 +34,12 @@ Still per key, once its branches stand on the base and the local checks are gree
 
 5. **Push to the same PRs.** The PR updates itself. Then `gh pr checks <url> --watch --fail-fast` per PR — the one form of waiting there is: the command finishes on its own. No sleep, no polling loops.
 6. **Serialized fresh gate → merge; refusal → stop.** For each remaining OPEN PR, call `coordinator_merge` with its exact URL, current full head SHA and the repository method established in step 1. The trusted parent serializes only that repository/base's fresh gate-and-merge section, rereads the current PR target and head, and passes exactly that fresh head to GitHub's match-head merge. A PR already confirmed MERGED is complete and is not requested again. Never call `gh pr merge`, `gh api`, a merge HTTP endpoint or an internal script directly. An `open`/`unknown` result or refusal, or red you cannot make green inside the ticket's scope → do not merge: put the literal output in the report and leave the folder and remaining PRs as they stand.
-7. **Log and clean up.** After every PR of the key is merged: append `- YYYY-MM-DD HH:MM <KEY> отгружено` to `home/journal/YYYY-MM.md` at the yokemate root (same shape as the other outcome lines), then `rm -rf work/<KEY>` — the yokemate tree, the guard lets it pass.
+7. **Finalize through the parent.** After every PR of the key is confirmed merged, call `coordinator_finish` with `outcome: "done"`. The live parent verifies every prepared PR, idempotently appends and syncs the single shipped journal outcome under the shared home lock, and removes the task folder. Never append that line or remove the folder directly.
 
 The scope is the update and the merge: no new features, no cleanups, no plan changes. Commit messages English only; no comments in code.
 
 ## Report
 
-Merging is not the finish. After the key is merged, its outcome line is written and its folder removed, call `coordinator_finish` with `outcome: "done"`. On a blocker call it with `outcome: "blocked"` and the literal failing output. The parent emits this key's terminal result and the ordered list aggregate when every sibling is terminal.
+Merging is not the finish. After the key is merged, call `coordinator_finish` with `outcome: "done"`; that request owns finalization and can be retried after a partial finalization. On a blocker call it with `outcome: "blocked"` and the literal failing output. The parent emits this key's terminal result and the ordered list aggregate when every sibling is terminal.
 
 The stage does not change — no «merged» stage exists; the accepted row has already left the queue.

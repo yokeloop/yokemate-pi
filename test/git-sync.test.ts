@@ -3,10 +3,11 @@
 // touches the real pool or the network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { commitExact, pullFastForward, syncPull, syncPush } from "../src/git-sync.ts";
+import { commitExact, gitMutationLockPath, pullFastForward, syncPull, syncPush } from "../src/git-sync.ts";
 import { recordPlan } from "../src/plan-record.ts";
 import { openDb } from "../src/db.ts";
 import { noteSave } from "../src/note-save.ts";
@@ -336,6 +337,34 @@ test("plan commit excludes foreign staged files and duplicate record does not re
     assert.equal(readFileSync(journalFile, "utf8"), before);
     assert.equal(git(origin, "log", "-1", "--format=%s", "main").trim(), "YM-1 план");
   } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test("a cancelled plan recorder waiting for the canonical lock makes no mutation", async () => {
+  const tmp = makeTmp();
+  let holder: ReturnType<typeof spawn> | undefined;
+  try {
+    const { a } = setupPair(tmp);
+    const engine = join(tmp, "engine");
+    mkdirSync(join(engine, ".pi"), { recursive: true });
+    writeFileSync(join(engine, ".pi", "settings.json"), "{}");
+    execFileSync("mv", [a, join(engine, "home")]);
+    const home = join(engine, "home");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    mkdirSync(join(plan, ".."), { recursive: true });
+    writeFileSync(plan, "# YM-1\n\n## Affected repositories\n- `org/repo` — app\n");
+    const db = openDb(join(engine, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
+    db.close();
+    holder = spawn("flock", ["--exclusive", "--no-fork", gitMutationLockPath(home), "sh", "-c", "echo locked; exec sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+    await new Promise<void>((resolve) => holder!.stdout!.once("data", () => resolve()));
+    const controller = new AbortController();
+    const pending = recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, /cancelled before lock acquisition/);
+    assert.equal(readFileSync(plan, "utf8").startsWith("# YM-1"), true);
+    const journal = existsSync(join(home, "journal")) ? readdirSync(join(home, "journal")).map((name) => readFileSync(join(home, "journal", name), "utf8")).join("\n") : "";
+    assert.doesNotMatch(journal, /YM-1 запланировано/);
+  } finally { holder?.kill("SIGKILL"); rmSync(tmp, { recursive: true, force: true }); }
 });
 
 test("parallel plan recorders serialize local writes", async () => {
