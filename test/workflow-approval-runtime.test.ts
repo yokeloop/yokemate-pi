@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { openDb } from "../src/db.ts";
 import { readRecordedPlanBinding } from "../src/plan-binding.ts";
+import { currentControlOrigin, requestPlanControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 
 const source = join(import.meta.dirname, "..");
 
@@ -171,6 +172,21 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.match(planComment.body, /YM-1 · plan · revision/);
     assert.match(planComment.body, /record: planned \(successful local record\)/);
     assert.ok(planComment.body.endsWith(text));
+    const recorded = db.prepare("SELECT id,publication_id FROM plan_record WHERE ticket='YM-1' AND successful_record=1 ORDER BY id DESC LIMIT 1").get() as { id: number; publication_id: number };
+    const planPublication = db.prepare("SELECT artifact_path FROM plan_publication WHERE id=?").get(recorded.publication_id) as { artifact_path: string };
+    const planArtifact = readFileSync(planPublication.artifact_path);
+    writeFileSync(planPublication.artifact_path, "tampered");
+    const parentTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const artifactReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    assert.equal(artifactReply.publication, "pending");
+    assert.equal(artifactReply.reason, "artifact_invalid");
+    assert.equal(db.prepare("SELECT error_code FROM plan_publication WHERE id=?").get(recorded.publication_id)?.error_code, "artifact_invalid");
+    writeFileSync(planPublication.artifact_path, planArtifact);
+    execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
+    const targetReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    assert.equal(targetReply.publication, "pending");
+    assert.equal(targetReply.reason, "binding_changed");
+    execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
     assert.match(output(await launch()), /current interactive approval/);

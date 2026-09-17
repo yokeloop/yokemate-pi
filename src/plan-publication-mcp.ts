@@ -10,19 +10,22 @@ type Execute = (id: string, params: Record<string, unknown>, signal: AbortSignal
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
 
 function safeError(details: Record<string, unknown> | undefined): PublicationFailure {
-  const error = String(details?.error ?? "");
-  if (/auth/.test(error)) return new PublicationFailure("auth");
-  if (/permission|forbidden|denied/.test(error)) return new PublicationFailure("permission");
-  if (/rate|429/.test(error)) return new PublicationFailure("rate_limit");
-  if (/size|large|413/.test(error)) return new PublicationFailure("size");
+  const raw = details?.mcpResult as any;
+  const content = Array.isArray(raw?.content) ? raw.content.filter((item: any) => item?.type === "text" && typeof item.text === "string").map((item: any) => item.text).join(" ") : "";
+  let structured = "";
+  try { structured = raw?.structuredContent === undefined ? "" : JSON.stringify(raw.structuredContent); } catch {}
+  const error = `${String(details?.error ?? "")} ${content} ${structured}`;
+  if (/\b401\b|auth/i.test(error)) return new PublicationFailure("auth");
+  if (/\b403\b|permission|forbidden|denied/i.test(error)) return new PublicationFailure("permission");
+  if (/\b429\b|rate.?limit/i.test(error)) return new PublicationFailure("rate_limit");
+  if (/\b413\b|size|too large|maximum/i.test(error)) return new PublicationFailure("size");
   return new PublicationFailure("unavailable");
 }
 
 function mcpData(result: any): unknown {
   const details = result?.details as Record<string, unknown> | undefined;
-  if (result?.isError || details?.error) throw safeError(details);
   const raw = details?.mcpResult as any;
-  if (raw?.isError) throw new PublicationFailure("unavailable");
+  if (result?.isError || details?.error || raw?.isError) throw safeError(details);
   if (raw?.structuredContent !== undefined) return raw.structuredContent;
   const texts = Array.isArray(raw?.content) ? raw.content.filter((item: any) => item?.type === "text" && typeof item.text === "string").map((item: any) => item.text) : [];
   if (texts.length === 1) {
@@ -35,7 +38,8 @@ class PrivateMcp {
   private execute?: Execute;
   private handlers = new Map<string, Handler[]>();
   private initialized = false;
-  private pending?: { tool: string; args: Record<string, unknown> };
+  private initializing?: Promise<void>;
+  private pending = new Set<string>();
   private pi: ExtensionAPI;
   private root: string;
   private server: string;
@@ -65,8 +69,8 @@ class PrivateMcp {
     const events = {
       emit(event: string, request: any) {
         if (event !== approvalEvent) return false;
-        const pending = bridge.pending;
-        if (!request?.claim || request.signal?.aborted || request.serverName !== bridge.server || request.originalToolName !== pending?.tool || JSON.stringify(request.args) !== JSON.stringify(pending?.args)) return false;
+        const key = `${String(request?.originalToolName)}\u0000${JSON.stringify(request?.args)}`;
+        if (!request?.claim || request.signal?.aborted || request.serverName !== bridge.server || !bridge.pending.has(key)) return false;
         return request.claim(() => "allow_once");
       },
       on() { return () => undefined; },
@@ -88,18 +92,24 @@ class PrivateMcp {
   }
   private async start(): Promise<void> {
     if (this.initialized) return;
-    const ctx = this.context();
-    if (!ctx) throw new PublicationFailure("unavailable");
-    try {
-      for (const handler of this.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
-      const connected = await this.invoke({ connect: this.server });
-      if (connected?.details?.server !== this.server || connected?.details?.error) throw safeError(connected?.details);
-      this.initialized = true;
-    } catch (error) {
-      for (const handler of this.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx);
-      this.initialized = false;
-      throw error;
-    }
+    if (this.initializing) return this.initializing;
+    const work = (async () => {
+      const ctx = this.context();
+      if (!ctx) throw new PublicationFailure("unavailable");
+      try {
+        for (const handler of this.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+        const connected = await this.invoke({ connect: this.server });
+        if (connected?.details?.server !== this.server || connected?.details?.error) throw safeError(connected?.details);
+        this.initialized = true;
+      } catch (error) {
+        for (const handler of this.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx);
+        this.initialized = false;
+        throw error;
+      }
+    })();
+    this.initializing = work;
+    try { await work; }
+    finally { if (this.initializing === work) this.initializing = undefined; }
   }
   private async invoke(params: Record<string, unknown>): Promise<any> {
     const ctx = this.context();
@@ -118,9 +128,10 @@ class PrivateMcp {
   async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
     await this.start();
     await this.describe(tool);
-    this.pending = { tool, args };
+    const key = `${tool}\u0000${JSON.stringify(args)}`;
+    this.pending.add(key);
     try { return mcpData(await this.invoke({ server: this.server, tool, args })); }
-    finally { this.pending = undefined; }
+    finally { this.pending.delete(key); }
   }
   async shutdown(): Promise<void> {
     if (!this.initialized) return;
@@ -131,18 +142,27 @@ class PrivateMcp {
 }
 
 export class PlanPublicationMcp {
-  private bridges = new Map<string, PrivateMcp>();
+  private bridges = new Map<string, Promise<PrivateMcp>>();
   private ctx?: ExtensionContext;
   private pi: ExtensionAPI;
   private root: string;
   constructor(pi: ExtensionAPI, root: string) { this.pi = pi; this.root = root; }
   setContext(ctx: ExtensionContext): void { this.ctx = ctx; }
   private async bridge(server: string): Promise<PrivateMcp> {
-    let bridge = this.bridges.get(server);
-    if (!bridge) { bridge = await PrivateMcp.create(this.pi, this.root, server, () => this.ctx); this.bridges.set(server, bridge); }
-    return bridge;
+    let pending = this.bridges.get(server);
+    if (!pending) {
+      pending = PrivateMcp.create(this.pi, this.root, server, () => this.ctx);
+      this.bridges.set(server, pending);
+    }
+    try { return await pending; }
+    catch (error) { if (this.bridges.get(server) === pending) this.bridges.delete(server); throw error; }
   }
-  async shutdown(): Promise<void> { await Promise.all([...this.bridges.values()].map((bridge) => bridge.shutdown())); this.bridges.clear(); }
+  async shutdown(): Promise<void> {
+    const pending = [...this.bridges.values()];
+    this.bridges.clear();
+    const bridges = (await Promise.allSettled(pending)).flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    await Promise.all(bridges.map((bridge) => bridge.shutdown()));
+  }
   async youTrackAdapter(server: string, issueId: string): Promise<{ adapter: PublicationAdapter; canonicalUrl: string }> {
     const bridge = await this.bridge(server);
     const issue = await bridge.call("get_issue", { issueId, recentCommentsCount: 0 }) as any;

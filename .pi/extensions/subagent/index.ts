@@ -626,6 +626,10 @@ export default function (pi: ExtensionAPI) {
 			bytes = readPublicationArtifact(ENGINE_ROOT, row);
 			target = resolvePublicationTarget(db, row.ticket);
 			if (target.target !== row.target || target.targetHash !== row.target_hash) throw new PublicationFailure("binding_changed");
+		} catch (error) {
+			const code = error instanceof PublicationFailure ? error.code : "artifact_invalid";
+			if (row) markPublicationResult(db, row.id, { complete: false, error: code });
+			return { complete: false, error: code, parts: 0, revision: row?.content_hash ?? "", target: row?.target ?? "unknown" };
 		} finally { db.close(); }
 		const key = `${row.target}\u0000${row.ticket}`;
 		const prior = publicationTail.get(key) ?? Promise.resolve();
@@ -635,8 +639,8 @@ export default function (pi: ExtensionAPI) {
 				const resolved = target.type === "github"
 					? { adapter: githubPublicationAdapter(target), canonicalUrl: target.canonicalUrl }
 					: await publicationMcp.youTrackAdapter(target.server, target.issueId);
-				canonicalUrl = resolved.canonicalUrl;
 				if (row.canonical_url && row.canonical_url !== resolved.canonicalUrl) throw new PublicationFailure("remote_conflict");
+				canonicalUrl = resolved.canonicalUrl;
 				const knowledgePath = row.plan_path ? path.relative(ENGINE_ROOT, row.plan_path) : undefined;
 				const result = await publishDocument(row, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding });
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));

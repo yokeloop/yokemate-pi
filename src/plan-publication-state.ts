@@ -179,7 +179,7 @@ export function readPublicationArtifact(root: string, row: PublicationRow): Buff
 }
 
 export function markPublicationResult(db: DatabaseSync, rowId: number, result: { complete: boolean; error?: PublicationError; canonicalUrl?: string }): void {
-  db.prepare("UPDATE plan_publication SET complete=?,error_code=?,canonical_url=COALESCE(?,canonical_url),updated_at=datetime('now') WHERE id=?")
+  db.prepare("UPDATE plan_publication SET complete=?,error_code=?,canonical_url=COALESCE(canonical_url,?),updated_at=datetime('now') WHERE id=?")
     .run(result.complete ? 1 : 0, result.error ?? null, result.canonicalUrl ?? null, rowId);
   const row = publicationById(db, rowId);
   if (!row) return;
