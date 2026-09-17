@@ -6,10 +6,11 @@ import { ensureDir, socketDir } from "./inbox.ts";
 import type { CoordinatorRequest } from "./coordinator-launch.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; runId?: string; targetRequestId?: string }
-export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; originId?: string; identity?: unknown }
-export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "plan-recorded";
-export interface ParentControl { planRecorded?(ticket: string, path: string, origin: ControlOrigin): Promise<{ runId?: string; reason: string }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId: string; identity: unknown }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string }
+export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reason?: string; identity?: unknown }
+export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; results?: ControlResult[] }
+export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "plan-recorded" | "plan-finished" | "record-plan";
+export interface ParentControl { planRecorded?(ticket: string, path: string, origin: ControlOrigin): Promise<{ runId?: string; reason: string }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[] }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 export function processStarttime(pid: number): string | undefined {
@@ -70,7 +71,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   if (identity.pane) paneParents.set(identity.pane, undefined);
   const replies = new Map<string, ControlReply>();
   const requestOrigins = new Map<string, string>();
-  const requestRuns = new Map<string, string>();
+  const requestRuns = new Map<string, string[]>();
+  const requestLists = new Map<string, string>();
   const runOrigins = new Map<string, string>();
   const bindOrigin = (origin: ControlOrigin): string => {
     if (!origin.sessionId || !origin.pid || !origin.starttime || resolve(origin.cwd) !== canonicalRoot) throw new Error("invalid coordinator origin");
@@ -109,7 +111,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         const origin = envelope.originId ? origins.get(envelope.originId) : undefined;
         if (!origin) { reply({ requestId: envelope.requestId, state: "refused", reason: "unknown origin binding" }); continue; }
         if (!processMatches(origin.pid, origin.starttime)) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin process is no longer live" }); continue; }
-        if (["register-plan", "bind-plan", "plan-started", "plan-recorded"].includes(envelope.operation)) {
+        if (["register-plan", "bind-plan", "plan-started", "plan-recorded", "plan-finished", "record-plan"].includes(envelope.operation)) {
           try {
             const ticket = envelope.ticket;
             if (!ticket || !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error("invalid plan handoff ticket");
@@ -140,9 +142,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           continue;
         }
         if (envelope.operation === "status") {
-          const target = envelope.targetRequestId ?? envelope.requestId;
-          if (requestOrigins.get(target) !== envelope.originId) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator request" }); continue; }
-          reply(parent.status(requestRuns.get(target) ?? target, origin));
+          const target = envelope.targetRequestId ?? envelope.listRunId ?? envelope.keyRunId ?? envelope.requestId;
+          const requestOwned = requestOrigins.get(target) === envelope.originId;
+          const runOwned = runOrigins.get(target) === envelope.originId;
+          if (!requestOwned && !runOwned) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator request" }); continue; }
+          const statusId = requestOwned ? requestLists.get(target) ?? requestRuns.get(target)?.[0] ?? target : target;
+          reply(parent.status(statusId, origin));
           continue;
         }
         if (envelope.operation === "cancel" && envelope.runId) {
@@ -158,10 +163,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         try {
           const accepted = await parent.launch(envelope.request, origin);
           const originId = envelope.originId!;
+          const runIds = accepted.results?.filter((result) => result.state === "accepted").map((result) => result.keyRunId) ?? (accepted.runId ? [accepted.runId] : []);
+          if (!runIds.length) throw new Error("coordinator launch accepted no keys");
           requestOrigins.set(envelope.requestId, originId);
-          requestRuns.set(envelope.requestId, accepted.runId);
-          runOrigins.set(accepted.runId, originId);
-          reply({ requestId: envelope.requestId, state: "accepted", ...accepted });
+          requestRuns.set(envelope.requestId, runIds);
+          if (accepted.listRunId) { requestLists.set(envelope.requestId, accepted.listRunId); runOrigins.set(accepted.listRunId, originId); }
+          for (const runId of runIds) runOrigins.set(runId, originId);
+          reply({ requestId: envelope.requestId, state: "accepted", ...accepted, runId: accepted.runId ?? runIds[0] });
         } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
       }
     });

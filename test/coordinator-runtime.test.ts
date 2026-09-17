@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CoordinatorRegistry, IDLE_NUDGE_LIMIT, ShipPermitStore, idleVerdict } from "../src/coordinator-runtime.ts";
+import { ListRunRegistry, type KeyRunContext } from "../src/list-run.ts";
+import { resolveRuntimeSettings } from "../src/guard-policy.ts";
 
 test("coordinator registry reserves ticket batches atomically and releases terminal runs", () => {
   const registry = new CoordinatorRegistry();
@@ -60,6 +62,69 @@ test("coordinator checks use the same policy and limits as ordinary admission", 
   assert.equal(off.checkAdmission(100), undefined);
   assert.equal(on.needsShipConfirmation({}), true);
   assert.equal(off.needsShipConfirmation({}), false);
+});
+
+test("list reservations precede starts and whole lifetimes share bounded capacity", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 2, maxDetached: 3 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, rejectDuplicate: true });
+  assert.deepEqual(run.entries.map((entry) => entry.immediate?.reservation), ["ready", "ready", "queued"]);
+  const events: string[] = [];
+  const releases = new Map<string, (value: import("../src/list-run.ts").ListTerminal) => void>();
+  registry.start(run.identity.listRunId, async (context) => {
+    events.push(`start:${context.key}`);
+    context.active();
+    return new Promise((resolve) => releases.set(context.key, resolve));
+  });
+  assert.deepEqual(events, []);
+  registry.publishImmediate(run.identity.listRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["start:A-1", "start:B-1"]);
+  releases.get("B-1")!({ outcome: "done", facts: { pr: "b" } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["start:A-1", "start:B-1", "start:C-1"]);
+  releases.get("C-1")!({ outcome: "done", facts: { pr: "c" } });
+  releases.get("A-1")!({ outcome: "done", facts: { pr: "a" } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(registry.aggregate(run.identity.listRunId)?.results.map((entry) => entry.key), ["A-1", "B-1", "C-1"]);
+});
+
+test("list ACK precedes fast terminal and cancel fences late outcomes to one key", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 2, maxDetached: 3 } });
+  const run = registry.admit({ mode: "ship", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  const order: string[] = [];
+  registry.onImmediate((_list, entry) => order.push(`ack:${entry.key}`));
+  registry.onTerminal((_list, entry) => order.push(`terminal:${entry.key}`));
+  registry.settle(run.identity.listRunId, run.entries[0]!.keyRunId, { outcome: "blocked", reason: "fast" });
+  registry.publishImmediate(run.identity.listRunId);
+  assert.deepEqual(order, ["ack:A-1", "ack:B-1", "terminal:A-1"]);
+  assert.equal(registry.cancel(run.entries[1]!.keyRunId), true);
+  assert.equal(registry.settle(run.identity.listRunId, run.entries[1]!.keyRunId, { outcome: "done" }), false);
+  assert.equal(run.entries[0]!.terminal?.reason, "fast");
+  assert.equal(run.entries[1]!.terminal?.outcome, "cancelled");
+});
+
+test("duplicate input has no accepted side effects and admissible siblings survive active duplicate and overflow", () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 2, maxDetached: 3 } });
+  const invalid = registry.admit({ mode: "plan", keys: ["A-1", "A-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, rejectDuplicate: true });
+  assert.ok(invalid.entries.every((entry) => entry.immediate?.state === "refused"));
+  const first = registry.admit({ mode: "do", keys: ["A-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, rejectDuplicate: true });
+  const next = registry.admit({ mode: "do", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, externalActiveUnits: 1, rejectDuplicate: true });
+  assert.equal(first.entries[0]!.immediate?.state, "accepted");
+  assert.deepEqual(next.entries.map((entry) => entry.immediate?.state), ["refused", "accepted", "refused"]);
+});
+
+test("list children retain parent list and key identity", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 2, maxDetached: 2 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  const contexts: KeyRunContext[] = [];
+  registry.start(run.identity.listRunId, async (context) => { contexts.push(context); return { outcome: "done" }; });
+  registry.publishImmediate(run.identity.listRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(contexts.map(({ listRunId, parentRunId, keyRunId }) => ({ listRunId, parentRunId, keyRunId })), run.entries.map((entry) => ({ listRunId: run.identity.listRunId, parentRunId: run.identity.listRunId, keyRunId: entry.keyRunId })));
 });
 
 test("duplicate off keeps independent atomic reservations and release does not hide siblings", () => {

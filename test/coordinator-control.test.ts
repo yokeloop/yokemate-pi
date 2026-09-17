@@ -41,6 +41,31 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
   }
 });
 
+test("one control request retains every sibling list identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-list-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-list-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  const statuses: string[] = [];
+  const server = bindCoordinatorControl(root, {
+    async launch(request) { return { listRunId: "list-1", results: request.tickets.map((key, index) => ({ key, keyRunId: `key-${index + 1}`, state: "accepted" as const })) }; },
+    status(runId) { statuses.push(runId); return { requestId: runId, state: "status", runId }; },
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+    const accepted = await requestCoordinator(root, { mode: "do", tickets: ["YM-1", "YM-2"] }, origin, target, env);
+    assert.equal(accepted.listRunId, "list-1");
+    assert.equal(accepted.runId, "key-1");
+    assert.deepEqual(accepted.results?.map((result) => result.keyRunId), ["key-1", "key-2"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("plan handoff is bound to the registered pane run and its live worker session", async () => {
   const { requestPlanControl } = await import("../src/coordinator-control.ts");
   const root = mkdtempSync(join(tmpdir(), "plan-control-"));
