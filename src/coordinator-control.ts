@@ -11,7 +11,7 @@ export interface ControlEnvelope { version: 1; operation: "attach-origin" | "lau
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reason?: string; identity?: unknown }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; results?: ControlResult[] }
 export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "plan-recorded" | "plan-finished" | "record-plan";
-export interface ParentControl { planRecorded?(ticket: string, path: string, origin: ControlOrigin, runId?: string): Promise<{ runId?: string; reason: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[] }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
+export interface ParentControl { recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string): Promise<{ runId?: string; reason: string }>; planRecorded?(ticket: string, path: string, origin: ControlOrigin, runId?: string): Promise<{ runId?: string; reason: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[] }>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 export function processStarttime(pid: number): string | undefined {
@@ -65,7 +65,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
-  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; listRunId?: string; pane?: string; worker?: ControlOrigin; terminal?: "recorded" | "blocked" | "cancelled" }>();
+  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; listRunId?: string; pane?: string; worker?: ControlOrigin; terminal?: "recorded" | "blocked" | "cancelled"; recordReply?: { runId?: string; reason: string } }>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const origins = new Map<string, ControlOrigin>();
   const paneParents = new Map<string, string | undefined>();
@@ -157,6 +157,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
               } else {
                 if (!main && (!planRun?.worker || planRun.ticket !== ticket || origin.mode !== "plan" || origin.ticket !== ticket || origin.pane !== planRun.pane || origin.sessionId !== planRun.worker.sessionId || !descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime))) throw new Error("plan result is not from its registered live worker");
+                if (planRun?.terminal === "recorded" && ["record-plan", "plan-recorded"].includes(envelope.operation)) {
+                  reply({ requestId: envelope.requestId, state: "accepted", ...planRun.recordReply });
+                  continue;
+                }
                 if (planRun?.terminal || (!main && !planRun)) throw new Error("plan run is no longer active");
                 if (envelope.operation === "plan-finished") {
                   if (!planRun || !envelope.runId || !envelope.outcome || !envelope.reason || !parent.planFinished) throw new Error("plan finish handoff is unavailable");
@@ -164,9 +168,11 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   planRun.terminal = envelope.outcome;
                   reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
                 } else {
-                  if (!envelope.path || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
-                  const outcome = await parent.planRecorded(ticket, envelope.path, origin, envelope.runId);
-                  if (planRun) planRun.terminal = "recorded";
+                  if (!envelope.path) throw new Error("plan record handoff is unavailable");
+                  const outcome = envelope.operation === "record-plan"
+                    ? envelope.runId && parent.recordPlan ? await parent.recordPlan(ticket, envelope.path, origin, envelope.runId) : (() => { throw new Error("parent plan recorder is unavailable"); })()
+                    : parent.planRecorded ? await parent.planRecorded(ticket, envelope.path, origin, envelope.runId) : (() => { throw new Error("plan record handoff is unavailable"); })();
+                  if (planRun) { planRun.terminal = "recorded"; planRun.recordReply = outcome; }
                   reply({ requestId: envelope.requestId, state: "accepted", ...outcome });
                 }
               }

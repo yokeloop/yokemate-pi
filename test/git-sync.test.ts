@@ -10,12 +10,15 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pullFastForward, syncPull, syncPush } from "../src/git-sync.ts";
+import { commitExact, pullFastForward, syncPull, syncPush } from "../src/git-sync.ts";
+import { recordPlan } from "../src/plan-record.ts";
+import { openDb } from "../src/db.ts";
 import { noteSave } from "../src/note-save.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -299,6 +302,78 @@ test("корень данных без своего .git не трогает д�
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("plan commit excludes foreign staged files and duplicate record does not repeat journal", async () => {
+  const tmp = makeTmp();
+  try {
+    const { origin, a } = setupPair(tmp);
+    const engine = join(tmp, "engine");
+    mkdirSync(join(engine, ".pi"), { recursive: true });
+    writeFileSync(join(engine, ".pi", "settings.json"), "{}");
+    execFileSync("mv", [a, join(engine, "home")]);
+    const home = join(engine, "home");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    mkdirSync(join(plan, ".."), { recursive: true });
+    writeFileSync(plan, "# YM-1\n\n## Affected repositories\n- `org/repo` — app\n");
+    writeFileSync(join(home, "foreign.txt"), "foreign\n");
+    git(home, "add", "foreign.txt");
+    const db = openDb(join(engine, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
+    db.close();
+    const first = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" });
+    assert.equal(first.recorded, true);
+    assert.equal(first.localSync.state, "committed");
+    const files = git(home, "show", "--name-only", "--format=", first.localSync.commit!).trim().split("\n");
+    assert.ok(files.includes("knowledge/org/repo/ai/YM-1-work/plan.md"));
+    assert.ok(files.some((file) => file.startsWith("journal/")));
+    assert.equal(files.includes("foreign.txt"), false);
+    assert.equal(git(home, "diff", "--cached", "--name-only").trim(), "foreign.txt");
+    const journalFile = join(home, "journal", readdirSync(join(home, "journal"))[0]!);
+    const before = readFileSync(journalFile, "utf8");
+    const repeat = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" });
+    assert.equal(repeat.repeat, true);
+    assert.equal(readFileSync(journalFile, "utf8"), before);
+    assert.equal(git(origin, "log", "-1", "--format=%s", "main").trim(), "YM-1 план");
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test("parallel plan recorders serialize local writes", async () => {
+  const tmp = makeTmp();
+  try {
+    const { origin, a } = setupPair(tmp);
+    const engine = join(tmp, "engine");
+    mkdirSync(join(engine, ".pi"), { recursive: true });
+    writeFileSync(join(engine, ".pi", "settings.json"), "{}");
+    execFileSync("mv", [a, join(engine, "home")]);
+    const home = join(engine, "home");
+    const db = openDb(join(engine, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
+    db.close();
+    const plans = ["YM-1", "YM-2"].map((ticket) => {
+      const plan = join(home, "knowledge", "org", "repo", "ai", `${ticket}-work`, "plan.md");
+      mkdirSync(join(plan, ".."), { recursive: true });
+      writeFileSync(plan, `# ${ticket}\n\n## Affected repositories\n- \`org/repo\` — app\n`);
+      return { ticket, plan };
+    });
+    const results = await Promise.all(plans.map(({ ticket, plan }) => recordPlan(engine, ticket, plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: ticket })));
+    assert.ok(results.every((result) => result.recorded && result.localSync.state === "committed"));
+    const log = git(origin, "log", "--format=%s", "main");
+    assert.match(log, /YM-1 план/);
+    assert.match(log, /YM-2 план/);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test("commitExact defers when a target already has staged content", () => {
+  const tmp = makeTmp();
+  try {
+    const { a } = setupPair(tmp);
+    appendFileSync(join(a, "journal", "2026-08.md"), "- staged\n");
+    git(a, "add", "journal/2026-08.md");
+    const result = commitExact(a, "plan", ["journal/2026-08.md"]);
+    assert.equal(result.state, "deferred");
+    assert.match(result.reason ?? "", /already staged/);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
 });
 
 test("syncPush не пишет в движок из чужого каталога", () => {

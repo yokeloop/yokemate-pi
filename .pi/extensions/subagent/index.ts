@@ -51,6 +51,7 @@ import { openDb } from "../../../src/db.ts";
 import { dataRoot } from "../../../src/data-root.ts";
 import { modelForTicket } from "../../../src/project-model.ts";
 import { poolModel } from "../../../src/pool.ts";
+import { recordPlan as recordPlanFile } from "../../../src/plan-record.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -936,6 +937,18 @@ export default function (pi: ExtensionAPI) {
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
+		const completePlanRecord = async (ticket: string, recordedPath: string, planRunId?: string) => {
+			const settings = readRuntimeSettings(ENGINE_ROOT);
+			const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
+			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
+			const advance = authority!.record(binding, settings.policy.workflowApproval);
+			const found = planRunId ? listRuns.get(planRunId) : undefined;
+			if (found && "run" in found) listRuns.settle(found.run.identity.listRunId, planRunId!, { outcome: "recorded", facts: { plan: binding.path, contentHash: binding.contentHash } });
+			if (!advance) return { reason: "plan-only; ready for /do; a new interactive approval is required" };
+			const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+			if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
+			return { runId: result.details.runId, reason: "advance plan+do authority consumed" };
+		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
 				launchPlan: async (request, controlOrigin) => {
@@ -965,18 +978,13 @@ export default function (pi: ExtensionAPI) {
 					const found = listRuns.get(planRunId);
 					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
-				planRecorded: async (ticket, recordedPath, _origin, planRunId) => {
-					const settings = readRuntimeSettings(ENGINE_ROOT);
-					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
-					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
-					const advance = authority!.record(binding, settings.policy.workflowApproval);
-					const found = planRunId ? listRuns.get(planRunId) : undefined;
-					if (found && "run" in found) listRuns.settle(found.run.identity.listRunId, planRunId!, { outcome: "recorded", facts: { plan: binding.path, contentHash: binding.contentHash } });
-					if (!advance) return { reason: "plan-only; ready for /do; a new interactive approval is required" };
-					const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
-					if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
-					return { runId: result.details.runId, reason: "advance plan+do authority consumed" };
+				recordPlan: async (ticket, planPath, _origin, planRunId) => {
+					const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath);
+					if (result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
+					if (result.push?.state === "deferred" || result.push?.state === "error") ctx.ui.notify(`git-sync: ${result.push.reason}`, "warning");
+					return completePlanRecord(ticket, result.plan, planRunId);
 				},
+				planRecorded: async (ticket, recordedPath, _origin, planRunId) => completePlanRecord(ticket, recordedPath, planRunId),
 				launch: async (request, controlOrigin) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
 					const result = await startCoordinator(request, ctx, origin);

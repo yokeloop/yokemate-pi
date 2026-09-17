@@ -6,7 +6,7 @@
 // what an offline session left behind. The move-log contract holds throughout:
 // no sync failure may fail the command that did the real work — every problem
 // is one line on stderr, exit 0.
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { dataRoot } from "./data-root.ts";
@@ -39,6 +39,40 @@ function pullRebase(root: string): "ok" | "offline" | "conflict" {
       return "offline";
     }
   }
+}
+
+export interface ExactSyncResult { state: "committed" | "unchanged" | "skipped" | "deferred" | "error"; commit?: string; reason?: string }
+
+export function commitExact(root: string, message: string, paths: readonly string[]): ExactSyncResult {
+  if (!existsSync(join(root, ".git"))) return { state: "skipped", reason: `${root} — не свой git-репозиторий` };
+  try {
+    const present = paths.filter((item) => existsSync(join(root, item)));
+    if (!present.length) return { state: "unchanged" };
+    const staged = git(root, "diff", "--cached", "--name-only", "--", ...present).trim();
+    if (staged) return { state: "deferred", reason: `target already staged: ${staged.replaceAll("\n", ", ")}` };
+    git(root, "add", "--", ...present);
+    try { git(root, "diff", "--cached", "--quiet", "--", ...present); return { state: "unchanged" }; } catch {}
+    git(root, "commit", "--only", "-m", message, "--", ...present);
+    return { state: "committed", commit: git(root, "rev-parse", "HEAD").trim() };
+  } catch (error) { return { state: "error", reason: error instanceof Error ? error.message : String(error) }; }
+}
+
+const gitAsync = (root: string, args: string[]): Promise<string> => new Promise((resolvePromise, reject) => execFile("git", ["-C", root, ...args], { encoding: "utf8", timeout: TIMEOUT_MS }, (error, stdout, stderr) => error ? reject(new Error(stderr.trim() || error.message)) : resolvePromise(stdout)));
+
+export async function pushWithRetryAsync(root: string): Promise<ExactSyncResult> {
+  try { await gitAsync(root, ["push"]); return { state: "committed", commit: (await gitAsync(root, ["rev-parse", "HEAD"])).trim() }; }
+  catch {}
+  try {
+    if ((await gitAsync(root, ["status", "--porcelain"])).trim()) return { state: "deferred", reason: "remote reconcile deferred: worktree or index is dirty" };
+    for (let index = 0; index < PUSH_RETRIES; index++) {
+      try {
+        await gitAsync(root, ["pull", "--rebase"]);
+        await gitAsync(root, ["push"]);
+        return { state: "committed", commit: (await gitAsync(root, ["rev-parse", "HEAD"])).trim() };
+      } catch {}
+    }
+    return { state: "error", reason: `push не прошёл за ${PUSH_RETRIES} попытки` };
+  } catch (error) { return { state: "deferred", reason: error instanceof Error ? error.message : String(error) }; }
 }
 
 function pushWithRetry(root: string): void {
