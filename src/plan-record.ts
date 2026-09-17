@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { commitExact, pushWithRetryAsync, type ExactSyncResult } from "./git-sync.ts";
@@ -45,6 +45,7 @@ const run = (file: string, args: string[], options: { cwd: string; env: NodeJS.P
 export async function recordPlan(root: string, ticket: string, planPath: string, env: NodeJS.ProcessEnv = process.env): Promise<PlanRecordResult> {
   const payload = Buffer.from(JSON.stringify({ root, ticket, planPath })).toString("base64");
   const lock = recordLockPath(dataRoot(root));
+  mkdirSync(dirname(lock), { recursive: true });
   const result = await run("flock", ["--exclusive", lock, process.execPath, "--experimental-strip-types", "--no-warnings", new URL(import.meta.url).pathname, "--locked", payload], { cwd: root, env });
   const recorded = JSON.parse(result.stdout) as PlanRecordResult;
   if (recorded.localSync.state === "committed") recorded.push = await pushWithRetryAsync(dataRoot(root));

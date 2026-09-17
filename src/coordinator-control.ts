@@ -203,7 +203,11 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           const accepted = await parent.launch(envelope.request, origin);
           const originId = envelope.originId!;
           const runIds = accepted.results?.filter((result) => result.state === "accepted").map((result) => result.keyRunId) ?? (accepted.runId ? [accepted.runId] : []);
-          if (!runIds.length) throw new Error("coordinator launch accepted no keys");
+          if (!runIds.length) {
+            const reason = accepted.results?.map((result) => `${result.key}: ${result.reason ?? "refused"}`).join("; ") || "coordinator launch accepted no keys";
+            reply({ requestId: envelope.requestId, state: "refused", reason, listRunId: accepted.listRunId, results: accepted.results });
+            continue;
+          }
           requestOrigins.set(envelope.requestId, originId);
           requestRuns.set(envelope.requestId, runIds);
           if (accepted.listRunId) { requestLists.set(envelope.requestId, accepted.listRunId); runOrigins.set(accepted.listRunId, originId); }

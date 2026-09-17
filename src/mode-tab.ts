@@ -235,7 +235,8 @@ if (import.meta.filename === process.argv[1]) {
       const parent = resolveCoordinatorParent(ROOT);
       const reply = await requestCoordinator(ROOT, { mode: "ship", tickets: ticket.split("+"), model: shipModel, note: tail.join(" ") || undefined }, { sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? fail("cannot read CLI process starttime"), cwd: ROOT, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
       if (reply.state !== "accepted" || !reply.runId) fail(reply.reason ?? "ship coordinator launch was not accepted");
-      console.log(`${ticket} → background run ${reply.runId}`);
+      for (const result of reply.results ?? []) console.log(result.state === "accepted" ? `${result.key} → reserved background run ${result.keyRunId}` : `refused ${result.key}: ${result.reason}`);
+      if (!reply.results?.length) console.log(`${ticket} → background run ${reply.runId}`);
       process.exit(0);
     } catch (error) { fail((error as Error).message); }
   }

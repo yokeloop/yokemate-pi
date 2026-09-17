@@ -15,6 +15,7 @@
     "record-report": "node --experimental-strip-types --no-warnings src/record-report.ts",
     "ready": "node --experimental-strip-types --no-warnings src/ready.ts",
     "gate": "node --experimental-strip-types --no-warnings src/gate.ts",
+    "ship-merge": "node --experimental-strip-types --no-warnings src/ship-merge.ts",
     "adopt": "node --experimental-strip-types --no-warnings src/adopt.ts",
     "accept": "node --experimental-strip-types --no-warnings src/accept.ts",
     "drop": "node --experimental-strip-types --no-warnings src/drop.ts",

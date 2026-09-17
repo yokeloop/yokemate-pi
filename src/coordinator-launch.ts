@@ -14,7 +14,7 @@ import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts"
 export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
 export interface CoordinatorOrigin extends MoveEnv { sessionId?: string; runId?: string; cwd?: string; pane?: string; parentPane?: string }
-export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string }
+export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; passportPath?: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string; remote?: string; observedHead?: string }
 export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
 
 const KEY = /^[A-Z][A-Z0-9]*-\d+$/;
@@ -107,6 +107,7 @@ const exec = (file: string, args: string[], cwd: string) => new Promise<string>(
 
 export async function prepareShip(root: string, request: CoordinatorRequest): Promise<PreparedCoordinator> {
   validateCoordinatorRequest(request);
+  if (request.mode !== "ship" || request.tickets.length !== 1) fail("prepareShip needs exactly one ship ticket");
   const db = openDb(join(root, "yokemate.db"));
   const plans: Record<string, string> = {};
   const parts: PreparedPart[] = [];
@@ -121,10 +122,11 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
       if (!existsSync(worktree)) fail(`no worktree ${worktree} for ${part.repo}`);
       const gitCwd = worktree;
       const remote = (await exec("git", ["remote", "get-url", "origin"], gitCwd)).trim();
-      const base = (await exec("gh", ["pr", "view", ticket, "--json", "baseRefName,url", "--jq", '"\\(.baseRefName)\\t\\(.url)"'], gitCwd)).trim().split("\t");
-      parts.push({ ...part, pr: base[1], base: base[0], path: gitCwd, figmaUrl: part.figmaUrl, figmaMcp: part.figmaMcp, remote } as PreparedPart);
+      const snapshot = JSON.parse(await exec("gh", ["pr", "view", ticket, "--json", "baseRefName,url,headRefOid,headRefName"], gitCwd)) as { baseRefName: string; url: string; headRefOid: string; headRefName: string };
+      if (snapshot.headRefName !== ticket) fail(`${part.repo}: PR head is ${snapshot.headRefName}, not ${ticket}`);
+      parts.push({ ...part, pr: snapshot.url, base: snapshot.baseRefName, path: gitCwd, passportPath: part.path, figmaUrl: part.figmaUrl, figmaMcp: part.figmaMcp, remote, observedHead: snapshot.headRefOid });
     }
   }
   const model = request.model ?? modelForTicket(db, request.tickets[0]!, "ship") ?? poolModel(dataRoot(root), "ship");
-  return { mode: "ship", tickets: [...request.tickets], model, cwd: root, plans, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:ship-worker ${request.tickets.join("+")}${request.note ? ` ${request.note}` : ""}. Work only in the listed task worktrees and call coordinator_finish with the verified outcome.` };
+  return { mode: "ship", tickets: [...request.tickets], model, cwd: root, plans, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:ship-worker ${request.tickets[0]}${request.note ? ` ${request.note}` : ""}. Work only in this ticket's listed task worktrees and call coordinator_finish with the verified outcome.` };
 }

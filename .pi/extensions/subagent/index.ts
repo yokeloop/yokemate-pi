@@ -44,7 +44,7 @@ import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, proce
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
-import { ListRunRegistry } from "../../../src/list-run.ts";
+import { ListRunRegistry, type KeyRunContext } from "../../../src/list-run.ts";
 import { launchPlanKey } from "../../../src/plan-launch.ts";
 import { herdrAsync } from "../../../src/herdr.ts";
 import { openDb } from "../../../src/db.ts";
@@ -631,13 +631,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const listRuns = new ListRunRegistry();
+	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => { try { pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true }); } catch {} };
 	let listUnits = 0;
 	listRuns.onTerminal((run, entry) => {
 		if (entry.immediate?.state === "accepted") { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 		if (entry.terminal?.outcome === "cancelled" && typeof entry.immediate?.facts?.agentName === "string") void herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
-		pi.sendMessage({ customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } }, { deliverAs: "followUp", triggerTurn: true });
+		sendListMessage({ customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
 	});
-	listRuns.onAggregate((aggregate) => pi.sendMessage({ customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }, { deliverAs: "followUp", triggerTurn: true }));
+	listRuns.onAggregate((aggregate) => sendListMessage({ customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
 	let ownedBinding: PlanBinding | undefined;
@@ -650,10 +651,12 @@ export default function (pi: ExtensionAPI) {
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
-	const cancelCoordinator = async (runId: string, reason: "parent_control_cancel" | "parent_cancel_run") => {
+	const suppressedCancellationReports = new Set<string>();
+	const cancelCoordinator = async (runId: string, reason: "parent_control_cancel" | "parent_cancel_run", suppressReport = false) => {
 		const run = coordinators.get(runId);
 		if (!run) throw new Error(`unknown coordinator run ${runId}`);
 		coordinators.finalize(runId, "blocked", "cancelled");
+		if (suppressReport) suppressedCancellationReports.add(runId);
 		releaseCoordinatorUnit(runId);
 		uiAbortByRun.get(runId)?.abort();
 		uiAbortByRun.delete(runId);
@@ -713,9 +716,11 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				if (!tickets.length || new Set(tickets).size !== tickets.length) throw new Error("do approval needs distinct ordered tickets");
-				const bindings = tickets.map((ticket) => readRecordedPlanBinding(ENGINE_ROOT, ticket));
-				for (const binding of bindings) if (plan && fs.realpathSync(path.resolve(ctx.cwd, plan)) !== binding.path) throw new Error("do approval --plan differs from the current recorded plan");
-				for (const binding of bindings) authority.approve("exact-do", binding.ticket, binding, generation);
+				for (const ticket of tickets) try {
+					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
+					if (plan && fs.realpathSync(path.resolve(ctx.cwd, plan)) !== binding.path) throw new Error("do approval --plan differs from the current recorded plan");
+					authority.approve("exact-do", binding.ticket, binding, generation);
+				} catch (error) { ctx.ui.notify(`${ticket}: ${(error as Error).message}`, "error"); }
 				return;
 			}
 			if (text.startsWith("/")) return;
@@ -753,37 +758,38 @@ export default function (pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), lane?: { context: KeyRunContext; doBinding?: PlanBinding }) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
-		if (request.mode === "ship") {
+		if (request.mode === "ship" && !lane) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
-		let doBinding: PlanBinding | undefined;
-		if (request.mode === "do") {
+		let doBinding: PlanBinding | undefined = lane?.doBinding;
+		if (request.mode === "do" && !lane) {
 			if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
 			doBinding = readRecordedPlanBinding(root, request.tickets[0]!);
 			if (request.plan && fs.realpathSync(path.resolve(origin.cwd ?? root, request.plan)) !== doBinding.path) throw new Error("do approval --plan differs from the recorded binding");
 			authority.check(request.tickets[0]!, doBinding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
 		}
-		const admission = checks.checkAdmission(activeUnits);
+		const admission = lane ? undefined : checks.checkAdmission(activeUnits);
 		if (admission) throw new Error(admission);
-		activeUnits += 1;
+		if (!lane) activeUnits += 1;
 		let run: CoordinatorRun | undefined;
 		let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
 		let reportBlocked: ((reason: string) => void) | undefined;
 		let cleanupReservation: ((reason: string) => Promise<void>) | undefined;
 		const finishCalls = new Set<string>();
 		try {
-			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode));
+			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode), lane ? { runId: lane.context.keyRunId, parentRunId: lane.context.listRunId } : undefined);
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
-			coordinatorUnits.add(ownedRun.identity.runId);
-			if (doBinding) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
+			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
+			if (!lane) coordinatorUnits.add(ownedRun.identity.runId);
+			if (doBinding && !lane) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
 			let cleanup: Promise<void> | undefined;
 			cleanupReservation = (reason) => cleanup ??= (async () => {
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
@@ -794,7 +800,7 @@ export default function (pi: ExtensionAPI) {
 				if (reportBlocked) reportBlocked(reason);
 				else {
 					coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
-					releaseCoordinatorUnit(ownedRun.identity.runId);
+					settleUnit("blocked", reason);
 				}
 				rpcByRun.delete(ownedRun.identity.runId);
 			})();
@@ -810,11 +816,12 @@ export default function (pi: ExtensionAPI) {
 			reportBlocked = (reason: string) => {
 				if (terminalReported) return;
 				terminalReported = true;
+				if (suppressedCancellationReports.delete(ownedRun.identity.runId)) return;
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
 				uiAbortByRun.delete(ownedRun.identity.runId);
 				const blocked = coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
-				releaseCoordinatorUnit(ownedRun.identity.runId);
 				const verification = verifyCoordinatorOutcome(root, prepared, { outcome: "blocked", summary: "coordinator stopped", reason }, rpc?.childState.verificationCount("blocked", reason) ?? 1);
+				settleUnit("blocked", reason, { verification });
 				pi.appendEntry("yokemate-coordinator-run", { identity: blocked.identity, state: "blocked", verification, summary: "coordinator stopped", reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${blocked.identity.mode} ${blocked.identity.ticket}] blocked: ${reason}`, display: true, details: { runId: blocked.identity.runId, mode: blocked.identity.mode, tickets: blocked.request.tickets, outcome: "blocked", verification } }, { deliverAs: "followUp", triggerTurn: true });
 				untrackRunning(rpc?.process);
@@ -848,7 +855,7 @@ export default function (pi: ExtensionAPI) {
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
 				uiAbortByRun.delete(ownedRun.identity.runId);
 				coordinators.finalize(ownedRun.identity.runId, proposal.outcome, proposal.reason);
-				releaseCoordinatorUnit(ownedRun.identity.runId);
+				settleUnit(proposal.outcome, proposal.reason, { verification });
 				pi.appendEntry("yokemate-coordinator-run", { identity: ownedRun.identity, state: proposal.outcome, verification, summary: proposal.summary, reason: proposal.reason });
 				pi.sendMessage({ customType: "subagent-report", content: `[coordinator ${ownedRun.identity.mode} ${ownedRun.identity.ticket}] ${proposal.outcome}: ${proposal.summary}`, display: true, details: { runId: ownedRun.identity.runId, mode: ownedRun.identity.mode, tickets: ownedRun.request.tickets, outcome: proposal.outcome, verification } }, { deliverAs: "followUp", triggerTurn: true });
 				untrackRunning(rpc?.process);
@@ -900,27 +907,48 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
 			if (cleanupReservation) await cleanupReservation((error as Error).message);
-			else activeUnits -= 1;
+			else if (!lane) activeUnits -= 1;
 			throw error;
 		}
 	};
-	const startCoordinator = async (...[request, ctx, origin, settings = readRuntimeSettings(ENGINE_ROOT)]: Parameters<typeof startOneCoordinator>) => {
-		if (request.mode !== "do") return startOneCoordinator(request, ctx, origin, settings);
-		const content: { type: "text"; text: string }[] = [];
-		const runs: { ticket: string; runId: string }[] = [];
-		let first: Awaited<ReturnType<typeof startOneCoordinator>>["details"] | undefined;
-		for (const part of splitDoRequest(request)) {
-			const ticket = part.tickets[0]!;
-			try {
-				const result = await startOneCoordinator(part, ctx, origin, settings);
-				content.push(...result.content as { type: "text"; text: string }[]);
-				runs.push({ ticket, runId: result.details.runId });
-				first ??= result.details;
-			} catch (error) {
-				content.push({ type: "text", text: `refused ${ticket}: ${(error as Error).message}` });
-			}
+	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
+		if (!request || !["do", "ship"].includes(request.mode) || !Array.isArray(request.tickets) || !request.tickets.length) throw new Error("coordinator request needs ordered tickets");
+		if (new Set(request.tickets).size !== request.tickets.length) throw new Error("ticket list contains duplicates");
+		const checks = coordinatorChecks(settings);
+		const caller = checks.checkCaller(origin, request);
+		if (caller) throw new Error(caller);
+		if (request.mode === "ship") {
+			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
+			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
 		}
-		return { content, details: { ...first, runs }, isError: runs.length === 0 };
+		const bindings = new Map<string, PlanBinding>();
+		const rejection = new Map<string, string>();
+		for (const ticket of request.tickets) {
+			if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) { rejection.set(ticket, `invalid ticket key ${JSON.stringify(ticket)}`); continue; }
+			if (request.mode === "do") try {
+				if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
+				const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
+				if (request.plan && fs.realpathSync(path.resolve(origin.cwd ?? ENGINE_ROOT, request.plan)) !== binding.path) throw new Error("do approval --plan differs from the recorded binding");
+				authority.check(ticket, binding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+				bindings.set(ticket, binding);
+			} catch (error) { rejection.set(ticket, (error as Error).message); }
+		}
+		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
+		const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
+		if (request.mode === "do") for (const entry of accepted) authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+		listUnits += accepted.length;
+		activeUnits += accepted.length;
+		listRuns.publishImmediate(run.identity.listRunId);
+		setImmediate(() => {
+			listRuns.start(run.identity.listRunId, async (lane) => {
+				lane.signal.addEventListener("abort", () => { void cancelCoordinator(lane.keyRunId, "parent_cancel_run", true).catch(() => {}); }, { once: true });
+				const part = { ...request, tickets: [lane.key] };
+				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key) });
+				lane.active({ identity: result.details.identity, model: result.details.identity?.model, cwd: result.details.identity?.cwd });
+			});
+		});
+		const rows = run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reason: entry.immediate?.reason }));
+		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
@@ -988,10 +1016,10 @@ export default function (pi: ExtensionAPI) {
 				launch: async (request, controlOrigin) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
 					const result = await startCoordinator(request, ctx, origin);
-					if ((result as { isError?: boolean }).isError) throw new Error((result.content[0] as { text?: string } | undefined)?.text ?? "coordinator launch refused");
-					const details = result.details as { runId?: string; identity?: unknown } | undefined;
-					if (!details?.runId) throw new Error("coordinator launch did not return a run id");
-					return { runId: details.runId, identity: details.identity };
+					if (result.isError) throw new Error((result.content[0] as { text?: string } | undefined)?.text ?? "coordinator launch refused");
+					const details = result.details as { runId?: string; listRunId?: string; results?: import("../../../src/coordinator-control.ts").ControlResult[] };
+					if (!details.runId) throw new Error("coordinator launch did not return a run id");
+					return details;
 				},
 				status: (requestId, _origin) => {
 					const run = coordinators.get(requestId);
@@ -999,7 +1027,11 @@ export default function (pi: ExtensionAPI) {
 					const list = listRuns.get(requestId);
 					return list ? { requestId, state: "status", runId: requestId, identity: list, reason: "list" } : { requestId, state: "refused", reason: "unknown coordinator request" };
 				},
-				cancel: async (runId, _origin) => { if (!listRuns.cancel(runId)) await cancelCoordinator(runId, "parent_control_cancel"); },
+				cancel: async (runId, _origin) => {
+					const cancelled = listRuns.cancel(runId);
+					if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_control_cancel", cancelled);
+					else if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+				},
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
@@ -1194,8 +1226,15 @@ export default function (pi: ExtensionAPI) {
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
-				try { const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run"); return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] }; }
-				catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+				try {
+					if (coordinators.get(params.cancelRun)) {
+						const cancelled = listRuns.cancel(params.cancelRun);
+						const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run", cancelled);
+						return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] };
+					}
+					if (listRuns.cancel(params.cancelRun)) return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
+					throw new Error(`unknown coordinator run ${params.cancelRun}`);
+				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (ownedBinding) {
 				try { assertPlanBinding(ownedBinding, readRecordedPlanBinding(ENGINE_ROOT, ownedBinding.ticket)); }
@@ -1219,7 +1258,7 @@ export default function (pi: ExtensionAPI) {
 							mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE,
 						}, parent);
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
-						return { content: [{ type: "text", text: `accepted ${reply.runId}` }], details: { runId: reply.runId, identity: reply.identity } };
+						return { content: reply.results?.map((result) => ({ type: "text" as const, text: result.state === "accepted" ? `accepted ${result.keyRunId}, key ${result.key}, reserved` : `refused ${result.key}: ${result.reason}` })) ?? [{ type: "text" as const, text: `accepted ${reply.runId}` }], details: { runId: reply.runId, listRunId: reply.listRunId, identity: reply.identity, results: reply.results } };
 					}
 					return await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
