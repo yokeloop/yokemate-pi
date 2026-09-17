@@ -670,6 +670,7 @@ export default function (pi: ExtensionAPI) {
 		const run = coordinators.get(runId);
 		if (!run) throw new Error(`unknown coordinator run ${runId}`);
 		coordinators.finalize(runId, "blocked", "cancelled");
+		coordinatorAdmissions.delete(runId);
 		releaseCoordinatorUnit(runId);
 		uiAbortByRun.get(runId)?.abort();
 		uiAbortByRun.delete(runId);
@@ -823,6 +824,7 @@ export default function (pi: ExtensionAPI) {
 				if (reportBlocked) reportBlocked(reason);
 				else {
 					coordinators.finalize(ownedRun.identity.runId, "blocked", reason);
+					coordinatorAdmissions.delete(ownedRun.identity.runId);
 					releaseCoordinatorUnit(ownedRun.identity.runId);
 				}
 				rpcByRun.delete(ownedRun.identity.runId);
@@ -1059,6 +1061,7 @@ export default function (pi: ExtensionAPI) {
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
+		coordinatorAdmissions.clear();
 		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
 		coordinatorChildren.clear();
@@ -1095,12 +1098,11 @@ export default function (pi: ExtensionAPI) {
 		if (delivery.state !== "pending") return;
 		const canonical = reportContent(envelope, delivery);
 		const factsByRun = new Map((envelope.kind === "result" ? [envelope] : envelope.results).map((result) => [result.identity.runId, diagnosticFacts(result.identity.runId)]));
-		const settledAt = Math.max(...delivery.runIds.map((runId) => reportSettledAt.get(runId) ?? Date.now()));
 		const facts = archiveFacts(envelope, delivery);
 		const stored = reportStore.writeReport(delivery.deliveryId, canonical, facts);
 		reportArchives.set(delivery.deliveryId, { facts });
 		const diagnosticCode = delivery.runIds.map((runId) => diagnostics.get(runId)?.metadata.displayDiagnostic).find((value): value is string => typeof value === "string");
-		const display = reportDisplays.get(delivery.deliveryId) ?? buildReportDisplay(envelope, reportAdmissions, settledAt, stored.archive, factsByRun, diagnosticCode);
+		const display = reportDisplays.get(delivery.deliveryId) ?? buildReportDisplay(envelope, reportAdmissions, reportSettledAt, stored.archive, factsByRun, diagnosticCode);
 		reportDisplays.set(delivery.deliveryId, display);
 		emitChildState();
 		if (shuttingDown) delivery.state = "delivery_unknown";

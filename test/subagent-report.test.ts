@@ -61,6 +61,18 @@ test("collapsed line stays in every viewport and recalculates after resize", () 
   assert.ok(visibleWidth(line.render(40)[0]!) <= 40);
 });
 
+test("aggregate members retain their own settlement durations", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("batch", [{ ...task, task: "first" }, { ...task, task: "second" }], cwd);
+  const results = ack.children.map(({ identity }, index) => resultEnvelope(identity, index ? "second" : "first", clean, "done"));
+  const envelope = { version: 1 as const, kind: "batch" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "batch", results };
+  const admissions = new Map(results.map((entry, index) => [entry.identity.runId, { startedAt: index * 100, taskExcerpt: index ? "second" : "first" }]));
+  const settlements = new Map([[results[0]!.identity.runId, 1000], [results[1]!.identity.runId, 3000]]);
+  const display = buildReportDisplay(envelope, admissions, settlements);
+  assert.deepEqual(display.members?.map((member) => member.durationMs), [1000, 2900]);
+  assert.equal(display.durationMs, 3000);
+});
+
 test("renderer handles typed, legacy and malformed reports without changing canonical content", () => {
   const envelope = result("canonical\nbody\nTAIL");
   const canonical = `[subagent worker] ${JSON.stringify({ envelope })}`;
@@ -71,7 +83,7 @@ test("renderer handles typed, legacy and malformed reports without changing cano
   const expanded = subagentReportRenderer(message, { expanded: true, outputPad: 1 }, theme)!;
   assert.match(expanded.render(120).join("\n"), /canonical.*body.*TAIL/s);
   assert.equal(message.content, canonical);
-  for (const details of [undefined, { display: { broken: true } }, { envelope: { version: 1, kind: "broken" } }]) {
+  for (const details of [undefined, { display: { broken: true } }, { envelope: { version: 1, kind: "broken" } }, { envelope: { version: 1, kind: "batch", batchId: "batch", results: [null] } }]) {
     const legacy = { ...message, details };
     assert.doesNotThrow(() => subagentReportRenderer(legacy, { expanded: false, outputPad: 0 }, theme)!.render(40));
     assert.doesNotThrow(() => subagentReportRenderer(legacy, { expanded: true, outputPad: 0 }, theme)!.render(80));

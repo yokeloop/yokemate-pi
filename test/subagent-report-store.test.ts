@@ -93,6 +93,26 @@ test("limits, symlinks, unknown objects and live locks fail closed without parti
     fs.symlinkSync(target, linked.reports);
     assert.equal(new SubagentReportStore(linked.reports).writeReport(id("linked"), "report", {}).ok, false);
   } finally { linked.cleanup(); fs.rmSync(target, { recursive: true, force: true }); }
+
+  const linkedParent = sandbox();
+  const parentTarget = fs.mkdtempSync(path.join(tmpdir(), "ym217-parent-target-"));
+  try {
+    fs.symlinkSync(parentTarget, path.join(linkedParent.root, ".pi"));
+    assert.equal(new SubagentReportStore(linkedParent.reports).writeReport(id("linked-parent"), "report", {}).code, "artifact_invalid");
+    assert.equal(fs.existsSync(path.join(parentTarget, "subagent-reports")), false);
+  } finally { linkedParent.cleanup(); fs.rmSync(parentTarget, { recursive: true, force: true }); }
+});
+
+test("diagnostics updates evict older artifacts to reserve temporary disk budget", () => {
+  const box = sandbox();
+  try {
+    const store = new SubagentReportStore(box.reports);
+    const keys = Array.from({ length: 17 }, (_, index) => id(`budget-${index}`));
+    for (const key of keys) assert.equal(store.writeReport(key, Buffer.alloc(REPORT_FILE_LIMIT - 1), { value: "x".repeat(900_000) }).ok, true);
+    assert.equal(store.updateDiagnostics(keys.at(-1)!, { value: "y".repeat(1_500_000) }).ok, true);
+    assert.ok(store.readReport(keys.at(-1)!));
+    assert.ok(fs.readdirSync(box.reports).filter((name) => /^[a-f0-9]{64}$/.test(name)).length < keys.length);
+  } finally { box.cleanup(); }
 });
 
 test("stale lock is recovered only with a provably absent owner and coordinator ids are stable", () => {

@@ -141,15 +141,19 @@ export function buildCoordinatorDisplay(admission: ReportAdmissionDisplay | unde
 export function buildReportDisplay(
   envelope: ReportEnvelope,
   admissions: ReadonlyMap<string, ReportAdmissionDisplay>,
-  settledAt: number,
+  settlements: number | ReadonlyMap<string, number>,
   archive: ReportArchiveDisplay = { state: "unavailable", code: "unknown" },
   diagnostics: ReadonlyMap<string, ReportDiagnosticFacts> = new Map(),
   diagnosticCode?: string,
 ): SubagentReportDisplayV1 {
   const results = envelope.kind === "result" ? [envelope] : envelope.results;
+  const settledAt = (runId: string): number | undefined => typeof settlements === "number" ? settlements : settlements.get(runId);
+  const terminalTimes = results.map((result) => settledAt(result.identity.runId)).filter((value): value is number => value !== undefined);
+  const terminalAt = terminalTimes.length ? Math.max(...terminalTimes) : undefined;
   const members = results.map((result) => {
     const admission = admissions.get(result.identity.runId);
-    return { taskExcerpt: admission?.taskExcerpt ?? "", ...(admission ? { durationMs: Math.max(0, settledAt - admission.startedAt) } : {}) };
+    const terminal = settledAt(result.identity.runId);
+    return { taskExcerpt: admission?.taskExcerpt ?? "", ...(admission && terminal !== undefined ? { durationMs: Math.max(0, terminal - admission.startedAt) } : {}) };
   });
   const firstFailure = results.find(failedEnvelope);
   const firstAdmission = admissions.get(results[0]?.identity.runId ?? "");
@@ -157,7 +161,7 @@ export function buildReportDisplay(
   return fitDisplay({
     version: 1,
     kind: envelope.kind,
-    ...(starts.length ? { durationMs: Math.max(0, settledAt - Math.min(...starts)) } : {}),
+    ...(starts.length && terminalAt !== undefined ? { durationMs: Math.max(0, terminalAt - Math.min(...starts)) } : {}),
     ...(envelope.kind === "result" && firstAdmission ? { taskExcerpt: firstAdmission.taskExcerpt, ordinal: firstAdmission.ordinal } : {}),
     ...(envelope.kind === "result" ? { brief: reportBrief(envelope.payload) } : {}),
     ...(firstFailure ? { failureReason: reportFailureReason(firstFailure, diagnostics.get(firstFailure.identity.runId)) } : {}),
@@ -190,13 +194,23 @@ function statusOf(result: ResultEnvelope): string {
   return failedEnvelope(result) ? "failed" : result.reviewVerdict ?? "done";
 }
 
+function isResultEnvelope(value: unknown): value is ResultEnvelope {
+  if (!isRecord(value) || value.version !== 1 || value.kind !== "result" || !isRecord(value.identity)) return false;
+  if (typeof value.identity.agent !== "string" || typeof value.identity.runId !== "string") return false;
+  if (!["exited", "signaled", "spawn_error", "cancelled", "not_started"].includes(String(value.processOutcome))) return false;
+  if (value.exitCode !== null && typeof value.exitCode !== "number") return false;
+  if (value.signal !== null && typeof value.signal !== "string") return false;
+  if (!["pending", "valid", "missing_final", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete"].includes(String(value.payloadOutcome))) return false;
+  return typeof value.payload === "string" && (value.reviewVerdict === null || value.reviewVerdict === "approved" || value.reviewVerdict === "changes_required");
+}
+
 function envelopeFrom(details: unknown): ReportEnvelope | undefined {
   if (!isRecord(details) || !isRecord(details.envelope)) return;
-  const envelope = details.envelope as unknown as ReportEnvelope;
-  if (envelope.version !== 1 || !["result", "batch", "chain"].includes(envelope.kind)) return;
-  if (envelope.kind === "result" && !isRecord(envelope.identity)) return;
-  if (envelope.kind !== "result" && !Array.isArray(envelope.results)) return;
-  return envelope;
+  const envelope = details.envelope;
+  if (isResultEnvelope(envelope)) return envelope;
+  if (envelope.version !== 1 || !["batch", "chain"].includes(String(envelope.kind)) || typeof envelope.batchId !== "string" || !Array.isArray(envelope.results)) return;
+  if (!envelope.results.every(isResultEnvelope)) return;
+  return envelope as unknown as ReportEnvelope;
 }
 
 function legacyLabel(content: string): string {

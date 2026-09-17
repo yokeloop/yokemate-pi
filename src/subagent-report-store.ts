@@ -78,7 +78,7 @@ export class SubagentReportStore {
   private initialized = false;
 
   constructor(root: string, options: StoreOptions = {}) {
-    this.root = root;
+    this.root = path.resolve(root);
     this.now = options.now ?? Date.now;
     this.pid = options.pid ?? process.pid;
     this.starttime = options.processStarttime ?? processStarttime;
@@ -129,8 +129,7 @@ export class SubagentReportStore {
       const data = Buffer.from(JSON.stringify(manifest), "utf8");
       if (data.length > DIAGNOSTICS_FILE_LIMIT) return this.failure("storage_limit");
       const artifacts = this.inspectArtifacts();
-      const total = artifacts.reduce((sum, artifact) => sum + artifact.bytes, 0);
-      if (total + data.length > REPORT_TOTAL_LIMIT) return this.failure("storage_limit");
+      this.evictForUpdate(artifacts, id, data.length);
       const target = path.join(this.root, id, "diagnostics.json");
       const temporary = path.join(this.root, id, `.diagnostics-${randomUUID()}.tmp`);
       try {
@@ -162,9 +161,21 @@ export class SubagentReportStore {
 
   private initialize(): void {
     if (this.initialized) return;
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    const stat = fs.lstatSync(this.root);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(this.root) !== path.resolve(this.root)) throw Object.assign(new Error("invalid root"), { code: "artifact_invalid" });
+    const parsed = path.parse(this.root);
+    let current = parsed.root;
+    for (const part of this.root.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      try {
+        const stat = fs.lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(current) !== current) throw Object.assign(new Error("invalid root component"), { code: "artifact_invalid" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        try { fs.mkdirSync(current, { mode: 0o700 }); }
+        catch (mkdirError) { if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError; }
+        const stat = fs.lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(current) !== current) throw Object.assign(new Error("invalid root component"), { code: "artifact_invalid" });
+      }
+    }
     fs.chmodSync(this.root, 0o700);
     this.initialized = true;
   }
@@ -312,6 +323,18 @@ export class SubagentReportStore {
       total -= oldest.bytes;
     }
     if (incomingBytes > REPORT_TOTAL_LIMIT) throw Object.assign(new Error("storage limit"), { code: "storage_limit" });
+  }
+
+  private evictForUpdate(artifacts: ArtifactInfo[], updatingId: string, temporaryBytes: number): void {
+    const retained = artifacts.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+    let total = retained.reduce((sum, artifact) => sum + artifact.bytes, 0);
+    while (total + temporaryBytes > REPORT_TOTAL_LIMIT) {
+      const index = retained.findIndex((artifact) => artifact.id !== updatingId);
+      if (index < 0) throw Object.assign(new Error("storage limit"), { code: "storage_limit" });
+      const [oldest] = retained.splice(index, 1);
+      this.removeArtifact(oldest!);
+      total -= oldest!.bytes;
+    }
   }
 
   private removeArtifact(artifact: ArtifactInfo): void {

@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { reportContent, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
+import { openDb } from "../src/db.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
 const child = join(root, "test/fixtures/subagent-report-child.js");
+const coordinatorChild = join(root, "test/fixtures/coordinator-report-child.ts");
 
 async function waitFor(predicate: () => boolean, timeout = 5000): Promise<void> {
   const started = Date.now();
@@ -18,6 +20,102 @@ async function waitFor(predicate: () => boolean, timeout = 5000): Promise<void> 
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "local") {
+  const dir = mkdtempSync(join(root, "test/fixtures", `ym217-coordinator-${scenario}-`));
+  const previousArgv = process.argv[1];
+  const previousScenario = process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO;
+  const previousMode = process.env.YOKEMATE_MODE;
+  const previousRole = process.env.YOKEMATE_ROLE;
+  const previousRunId = process.env.YOKEMATE_RUN_ID;
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO = scenario;
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, ".pi/extensions/subagent"), join(dir, ".pi/extensions/subagent"), { recursive: true });
+    mkdirSync(join(dir, ".pi/agents/do"), { recursive: true });
+    mkdirSync(join(dir, "home/knowledge/org/repo/ai/YM-1-work"), { recursive: true });
+    writeFileSync(join(dir, ".pi/settings.json"), "{}");
+    writeFileSync(join(dir, ".pi/agents/do-coordinator.md"), "fixture");
+    const plan = join(dir, "home/knowledge/org/repo/ai/YM-1-work/plan.md");
+    writeFileSync(plan, "# YM-1 — compact coordinator report\n\n## Affected repositories\n- `org/repo` — app\n");
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'github', 'YM', 'test/model')").run(join(dir, "clone"));
+    db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);
+    db.close();
+    const agentDir = join(dir, "agent");
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi/extensions/subagent/index.ts")] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const sent: { message: any; options: any }[] = [];
+    loaded.runtime.appendEntry = () => undefined;
+    loaded.runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+    loaded.runtime.sendMessage = ((message: any, options: any) => { sent.push({ message, options }); }) as any;
+    const ctx = { cwd: dir, mode: "rpc", hasUI: true, isProjectTrusted: () => true, sessionManager: { getSessionId: () => `parent-${scenario}` }, ui: { notify: () => undefined, setWidget: () => undefined }, modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true } } as unknown as ExtensionContext;
+    const loadedExtension = loaded.extensions.find((entry) => entry.path.endsWith("subagent/index.ts"))!;
+    for (const handler of loadedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of loadedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    for (const handler of loadedExtension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "/do YM-1" } as never, { ...ctx, mode: "tui" });
+    process.argv[1] = coordinatorChild;
+    const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent");
+    assert.ok(tool);
+    const accepted = await tool.definition.execute(`coordinator-${scenario}`, { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
+    if (scenario === "local") {
+      const runId = (accepted.details as { runId: string }).runId;
+      process.env.YOKEMATE_MODE = "do";
+      process.env.YOKEMATE_ROLE = "coordinator";
+      process.env.YOKEMATE_RUN_ID = runId;
+      const ready = loadedExtension.commands.get("yokemate-coordinator-ready")!;
+      const payload = Buffer.from(JSON.stringify({ identity: { runId, role: "coordinator", cwd: dir }, prepared: { cwd: dir } })).toString("base64");
+      await ready.handler(payload, ctx as any);
+      assert.equal(sent.at(-1)?.message.details.ok, true, JSON.stringify(sent.at(-1)?.message.details));
+      const finish = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "coordinator_finish")!;
+      const result = await finish.definition.execute("local-finish", { outcome: "blocked", summary: "local summary", reason: "local blocked" }, undefined, () => undefined, ctx);
+      assert.equal((result.content[0] as any).text, "blocked verified");
+    }
+    const terminalReports = () => sent.filter((entry) => entry.message.customType === "subagent-report");
+    await waitFor(() => terminalReports().length === 1);
+    const terminal = terminalReports()[0]!;
+    assert.deepEqual(terminal.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.equal(terminal.message.customType, "subagent-report");
+    assert.equal(terminal.message.display, true);
+    assert.equal(terminal.message.details.mode, "do");
+    assert.equal(terminal.message.details.outcome, "blocked");
+    assert.equal(terminal.message.details.tickets[0], "YM-1");
+    assert.equal(terminal.message.details.display.kind, "coordinator");
+    assert.doesNotMatch(terminal.message.content, /nested child report/);
+    const expected = scenario === "verified" ? "[coordinator do YM-1] blocked: verified summary" : scenario === "blocked" ? "[coordinator do YM-1] blocked: coordinator RPC exited without outcome" : "[coordinator do YM-1] blocked: local summary";
+    assert.equal(terminal.message.content, expected);
+    assert.equal(readFileSync(terminal.message.details.display.archive.reportPath, "utf8"), expected);
+    await waitFor(() => {
+      try {
+        const diagnostics = JSON.parse(readFileSync(terminal.message.details.display.archive.diagnosticsPath, "utf8"));
+        return diagnostics.diagnostics.process.exitCode !== undefined;
+      } catch { return false; }
+    });
+    assert.equal(terminalReports().length, 1);
+    return terminal.message;
+  } finally {
+    await shutdown?.();
+    process.argv[1] = previousArgv;
+    if (previousScenario === undefined) delete process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO; else process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO = previousScenario;
+    if (previousMode === undefined) delete process.env.YOKEMATE_MODE; else process.env.YOKEMATE_MODE = previousMode;
+    if (previousRole === undefined) delete process.env.YOKEMATE_ROLE; else process.env.YOKEMATE_ROLE = previousRole;
+    if (previousRunId === undefined) delete process.env.YOKEMATE_RUN_ID; else process.env.YOKEMATE_RUN_ID = previousRunId;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("real loader sends one compact parent terminal for every coordinator terminal path", async () => {
+  const verified = await coordinatorTerminalScenario("verified");
+  const blocked = await coordinatorTerminalScenario("blocked");
+  const local = await coordinatorTerminalScenario("local");
+  assert.equal(new Set([verified.details.runId, blocked.details.runId, local.details.runId]).size, 3);
+});
 
 test("real loader keeps canonical reports byte-equivalent while renderer collapses and expands", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ym217-loader-"));
