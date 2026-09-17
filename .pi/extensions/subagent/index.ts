@@ -32,7 +32,7 @@ import {
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
-import { buildCoordinatorDisplay, buildReportDisplay, subagentReportRenderer, type ReportAdmissionDisplay, type ReportDiagnosticFacts, type SubagentReportDisplayV1 } from "../../../src/subagent-report.ts";
+import { buildCoordinatorDisplay, buildReportDisplay, reportTaskExcerpt, subagentReportRenderer, type ReportAdmissionDisplay, type ReportDiagnosticFacts, type SubagentReportDisplayV1 } from "../../../src/subagent-report.ts";
 import { coordinatorArtifactId, SubagentReportStore } from "../../../src/subagent-report-store.ts";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
@@ -811,7 +811,7 @@ export default function (pi: ExtensionAPI) {
 			run = coordinators.reserve(request, origin, origin.sessionId ?? "main", request.model ?? "pending", request.mode === "do" ? path.join(root, "work", request.tickets[0]!) : root, [], checks.rejectDuplicate(request.mode));
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
-			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: taskExcerpt(request.tickets.join("+")) });
+			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: reportTaskExcerpt(request.tickets.join("+")) });
 			coordinatorUnits.add(ownedRun.identity.runId);
 			if (doBinding) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
 			let cleanup: Promise<void> | undefined;
@@ -933,7 +933,7 @@ export default function (pi: ExtensionAPI) {
 			const prefix = `# ${tickets[0]} — `;
 			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
 			const admissionDisplay = coordinatorAdmissions.get(ownedRun.identity.runId);
-			if (admissionDisplay) admissionDisplay.taskExcerpt = taskExcerpt(excerpt || tickets.join("+"));
+			if (admissionDisplay) admissionDisplay.taskExcerpt = reportTaskExcerpt(excerpt || tickets.join("+"));
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
@@ -1036,8 +1036,20 @@ export default function (pi: ExtensionAPI) {
 			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
 			if (payload.runId !== ownedReadyRunId || !Array.isArray(payload.deliveryIds)) throw new Error("invalid delivery error owner");
 			for (const id of payload.deliveryIds) {
-				const delivery = deliveries.get(id)?.delivery;
-				if (delivery && delivery.state !== "observed" && delivery.state !== "delivery_failed") delivery.state = "delivery_unknown";
+				const entry = deliveries.get(id);
+				if (!entry || entry.delivery.state === "observed" || entry.delivery.state === "delivery_failed") continue;
+				entry.delivery.state = "delivery_unknown";
+				for (const runId of entry.delivery.runIds) {
+					const diagnostic = diagnostics.get(runId);
+					if (!diagnostic) continue;
+					const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+					states[id] = { state: entry.delivery.state, envelopeHash: entry.delivery.envelopeHash, failedAt: new Date().toISOString() };
+					diagnostic.metadata.deliveries = states;
+					diagnostic.save(true);
+				}
+				const retained = reportArchives.get(id);
+				if (retained) retained.facts = archiveFacts(entry.envelope, entry.delivery);
+				updateReportArchive(id);
 			}
 			emitChildState();
 		},
@@ -1274,8 +1286,10 @@ export default function (pi: ExtensionAPI) {
 					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
-					const originalPayload = diagnostic.metadata.payload as Record<string, unknown>;
-					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes: Buffer.byteLength(envelope.payload), retainedHash: sha256(envelope.payload), truncated: originalPayload.bytes !== Buffer.byteLength(envelope.payload) || originalPayload.hash !== sha256(envelope.payload), verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
+					const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
+					const retainedBytes = Buffer.byteLength(envelope.payload);
+					const retainedHash = sha256(envelope.payload);
+					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes, retainedHash, truncated: originalPayload === undefined ? false : originalPayload.bytes !== retainedBytes || originalPayload.hash !== retainedHash, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
 					const diagnostic = diagnostics.get(identity.runId);
@@ -1296,7 +1310,7 @@ export default function (pi: ExtensionAPI) {
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
-					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: taskExcerpt(tasks[index]!.task), ordinal: index + 1 });
+					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
 					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
 					diagnostics.set(identity.runId, diagnostic);

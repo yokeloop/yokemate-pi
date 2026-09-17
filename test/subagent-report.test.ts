@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { buildReportDisplay, isReportDisplay, reportBrief, reportDisplayBudgets, reportFailureReason, SubagentReportLine, subagentReportRenderer } from "../src/subagent-report.ts";
-import { ChildRuns, resultEnvelope } from "../src/subagent-runs.ts";
+import { buildReportDisplay, isReportDisplay, reportBrief, reportDisplayBudgets, reportFailureReason, reportTaskExcerpt, SubagentReportLine, subagentReportRenderer } from "../src/subagent-report.ts";
+import { SubagentReportStore } from "../src/subagent-report-store.ts";
+import { ChildRuns, resultEnvelope, sha256 } from "../src/subagent-runs.ts";
 
 const cwd = process.cwd();
 const task = { agent: "worker", task: "inspect\nfull\tchange\u001b[31m privately", cwd };
@@ -48,6 +52,11 @@ test("display snapshots preserve envelopes, normalize controls and fit JSON budg
   assert.equal(isReportDisplay({ version: 1, kind: "result", archive: { state: "broken" } }), false);
 });
 
+test("task excerpts normalize the full input before applying the 24-code-unit bound", () => {
+  assert.equal(reportTaskExcerpt(`${"\0".repeat(24)}visible task`), "visible task");
+  assert.equal(reportTaskExcerpt(`\u001b[31mline one\nline two`), "line one line two");
+});
+
 test("collapsed line stays in every viewport and recalculates after resize", () => {
   const line = new SubagentReportLine("worker · result abcdef12 · approved · 0:04 · 🙂 wide e\u0301 text · to expand", 3);
   for (const width of [0, 1, 2, 3, 40, 80, 120]) {
@@ -71,6 +80,25 @@ test("aggregate members retain their own settlement durations", () => {
   const display = buildReportDisplay(envelope, admissions, settlements);
   assert.deepEqual(display.members?.map((member) => member.durationMs), [1000, 2900]);
   assert.equal(display.durationMs, 3000);
+});
+
+test("expanded renderer rejects archive integrity failures but keeps canonical content", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ym217-render-archive-"));
+  try {
+    const store = new SubagentReportStore(path.join(directory, "reports"));
+    const canonical = "canonical body tail";
+    const stored = store.writeReport(sha256("renderer archive"), canonical, {});
+    assert.equal(stored.ok, true);
+    const envelope = result(canonical);
+    const display = buildReportDisplay(envelope, new Map([[envelope.identity.runId, { startedAt: 0, taskExcerpt: "task" }]]), 1, stored.archive);
+    const message = { role: "custom", customType: "subagent-report", content: canonical, display: true, timestamp: 0, details: { envelope, display } } as any;
+    const available = subagentReportRenderer(message, { expanded: true, outputPad: 0 }, theme)!.render(120).join("\n");
+    assert.match(available, /report\.txt:/);
+    fs.writeFileSync(stored.archive.reportPath!, "tampered");
+    const invalid = subagentReportRenderer(message, { expanded: true, outputPad: 0 }, theme)!.render(120).join("\n");
+    assert.match(invalid, /diagnostics expired\/unavailable/);
+    assert.match(invalid, /canonical body tail/);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("renderer handles typed, legacy and malformed reports without changing canonical content", () => {

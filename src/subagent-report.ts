@@ -1,7 +1,8 @@
 import fs from "node:fs";
+import path from "node:path";
 import { keyHint, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { failedEnvelope, reviewerVerdict, type ReportEnvelope, type ResultEnvelope } from "./subagent-runs.ts";
+import { failedEnvelope, reviewerVerdict, sha256, type ReportEnvelope, type ResultEnvelope } from "./subagent-runs.ts";
 import { formatElapsed, taskExcerpt } from "./subagent-widget.ts";
 
 export interface ReportArchiveDisplay {
@@ -68,7 +69,7 @@ function boundedScalars(value: string, scalarLimit: number, byteLimit: number): 
   return result;
 }
 
-function boundedTask(value: string): string {
+export function reportTaskExcerpt(value: string): string {
   return taskExcerpt(normalizeDisplay(value));
 }
 
@@ -104,7 +105,7 @@ export function reportFailureReason(result: ResultEnvelope, facts: ReportDiagnos
 }
 
 function fitMember(member: ReportDisplayMemberV1): ReportDisplayMemberV1 {
-  const fitted = { ...member, taskExcerpt: boundedTask(member.taskExcerpt) };
+  const fitted = { ...member, taskExcerpt: reportTaskExcerpt(member.taskExcerpt) };
   if (Buffer.byteLength(JSON.stringify(fitted)) <= DISPLAY_MEMBER_BUDGET) return fitted;
   return { ...fitted, taskExcerpt: "" };
 }
@@ -112,7 +113,7 @@ function fitMember(member: ReportDisplayMemberV1): ReportDisplayMemberV1 {
 function fitDisplay(display: SubagentReportDisplayV1): SubagentReportDisplayV1 {
   const fitted: SubagentReportDisplayV1 = {
     ...display,
-    taskExcerpt: display.taskExcerpt === undefined ? undefined : boundedTask(display.taskExcerpt),
+    taskExcerpt: display.taskExcerpt === undefined ? undefined : reportTaskExcerpt(display.taskExcerpt),
     brief: display.brief === undefined ? undefined : boundedScalars(display.brief, BRIEF_SCALARS, BRIEF_BYTES),
     failureReason: display.failureReason === undefined ? undefined : boundedScalars(display.failureReason, BRIEF_SCALARS, BRIEF_BYTES),
     members: display.members?.map(fitMember),
@@ -218,9 +219,30 @@ function legacyLabel(content: string): string {
   return normalizeDisplay(prefix ?? "subagent report");
 }
 
+function archivePairIsValid(archive: ReportArchiveDisplay): boolean {
+  try {
+    if (!archive.reportPath || !archive.diagnosticsPath) return false;
+    if (path.basename(archive.reportPath) !== "report.txt" || path.basename(archive.diagnosticsPath) !== "diagnostics.json" || path.dirname(archive.reportPath) !== path.dirname(archive.diagnosticsPath)) return false;
+    for (const file of [archive.reportPath, archive.diagnosticsPath]) {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || fs.realpathSync(file) !== path.resolve(file)) return false;
+    }
+    const reportStat = fs.statSync(archive.reportPath);
+    const diagnosticsStat = fs.statSync(archive.diagnosticsPath);
+    if (reportStat.size > 1024 * 1024 || diagnosticsStat.size > 2 * 1024 * 1024) return false;
+    const report = fs.readFileSync(archive.reportPath);
+    const diagnostics = JSON.parse(fs.readFileSync(archive.diagnosticsPath, "utf8"));
+    if (!isRecord(diagnostics) || diagnostics.customType !== "yokemate-subagent-report" || diagnostics.version !== 1 || !isRecord(diagnostics.canonical)) return false;
+    const hash = sha256(report);
+    if (diagnostics.canonical.bytes !== report.length || diagnostics.canonical.hash !== hash) return false;
+    if (archive.reportBytes !== undefined && archive.reportBytes !== report.length) return false;
+    return archive.reportHash === undefined || archive.reportHash === hash;
+  } catch { return false; }
+}
+
 function archiveLines(archive: ReportArchiveDisplay | undefined): string[] {
   if (!archive) return ["diagnostics unavailable: unknown"];
-  if (archive.state === "available" && (!archive.reportPath || !archive.diagnosticsPath || !fs.existsSync(archive.reportPath) || !fs.existsSync(archive.diagnosticsPath))) return ["diagnostics expired/unavailable"];
+  if (archive.state === "available" && !archivePairIsValid(archive)) return ["diagnostics expired/unavailable"];
   if (archive.state !== "available") return [`diagnostics ${archive.state === "expired" ? "expired/unavailable" : `unavailable: ${archive.code ?? "unknown"}`}`];
   return [
     `report.txt: ${archive.reportPath ?? "unavailable"}${archive.reportBytes === undefined ? "" : ` (${archive.reportBytes} bytes, ${archive.reportHash ?? "hash unavailable"})`}`,

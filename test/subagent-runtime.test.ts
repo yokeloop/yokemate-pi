@@ -183,6 +183,8 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
   let complete!: () => void;
   const delivered = new Promise<void>((resolve) => { complete = resolve; });
+  let markAsyncUpdated!: () => void;
+  const asyncUpdated = new Promise<void>((resolve) => { markAsyncUpdated = resolve; });
   let batch: any;
   const reports: any[] = [];
   let failureReason: string | undefined;
@@ -200,6 +202,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         if (envelope?.kind === "batch") batch = envelope;
         if (event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state") {
           const state = (event.entry as any).data;
+          if (scenario === "delivery_async" && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "delivery_unknown")) markAsyncUpdated();
           if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
@@ -230,7 +233,15 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.equal(rpc.childState.canFinish("blocked", failureReason), true);
       assert.equal(rpc.events.filter((event) => event.type === "tool_execution_start" && event.toolName === "subagent").length, 1);
       assert.equal(rpc.childState.pendingIds().length, 2);
-      if (scenario === "delivery_async") assert.ok(rpc.events.some((event) => event.type === "extension_error" && event.event === "send_message"));
+      if (scenario === "delivery_async") {
+        assert.ok(rpc.events.some((event) => event.type === "extension_error" && event.event === "send_message"));
+        await untilAborted(asyncUpdated, signal);
+        assert.equal(rpc.childState.pendingIds().length, 2);
+        for (const deliveryId of rpc.childState.pendingIds()) {
+          const archived = JSON.parse(readFileSync(join(root, ".pi/subagent-reports", deliveryId, "diagnostics.json"), "utf8"));
+          assert.equal(archived.diagnostics.delivery.state, "delivery_unknown");
+        }
+      }
       rpc.acceptTerminal();
       return;
     }

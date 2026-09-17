@@ -173,6 +173,18 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.equal(sent[1]!.message.details.envelope.kind, "batch");
     assert.equal(sent[0]!.message.details.envelope.identity.runId, parsedAck.children[0].identity.runId);
 
+    const controlledTask = `${"\0".repeat(24)}visible unknown task`;
+    const unknownAck = await tool.definition.execute("unknown-single", { agent: "missing", task: controlledTask }, undefined, () => undefined, ctx);
+    assert.equal((unknownAck.details as any).display.members[0].taskExcerpt, "visible unknown task");
+    await waitFor(() => sent.length === 4);
+    assert.equal(sent[2]!.message.details.envelope.processOutcome, "not_started");
+    assert.equal(sent[2]!.message.details.display.diagnosticCode, "unknown_agent");
+    await tool.definition.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
+    await waitFor(() => sent.length === 6);
+    assert.equal(sent[4]!.message.details.envelope.kind, "chain");
+    assert.deepEqual(sent[4]!.message.details.envelope.results.map((entry: any) => entry.processOutcome), ["not_started", "not_started"]);
+    assert.equal(sent[4]!.message.details.display.diagnosticCode, "unknown_agent");
+
     initTheme("dark", false);
     const renderer = loaded.extensions.flatMap((entry) => [...entry.messageRenderers.entries()]).find(([name]) => name === "subagent-report")?.[1];
     assert.ok(renderer);
