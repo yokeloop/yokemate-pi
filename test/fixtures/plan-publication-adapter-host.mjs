@@ -6,10 +6,8 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     runtime.setContext(ctx);
     if (process.env.YM216_RETRY_CONNECT) {
-      const attempts = process.env.YM216_PARALLEL_CONNECT
-        ? await Promise.allSettled([runtime.youTrackAdapter("youtrack-fixture", "YM-216"), runtime.youTrackAdapter("youtrack-fixture", "YM-217")])
-        : [await runtime.youTrackAdapter("youtrack-fixture", "YM-216").then(() => ({ status: "fulfilled" })).catch(() => ({ status: "rejected" }))];
-      if (attempts.every((attempt) => attempt.status !== "rejected")) throw new Error("fixture expected the first connect to fail");
+      if (process.env.YM216_PARALLEL_CONNECT) await Promise.allSettled([runtime.youTrackAdapter("youtrack-fixture", "YM-216"), runtime.youTrackAdapter("youtrack-fixture", "YM-217")]);
+      else await runtime.youTrackAdapter("youtrack-fixture", "YM-216").catch(() => undefined);
     }
     if (process.env.YM216_EXPECT_ERROR) {
       try { await runtime.youTrackAdapter("youtrack-fixture", "YM-216"); }

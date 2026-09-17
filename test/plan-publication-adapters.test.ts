@@ -108,6 +108,7 @@ test("private YouTrack bridge uses the real pinned adapter, exact schemas and pa
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     const value = JSON.parse(readFileSync(result, "utf8"));
     assert.deepEqual(value, { canonicalUrl: "https://tracker.example/issue/YM-216", before: 23, after: 24, tail: "Unicode 🙂 publication" });
+    assert.equal(readFileSync(connectMarker, "utf8"), "failed-once");
     assert.equal(readFileSync(serverStarts, "utf8"), "1");
   } finally {
     if (extension && ctx) for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx);
