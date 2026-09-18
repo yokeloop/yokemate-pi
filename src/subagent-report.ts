@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { keyHint, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { failedEnvelope, reviewerVerdict, sha256, type ReportEnvelope, type ResultEnvelope } from "./subagent-runs.ts";
+import { failedEnvelope, reviewerVerdict, sha256, type BatchEnvelope, type ReportEnvelope, type ResultEnvelope } from "./subagent-runs.ts";
 import { formatElapsed, taskExcerpt } from "./subagent-widget.ts";
 
 export interface ReportArchiveDisplay {
@@ -257,6 +257,31 @@ function messageContent(content: unknown): string {
   return "";
 }
 
+function processLine(result: ResultEnvelope): string {
+  return `process: ${result.processOutcome} · exit ${result.exitCode ?? "—"} · signal ${result.signal ?? "—"}`;
+}
+
+function payloadLine(result: ResultEnvelope): string {
+  return `payload: ${result.payloadOutcome}${result.reviewVerdict ? ` · review: ${result.reviewVerdict}` : ""}`;
+}
+
+function addResultBody(container: Container, result: ResultEnvelope, padding: number, theme: Parameters<MessageRenderer>[2]): void {
+  container.addChild(new Text(theme.fg("dim", processLine(result)), padding, 0));
+  container.addChild(new Text(theme.fg("dim", payloadLine(result)), padding, 0));
+  if (result.processOutcome !== "not_started" && result.payload) {
+    container.addChild(new Spacer(1));
+    container.addChild(new Text(result.payload, padding, 0));
+  }
+}
+
+function addChainBody(container: Container, envelope: BatchEnvelope, padding: number, theme: Parameters<MessageRenderer>[2]): void {
+  for (const [index, result] of envelope.results.entries()) {
+    container.addChild(new Spacer(1));
+    container.addChild(new Text(theme.fg("muted", `step #${index + 1} · ${safeAgent(result.identity.agent)} · ${result.identity.runId} · ${statusOf(result)}`), padding, 0));
+    addResultBody(container, result, padding, theme);
+  }
+}
+
 function compactText(message: { content: unknown; details?: unknown }, display: SubagentReportDisplayV1 | undefined, envelope: ReportEnvelope | undefined): string {
   const duration = display?.durationMs === undefined ? "—" : formatElapsed(display.durationMs);
   const hint = keyHint("app.tools.expand", "to expand");
@@ -313,7 +338,9 @@ export const subagentReportRenderer: MessageRenderer = (message, options, theme)
   container.addChild(new Text(theme.fg("muted", identity), padding, 0));
   for (const line of archiveLines(display?.archive)) container.addChild(new Text(theme.fg("dim", line), padding, 0));
   container.addChild(new Spacer(1));
-  container.addChild(new Text(canonical, padding, 0));
+  if (envelope?.kind === "result") addResultBody(container, envelope, padding, theme);
+  else if (envelope?.kind === "chain") addChainBody(container, envelope, padding, theme);
+  else container.addChild(new Text(canonical, padding, 0));
   return container;
 };
 

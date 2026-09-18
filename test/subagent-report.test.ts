@@ -101,6 +101,35 @@ test("expanded renderer rejects archive integrity failures but keeps canonical c
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("expanded result and chain render structured status and multiline payloads without transport JSON", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("chain", [{ ...task, task: "first task" }, { ...task, task: "second task" }, { ...task, task: "skipped task" }], cwd);
+  const first = resultEnvelope(ack.children[0]!.identity, "first task", clean, "FIRST UNIQUE\nfirst tail");
+  const second = resultEnvelope(ack.children[1]!.identity, "second task", clean, "SECOND UNIQUE\nsecond tail");
+  const skipped = resultEnvelope(ack.children[2]!.identity, "skipped task", { processOutcome: "not_started", exitCode: null, signal: null }, "");
+  const admissions = new Map(ack.children.map(({ identity }, index) => [identity.runId, { startedAt: index, taskExcerpt: `${index + 1} task`, ordinal: index + 1 }]));
+
+  const resultCanonical = `[subagent worker] ${JSON.stringify({ version: 1, deliveryId: "result-delivery", envelope: first })}`;
+  const resultMessage = { role: "custom", customType: "subagent-report", content: resultCanonical, display: true, timestamp: 0, details: { envelope: first, display: buildReportDisplay(first, admissions, 10) } } as any;
+  const expandedResult = subagentReportRenderer(resultMessage, { expanded: true, outputPad: 0 }, theme)!.render(120).map((line) => line.trimEnd()).join("\n");
+  assert.match(expandedResult, /process: exited · exit 0/);
+  assert.match(expandedResult, /payload: valid/);
+  assert.match(expandedResult, /FIRST UNIQUE\nfirst tail/);
+  assert.doesNotMatch(expandedResult, /result-delivery|"envelope"/);
+  assert.equal(resultMessage.content, resultCanonical);
+
+  const chain = { version: 1 as const, kind: "chain" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "chain", results: [first, second, skipped] };
+  const chainCanonical = `[subagent chain] ${JSON.stringify({ version: 1, deliveryId: "chain-delivery", envelope: chain })}`;
+  const chainMessage = { role: "custom", customType: "subagent-report", content: chainCanonical, display: true, timestamp: 0, details: { envelope: chain, display: buildReportDisplay(chain, admissions, new Map(ack.children.map(({ identity }, index) => [identity.runId, 10 + index]))) } } as any;
+  const expandedChain = subagentReportRenderer(chainMessage, { expanded: true, outputPad: 0 }, theme)!.render(120).map((line) => line.trimEnd()).join("\n");
+  assert.match(expandedChain, /step #1 · worker · .* · done/);
+  assert.match(expandedChain, /FIRST UNIQUE\nfirst tail/);
+  assert.match(expandedChain, /step #2 · worker · .* · done/);
+  assert.match(expandedChain, /SECOND UNIQUE\nsecond tail/);
+  assert.match(expandedChain, /step #3 · worker · .* · not_started/);
+  assert.doesNotMatch(expandedChain, /chain-delivery|"envelope"/);
+});
+
 test("renderer handles typed, legacy and malformed reports without changing canonical content", () => {
   const envelope = result("canonical\nbody\nTAIL");
   const canonical = `[subagent worker] ${JSON.stringify({ envelope })}`;
@@ -108,12 +137,14 @@ test("renderer handles typed, legacy and malformed reports without changing cano
   const message = { role: "custom", customType: "subagent-report", content: canonical, display: true, timestamp: 0, details: { envelope, display } } as any;
   const collapsed = subagentReportRenderer(message, { expanded: false, outputPad: 1 }, theme)!;
   assert.match(collapsed.render(120)[0]!, /worker.*done.*same-name sibling/);
-  const expanded = subagentReportRenderer(message, { expanded: true, outputPad: 1 }, theme)!;
-  assert.match(expanded.render(120).join("\n"), /canonical.*body.*TAIL/s);
+  const expanded = subagentReportRenderer(message, { expanded: true, outputPad: 0 }, theme)!;
+  assert.match(expanded.render(120).map((line) => line.trimEnd()).join("\n"), /canonical\nbody\nTAIL/);
+  assert.doesNotMatch(expanded.render(120).join("\n"), /"envelope"/);
   assert.equal(message.content, canonical);
   for (const details of [undefined, { display: { broken: true } }, { envelope: { version: 1, kind: "broken" } }, { envelope: { version: 1, kind: "batch", batchId: "batch", results: [null] } }]) {
     const legacy = { ...message, details };
     assert.doesNotThrow(() => subagentReportRenderer(legacy, { expanded: false, outputPad: 0 }, theme)!.render(40));
     assert.doesNotThrow(() => subagentReportRenderer(legacy, { expanded: true, outputPad: 0 }, theme)!.render(80));
+    assert.match(subagentReportRenderer(legacy, { expanded: true, outputPad: 0 }, theme)!.render(120).join("\n"), /"envelope"/);
   }
 });
