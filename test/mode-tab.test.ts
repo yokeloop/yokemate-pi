@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { openDb } from "../src/db.ts";
+import { socketDir } from "../src/inbox.ts";
 
 const modes = ["plan", "review", "worklog", "note", "research"] as const;
 type Mode = typeof modes[number];
@@ -76,6 +79,46 @@ function value(args: string[], option: string): string | undefined {
   const index = args.indexOf(option);
   return index < 0 ? undefined : args[index + 1];
 }
+
+test("package and Node plan-list launchers print a parent refusal before admission", async () => {
+  const f = fixture();
+  const target = { sessionId: "fixture-session", runtimeId: "fixture-runtime" };
+  let launches = 0;
+  const parent = bindCoordinatorControl(f.root, {
+    async launch() { throw new Error("unexpected coordinator launch"); },
+    async launchPlan() { launches++; return { listRunId: "unexpected", results: [] }; },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel() {},
+  }, { root: f.root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: f.root, pane: ids.parent }, f.env);
+  try {
+    if (!parent.listening) await once(parent, "listening");
+    const runtimeDir = socketDir(f.env, process.getuid!());
+    writeFileSync(join(runtimeDir, `${ids.parent}.json`), JSON.stringify({ mode: "review", ticket: null, cwd: f.root, pid: process.pid }));
+    for (const entry of ["node", "package"]) {
+      writeFileSync(join(f.root, "journal.jsonl"), "");
+      const command = entry === "package" ? "pnpm" : process.execPath;
+      const args = entry === "package"
+        ? ["split", "plan", "YM-1", "YM-2"]
+        : ["--experimental-strip-types", "--no-warnings", "src/mode-tab.ts", "plan", "YM-1", "YM-2"];
+      const child = spawn(command, args, { cwd: f.root, env: { ...f.env, PI_SESSION_ID: target.sessionId }, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const [status] = await once(child, "close") as [number, NodeJS.Signals | null];
+      assert.equal(status, 1, stdout + stderr);
+      assert.match(stderr, /panel origin is not registered with this parent/);
+      const calls = readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+      assert.equal(calls.some((call) => call[1] === "create" || call[1] === "split"), false);
+    }
+    assert.equal(launches, 0);
+  } finally {
+    await new Promise<void>((resolve) => parent.close(() => resolve()));
+    f.cleanup();
+  }
+});
 
 for (const mode of modes) {
   for (const entry of ["node", "package"]) {

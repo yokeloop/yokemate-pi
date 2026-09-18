@@ -262,6 +262,7 @@ if (import.meta.filename === process.argv[1]) {
         if (result.state === "accepted") console.log(`${result.key} → reserved in plan list ${reply.listRunId}, run ${result.keyRunId}`);
         else console.error(`${result.key}: ${result.reason ?? "plan launch refused"}`);
       }
+      if (reply.state !== "accepted" && !reply.results?.length) fail(reply.reason ?? "plan launch refused");
       if (reply.state !== "accepted" || reply.results?.some((result) => result.state === "refused")) process.exitCode = 1;
     } catch (error) { fail((error as Error).message); }
   } else for (const { ticket, workerWords } of targets) {
