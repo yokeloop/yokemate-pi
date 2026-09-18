@@ -19,7 +19,6 @@ import { RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRu
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
-import { gate } from "./gate.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -92,24 +91,6 @@ export default function guards(pi: ExtensionAPI) {
       const settings = readRuntimeSettings(ROOT);
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
-      if (process.env.YOKEMATE_MODE === "ship" && call.name === "Bash") {
-        const command = call.input.command ?? "";
-        const merges = [...command.matchAll(/\bgh\s+pr\s+merge(?:\s|$)/g)];
-        if (merges.length) {
-          const tickets = (process.env.YOKEMATE_TICKET ?? "").split("+").filter(Boolean);
-          const heads = merges.map((merge, index) => [...command.slice(merge.index, merges[index + 1]?.index ?? command.length).matchAll(/--match-head-commit(?:=|\s+)([0-9a-f]{40})(?:\s|$)/g)]);
-          if (tickets.length === 0 || heads.some((matches) => matches.length !== 1)) return { block: true, reason: "each ship merge requires exactly one --match-head-commit from a fresh passed gate" };
-          const verdicts = tickets.map((ticket) => ({ ticket, verdict: gate(ROOT, ticket) }));
-          for (const matches of heads) {
-            const head = matches[0]![1]!;
-            const passed = verdicts.find(({ verdict }) => verdict.ok && Object.values(verdict.heads).includes(head));
-            if (!passed) {
-              const reason = verdicts.map(({ ticket, verdict }) => `${ticket}: ${verdict.ok ? `gate heads do not include ${head}` : verdict.reason}`).join("; ");
-              return { block: true, reason: `ship merge gate refused: ${reason}` };
-            }
-          }
-        }
-      }
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {
         root: ROOT,
         dataRoot: dataRootOf(ROOT),
@@ -124,6 +105,7 @@ export default function guards(pi: ExtensionAPI) {
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
       if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
+      if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }
   });

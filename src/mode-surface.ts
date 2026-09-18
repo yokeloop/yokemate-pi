@@ -1,4 +1,4 @@
-import { herdr } from "./herdr.ts";
+import { herdr, herdrAsync } from "./herdr.ts";
 
 export type Surface = "tab" | "split";
 
@@ -36,6 +36,15 @@ export interface OpenedSurface {
   paneId: string;
   tabId?: string;
   cleanup(): void;
+}
+
+export async function openModeSurfaceAsync(surface: Surface, parentPane: string, parentWorkspace: string, cwd: string, label: string, env: string[]): Promise<OpenedSurface> {
+  if (surface === "split") {
+    const { pane } = (await herdrAsync(["pane", "split", parentPane, "--direction", "down", "--cwd", cwd, ...env.flatMap((entry) => ["--env", entry])]) as { result: { pane: { pane_id: string } } }).result;
+    return { paneId: pane.pane_id, cleanup: () => void herdrAsync(["pane", "close", pane.pane_id]) };
+  }
+  const { tab, root_pane } = (await herdrAsync(["tab", "create", "--workspace", parentWorkspace, "--cwd", cwd, "--label", label, ...env.flatMap((entry) => ["--env", entry])]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
+  return { paneId: root_pane.pane_id, tabId: tab.tab_id, cleanup: () => void herdrAsync(["tab", "close", tab.tab_id]) };
 }
 
 export function openModeSurface(

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatHerdrError, herdr, herdrRaw, runHerdr, startAgent } from "../src/herdr.ts";
+import { formatHerdrError, herdr, herdrRaw, runHerdr, startAgent, startAgentAsync } from "../src/herdr.ts";
 
 function spawn(result: Record<string, unknown>) {
   return (_command: string, _args: string[], _options: Record<string, unknown>) => ({ status: 0, signal: null, ...result });
@@ -34,6 +34,20 @@ test("raw herdr output does not parse JSON and malformed JSON retains streams", 
     assert.match(formatHerdrError(error), /diagnostic/);
     return true;
   });
+});
+
+test("async plan start retry yields so a sibling can progress", async () => {
+  const events: string[] = [];
+  let attempts = 0;
+  const first = startAgentAsync("a", "p-a", "a", [], 3, 1, async () => {
+    attempts++;
+    events.push(`a:${attempts}`);
+    if (attempts < 3) throw Object.assign(new Error("busy"), { stderr: "agent_pane_busy" });
+  });
+  const second = Promise.resolve().then(() => events.push("b"));
+  await Promise.all([first, second]);
+  assert.deepEqual(events.slice(0, 2), ["a:1", "b"]);
+  assert.equal(attempts, 3);
 });
 
 test("startAgent retries busy diagnostics from stdout or stderr and preserves another failure", () => {
