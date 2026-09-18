@@ -82,7 +82,6 @@ test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when paren
     await new Promise<void>((resolve) => barrier.close(() => resolve()));
     rmSync(sandbox, { recursive: true, force: true });
   }
-}
 });
 
 test("real runtime keeps merge and ship finalization on owned parent control operations", () => {

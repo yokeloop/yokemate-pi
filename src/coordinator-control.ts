@@ -244,7 +244,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   if (!envelope.path || !envelope.contentHash || !Number.isSafeInteger(acceptanceId) || !parent.preparePlanPublication) throw new Error("plan publication preparation requires a current accepted scout");
                   const outcome = await parent.preparePlanPublication(ticket, envelope.path, envelope.contentHash, acceptanceId!, origin);
                   reply({ requestId: envelope.requestId, state: "accepted", ...outcome });
+                } else {
+                  if (!envelope.path || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
+                  const outcome = await parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin);
+                  reply({ requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...outcome });
                 }
+              }
               }
             }
           } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }

@@ -221,7 +221,6 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.match(auto, /background run [a-f0-9-]+/);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount + 1);
     const autoId = auto.match(/background run ([a-f0-9-]+)/)![1]!;
-    await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
     assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), autoId);
     assert.match(output(await launch()), /already consumed/);
     await cancel(autoId);
