@@ -294,3 +294,113 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     rmSync(runtime, { recursive: true, force: true });
   }
 });
+
+
+test("plan worker process exit settles once without using herdr agent status", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "plan-process-exit-"));
+  const runtime = mkdtempSync(join(tmpdir(), "plan-process-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  let finishes = 0;
+  let resolveFinished!: () => void;
+  const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }),
+    cancel: async () => {},
+    planFinished: async (_ticket, _runId, outcome, reason) => {
+      finishes += 1;
+      assert.equal(outcome, "cancelled");
+      assert.match(reason, /process ended before a terminal record/);
+      resolveFinished();
+    },
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);
+  let child: ChildProcess | undefined;
+  try {
+    if (!server.listening) await once(server, "listening");
+    const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+    const registered = await requestPlanControl(root, "register-plan", { ticket: "YM-1" }, main, target, env);
+    assert.equal(registered.state, "accepted");
+    assert.ok(registered.runId);
+    assert.equal((await requestPlanControl(root, "bind-plan", { ticket: "YM-1", runId: registered.runId, pane: "plan" }, main, target, env)).state, "accepted");
+    child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(child, "spawn");
+    const worker = { sessionId: "plan-session", pid: child.pid!, starttime: processStarttime(child.pid!)!, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-1", role: "coordinator" };
+    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: child.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: registered.runId }, worker, target, env)).state, "accepted");
+    child.kill("SIGKILL");
+    await once(child, "exit");
+    await finished;
+    await new Promise<void>((resolve) => setTimeout(resolve, 600));
+    assert.equal(finishes, 1);
+  } finally {
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "plan-record-exit-"));
+  const runtime = mkdtempSync(join(tmpdir(), "plan-record-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  let finishes = 0;
+  let records = 0;
+  let releaseRecord!: () => void;
+  let markRecordStarted!: () => void;
+  const recordStarted = new Promise<void>((resolve) => { markRecordStarted = resolve; });
+  const recordBarrier = new Promise<void>((resolve) => { releaseRecord = resolve; });
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }),
+    cancel: async () => {},
+    planFinished: async () => { finishes += 1; },
+    recordPlan: async () => {
+      records += 1;
+      markRecordStarted();
+      await recordBarrier;
+      return { reason: "recorded" };
+    },
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);
+  let child: ChildProcess | undefined;
+  try {
+    if (!server.listening) await once(server, "listening");
+    const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+    const registered = await requestPlanControl(root, "register-plan", { ticket: "YM-2" }, main, target, env);
+    assert.ok(registered.runId);
+    assert.equal((await requestPlanControl(root, "bind-plan", { ticket: "YM-2", runId: registered.runId, pane: "plan" }, main, target, env)).state, "accepted");
+    child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(child, "spawn");
+    const worker = { sessionId: "plan-session", pid: child.pid!, starttime: processStarttime(child.pid!)!, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-2", role: "coordinator" };
+    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: child.pid, cwd: root, mode: "plan", ticket: "YM-2" }));
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-2", runId: registered.runId }, worker, target, env)).state, "accepted");
+    const recording = requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, worker, target, env);
+    await recordStarted;
+    child.kill("SIGKILL");
+    await once(child, "exit");
+    await new Promise<void>((resolve) => setTimeout(resolve, 600));
+    releaseRecord();
+    const reply = await recording;
+    assert.equal(reply.state, "accepted", reply.reason ?? "record refused");
+    assert.equal(reply.reason, "recorded");
+    assert.equal(records, 1);
+    assert.equal(finishes, 0);
+    const replay = await requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, main, target, env);
+    assert.equal(replay.state, "accepted");
+    assert.equal(records, 1);
+  } finally {
+    releaseRecord?.();
+    if (child && child.exitCode === null) child.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});

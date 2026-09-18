@@ -1298,12 +1298,6 @@ export default function (pi: ExtensionAPI) {
 								if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
 							});
 							key.active({ ...facts });
-							void herdrAsync(["agent", "wait", facts.agentName, "--until", "done", "--until", "blocked", "--until", "unknown"]).then(async () => {
-								try {
-									const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: key.key, runId: key.keyRunId, outcome: "cancelled", reason: "plan worker process or pane ended before a terminal record" }, currentControlOrigin(ENGINE_ROOT, sessionId), controlIdentity!);
-									if (reply.state !== "accepted" && !/no longer active/.test(reply.reason ?? "")) throw new Error(reply.reason ?? "plan lifecycle settlement refused");
-								} catch (error) { try { ctx.ui.notify(`plan lifecycle: ${(error as Error).message}`, "warning"); } catch {} }
-							}).catch((error) => { try { ctx.ui.notify(`plan lifecycle watch failed: ${(error as Error).message}`, "warning"); } catch {} });
 						});
 						listRuns.publishImmediate(run.identity.listRunId);
 					});
