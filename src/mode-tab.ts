@@ -253,13 +253,15 @@ if (import.meta.filename === process.argv[1]) {
 
   const targets = mode === "plan" ? resolvePlanTargets(parsed) : [{ ticket, workerWords }];
   const explicitPlanKeys = mode === "plan" ? parseKeyList(parsed.words, true) : { keys: [], tail: [] };
+  const keyedPlanList = mode === "plan" && explicitPlanKeys.keys.length && !explicitPlanKeys.tail.length;
   let planParent: ReturnType<typeof resolveCoordinatorParent> | undefined;
-  if (mode === "plan" && explicitPlanKeys.keys.length && !explicitPlanKeys.tail.length) try { planParent = resolveCoordinatorParent(ROOT); } catch {}
-  if (mode === "plan" && explicitPlanKeys.keys.length && !explicitPlanKeys.tail.length && planParent) {
+  if (keyedPlanList) try { planParent = resolveCoordinatorParent(ROOT); }
+  catch (error) { if (process.env.PI_SESSION_ID) fail((error as Error).message); }
+  if (keyedPlanList && planParent) {
     try {
       const reply = await requestPlanLaunch(ROOT, { targets, surface: parsed.surface, model: parsed.model, literal: parsed.literal, parentPane, parentWorkspace }, currentControlOrigin(ROOT), planParent);
       for (const result of reply.results ?? []) {
-        if (result.state === "accepted") console.log(`${result.key} → reserved in plan list ${reply.listRunId}, run ${result.keyRunId}`);
+        if (result.state === "accepted") console.log(`${result.key} → ${result.reservation ?? "reserved"} in plan list ${reply.listRunId}, run ${result.keyRunId}`);
         else console.error(`${result.key}: ${result.reason ?? "plan launch refused"}`);
       }
       if (reply.state !== "accepted" && !reply.results?.length) fail(reply.reason ?? "plan launch refused");
