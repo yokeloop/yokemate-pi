@@ -6,4 +6,5 @@ projects/
 node_modules/
 docs/plans/
 .pi/settings.local.json
+.pi/subagent-reports/
 home/

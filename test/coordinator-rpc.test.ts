@@ -269,11 +269,13 @@ test("blocked teardown after unexpected exit preserves the completed parent snap
   const plan = join(folder, "plan.md");
   fs.writeFileSync(plan, "plan");
   let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+  const diagnostics: { snapshot: Record<string, unknown>; completed: boolean }[] = [];
   let stopped!: () => void;
   const complete = new Promise<void>((resolve) => { stopped = resolve; });
   try {
     rpc = startCoordinatorRpc({ ...prepared, cwd: root, resourcesPath: root, plan }, identity, expected, {
       onBlocked() { void rpc?.stop().then(stopped); },
+      onDiagnostic(snapshot, completed) { diagnostics.push({ snapshot, completed }); },
     }, { invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture, "exit-no-descendants"] }, stopGraceMs: 20 });
     await rpc.ready;
     await rpc.request({ type: "prompt", message: "work" });
@@ -284,6 +286,11 @@ test("blocked teardown after unexpected exit preserves the completed parent snap
     assert.equal(snapshot.completed, true);
     assert.equal(snapshot.exitCode, 9);
     assert.equal(snapshot.cancellationInitiator, "unknown");
+    assert.ok(diagnostics.some((entry) => entry.completed));
+    const terminalDiagnostic = rpc.diagnosticSnapshot();
+    assert.equal(terminalDiagnostic.exitCode, 9);
+    assert.equal((terminalDiagnostic.stderr as any).bytes, Buffer.byteLength("private coordinator sentinel"));
+    assert.doesNotMatch(JSON.stringify(terminalDiagnostic), /private coordinator sentinel/);
     const snapshots = new RunSnapshots(root, plan);
     for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, {}, true);
     assert.equal(fs.existsSync(file), false);
