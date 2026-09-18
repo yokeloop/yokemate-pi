@@ -15,6 +15,14 @@ import { currentControlOrigin, requestPlanControl, resolveCoordinatorParent } fr
 
 const source = join(import.meta.dirname, "..");
 
+async function waitForFile(path: string, timeout = 15000): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 60000 }, async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "workflow-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
@@ -221,9 +229,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.match(auto, /background run [a-f0-9-]+/);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount + 1);
     const autoId = auto.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
     assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), autoId);
     assert.match(output(await launch()), /already consumed/);
     await cancel(autoId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const socket of eventConnections.splice(0)) socket.destroy();
     reset();
     set(true);
     await input("Plan and then do YM-1");
