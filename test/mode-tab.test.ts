@@ -1,9 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { bindCoordinatorControl, processStarttime, requestPlanControl } from "../src/coordinator-control.ts";
 import { openDb } from "../src/db.ts";
+import { resolveRuntimeSettings } from "../src/guard-policy.ts";
+import { socketDir } from "../src/inbox.ts";
+import { ListRunRegistry } from "../src/list-run.ts";
+import { launchPlanKey } from "../src/plan-launch.ts";
 
 const modes = ["plan", "review", "worklog", "note", "research"] as const;
 type Mode = typeof modes[number];
@@ -76,6 +82,138 @@ function value(args: string[], option: string): string | undefined {
   const index = args.indexOf(option);
   return index < 0 ? undefined : args[index + 1];
 }
+
+test("explicit plan lists do not bypass an unavailable live parent", () => {
+  const f = fixture();
+  try {
+    for (const entry of ["node", "package"]) {
+      const out = f.run("plan", ["YM-1", "YM-2"], { PI_SESSION_ID: "missing-parent-session" }, entry);
+      assert.equal(out.status, 1);
+      assert.match(out.stderr, /no live coordinator parent for this yokemate root/);
+      assert.equal(out.calls.some((call) => call[1] === "create" || call[1] === "split"), false);
+    }
+  } finally { f.cleanup(); }
+});
+
+test("package and Node plan-list launchers print a parent refusal before admission", async () => {
+  const f = fixture();
+  const target = { sessionId: "fixture-session", runtimeId: "fixture-runtime" };
+  let launches = 0;
+  const parent = bindCoordinatorControl(f.root, {
+    async launch() { throw new Error("unexpected coordinator launch"); },
+    async launchPlan() { launches++; return { listRunId: "unexpected", results: [] }; },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel() {},
+  }, { root: f.root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: f.root, pane: ids.parent }, f.env);
+  try {
+    if (!parent.listening) await once(parent, "listening");
+    const runtimeDir = socketDir(f.env, process.getuid!());
+    writeFileSync(join(runtimeDir, `${ids.parent}.json`), JSON.stringify({ mode: "review", ticket: null, cwd: f.root, pid: process.pid }));
+    for (const entry of ["node", "package"]) {
+      writeFileSync(join(f.root, "journal.jsonl"), "");
+      const command = entry === "package" ? "pnpm" : process.execPath;
+      const args = entry === "package"
+        ? ["split", "plan", "YM-1", "YM-2"]
+        : ["--experimental-strip-types", "--no-warnings", "src/mode-tab.ts", "plan", "YM-1", "YM-2"];
+      const child = spawn(command, args, { cwd: f.root, env: { ...f.env, PI_SESSION_ID: target.sessionId }, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const [status] = await once(child, "close") as [number, NodeJS.Signals | null];
+      assert.equal(status, 1, stdout + stderr);
+      assert.match(stderr, /panel origin is not registered with this parent/);
+      const calls = readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+      assert.equal(calls.some((call) => call[1] === "create" || call[1] === "split"), false);
+    }
+    assert.equal(launches, 0);
+  } finally {
+    await new Promise<void>((resolve) => parent.close(() => resolve()));
+    f.cleanup();
+  }
+});
+
+test("package and Node plan lists show ready, queued and mixed parent admission in input order", { timeout: 20000 }, async () => {
+  const f = fixture();
+  const target = { sessionId: "fixture-session", runtimeId: "fixture-runtime" };
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 6, maxConcurrency: 2, maxDetached: 6 } });
+  const listIds: string[] = [];
+  const previous = { PATH: process.env.PATH, JOURNAL: process.env.JOURNAL };
+  process.env.PATH = f.env.PATH;
+  process.env.JOURNAL = f.env.JOURNAL;
+  const parent = bindCoordinatorControl(f.root, {
+    async launch() { throw new Error("unexpected coordinator launch"); },
+    async launchPlan(request, origin) {
+      const run = registry.admit({ mode: "plan", keys: request.targets.map((item) => item.ticket), parentSessionId: target.sessionId, parentRuntimeId: target.runtimeId, settings, rejectKey: (key) => key === "YM-3" ? "fixture admission refusal" : undefined });
+      listIds.push(run.identity.listRunId);
+      setImmediate(() => {
+        registry.start(run.identity.listRunId, async (lane) => {
+          const item = request.targets[lane.index]!;
+          const facts = await launchPlanKey(f.root, request, item, lane.keyRunId, request.model!, async (pane) => {
+            const reply = await requestPlanControl(f.root, "bind-plan", { ticket: lane.key, runId: lane.keyRunId, pane }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: f.root }, target, f.env);
+            if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
+          });
+          lane.active({ ...facts });
+        });
+        registry.publishImmediate(run.identity.listRunId);
+      });
+      return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
+    },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel(runId) { registry.cancel(runId); },
+  }, { root: f.root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: f.root, pane: ids.parent }, f.env);
+  const waitForLaunches = async () => {
+    const count = () => readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]).filter((call) => call[1] === "prompt").length;
+    if (count() >= 2) return;
+    await new Promise<void>((resolve, reject) => {
+      const watcher = watch(join(f.root, "journal.jsonl"), () => { if (count() >= 2) { clearTimeout(timer); watcher.close(); resolve(); } });
+      const timer = setTimeout(() => { watcher.close(); reject(new Error("timed out waiting for scheduled plan launches")); }, 5000);
+    });
+  };
+  try {
+    if (!parent.listening) await once(parent, "listening");
+    writeFileSync(join(socketDir(f.env, process.getuid!()), `${ids.parent}.json`), JSON.stringify({ mode: "main", ticket: null, cwd: f.root, pid: process.pid }));
+    for (const entry of ["node", "package"]) {
+      writeFileSync(join(f.root, "journal.jsonl"), "");
+      const command = entry === "package" ? "pnpm" : process.execPath;
+      const args = entry === "package"
+        ? ["split", "plan", "YM-1", "YM-2", "YM-3", "YM-4", "YM-5", "--model", "test/explicit"]
+        : ["--experimental-strip-types", "--no-warnings", "src/mode-tab.ts", "plan", "YM-1", "YM-2", "YM-3", "YM-4", "YM-5", "--model", "test/explicit"];
+      const child = spawn(command, args, { cwd: f.root, env: { ...f.env, PI_SESSION_ID: target.sessionId }, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const [status] = await once(child, "close") as [number, NodeJS.Signals | null];
+      assert.equal(status, 1, stdout + stderr);
+      const listId = listIds.at(-1)!;
+      const admitted = registry.get(listId);
+      assert.ok(admitted && !("run" in admitted));
+      assert.deepEqual(stdout.trim().split("\n").filter((line) => /^YM-/.test(line)), [
+        "YM-1 → ready in plan list " + listId + ", run " + admitted.entries[0]!.keyRunId,
+        "YM-2 → ready in plan list " + listId + ", run " + admitted.entries[1]!.keyRunId,
+        "YM-4 → queued in plan list " + listId + ", run " + admitted.entries[3]!.keyRunId,
+        "YM-5 → queued in plan list " + listId + ", run " + admitted.entries[4]!.keyRunId,
+      ]);
+      assert.match(stderr, /^YM-3: fixture admission refusal/m);
+      await waitForLaunches();
+      const calls = readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
+      assert.equal(calls.filter((call) => call[1] === "create" || call[1] === "split").length, 2);
+      assert.deepEqual(calls.filter((call) => call[1] === "prompt").map((call) => call[3]).sort(), ["/skill:plan YM-1", "/skill:plan YM-2"]);
+      for (const item of [...admitted.entries].reverse()) registry.cancel(item.keyRunId);
+    }
+  } finally {
+    await new Promise<void>((resolve) => parent.close(() => resolve()));
+    if (previous.PATH === undefined) delete process.env.PATH; else process.env.PATH = previous.PATH;
+    if (previous.JOURNAL === undefined) delete process.env.JOURNAL; else process.env.JOURNAL = previous.JOURNAL;
+    f.cleanup();
+  }
+});
 
 for (const mode of modes) {
   for (const entry of ["node", "package"]) {
@@ -272,10 +410,10 @@ for (const entry of ["node", "package"]) {
     test(`${entry} plan ${split ? "split" : "tab"}: each key owns its surface, model and literal context`, () => {
       const f = fixture();
       try {
-        const plain = f.run("plan", [...(split ? ["--split"] : []), "YM-1", "YM-2"], {}, entry);
+        const plain = f.run("plan", [...(split ? ["--split"] : []), "YM-1", "YM-2", "YM-3"], {}, entry);
         assert.equal(plain.status, 0, plain.stderr);
-        assert.equal(plain.calls.filter(c => c[1] === "create" || c[1] === "split").length, 2);
-        assert.deepEqual(plain.calls.filter(c => c[1] === "prompt").map(c => c[3]), ["/skill:plan YM-1", "/skill:plan YM-2"]);
+        assert.equal(plain.calls.filter(c => c[1] === "create" || c[1] === "split").length, 3);
+        assert.deepEqual(plain.calls.filter(c => c[1] === "prompt").map(c => c[3]), ["/skill:plan YM-1", "/skill:plan YM-2", "/skill:plan YM-3"]);
         for (const explicit of [false, true]) {
           const keys = ["YM-1", "ACME-2"];
           const literal = ["YM-99", "--split", "--model", "literal"];

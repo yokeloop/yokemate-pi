@@ -4,13 +4,24 @@ import { once } from "node:events";
 import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
+
+async function waitForFile(file: string): Promise<void> {
+  if (existsSync(file)) return;
+  mkdirSync(join(file, ".."), { recursive: true });
+  await new Promise<void>((resolve) => {
+    const watcher = watch(join(file, ".."), (_event, name) => {
+      if (name === file.split("/").at(-1) && existsSync(file)) { watcher.close(); resolve(); }
+    });
+    if (existsSync(file)) { watcher.close(); resolve(); }
+  });
+}
 
 function root(): string {
   const root = mkdtempSync(join(tmpdir(), "coordinator-launch-"));
@@ -117,14 +128,19 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const approve = async (text: string) => { for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, { ...ctx, mode: "tui" }); };
     for (let attempt = 0; attempt < 10; attempt++) {
-      const result: AgentToolResult<unknown> = await tool.definition.execute(`retry-${attempt}`, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      const callId = `retry-${attempt}`;
+      const result: AgentToolResult<unknown> = await tool.definition.execute(callId, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
+      for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: callId, result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
       assert.equal("isError" in result && result.isError, true);
       const text = result.content[0];
       assert.ok(text?.type === "text");
       assert.match(text.text, /no current recorded plan for approval/);
       assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
     }
-    assert.deepEqual(reports, []);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(reports.length, 10);
+    assert.ok(reports.every((report) => (report as { customType?: string }).customType === "yokemate-list-aggregate"));
+    reports.length = 0;
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "Fixture");
     const db = openDb(join(dir, "yokemate.db"));
@@ -152,6 +168,7 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     assert.deepEqual(accepted.content.map((part) => part.type === "text" ? part.text.split(",")[0] : ""), [
       'refused not-a-key: invalid ticket key "not-a-key"', `accepted ${runs[0].runId}`, `accepted ${runs[1].runId}`,
     ]);
+    await Promise.all(runs.map((run) => waitForFile(join(dir, "work", run.ticket, "fixture-pids.json"))));
     const queue = openDb(join(dir, "yokemate.db"));
     assert.deepEqual(queue.prepare("SELECT ticket, stage FROM work ORDER BY ticket").all().map((row) => ({ ...row })), [
       { ticket: "YM-1", stage: "running" }, { ticket: "YM-2", stage: "running" },
@@ -176,7 +193,8 @@ test("failed coordinator starts release duplicate reservations and capacity befo
       for (const pid of pids) assert.throws(() => process.kill(pid, 0));
       const again = await tool.definition.execute("cancel-again", { cancelRun: runId }, undefined, () => undefined, ctx);
       assert.deepEqual(again.content, cancelled.content);
-      assert.deepEqual(reports, []);
+      const cancelledRuns = new Set([...runs.map((run) => run.runId), ...extra.map((run) => run.runId)]);
+      assert.ok(!reports.some((report) => (report as { customType?: string; details?: { runId?: string } }).customType === "subagent-report" && cancelledRuns.has((report as { details: { runId?: string } }).details.runId ?? "")));
     } finally {
       await tool.definition.execute("cleanup", { cancelRun: runId }, undefined, () => undefined, ctx);
     }
@@ -212,8 +230,7 @@ test("spawn routes each key independently through its retained parent", async ()
   const parent = bindCoordinatorControl(dir, {
     launch: async (request) => {
       requests.push(request);
-      if (request.tickets[0] === "YM-1") throw new Error("already running");
-      return { runId: "fixture-run-2", identity: {} };
+      return { listRunId: "fixture-list", results: request.tickets.map((key, index) => index === 0 ? { key, keyRunId: "fixture-run-1", state: "refused" as const, reason: "already running" } : { key, keyRunId: "fixture-run-2", state: "accepted" as const }) };
     },
     status: () => ({ requestId: "unused", state: "refused" }),
     cancel: async () => {},
@@ -224,11 +241,8 @@ test("spawn routes each key independently through its retained parent", async ()
     const out = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"], {
       cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "fixture-session" },
     });
-    assert.deepEqual(out.stdout.trim().split("\n"), ["refused YM-1: already running", "YM-2 → background run fixture-run-2"]);
-    assert.deepEqual(requests, [
-      { mode: "do", tickets: ["YM-1"], plan: "/explicit.md", model: "test/model" },
-      { mode: "do", tickets: ["YM-2"], plan: "/explicit.md", model: "test/model" },
-    ]);
+    assert.deepEqual(out.stdout.trim().split("\n"), ["refused YM-1: already running", "YM-2 → reserved background run fixture-run-2"]);
+    assert.deepEqual(requests, [{ mode: "do", tickets: ["YM-1", "YM-2"], plan: "/explicit.md", model: "test/model" }]);
   } finally {
     await new Promise<void>((resolve, reject) => parent.close((error) => error ? reject(error) : resolve()));
     rmSync(dir, { recursive: true, force: true });
@@ -245,7 +259,7 @@ test("ship preparation keeps the ordered batch", async () => {
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo-b', ?, 'x', 'B', 'model-b')").run(join(dir, "clone-b"));
     const shim = join(dir, "shim");
     mkdirSync(shim);
-    writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf "main\\thttps://github.com/org/repo/pull/%s\\n" "$3"\n', { mode: 0o755 });
+    writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf \'{"baseRefName":"main","url":"https://github.com/org/repo/pull/%s","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"%s"}\\n\' "$3" "$3"\n', { mode: 0o755 });
     for (const [ticket, repo] of [["A-1", "repo-a"], ["B-1", "repo-b"], ["C-1", "repo-a"]]) {
       const folder = join(dir, "home", "knowledge", "org", repo, "ai", `${ticket}-work`);
       mkdirSync(folder, { recursive: true });
@@ -260,17 +274,16 @@ test("ship preparation keeps the ordered batch", async () => {
     assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["C-1"] })).model, "pool-ship");
     writeFileSync(join(dir, "home", "pool.json"), "not json");
     assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["C-1"], model: "explicit" })).model, "explicit");
-    const prepared = await prepareShip(dir, { mode: "ship", tickets: ["B-1", "A-1"] });
-    assert.deepEqual(prepared.tickets, ["B-1", "A-1"]);
-    assert.deepEqual(Object.keys(prepared.plans), ["B-1", "A-1"]);
-    assert.deepEqual(prepared.parts.map((part) => part.branch), ["B-1", "A-1"]);
-    assert.deepEqual(prepared.parts.map((part) => part.pr), [
-      "https://github.com/org/repo/pull/B-1",
-      "https://github.com/org/repo/pull/A-1",
-    ]);
+    const prepared = await prepareShip(dir, { mode: "ship", tickets: ["B-1"] });
+    assert.deepEqual(prepared.tickets, ["B-1"]);
+    assert.deepEqual(Object.keys(prepared.plans), ["B-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.branch), ["B-1"]);
+    assert.deepEqual(prepared.parts.map((part) => part.pr), ["https://github.com/org/repo/pull/B-1"]);
+    assert.equal(prepared.parts[0]?.remote, "https://github.com/org/repo-b.git");
+    assert.equal(prepared.parts[0]?.observedHead, "a".repeat(40));
     assert.equal(prepared.model, "model-b");
-    assert.match(prepared.prompt, /^\/skill:ship-worker B-1\+A-1\./);
-    assert.equal((await prepareShip(dir, { mode: "ship", tickets: ["A-1", "B-1"] })).model, "model-a");
+    assert.match(prepared.prompt, /^\/skill:ship-worker B-1\./);
+    await assert.rejects(() => prepareShip(dir, { mode: "ship", tickets: ["A-1", "B-1"] }), /exactly one/);
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     rmSync(dir, { recursive: true, force: true });

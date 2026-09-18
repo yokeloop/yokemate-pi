@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { sidecarPath, socketDir, type Sidecar } from "./inbox.ts";
@@ -49,6 +49,21 @@ export function runHerdr(args: string[], options: HerdrRunOptions = {}, execute:
   if (capture.status !== 0 || capture.signal)
     throw capturedError(`herdr ${args.join(" ")} exited with ${capture.signal ? `signal ${capture.signal}` : `status ${capture.status}`}`, capture);
   return capture;
+}
+
+export async function runHerdrAsync(args: string[], options: HerdrRunOptions = {}, execute: typeof execFile = execFile): Promise<HerdrCapture> {
+  const capture = await new Promise<HerdrCapture>((resolvePromise) => {
+    execute("herdr", args, { encoding: "utf8", timeout: options.timeout, maxBuffer: options.maxBuffer }, (error, stdout, stderr) => resolvePromise({ argv: args, stdout: text(stdout), stderr: text(stderr), status: error && typeof error.code === "number" ? error.code : error ? 1 : 0, signal: error?.signal ?? null, error: error ?? undefined }));
+  });
+  if (capture.error) throw capturedError(`herdr ${args.join(" ")} failed: ${capture.error.message}`, capture);
+  if (capture.status !== 0 || capture.signal) throw capturedError(`herdr ${args.join(" ")} exited with ${capture.signal ? `signal ${capture.signal}` : `status ${capture.status}`}`, capture);
+  return capture;
+}
+
+export async function herdrAsync(args: string[], options?: HerdrRunOptions): Promise<unknown> {
+  const capture = await runHerdrAsync(args, options);
+  try { return JSON.parse(capture.stdout); }
+  catch (error) { throw capturedError(`herdr ${args.join(" ")} returned malformed JSON: ${(error as Error).message}`, capture); }
 }
 
 export function herdrRaw(args: string[], options?: HerdrRunOptions, execute?: HerdrSpawn): string {
@@ -113,6 +128,20 @@ export function findRunningAgent(
     } catch {}
   }
   return undefined;
+}
+
+export async function startAgentAsync(agentName: string, paneId: string, displayName: string, extraAgentArgs: string[] = [], tries = 20, waitMs = 250, run: (args: string[]) => Promise<unknown> = herdrAsync): Promise<void> {
+  for (let index = 1; ; index++) {
+    try {
+      await run(["agent", "start", agentName, "--kind", "pi", "--pane", paneId, "--", "-n", displayName, "-a", ...extraAgentArgs]);
+      return;
+    } catch (error) {
+      const value = error as Error & { stdout?: string; stderr?: string };
+      const said = `${value.message}${value.stdout ?? ""}${value.stderr ?? ""}`;
+      if (index === tries || !said.includes("agent_pane_busy")) throw error;
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, waitMs));
+    }
+  }
 }
 
 export function startAgent(

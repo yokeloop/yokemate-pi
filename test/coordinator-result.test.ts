@@ -69,6 +69,24 @@ test("ship verification reads the journal after the worktree is gone", async () 
   } finally { rmSync(s.root, { recursive: true, force: true }); }
 });
 
+test("blocked ship verification reports confirmed merged and remaining parts", async () => {
+  const s = stand("YM-1");
+  try {
+    writeFileSync(join(s.shim, "34.json"), JSON.stringify({ state: "MERGED", mergedAt: "2026-09-12T20:00:00Z", headRefName: "YM-1", headRefOid: HEAD, url: "https://github.com/org/repo/pull/34" }));
+    writeFileSync(join(s.shim, "35.json"), JSON.stringify({ state: "OPEN", headRefName: "YM-1", headRefOid: HEAD, url: "https://github.com/org/other/pull/35" }));
+    const prepared = { mode: "ship", tickets: ["YM-1"], model: "m", cwd: s.root, plans: {}, prompt: "", skillsPath: "", resourcesPath: "", parts: [
+      { repo: "org/repo", org: "org", role: "app", roleAssumed: false, path: s.worktree, passportPath: s.root, branch: "YM-1", pr: "https://github.com/org/repo/pull/34" },
+      { repo: "org/other", org: "org", role: "app", roleAssumed: false, path: s.worktree, passportPath: s.root, branch: "YM-1", pr: "https://github.com/org/other/pull/35" },
+    ] } as PreparedCoordinator;
+    await withShim(s, () => {
+      const result = verifyCoordinatorOutcome(s.root, prepared, { outcome: "blocked", summary: "", reason: "second PR blocked" });
+      assert.deepEqual(result.merged, ["https://github.com/org/repo/pull/34"]);
+      assert.deepEqual(result.remaining, ["https://github.com/org/other/pull/35"]);
+      assert.deepEqual(result.partFacts?.map(({ repo, state }) => ({ repo, state })), [{ repo: "org/repo", state: "merged" }, { repo: "org/other", state: "remaining" }]);
+    });
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
+});
+
 test("do verification runs the gate on the recorded PR", async () => {
   const s = stand("YM-9");
   try {

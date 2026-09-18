@@ -15,6 +15,14 @@ const provider = join(root, "test/fixtures/subagent-runtime-provider.ts");
 const piVersion = JSON.parse(readFileSync(join(root, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
 const cli = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
 
+test("real runtime keeps merge and ship finalization on owned parent control operations", () => {
+  const source = readFileSync(extension, "utf8");
+  assert.match(source, /name: "coordinator_merge"/);
+  assert.match(source, /requestShipFinalize\(ENGINE_ROOT, runId/);
+  assert.match(source, /finalizeShip: async \(runId, finalizeOrigin\)/);
+  assert.ok(source.indexOf("requestShipFinalize(ENGINE_ROOT, runId") < source.indexOf("outcome proposed"));
+});
+
 test("real Pi correlates delayed A batch after B admission and keeps B owned", { timeout: 30000 }, async () => {
   const sandbox = mkdtempSync(join(tmpdir(), "ym204-runtime-"));
   const cwd = join(sandbox, "cwd");

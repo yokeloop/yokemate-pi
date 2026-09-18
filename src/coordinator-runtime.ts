@@ -2,7 +2,7 @@ import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { randomUUID } from "node:crypto";
 import type { CoordinatorMode, CoordinatorOrigin, CoordinatorRequest, PreparedCoordinator } from "./coordinator-launch.ts";
 
-export interface RuntimeIdentity { runId: string; parentRunId?: string; parentSessionId: string; mode: CoordinatorMode; ticket: string; project: string[]; role: "coordinator" | "executor"; cwd: string; model: string }
+export interface RuntimeIdentity { runId: string; parentRunId?: string; listRunId?: string; keyRunId?: string; parentSessionId: string; mode: CoordinatorMode; ticket: string; project: string[]; role: "coordinator" | "executor"; cwd: string; model: string }
 export type RuntimeState = "preparing" | "starting" | "active" | "finishing" | "done" | "blocked";
 export interface CoordinatorRun { identity: RuntimeIdentity; request: CoordinatorRequest; origin: CoordinatorOrigin; state: RuntimeState; process?: { kill(signal?: NodeJS.Signals): boolean }; requestId?: string; prepared?: PreparedCoordinator; reason?: string }
 export interface CoordinatorLaunchChecks { checkCaller(origin: CoordinatorOrigin, request: CoordinatorRequest): string | undefined; rejectDuplicate(mode: CoordinatorMode): boolean; checkAdmission(activeUnits: number): string | undefined; needsShipConfirmation(origin: CoordinatorOrigin): boolean }
@@ -27,14 +27,15 @@ export const coordinatorChecks = ({ policy, limits }: RuntimeSettings): Coordina
 export class CoordinatorRegistry {
   private readonly runs = new Map<string, CoordinatorRun>();
   private readonly keyIndex = new Map<string, Set<string>>();
-  reserve(request: CoordinatorRequest, origin: CoordinatorOrigin, parentSessionId: string, model: string, cwd: string, projects: string[], rejectDuplicate: boolean): CoordinatorRun {
+  reserve(request: CoordinatorRequest, origin: CoordinatorOrigin, parentSessionId: string, model: string, cwd: string, projects: string[], rejectDuplicate: boolean, reserved?: { runId: string; parentRunId: string }): CoordinatorRun {
     const keys = request.tickets.map((ticket) => `${request.mode}:${ticket}`);
     if (rejectDuplicate) {
       const existing = keys.flatMap((key) => [...(this.keyIndex.get(key) ?? [])]).map((id) => this.runs.get(id)).find((run) => run && !["done", "blocked"].includes(run.state));
       if (existing) throw new Error(`${existing.identity.ticket} already runs as ${existing.identity.runId}, cwd ${existing.identity.cwd}, model ${existing.identity.model}`);
     }
-    const runId = randomUUID();
-    const identity: RuntimeIdentity = { runId, parentSessionId, mode: request.mode, ticket: request.tickets.join("+"), project: projects, role: "coordinator", cwd, model };
+    const runId = reserved?.runId ?? randomUUID();
+    if (this.runs.has(runId)) throw new Error(`coordinator run ${runId} is already reserved`);
+    const identity: RuntimeIdentity = { runId, parentRunId: reserved?.parentRunId, listRunId: reserved?.parentRunId, keyRunId: reserved?.runId, parentSessionId, mode: request.mode, ticket: request.tickets.join("+"), project: projects, role: "coordinator", cwd, model };
     const run: CoordinatorRun = { identity, request: { ...request, tickets: [...request.tickets] }, origin: { ...origin }, state: "preparing" };
     this.runs.set(runId, run);
     for (const key of keys) (this.keyIndex.get(key) ?? this.keyIndex.set(key, new Set()).get(key)!).add(runId);
@@ -63,5 +64,5 @@ export class ShipPermitStore {
 }
 
 export function runtimeEnv(identity: RuntimeIdentity): NodeJS.ProcessEnv {
-  return { YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: identity.role, YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
+  return { YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: identity.role, YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_LIST_RUN_ID: identity.listRunId, YOKEMATE_KEY_RUN_ID: identity.keyRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
 }

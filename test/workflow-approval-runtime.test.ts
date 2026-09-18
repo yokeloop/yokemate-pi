@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,7 +19,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
   const env = { ...process.env };
   const script = process.argv[1];
   const eventConnections: Socket[] = [];
-  const eventServer = createServer((socket) => eventConnections.push(socket));
+  const eventServer = createServer((socket) => {
+    eventConnections.push(socket);
+    socket.once("close", () => { const index = eventConnections.indexOf(socket); if (index >= 0) eventConnections.splice(index, 1); });
+  });
   let shutdown: (() => Promise<void>) | undefined;
   try {
     const eventSocket = join(runtime, "review.sock");
@@ -76,6 +79,14 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    const waitForFile = async (file: string) => {
+      if (existsSync(file)) return;
+      mkdirSync(join(file, ".."), { recursive: true });
+      await new Promise<void>((resolve) => {
+        const watcher = watch(join(file, ".."), (_event, name) => { if (name === file.split("/").at(-1) && existsSync(file)) { watcher.close(); resolve(); } });
+        if (existsSync(file)) { watcher.close(); resolve(); }
+      });
+    };
     const record = async () => (await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent" } })).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
     const triggerReview = async () => {
@@ -99,6 +110,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const auto = await record();
     assert.match(auto, /background run [a-f0-9-]+/);
     const autoId = auto.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
     assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), autoId);
     assert.match(output(await launch()), /already consumed/);
     await cancel(autoId);
@@ -126,16 +138,23 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const explicit = await launch();
     const explicitId = (explicit.details as { runId: string }).runId;
     assert.ok(explicitId, output(explicit));
+    if (eventConnections.length === 0) await once(eventServer, "connection");
+    await new Promise<void>((resolve) => setImmediate(resolve));
     const reportsBeforeReview = reports.length;
     await triggerReview();
     assert.equal(reports.length, reportsBeforeReview);
+    const explicitSocket = eventConnections.at(-1);
     await cancel(explicitId);
+    explicitSocket?.destroy();
+    const explicitIndex = explicitSocket ? eventConnections.indexOf(explicitSocket) : -1;
+    if (explicitIndex >= 0) eventConnections.splice(explicitIndex, 1);
     reset();
     extraction = "approve-ready-do";
     await input("План согласован, запускай YM-1");
     const approved = await launch();
     const approvedId = (approved.details as { runId: string }).runId;
     assert.ok(approvedId, output(approved));
+    if (eventConnections.length === 0) await once(eventServer, "connection");
     writeFileSync(plan, text + "\ncycle changed");
     const bindingBlocked = new Promise<void>((resolve) => { reportReady = resolve; });
     await triggerReview();
