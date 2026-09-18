@@ -93,7 +93,7 @@ test("private YouTrack bridge uses the real pinned adapter, exact schemas and pa
   try {
     mkdirSync(join(root, ".pi"), { recursive: true });
     symlinkSync(join(source, "node_modules"), join(root, "node_modules"), "dir");
-    writeFileSync(comments, JSON.stringify(Array.from({ length: 23 }, (_, index) => ({ id: String(index + 1), text: `comment-${index + 1}`, author: "fixture", url: `https://tracker.example/comment/${index + 1}`, createdAt: "2026-01-01" }))));
+    writeFileSync(comments, JSON.stringify(Array.from({ length: 23 }, (_, index) => ({ ...(index ? { id: String(index + 1) } : {}), text: `comment-${index + 1}`, author: "fixture", url: `https://tracker.example/comment/${index + 1}`, createdAt: index ? "2026-01-01" : 1789724993409 }))));
     const connectMarker = join(root, "connect-failed-once");
     const serverStarts = join(root, "server-starts");
     writeFileSync(join(root, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "youtrack-fixture": { command: process.execPath, args: [join(source, "test/fixtures/plan-publication-mcp-flaky.mjs")], env: { YM216_COMMENTS: comments, YM216_CONNECT_MARKER: connectMarker, YM216_SERVER_STARTS: serverStarts } } }, settings: {} }));

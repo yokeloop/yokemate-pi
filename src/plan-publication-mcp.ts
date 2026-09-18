@@ -185,7 +185,7 @@ export class PlanPublicationMcp {
           if (rows.length === 0) return comments;
           let added = 0;
           for (const row of rows) {
-            if (!row || typeof row.text !== "string" || row.author === undefined || typeof row.url !== "string" || typeof row.createdAt !== "string") throw new PublicationFailure("incomplete_listing");
+            if (!row || typeof row.text !== "string" || row.author === undefined || typeof row.url !== "string" || !(typeof row.createdAt === "string" && row.createdAt.length > 0 || typeof row.createdAt === "number" && Number.isFinite(row.createdAt) && row.createdAt >= 0)) throw new PublicationFailure("incomplete_listing");
             const id = typeof row.id === "string" || typeof row.id === "number" ? String(row.id) : row.url;
             if (!id || seen.has(id)) throw new PublicationFailure("incomplete_listing");
             seen.add(id); added++;
