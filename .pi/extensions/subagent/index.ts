@@ -930,7 +930,7 @@ export default function (pi: ExtensionAPI) {
 			let terminalReported = false;
 
 			reportBlocked = (reason: string) => {
-				if (terminalReported) return;
+				if (finishingCoordinatorRunId === ownedRun.identity.runId || terminalReported) return;
 				terminalReported = true;
 				if (suppressedCancellationReports.delete(ownedRun.identity.runId)) return;
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
@@ -1432,6 +1432,7 @@ export default function (pi: ExtensionAPI) {
 			if (runs?.active().length || batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
 			const pending = [...deliveries.values()].map(({ delivery }) => delivery).filter((delivery) => delivery.state !== "observed");
 			if (pending.length && !(params.outcome === "blocked" && pending.some((delivery) => delivery.state === "delivery_failed" || delivery.state === "delivery_unknown") && pending.every((delivery) => params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			const run = coordinators.get(runId);
 			if (!run) {
 				if (params.outcome === "done" && process.env.YOKEMATE_MODE === "ship") {
