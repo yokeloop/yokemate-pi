@@ -52,7 +52,7 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
     process.env.YOKEMATE_MODE = "ship";
     const merge = await call("bash", { command: `gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}` }) as { block: boolean; reason: string };
     assert.equal(merge.block, true);
-    assert.match(merge.reason, /ship merge gate refused/);
+    assert.match(merge.reason, /parent coordinator/);
     for (const command of [
       `command gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}`,
       `sh -c 'gh pr merge https://example.invalid/pull/1 --match-head-commit ${"a".repeat(40)}'`,
@@ -602,7 +602,7 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     execFileSync("git", ["-C", worktree, "remote", "add", "origin", "https://github.com/org/repo.git"]);
     const shim = join(dir, "shim");
     mkdirSync(shim);
-    writeFileSync(join(shim, "gh"), "#!/bin/sh\nprintf 'main\\thttps://github.com/org/repo/pull/1\\n'\n", { mode: 0o755 });
+    writeFileSync(join(shim, "gh"), `#!/bin/sh\nprintf '{"baseRefName":"main","url":"https://github.com/org/repo/pull/1","headRefOid":"${"a".repeat(40)}","headRefName":"YM-1"}\\n'\n`, { mode: 0o755 });
     process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
@@ -683,6 +683,21 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     await loader.reload();
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []);
+    const reportWaiters: Array<(message: string) => void> = [];
+    const reportMessages: string[] = [];
+    loaded.runtime.sendMessage = (message) => {
+      const text = String((message as { content?: string }).content ?? "");
+      reportMessages.push(text);
+      for (const resolve of reportWaiters.splice(0)) resolve(text);
+    };
+    const waitForReport = async (pattern: RegExp): Promise<string> => {
+      const found = reportMessages.find((message) => pattern.test(message));
+      if (found) return found;
+      for (;;) {
+        const message = await new Promise<string>((resolve) => reportWaiters.push(resolve));
+        if (pattern.test(message)) return message;
+      }
+    };
     const extension = loaded.extensions[0]!;
     const input = extension.handlers.get("input")![0]!;
     const tool = extension.tools.get("subagent")!.definition;
@@ -696,7 +711,11 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     assert.match(notifications.at(-1) ?? "", /configured model and external authentication/);
     const malformedRequest = await tool.execute("invalid", { coordinator: { mode: "do", tickets: ["../YM-1"] } }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(malformedRequest), /invalid ticket key/);
-    const launch = async (tickets = ["YM-1"]) => (await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx)).content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    const launch = async (tickets = ["YM-1"]) => {
+      const result = await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx);
+      for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: "ship", result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
+      return result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
+    };
     process.env.YOKEMATE_MODE = "plan";
     process.env.YOKEMATE_TICKET = "YM-1";
     writeFileSync(file, "{}");
@@ -723,7 +742,8 @@ test("coordinator public admission rereads ship confirmation and never manufactu
       await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
       assert.match(await launch(["YM-2"]), /current interactive \/ship/);
       assert.equal(confirmations, before);
-      assert.match(await launch(), /no task folder/);
+      assert.match(await launch(), /accepted/);
+      assert.match(await waitForReport(/no task folder/), /no task folder/);
       assert.equal(confirmations, before + Number(enabled));
       assert.match(await launch(), /current interactive \/ship/);
     }

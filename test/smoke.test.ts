@@ -717,6 +717,8 @@ test("ship prompt preserves single and batch arguments through where", async () 
     const where = expanded.match(/pnpm where ship(?: [^`\n]*)?/)?.[0];
     assert.match(expanded, /subagent.*coordinator/);
     assert.match(expanded, /tickets: \[ordered engineer keys\]/);
+    assert.match(expanded, /coordinator_merge/);
+    assert.doesNotMatch(expanded, /pnpm ship-merge/);
     assert.ok(where);
     const whereArgs = where.split(/\s+/).slice(3);
     const main = runWhere(whereArgs, {});
@@ -793,6 +795,13 @@ test("plan prompt preserves several keys", async () => {
   const skill = fs.readFileSync(join(root, ".pi", "skills", "plan", "SKILL.md"), "utf8");
   assert.ok(skill.includes("/plan <KEY> [<KEY> …]"));
   assert.ok(skill.includes("pnpm where plan [KEY …]"));
+});
+
+test("ship worker delegates idempotent journal and cleanup finalization to its parent", () => {
+  const worker = fs.readFileSync(join(import.meta.dirname, "../.pi/skills/ship-worker/SKILL.md"), "utf8");
+  assert.match(worker, /call `coordinator_finish` with `outcome: "done"`/);
+  assert.match(worker, /idempotently appends and syncs the single shipped journal outcome under the shared home lock/);
+  assert.doesNotMatch(worker, /then `rm -rf work\/<KEY>`/);
 });
 
 test("do prompt preserves its keys through where", async () => {

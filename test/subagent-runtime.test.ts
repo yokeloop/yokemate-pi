@@ -82,6 +82,15 @@ test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when paren
     await new Promise<void>((resolve) => barrier.close(() => resolve()));
     rmSync(sandbox, { recursive: true, force: true });
   }
+}
+});
+
+test("real runtime keeps merge and ship finalization on owned parent control operations", () => {
+  const source = readFileSync(extension, "utf8");
+  assert.match(source, /name: "coordinator_merge"/);
+  assert.match(source, /requestShipFinalize\(ENGINE_ROOT, runId/);
+  assert.match(source, /finalizeShip: async \(runId, finalizeOrigin\)/);
+  assert.ok(source.indexOf("requestShipFinalize(ENGINE_ROOT, runId") < source.indexOf("outcome proposed"));
 });
 
 test("real Pi correlates delayed A batch after B admission and keeps B owned", { timeout: 30000 }, async () => {

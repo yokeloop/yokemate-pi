@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestPlanControl } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -29,10 +30,10 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
     assert.equal(reusedPid.state, "refused");
     const runtimeDir = socketDir(env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: process.pid, cwd: root }));
-    const panel = await requestCoordinator(root, { mode: "do", tickets: ["YM-4"] }, { ...origin, sessionId: "plan-session", pane: "plan", parentPane: "main" }, { sessionId: "session", runtimeId: "runtime" }, env);
+    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: null }));
+    const panel = await requestCoordinator(root, { mode: "do", tickets: ["YM-4"] }, { ...origin, sessionId: "plan-session", pane: "plan", parentPane: "main", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
     assert.equal(panel.state, "accepted");
-    const brokenChain = await requestCoordinator(root, { mode: "do", tickets: ["YM-5"] }, { ...origin, sessionId: "other-panel", pane: "plan", parentPane: "missing" }, { sessionId: "session", runtimeId: "runtime" }, env);
+    const brokenChain = await requestCoordinator(root, { mode: "do", tickets: ["YM-5"] }, { ...origin, sessionId: "other-panel", pane: "plan", parentPane: "missing", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
     assert.equal(brokenChain.state, "refused");
     assert.equal(launches, 2);
   } finally {
@@ -112,6 +113,108 @@ test("ticketless problem workers can continue only tickets admitted by their acc
   } finally {
     if (descendant?.exitCode === null && descendant.signalCode === null) descendant.kill("SIGTERM");
     if (descendant && descendant.exitCode === null && descendant.signalCode === null) await new Promise<void>((resolve) => descendant!.once("close", () => resolve()));
+  }
+});
+
+test("real main pane sidecar admits an unstamped child plan list without widening origin checks", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-main-plan-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-main-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  await once(child, "spawn");
+  const childStarttime = processStarttime(child.pid!);
+  assert.ok(childStarttime);
+  const origins: unknown[] = [];
+  const server = bindCoordinatorControl(root, {
+    async launch() { throw new Error("unexpected coordinator launch"); },
+    async launchPlan(request, origin) {
+      origins.push(origin);
+      return { listRunId: "plan-list-1", results: request.targets.map((item, index) => ({ key: item.ticket, keyRunId: `plan-${index + 1}`, state: "accepted" as const })) };
+    },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main-pane" }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const runtimeDir = socketDir(env, process.getuid!());
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: root, pid: process.pid }));
+    const request = { targets: ["YM-1", "YM-2"].map((ticket) => ({ ticket, workerWords: [ticket] })), surface: "tab" as const, literal: [], parentPane: "main-pane", parentWorkspace: "workspace" };
+    const origin = { sessionId: target.sessionId, pid: child.pid!, starttime: childStarttime, cwd: root, pane: "main-pane" };
+    const accepted = await requestPlanLaunch(root, request, origin, target, env);
+    assert.equal(accepted.state, "accepted");
+    assert.equal(accepted.listRunId, "plan-list-1");
+    assert.deepEqual(accepted.results?.map((result) => [result.key, result.keyRunId]), [["YM-1", "plan-1"], ["YM-2", "plan-2"]]);
+    assert.deepEqual(origins, [origin]);
+    for (const changed of [
+      { origin: { ...origin, mode: "plan" }, target },
+      { origin: { ...origin, ticket: "YM-1" }, target },
+      { origin: { ...origin, cwd: join(root, "foreign") }, target },
+      { origin: { ...origin, starttime: "0" }, target },
+      { origin: { ...origin, sessionId: "foreign-session", parentPane: "foreign-pane" }, target },
+      { origin, target: { ...target, sessionId: "foreign-parent" } },
+      { origin, target: { ...target, runtimeId: "foreign-runtime" } },
+    ]) assert.equal((await requestPlanLaunch(root, request, changed.origin, changed.target, env)).state, "refused");
+    assert.equal(origins.length, 1);
+  } finally {
+    child.kill();
+    await once(child, "exit");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("one control request retains every sibling list identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-list-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-list-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  const statuses: string[] = [];
+  const server = bindCoordinatorControl(root, {
+    async launch(request) { return { listRunId: "list-1", results: request.tickets.map((key, index) => ({ key, keyRunId: `key-${index + 1}`, state: "accepted" as const })) }; },
+    status(runId) { statuses.push(runId); return { requestId: runId, state: "status", runId }; },
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+    const accepted = await requestCoordinator(root, { mode: "do", tickets: ["YM-1", "YM-2"] }, origin, target, env);
+    assert.equal(accepted.listRunId, "list-1");
+    assert.equal(accepted.runId, "key-1");
+    assert.deepEqual(accepted.results?.map((result) => result.keyRunId), ["key-1", "key-2"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("merge control passes trusted live origin and structured result to the parent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-merge-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-merge-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  let calls = 0;
+  const server = bindCoordinatorControl(root, {
+    async launch() { throw new Error("unexpected launch"); },
+    async merge(runId, request, origin) { calls++; assert.equal(runId, "run-1"); assert.equal(origin.pid, process.pid); return { repo: "org/repo", pr: request.pr, head: request.expectedHead, state: "merged" }; },
+    async finalizeShip(runId, origin) { calls++; assert.equal(runId, "run-1"); assert.equal(origin.pid, process.pid); return { journal: { line: "shipped", path: "journal/2026-09.md", repeated: false }, localSync: { state: "committed" }, push: { state: "committed" }, cleanup: "removed" }; },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, mode: "ship", ticket: "YM-1", role: "coordinator" };
+    const reply = await requestCoordinatorMerge(root, "run-1", { pr: "https://github.com/org/repo/pull/1", expectedHead: "a".repeat(40), method: "merge" }, origin, target, env);
+    assert.equal(reply.state, "accepted");
+    assert.equal(reply.merge?.state, "merged");
+    const finalized = await requestShipFinalize(root, "run-1", origin, target, env);
+    assert.equal(finalized.state, "accepted");
+    assert.equal(finalized.finalization?.cleanup, "removed");
+    assert.equal(calls, 2);
+  } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
