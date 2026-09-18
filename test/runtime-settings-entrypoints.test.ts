@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -207,15 +208,22 @@ test("public file and Bash guards disable only their named refusal", async () =>
 });
 
 test("public CLI decisions reread settings and refuse malformed blocks before repair", async () => {
-  const { spawnSync } = await import("node:child_process");
+  const { spawn, spawnSync } = await import("node:child_process");
+  const { once } = await import("node:events");
   const { openDb } = await import("../src/db.ts");
+  const { coordinatorSocketPath } = await import("../src/coordinator-control.ts");
+  const { readCandidatePlanSnapshot } = await import("../src/plan-binding.ts");
+  const { acceptPlanRecord, acceptPublication } = await import("../src/plan-publication-state.ts");
+  const { sha256 } = await import("../src/subagent-runs.ts");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-cli-"));
+  const runtime = mkdtempSync(join(tmpdir(), "runtime-cli-control-"));
+  let parent: ReturnType<typeof spawn> | undefined;
   try {
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     mkdirSync(join(dir, ".pi"));
     const file = join(dir, ".pi", "settings.json");
     const set = (guardPolicy: unknown, subagent?: unknown) => writeFileSync(file, JSON.stringify({ guardPolicy, subagent }));
-    const run = (script: string, args: string[], env: Record<string, string> = {}, input?: string) => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", script), ...args], { cwd: dir, env: { PATH: process.env.PATH, ...env }, input, encoding: "utf8" });
+    const run = (script: string, args: string[], env: Record<string, string> = {}, input?: string) => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", script), ...args], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", ...env }, input, encoding: "utf8" });
     const stamp = { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-1" };
     set({});
     assert.equal(run("mode-guard.ts", ["do", "YM-1"], stamp).status, 1);
@@ -223,23 +231,40 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     assert.equal(run("mode-guard.ts", ["do", "YM-1"], stamp).stdout.trim(), "launch");
     const db = openDb(join(dir, "yokemate.db"));
     db.close();
-    const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
-    mkdirSync(join(plan, ".."), { recursive: true });
-    writeFileSync(plan, "# YM-1\n\n## Affected repositories\n- `org/repo` — app\n");
+    const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
+    mkdirSync(planDir, { recursive: true });
+    const plan = join(planDir, "plan.md");
+    writeFileSync(plan, "# YM-1\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
+    const snapshot = readCandidatePlanSnapshot(dir, "YM-1", plan);
+    const publicationDb = openDb(join(dir, "yokemate.db"));
+    const target = "github:org/repo#1";
+    const scout = acceptPublication(publicationDb, dir, { target, targetHash: sha256(target), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# Scout\n"), runId: "scout" });
+    const publication = acceptPublication(publicationDb, dir, { target, targetHash: sha256(target), ticket: "YM-1", kind: "plan", bytes: snapshot.bytes, runId: "plan" });
+    const record = acceptPlanRecord(publicationDb, { ticket: "YM-1", publicationId: publication.id, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, scoutPublication: scout.id });
+    publicationDb.close();
+    const socket = coordinatorSocketPath(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    parent = spawn(process.execPath, [join(root, "test/fixtures/plan-control-server.mjs")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLAN_CONTROL_SOCKET: socket, PLAN_CONTROL_ROOT: dir, PLAN_PUBLICATION_ID: String(publication.id), PLAN_RECORD_ID: String(record.id), PLAN_SCOUT_ID: String(scout.id), PLAN_SNAPSHOT: publication.artifact_path, PLAN_REVISION: publication.content_hash } });
+    await once(parent.stdout!, "data");
     const review = { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-1" };
     set({});
     assert.match(run("plan-ticket.ts", ["YM-1", plan], review).stderr, /not review's move/);
     set({ guards: { transitionCaller: false } });
     assert.match(run("plan-ticket.ts", ["YM-1", plan], { ...review, YOKEMATE_TICKET: "YM-2" }).stderr, /stamped YM-2, not YM-1/);
     set({ guards: { transitionCaller: false, transitionTicket: false } });
-    assert.equal(run("plan-ticket.ts", ["YM-1", plan], { ...review, YOKEMATE_TICKET: "YM-2" }).status, 0);
-    const runningDb = openDb(join(dir, "yokemate.db"));
-    runningDb.prepare("UPDATE work SET stage='running' WHERE ticket='YM-1'").run();
-    runningDb.close();
+    const ticketGuardOff = run("plan-ticket.ts", ["YM-1", plan], { ...review, YOKEMATE_TICKET: "YM-2" });
+    assert.equal(ticketGuardOff.status, 0, ticketGuardOff.stderr);
+    const afterTicketGuard = openDb(join(dir, "yokemate.db"));
+    assert.equal(afterTicketGuard.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get()?.stage, "planned");
+    afterTicketGuard.prepare("UPDATE work SET stage='running' WHERE ticket='YM-1'").run();
+    afterTicketGuard.close();
     set({});
     assert.match(run("plan-ticket.ts", ["YM-1", plan], { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }).stderr, /plan moves from/);
     set({ guards: { transitionSource: false } });
-    assert.equal(run("plan-ticket.ts", ["YM-1", plan], { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }).status, 0);
+    const sourceGuardOff = run("plan-ticket.ts", ["YM-1", plan], { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" });
+    assert.equal(sourceGuardOff.status, 0, sourceGuardOff.stderr);
+    const afterSourceGuard = openDb(join(dir, "yokemate.db"));
+    assert.equal(afterSourceGuard.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get()?.stage, "planned");
+    afterSourceGuard.close();
     set({});
     assert.match(run("stage.ts", ["YM-1", "planned", "--force"], stamp).stderr, /main chat's repair/);
     set({ guards: { stageCaller: false } });
@@ -266,7 +291,14 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     finalDb.close();
     runtimeCases(["guards.modeOwnership", "guards.transitionCaller", "guards.transitionTicket", "guards.transitionSource"], ["cli", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.stageCaller", "guards.stageForce"], ["cli", "pane", "ordinary", "coordinator"]);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    if (parent && parent.exitCode === null) {
+      parent.kill("SIGTERM");
+      await once(parent, "exit").catch(() => undefined);
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
 });
 
 test("loaded completion and report hooks reread only their named settings", async () => {
@@ -464,7 +496,7 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(planDir, { recursive: true });
     const plan = join(planDir, "plan.md");
-    writeFileSync(plan, "# YM-1 — fixture\n\n## Affected repositories\n- `org/repo` — app\n");
+    writeFileSync(plan, "# YM-1 — fixture\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
     db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);
@@ -563,7 +595,7 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(planDir, { recursive: true });
     const plan = join(planDir, "plan.md");
-    writeFileSync(plan, "# YM-1 — fixture\n\n## Affected repositories\n- `org/repo` — app\n");
+    writeFileSync(plan, "# YM-1 — fixture\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
     const worktree = join(dir, "work", "YM-1", "repo");
     mkdirSync(worktree, { recursive: true });
     execFileSync("git", ["init", "-b", "YM-1", worktree], { stdio: "pipe" });

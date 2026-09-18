@@ -16,9 +16,11 @@ export interface ChildIdentity {
   agent: string;
   taskHash: string;
   cwd: string;
+  ticket?: string;
   review?: ReviewRevision;
 }
-export interface ChildTask { agent: string; task: string; cwd?: string; review?: ReviewRevision }
+export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
+export interface PublicationReference { state: "pending" | "complete" | "blocked"; path?: string; hash?: string; bytes?: number; target?: string; targetHash?: string; publicationId?: number; acceptanceId?: number; error?: string }
 export type ProcessOutcome = "exited" | "signaled" | "spawn_error" | "cancelled" | "not_started";
 export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
 export interface ResultEnvelope {
@@ -34,6 +36,7 @@ export interface ResultEnvelope {
   payload: string;
   outputLimit?: "batch_transport";
   reviewVerdict: "approved" | "changes_required" | null;
+  publication?: PublicationReference;
 }
 export interface BatchEnvelope {
   version: 1;
@@ -50,8 +53,11 @@ export interface LaunchAck {
   batchId: string;
   children: { identity: ChildIdentity; state: "queued" | "running" }[];
 }
-export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batchId: string, task: ChildTask, defaultCwd: string): ChildIdentity {
+export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batchId: string, task: ChildTask, defaultCwd: string, defaultTicket?: string): ChildIdentity {
   const cwd = realpathSync(task.cwd ?? defaultCwd);
+  const ticket = task.ticket ?? defaultTicket;
+  if (task.agent === "plan-scout" && !ticket) throw new Error("plan-scout requires an explicit ticket binding");
+  if (task.agent === "plan-scout" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-scout ticket differs from the stamped plan ticket");
   if (task.agent === "task-reviewer" && !task.review) throw new Error("task-reviewer requires review.baseSha and review.headSha");
   if (task.review) {
     for (const sha of [task.review.baseSha, task.review.headSha]) {
@@ -61,7 +67,7 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
     if (head !== task.review.headSha) throw new Error("review.headSha does not match HEAD in cwd");
   }
-  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(task.review ? { review: { ...task.review } } : {}) };
+  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}) };
 }
 export function reviewerVerdict(text: string): "approved" | "changes_required" | null {
   try {
@@ -96,10 +102,11 @@ export class ChildRuns {
   readonly ownerSessionId: string;
   readonly children = new Map<string, { identity: ChildIdentity; state: "queued" | "running"; result?: ResultEnvelope }>();
   readonly batches = new Map<string, ChildIdentity[]>();
-  constructor(ownerRunId: string, ownerSessionId: string) { this.ownerRunId = ownerRunId; this.ownerSessionId = ownerSessionId; }
+  private defaultTicket?: string;
+  constructor(ownerRunId: string, ownerSessionId: string, defaultTicket?: string) { this.ownerRunId = ownerRunId; this.ownerSessionId = ownerSessionId; this.defaultTicket = defaultTicket; }
   admit(batchId: string, tasks: ChildTask[], cwd: string): LaunchAck {
     if (this.batches.has(batchId)) throw new Error("duplicate subagent batch admission");
-    const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd));
+    const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd, this.defaultTicket));
     batchPayloadQuota(identities);
     this.batches.set(batchId, identities);
     for (const identity of identities) this.children.set(identity.runId, { identity, state: "queued" });
@@ -371,7 +378,7 @@ export class OwnedChildState {
     return !!tasks?.some((task) => {
       let cwd: string;
       try { cwd = realpathSync(task.cwd ?? identity.cwd); } catch { return false; }
-      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && JSON.stringify(task.review) === JSON.stringify(identity.review);
+      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && (task.ticket ?? (task.agent === "plan-scout" ? identity.ticket : undefined)) === identity.ticket && JSON.stringify(task.review) === JSON.stringify(identity.review);
     });
   }
   accept(value: unknown): boolean {

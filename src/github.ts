@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import type { TicketState } from "./sync.ts";
+import { PublicationFailure, type PublicationAdapter, type RemoteComment } from "./plan-publication.ts";
 
 export interface GithubProject {
   org: string;
@@ -106,4 +107,51 @@ export function issueUrl(path: string, number: number, remoteOf?: RemoteOf): str
 
 export function validGithubPrefix(s: string): boolean {
   return /^[A-Z][A-Z0-9]*$/.test(s);
+}
+
+export type GhPublicationExec = (args: string[], options: { cwd: string; input?: string }) => string;
+const ghPublicationExec: GhPublicationExec = (args, options) => execFileSync("gh", args, { cwd: options.cwd, input: options.input, encoding: "utf8", timeout: 30_000, stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+
+function githubFailure(error: unknown): PublicationFailure {
+  const value = error as { status?: number; stderr?: string | Buffer; publicationCode?: string };
+  if (["auth", "permission", "rate_limit", "size", "unavailable"].includes(value.publicationCode ?? "")) return new PublicationFailure(value.publicationCode as "auth" | "permission" | "rate_limit" | "size" | "unavailable");
+  const status = Number(value.status);
+  const stderr = Buffer.isBuffer(value.stderr) ? value.stderr.toString("utf8") : String(value.stderr ?? "");
+  if (status === 4 || /\b401\b|authentication/i.test(stderr)) return new PublicationFailure("auth");
+  if (/\b403\b|forbidden|permission/i.test(stderr)) return new PublicationFailure("permission");
+  if (/\b429\b|rate.?limit/i.test(stderr)) return new PublicationFailure("rate_limit");
+  if (/\b413\b|too large|maximum size/i.test(stderr)) return new PublicationFailure("size");
+  return new PublicationFailure("unavailable");
+}
+
+export function githubPublicationAdapter(project: { owner: string; repo: string; issueNumber: number; clonePath: string }, exec: GhPublicationExec = ghPublicationExec): PublicationAdapter {
+  const repo = `${project.owner}/${project.repo}`;
+  return {
+    async list(): Promise<RemoteComment[]> {
+      const comments: RemoteComment[] = [];
+      const seen = new Set<string>();
+      for (let page = 1; page <= 10_000; page++) {
+        let raw: string;
+        try { raw = exec(["api", `repos/${repo}/issues/${project.issueNumber}/comments?per_page=100&page=${page}`], { cwd: project.clonePath }); }
+        catch (error) { throw githubFailure(error); }
+        let values: unknown;
+        try { values = JSON.parse(raw); } catch { throw new PublicationFailure("incomplete_listing"); }
+        if (!Array.isArray(values)) throw new PublicationFailure("incomplete_listing");
+        if (values.length === 0) return comments;
+        for (const value of values) {
+          if (!value || typeof value !== "object" || !("id" in value) || !("body" in value) || !["string", "number"].includes(typeof value.id) || typeof value.body !== "string") throw new PublicationFailure("incomplete_listing");
+          const item = value as { id: string | number; body: string; html_url?: unknown };
+          const id = String(item.id);
+          if (seen.has(id)) throw new PublicationFailure("incomplete_listing");
+          seen.add(id);
+          comments.push({ id, text: item.body, ...(typeof item.html_url === "string" ? { url: item.html_url } : {}) });
+        }
+      }
+      throw new PublicationFailure("incomplete_listing");
+    },
+    async add(body: string): Promise<void> {
+      try { exec(["issue", "comment", String(project.issueNumber), "--repo", repo, "--body-file", "-"], { cwd: project.clonePath, input: body }); }
+      catch (error) { throw githubFailure(error); }
+    },
+  };
 }

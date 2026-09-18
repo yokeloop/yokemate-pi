@@ -82,7 +82,7 @@ test("recorded plan binding reads exact bytes, canonical scope and contained reg
     const folder = join(root, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(folder, { recursive: true });
     const path = join(folder, "plan.md");
-    const text = "# YM-1 — work\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fix behavior\n\n## Acceptance\nBehavior works\n";
+    const text = "# YM-1 — work\n\n## Goal\nShip work.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fix behavior\n\n## Assumptions\n- Existing contract.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nBehavior works.\n";
     writeFileSync(path, text);
     const db = openDb(join(root, "yokemate.db"));
     db.prepare("INSERT INTO work (ticket, url, stage, plan) VALUES ('YM-1','u','planned',?)").run(path);

@@ -13,7 +13,7 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { readRecordedPlanBinding, assertPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
+import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
 import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -56,6 +56,11 @@ import { poolModel } from "../../../src/pool.ts";
 import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../src/plan-record.ts";
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 import { finalizeShip } from "../../../src/ship-finalize.ts";
+import { resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type PublicationError, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
+import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
+import { githubPublicationAdapter } from "../../../src/github.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -533,6 +538,22 @@ async function runSingleAgent(
 		});
 		currentResult.exitCode = terminal.exitCode;
 		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
+			const bytes = normalizeScoutMarkdown(observation.finalText);
+			try {
+				assertPublishable(bytes);
+				const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const target = resolvePublicationTarget(db, identity.ticket);
+					const hash = sha256(bytes);
+					const artifact = writePublicationArtifact(ENGINE_ROOT, identity.ticket, "scout", hash, bytes);
+					currentResult.envelope.publication = { state: "pending", path: artifact, hash, bytes: bytes.length, target: target.target, targetHash: target.targetHash };
+				} finally { db.close(); }
+			} catch (error) {
+				const code = error instanceof PublicationFailure ? error.code : "artifact_invalid";
+				currentResult.envelope.publication = { state: "blocked", hash: sha256(bytes), bytes: bytes.length, error: code };
+			}
+		}
 		refreshObservation();
 		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
 		diagnostic.metadata.usage = { ...currentResult.usage };
@@ -560,6 +581,7 @@ const ReviewRevisionSchema = Type.Object({ baseSha: Type.String(), headSha: Type
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
+	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
@@ -567,6 +589,7 @@ const TaskItem = Type.Object({
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
@@ -590,6 +613,7 @@ const SubagentParams = Type.Object({
 	cancelRun: Type.Optional(Type.String()),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -603,6 +627,65 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
 	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
+	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
+	const publicationTail = new Map<string, Promise<unknown>>();
+	const publishAccepted = async (publicationId: number, verifyBinding?: () => void | Promise<void>) => {
+		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		let row: PublicationRow | undefined;
+		let bytes;
+		try {
+			row = publicationById(db, publicationId);
+			if (!row) throw new PublicationFailure("artifact_invalid");
+			bytes = readPublicationArtifact(ENGINE_ROOT, row);
+		} catch (error) {
+			const code = error instanceof PublicationFailure ? error.code : "artifact_invalid";
+			if (row) markPublicationResult(db, row.id, { complete: false, error: code });
+			return { complete: false, error: code, parts: 0, revision: row?.content_hash ?? "", target: row?.target ?? "unknown" };
+		} finally { db.close(); }
+		let publication = row as PublicationRow;
+		const key = `${publication.target}\u0000${publication.ticket}`;
+		const prior = publicationTail.get(key) ?? Promise.resolve();
+		const work = prior.catch(() => undefined).then(async () => {
+			let canonicalUrl: string | undefined;
+			let target: ReturnType<typeof resolvePublicationTarget>;
+			const verifyPublicationBinding = async () => {
+				const binding = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const current = resolvePublicationTarget(binding, publication.ticket);
+					if (current.target !== publication.target || current.targetHash !== publication.target_hash) throw new PublicationFailure("binding_changed");
+					target = current;
+				} finally { binding.close(); }
+				await verifyBinding?.();
+			};
+			try {
+				await verifyPublicationBinding();
+				const resolved = target!.type === "github"
+					? { adapter: githubPublicationAdapter(target!), canonicalUrl: target!.canonicalUrl }
+					: await publicationMcp.youTrackAdapter(target!.server, target!.issueId);
+				const binding = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					if (!reserveCanonicalUrl(binding, publication.id, resolved.canonicalUrl)) throw new PublicationFailure("remote_conflict");
+					publication = publicationById(binding, publication.id)!;
+				} finally { binding.close(); }
+				canonicalUrl = resolved.canonicalUrl;
+				const knowledgePath = publication.plan_path ? path.relative(ENGINE_ROOT, publication.plan_path) : undefined;
+				const result = await publishDocument(publication, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding: verifyPublicationBinding });
+				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try { markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl }); }
+				finally { update.close(); }
+				return { ...result, target: resolved.canonicalUrl };
+			} catch (error) {
+				const code = error instanceof PublicationFailure ? error.code : "unavailable";
+				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try { markPublicationResult(update, publication.id, { complete: false, error: code, canonicalUrl }); }
+				finally { update.close(); }
+				return { complete: false, error: code, parts: 0, revision: publication.content_hash, target: canonicalUrl ?? publication.target };
+			}
+		});
+		publicationTail.set(key, work);
+		try { return await work; }
+		finally { if (publicationTail.get(key) === work) publicationTail.delete(key); }
+	};
 	let snapshots: RunSnapshots | undefined;
 	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
 	const reportAdmissions = new Map<string, ReportAdmissionDisplay>();
@@ -1078,6 +1161,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
+		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
 			try {
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
@@ -1116,6 +1200,86 @@ export default function (pi: ExtensionAPI) {
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
+				publishPlanScout: async (ticket, acceptanceId, origin) => {
+					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let row;
+					try {
+						const acceptance = publicationAcceptanceById(db, acceptanceId);
+						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_session_id !== origin.sessionId || !acceptance.owner_run_id || !acceptance.batch_id || !acceptance.task_hash) throw new Error("accepted scout identity does not match its live plan worker");
+						row = publicationById(db, acceptance.publication_id);
+						if (!row || row.ticket !== ticket || row.kind !== "scout") throw new Error("accepted scout identity does not match its live plan worker");
+					} finally { db.close(); }
+					const result = await publishAccepted(row.id);
+					return { reason: result.complete ? "scout publication complete" : result.error ?? "unavailable", publication: result.complete ? "complete" as const : "pending" as const, target: result.target, revision: row.content_hash };
+				},
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
+					const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
+					if (snapshot.contentHash !== contentHash) throw new Error("binding_changed");
+					assertPublishable(snapshot.bytes);
+					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let target;
+					let scout;
+					try {
+						target = resolvePublicationTarget(db, ticket);
+						const acceptance = publicationAcceptanceById(db, acceptanceId);
+						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_session_id !== origin.sessionId) throw new Error("scout publication pending: unavailable");
+						scout = publicationById(db, acceptance.publication_id);
+						if (!scout || scout.ticket !== ticket || scout.kind !== "scout" || scout.target !== target.target || scout.target_hash !== target.targetHash) throw new Error("scout publication pending: binding_changed");
+					} finally { db.close(); }
+					const scoutResult = await publishAccepted(scout.id);
+					if (!scoutResult.complete) throw new Error(`${target.visibleTarget}: scout publication pending: ${scoutResult.error ?? "unavailable"}`);
+					const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let plan;
+					let record;
+					try {
+						plan = acceptPublication(state, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket, kind: "plan", bytes: snapshot.bytes, runId: origin.sessionId });
+						record = acceptPlanRecord(state, { ticket, publicationId: plan.id, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, scoutPublication: scout.id });
+					} finally { state.close(); }
+					return { reason: "publication prepared", publicationId: plan.id, recordId: record.id, snapshotPath: plan.artifact_path, scoutPublication: scout.id, target: target.visibleTarget, revision: plan.content_hash };
+				},
+				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, originOrRunId) => {
+					if (typeof recordIdOrOrigin !== "number") return completePlanRecord(ticket, recordedPath, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					const recordId = recordIdOrOrigin;
+					const settings = readRuntimeSettings(ENGINE_ROOT);
+					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
+					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
+					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let row;
+					let record;
+					let scout;
+					try {
+						record = planRecordById(db, recordId);
+						if (!record || record.ticket !== ticket || !record.successful_record || record.plan_path !== binding.path || record.content_hash !== binding.contentHash || record.scope_hash !== binding.scopeHash) throw new Error("binding_changed");
+						row = publicationById(db, record.publication_id);
+						if (!row || row.ticket !== ticket || row.kind !== "plan" || row.content_hash !== binding.contentHash) throw new Error("binding_changed");
+						scout = publicationById(db, record.scout_publication);
+						if (!scout || scout.kind !== "scout" || scout.ticket !== ticket) throw new Error("binding_changed");
+					} finally { db.close(); }
+					const scoutResult = await publishAccepted(scout.id);
+					if (!scoutResult.complete) return { reason: scoutResult.error ?? "unavailable", publication: "pending" as const, target: scoutResult.target, revision: row.content_hash };
+					const planResult = await publishAccepted(row.id, () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); } catch { throw new PublicationFailure("binding_changed"); } });
+					if (!planResult.complete) return { reason: planResult.error ?? "unavailable", publication: "pending" as const, target: planResult.target, revision: row.content_hash };
+					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
+					catch {
+						const changed = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						try { markPublicationResult(changed, row.id, { complete: false, error: "binding_changed" }); }
+						finally { changed.close(); }
+						throw new Error("binding_changed");
+					}
+					if (!authority!.record(binding, settings.policy.workflowApproval)) return { reason: "plan-only; ready for /do; a new interactive approval is required", publication: "complete" as const, handoff: "plan-only" as const, target: planResult.target, revision: row.content_hash };
+					try {
+						const modelDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						try {
+							const model = modelForTicket(modelDb, ticket, "do") ?? poolModel(dataRoot(ENGINE_ROOT), "do");
+							resolveCoordinatorModel(model, ctx.modelRegistry);
+						} finally { modelDb.close(); }
+						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+						if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
+						return { runId: result.details.runId, reason: "advance plan+do authority consumed", publication: "complete" as const, handoff: "started" as const, target: planResult.target, revision: row.content_hash };
+					} catch (error) {
+						return { reason: (error as Error).message, publication: "complete" as const, handoff: "refused" as const, target: planResult.target, revision: row.content_hash };
+					}
+				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
 					const run = listRuns.admit({ mode: "plan", keys: request.targets.map((target) => target.ticket), parentSessionId: sessionId, parentRuntimeId: runtimeId, settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: settings.policy.guards.duplicateMode, rejectKey: (key) => /^[A-Z][A-Z0-9]*-\d+$/.test(key) ? undefined : `invalid ticket key ${JSON.stringify(key)}` });
@@ -1175,7 +1339,6 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 				},
-				planRecorded: async (ticket, recordedPath, _origin, planRunId) => completePlanRecord(ticket, recordedPath, planRunId),
 				launch: async (request, controlOrigin) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
 					const result = await startCoordinator(request, ctx, origin);
@@ -1293,6 +1456,7 @@ export default function (pi: ExtensionAPI) {
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
+		await publicationMcp.shutdown();
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
@@ -1371,8 +1535,68 @@ export default function (pi: ExtensionAPI) {
 		}
 		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
 	};
-	const settleResult = (result: ResultEnvelope, report: boolean) => {
+	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
+	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
+	const persistScoutBlock = (result: ResultEnvelope, reason: unknown): void => {
+		if (!result.identity.ticket) return;
+		let safe = safePublicationReason(reason);
+		try {
+			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+			try {
+				if (result.publication?.publicationId) markPublicationResult(db, result.publication.publicationId, { complete: false, error: safe });
+				recordPublicationBlock(db, result.identity.ticket, result.identity.runId, safe);
+			} finally { db.close(); }
+		} catch { safe = "artifact_invalid"; }
+		if (result.publication) {
+			result.publication.state = "blocked";
+			result.publication.error = safe;
+		}
+	};
+	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
+		ENGINE_ROOT,
+		operation,
+		{ ticket: result.identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, ...payload },
+		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
+		resolveCoordinatorParent(ENGINE_ROOT),
+	);
+	const rejectScout = async (result: ResultEnvelope, reason: unknown): Promise<void> => {
+		let safe = safePublicationReason(reason);
+		try {
+			const reply = await requestScoutControl(result, "reject-plan-scout", { acceptanceId: result.publication?.acceptanceId });
+			if (reply.state !== "accepted") safe = "unavailable";
+		} catch { safe = "unavailable"; }
+		persistScoutBlock(result, safe);
+	};
+	const settleResult = async (result: ResultEnvelope, report: boolean) => {
 		if (!runs?.settle(result)) return;
+		if (result.identity.agent === "plan-scout" && result.identity.ticket && !(result.payloadOutcome === "valid" && result.publication?.state === "pending")) {
+			await rejectScout(result, result.publication?.error ?? result.payloadOutcome);
+		}
+		if (result.identity.agent === "plan-scout" && result.identity.ticket && result.payloadOutcome === "valid" && result.publication?.state === "pending") {
+			try {
+				const reference = result.publication;
+				if (!reference.path || !reference.hash || reference.bytes === undefined || !reference.target || !reference.targetHash) throw new PublicationFailure("artifact_invalid");
+				const bytes = fs.readFileSync(reference.path);
+				if (bytes.length !== reference.bytes || sha256(bytes) !== reference.hash) throw new PublicationFailure("artifact_invalid");
+				assertPublishable(bytes);
+				const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				let accepted;
+				let acceptance;
+				try {
+					const target = resolvePublicationTarget(db, result.identity.ticket);
+					if (target.target !== reference.target || target.targetHash !== reference.targetHash) throw new PublicationFailure("binding_changed");
+					accepted = acceptPublication(db, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket: result.identity.ticket, kind: "scout", bytes, runId: result.identity.runId, child: result.identity });
+					acceptance = acceptPublicationDelivery(db, accepted.id, result.identity);
+				} finally { db.close(); }
+				result.publication.publicationId = accepted.id;
+				result.publication.acceptanceId = acceptance.id;
+				const reply = await requestScoutControl(result, "publish-plan-scout", { acceptanceId: acceptance.id });
+				if (reply.state === "accepted" && reply.publication === "complete") result.publication.state = "complete";
+				else await rejectScout(result, reply.reason);
+			} catch (error) {
+				await rejectScout(result, error);
+			}
+		}
 		reportSettledAt.set(result.identity.runId, Date.now());
 		if (report) registerDelivery(result);
 		const batch = runs.batch(result.identity.batchId);
@@ -1538,7 +1762,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
-			if (!runs) runs = new ChildRuns(ownerRunId, sessionId);
+			if (!runs) runs = new ChildRuns(ownerRunId, sessionId, process.env.YOKEMATE_MODE === "plan" ? process.env.YOKEMATE_TICKET : undefined);
 			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
@@ -1576,7 +1800,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { envelope, output };
 			};
-			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; review?: { baseSha: string; headSha: string } }[]) => {
+			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string } }[]) => {
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
@@ -1601,7 +1825,7 @@ export default function (pi: ExtensionAPI) {
 								const identity = ack.children[i]!.identity;
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
 								const { envelope: result, output } = failed ? { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output: "" } : await runDetachedAgent(mode, identity, task, i + 1);
-								settleResult(result, false);
+								await settleResult(result, false);
 								failed ||= failedEnvelope(result);
 								previous = output;
 							}
@@ -1609,7 +1833,7 @@ export default function (pi: ExtensionAPI) {
 						} else {
 							await mapWithConcurrencyLimit(tasks, subagentConcurrency(settings, tasks.length), async (task, i) => {
 								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
-								settleResult(result, true);
+								await settleResult(result, true);
 							});
 						}
 						settleBatch(toolCallId);
@@ -1665,7 +1889,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain?.length) return launch("chain", params.chain);
 			if (params.tasks?.length) return launch("parallel", params.tasks);
-			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, review: params.review }]);
+			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, ticket: params.ticket, review: params.review }]);
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {

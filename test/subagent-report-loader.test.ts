@@ -40,7 +40,7 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     writeFileSync(join(dir, ".pi/settings.json"), "{}");
     writeFileSync(join(dir, ".pi/agents/do-coordinator.md"), "fixture");
     const plan = join(dir, "home/knowledge/org/repo/ai/YM-1-work/plan.md");
-    writeFileSync(plan, "# YM-1 — compact coordinator report\n\n## Affected repositories\n- `org/repo` — app\n");
+    writeFileSync(plan, "# YM-1 — compact coordinator report\n\n## Goal\nExercise coordinator terminal reporting.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Run the coordinator report fixture and verify the terminal envelope.\n\n## Assumptions\n- The fixture repository is available locally.\n\n## Out of scope\n- Changes to the fixture repository.\n\n## Acceptance\nThe parent receives exactly one compact coordinator terminal report.\n");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'github', 'YM', 'test/model')").run(join(dir, "clone"));
     db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);

@@ -1,19 +1,88 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, type Socket } from "node:net";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileProvenance } from "../src/subagent-runs.ts";
 import { continueOwnedCoordinator, startCoordinatorRpc, type RpcEvent } from "../src/coordinator-rpc.ts";
 import { runBoundedRuntimeCase, untilAborted } from "./fixtures/bounded-runtime-case.ts";
+import { openDb } from "../src/db.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
 const provider = join(root, "test/fixtures/subagent-runtime-provider.ts");
 const piVersion = JSON.parse(readFileSync(join(root, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
 const cli = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+
+test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when parent control is unavailable", { timeout: 30000 }, async () => {
+  const sandbox = mkdtempSync(join(tmpdir(), "plan-scout-terminal-"));
+  const runtime = join(sandbox, "runtime");
+  const agentDir = join(sandbox, "agent");
+  const copiedExtension = join(sandbox, ".pi/extensions/subagent/index.ts");
+  mkdirSync(runtime, { recursive: true });
+  mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  cpSync(join(root, "src"), join(sandbox, "src"), { recursive: true });
+  cpSync(join(root, ".pi/extensions/subagent"), join(sandbox, ".pi/extensions/subagent"), { recursive: true });
+  cpSync(join(root, ".pi/settings.json"), join(sandbox, ".pi/settings.json"));
+  symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
+  symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
+  writeFileSync(join(sandbox, ".pi/agents/plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
+  writeFileSync(join(sandbox, ".env.local"), "");
+  const clone = join(sandbox, "clone");
+  mkdirSync(clone);
+  execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe" });
+  execFileSync("git", ["-C", clone, "remote", "add", "origin", "https://github.com/org/repo.git"], { stdio: "pipe" });
+  const db = openDb(join(sandbox, "yokemate.db"));
+  db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','ym204-fixture/deterministic')").run(clone);
+  db.close();
+  const sockets = new Set<Socket>();
+  const barrier = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => { if (chunk.toString().includes("\n")) socket.end("release\n"); });
+  });
+  const socketPath = join(runtime, "provider.sock");
+  await new Promise<void>((resolve) => barrier.listen(socketPath, resolve));
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: sandbox, XDG_RUNTIME_DIR: runtime, PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: socketPath, YM204_FIXTURE_SCENARIO: "plan_scout_terminal", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" };
+  delete env.PI_SESSION_ID;
+  delete env.YOKEMATE_ROLE;
+  delete env.YOKEMATE_PLAN_RUN_ID;
+  delete env.HERDR_PANE_ID;
+  delete env.YOKEMATE_PARENT_PANE;
+  let proc: ReturnType<typeof spawn> | undefined;
+  try {
+    proc = spawn(process.execPath, [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", copiedExtension, "--model", "ym204-fixture/deterministic:high"], { cwd: sandbox, env, stdio: ["pipe", "pipe", "pipe"] });
+    const stdoutStream = proc.stdout!;
+    const stderrStream = proc.stderr!;
+    let stdout = "";
+    let stderr = "";
+    stdoutStream.on("data", (chunk) => { stdout += chunk.toString(); });
+    stderrStream.on("data", (chunk) => { stderr += chunk.toString(); });
+    proc.stdin!.write(JSON.stringify({ id: "work", type: "prompt", message: "Launch the scout." }) + "\n");
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        new Promise<void>((resolve) => stdoutStream.on("data", () => { if (/"publication":\{"state":"blocked"/.test(stdout)) resolve(); })),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`scout terminal timeout: ${JSON.stringify({ stdout: stdout.slice(-12000), stderr })}`)), 20000); }),
+      ]);
+    } finally { clearTimeout(timer); }
+    assert.match(stdout, /"batchId":"scout-terminal"/);
+    assert.match(stdout, /"publication":\{"state":"blocked"/);
+    assert.match(stdout, /"error":"unavailable"/);
+    const state = openDb(join(sandbox, "yokemate.db"));
+    try { assert.equal(state.prepare("SELECT reason FROM plan_publication_block WHERE ticket='YM-1' ORDER BY id DESC LIMIT 1").get()?.reason, "unavailable"); }
+    finally { state.close(); }
+  } finally {
+    if (proc?.exitCode === null && proc.signalCode === null) proc.kill("SIGTERM");
+    if (proc && proc.exitCode === null && proc.signalCode === null) await new Promise<void>((resolve) => proc!.once("close", () => resolve()));
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => barrier.close(() => resolve()));
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
 
 test("real runtime keeps merge and ship finalization on owned parent control operations", () => {
   const source = readFileSync(extension, "utf8");

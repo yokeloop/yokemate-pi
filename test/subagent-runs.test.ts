@@ -28,6 +28,16 @@ test("identities distinguish same-name siblings and batches; duplicate and forei
   assert.deepEqual(runs.active().map((child) => child.identity.batchId), ["B"]);
 });
 
+test("plan scouts require an explicit or stamped ticket and keep it in correlation identity", () => {
+  assert.throws(() => new ChildRuns("owner", "session").admit("missing", [{ agent: "plan-scout", task: "scout" }], cwd), /ticket binding/);
+  const stamped = new ChildRuns("owner", "session", "YM-1");
+  const identity = stamped.admit("stamped", [{ agent: "plan-scout", task: "scout" }], cwd).children[0]!.identity;
+  assert.equal(identity.ticket, "YM-1");
+  assert.throws(() => stamped.admit("foreign", [{ agent: "plan-scout", task: "scout", ticket: "YM-2" }], cwd), /differs/);
+  const problem = new ChildRuns("owner", "session").admit("problem", [{ agent: "plan-scout", task: "scout", ticket: "YM-3" }], cwd);
+  assert.equal(problem.children[0]!.identity.ticket, "YM-3");
+});
+
 test("review revisions are validated before admission and template hashes survive chain substitution", () => {
   const runs = new ChildRuns("owner", "session");
   assert.throws(() => runs.admit("bad", [{ agent: "task-reviewer", task: "task" }], cwd), /requires review/);

@@ -82,6 +82,70 @@ export function openDb(path: string): DatabaseSync {
       branch   TEXT,
       pr       TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS plan_publication (
+      id                 INTEGER PRIMARY KEY,
+      target             TEXT NOT NULL,
+      target_hash        TEXT NOT NULL,
+      canonical_url      TEXT,
+      ticket             TEXT NOT NULL,
+      kind               TEXT NOT NULL CHECK (kind IN ('scout','plan')),
+      content_hash       TEXT NOT NULL,
+      artifact_path      TEXT NOT NULL,
+      bytes              INTEGER NOT NULL,
+      run_id             TEXT NOT NULL,
+      owner_run_id       TEXT,
+      owner_session_id   TEXT,
+      batch_id           TEXT,
+      task_hash          TEXT,
+      plan_path          TEXT,
+      scope_hash         TEXT,
+      scout_publication  INTEGER REFERENCES plan_publication(id),
+      successful_record  INTEGER NOT NULL DEFAULT 0 CHECK (successful_record IN (0,1)),
+      complete           INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0,1)),
+      error_code         TEXT,
+      side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
+      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (target, ticket, kind, content_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS plan_publication_acceptance (
+      id               INTEGER PRIMARY KEY,
+      publication_id   INTEGER NOT NULL REFERENCES plan_publication(id),
+      ticket           TEXT NOT NULL,
+      run_id           TEXT NOT NULL,
+      owner_run_id     TEXT NOT NULL,
+      owner_session_id TEXT NOT NULL,
+      batch_id         TEXT NOT NULL,
+      task_hash        TEXT NOT NULL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (owner_run_id, owner_session_id, batch_id, run_id, task_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS plan_record (
+      id                   INTEGER PRIMARY KEY,
+      ticket               TEXT NOT NULL,
+      publication_id       INTEGER NOT NULL REFERENCES plan_publication(id),
+      plan_path            TEXT NOT NULL,
+      content_hash         TEXT NOT NULL,
+      scope_hash           TEXT NOT NULL,
+      scout_publication    INTEGER NOT NULL REFERENCES plan_publication(id),
+      successful_record    INTEGER NOT NULL DEFAULT 0 CHECK (successful_record IN (0,1)),
+      side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
+      created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (ticket, publication_id, plan_path, content_hash, scope_hash, scout_publication)
+    );
+
+    CREATE TABLE IF NOT EXISTS plan_publication_block (
+      id         INTEGER PRIMARY KEY,
+      ticket     TEXT NOT NULL,
+      run_id     TEXT NOT NULL,
+      reason     TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (ticket, run_id, reason)
+    );
   `);
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.

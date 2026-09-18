@@ -6,5 +6,6 @@ projects/
 node_modules/
 docs/plans/
 .pi/settings.local.json
+.pi/plan-publications/
 .pi/subagent-reports/
 home/
