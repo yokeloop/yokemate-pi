@@ -25,6 +25,84 @@ export const FIELDS =
   "idReadable,summary,resolved,project(shortName)," +
   "customFields(name,$type,value(name,localizedName))";
 
+export const ISSUE_PREVIEW_FIELDS = "idReadable,summary,description";
+
+export interface IssuePreview {
+  idReadable: string;
+  summary: string;
+  description: string | null;
+}
+
+export type IssuePreviewFailure = "timeout" | "http" | "network" | "json";
+
+export class IssuePreviewFetchError extends Error {
+  readonly kind: IssuePreviewFailure;
+  readonly status?: number;
+
+  constructor(kind: IssuePreviewFailure, status?: number) {
+    super(kind);
+    this.name = "IssuePreviewFetchError";
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+export async function fetchIssuePreview(
+  t: Tracker,
+  key: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 5000,
+): Promise<IssuePreview | null> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new IssuePreviewFetchError("timeout"));
+    }, timeoutMs);
+  });
+  const request = (async (): Promise<IssuePreview | null> => {
+    let res: Response;
+    try {
+      res = await fetchImpl(
+        `${t.baseUrl}/api/issues/${encodeURIComponent(key)}?fields=${encodeURIComponent(ISSUE_PREVIEW_FIELDS)}`,
+        {
+          headers: { Authorization: `Bearer ${t.token}`, Accept: "application/json" },
+          signal: controller.signal,
+        },
+      );
+    } catch {
+      throw new IssuePreviewFetchError("network");
+    }
+    if (res.status === 404) return null;
+    if (!res.ok) throw new IssuePreviewFetchError("http", res.status);
+    let raw: unknown;
+    try {
+      raw = await res.json();
+    } catch {
+      throw new IssuePreviewFetchError("json");
+    }
+    if (
+      typeof raw !== "object" || raw === null ||
+      typeof (raw as { idReadable?: unknown }).idReadable !== "string" ||
+      typeof (raw as { summary?: unknown }).summary !== "string"
+    ) throw new IssuePreviewFetchError("json");
+    const description = (raw as { description?: unknown }).description;
+    if (description !== undefined && description !== null && typeof description !== "string")
+      throw new IssuePreviewFetchError("json");
+    return {
+      idReadable: (raw as { idReadable: string }).idReadable,
+      summary: (raw as { summary: string }).summary,
+      description: typeof description === "string" ? description : null,
+    };
+  })();
+  try {
+    return await Promise.race([request, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Fetch every page of `Assignee: me` from one instance (R2.3). */
 export async function fetchAll(
   t: Tracker,

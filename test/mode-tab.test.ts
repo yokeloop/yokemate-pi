@@ -492,6 +492,31 @@ for (const entry of ["node", "package"]) {
   }
 }
 
+test("plan and review launches carry only identity and worker words, never cached preview content", () => {
+  const f = fixture();
+  try {
+    const summary = "SENTINEL SUMMARY FROM CACHE";
+    const description = "SENTINEL DESCRIPTION FROM TRACKER";
+    const db = openDb(join(f.root, "yokemate.db"));
+    db.prepare("INSERT INTO work (ticket, url, title, stage) VALUES ('YM-1', 'ticket:YM-1', ?, 'review')").run(summary);
+    db.close();
+    writeFileSync(join(f.root, ".env.local"), `DESCRIPTION=${description}\n`);
+    for (const mode of ["plan", "review"] as const) for (const split of [[], ["--split"]]) {
+      const out = f.run(mode, [...split, "YM-1", "worker-note"]);
+      assert.equal(out.status, 0, out.stderr);
+      const serialized = JSON.stringify(out.calls);
+      assert.doesNotMatch(serialized, /SENTINEL SUMMARY FROM CACHE|SENTINEL DESCRIPTION FROM TRACKER/);
+      assert.doesNotMatch(out.stdout + out.stderr, /SENTINEL SUMMARY FROM CACHE|SENTINEL DESCRIPTION FROM TRACKER/);
+      const surface = out.calls.find((call) => call[1] === "create" || call[1] === "split")!;
+      const stampEnv = surface.flatMap((word, index) => word === "--env" ? [surface[index + 1]!] : []);
+      assert.ok(stampEnv.includes(`YOKEMATE_MODE=${mode}`));
+      assert.ok(stampEnv.includes("YOKEMATE_TICKET=YM-1"));
+      assert.ok(stampEnv.includes("YOKEMATE_ROLE=coordinator"));
+      assert.equal(out.calls.find((call) => call[1] === "prompt")![3], `/skill:${mode === "plan" ? "plan" : "review-worker"} YM-1 worker-note`);
+    }
+  } finally { f.cleanup(); }
+});
+
 for (const entry of ["node", "package"]) {
   test(`${entry} plan: problem and mixed input stay in one conversational surface`, () => {
     const f = fixture();
