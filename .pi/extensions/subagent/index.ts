@@ -46,7 +46,7 @@ import { researchChildLaunch, researchIdentity } from "../../../src/research-gua
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 import { openDb } from "../../../src/db.ts";
 import { resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type PublicationError, type PublicationRow } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
@@ -1205,13 +1205,42 @@ export default function (pi: ExtensionAPI) {
 		sendReport(batch);
 		batches.delete(batchId);
 	};
+	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
+	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
+	const persistScoutBlock = (result: ResultEnvelope, reason: unknown): void => {
+		if (!result.identity.ticket) return;
+		let safe = safePublicationReason(reason);
+		try {
+			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+			try {
+				if (result.publication?.publicationId) markPublicationResult(db, result.publication.publicationId, { complete: false, error: safe });
+				recordPublicationBlock(db, result.identity.ticket, result.identity.runId, safe);
+			} finally { db.close(); }
+		} catch { safe = "artifact_invalid"; }
+		if (result.publication) {
+			result.publication.state = "blocked";
+			result.publication.error = safe;
+		}
+	};
+	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
+		ENGINE_ROOT,
+		operation,
+		{ ticket: result.identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, ...payload },
+		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
+		resolveCoordinatorParent(ENGINE_ROOT),
+	);
+	const rejectScout = async (result: ResultEnvelope, reason: unknown): Promise<void> => {
+		let safe = safePublicationReason(reason);
+		try {
+			const reply = await requestScoutControl(result, "reject-plan-scout", {});
+			if (reply.state !== "accepted") safe = "unavailable";
+		} catch { safe = "unavailable"; }
+		persistScoutBlock(result, safe);
+	};
 	const settleResult = async (result: ResultEnvelope, report: boolean) => {
 		if (!runs?.settle(result)) return;
 		if (result.identity.agent === "plan-scout" && result.identity.ticket && !(result.payloadOutcome === "valid" && result.publication?.state === "pending")) {
-			const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: result.identity.ticket, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
-			if (reply.state !== "accepted") throw new Error(reply.reason ?? "scout rejection was not recorded");
-			try { const db = openDb(path.join(ENGINE_ROOT, "yokemate.db")); try { recordPublicationBlock(db, result.identity.ticket, result.identity.runId, result.publication?.error ?? result.payloadOutcome); } finally { db.close(); } }
-			catch { if (result.publication) result.publication.error = "artifact_invalid"; }
+			await rejectScout(result, result.publication?.error ?? result.payloadOutcome);
 		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket && result.payloadOutcome === "valid" && result.publication?.state === "pending") {
 			try {
@@ -1231,19 +1260,11 @@ export default function (pi: ExtensionAPI) {
 				} finally { db.close(); }
 				result.publication.publicationId = accepted.id;
 				result.publication.acceptanceId = acceptance.id;
-				const reply = await requestPlanControl(ENGINE_ROOT, "publish-plan-scout", { ticket: result.identity.ticket, acceptanceId: acceptance.id, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
-				result.publication.state = reply.state === "accepted" && reply.publication === "complete" ? "complete" : "blocked";
-				if (result.publication.state === "blocked") result.publication.error = reply.reason ?? "unavailable";
+				const reply = await requestScoutControl(result, "publish-plan-scout", { acceptanceId: acceptance.id });
+				if (reply.state === "accepted" && reply.publication === "complete") result.publication.state = "complete";
+				else await rejectScout(result, reply.reason);
 			} catch (error) {
-				result.publication.state = "blocked";
-				result.publication.error = error instanceof PublicationFailure ? error.code : "unavailable";
-				const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: result.identity.ticket, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
-				if (reply.state !== "accepted") throw new Error(reply.reason ?? "scout rejection was not recorded");
-				try {
-					const blocked = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-					try { recordPublicationBlock(blocked, result.identity.ticket, result.identity.runId, result.publication.error); }
-					finally { blocked.close(); }
-				} catch { result.publication.error = "artifact_invalid"; }
+				await rejectScout(result, error);
 			}
 		}
 		if (report) registerDelivery(result);

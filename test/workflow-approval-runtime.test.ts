@@ -55,7 +55,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     symlinkSync(join(source, "test/fixtures/subagent-runtime-provider.ts"), join(agentDir, "extensions/provider.ts"));
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    process.env.PI_SESSION_ID = "parent";
+    delete process.env.PI_SESSION_ID;
     writeFileSync(join(dir, ".env.local"), "");
     const settings = join(dir, ".pi", "settings.json");
     const set = (workflowApproval: boolean, guards = {}) => writeFileSync(settings, JSON.stringify({ guardPolicy: { workflowApproval, guards } }));
@@ -139,6 +139,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const workflowChild = process.argv[1];
     process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+    assert.equal(process.env.PI_SESSION_ID, undefined);
     const scoutEnvelope = await runScout("scout-long");
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
@@ -164,6 +165,17 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(invalidScout.publication, undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
+    process.env.YOKEMATE_MODE = "plan";
+    process.env.YOKEMATE_TICKET = "YM-1";
+    process.env.YOKEMATE_PLAN_RUN_ID = "foreign-plan-run";
+    const refusedScout = await runScout("scout-parent-refusal");
+    assert.equal(refusedScout.publication.state, "blocked");
+    assert.equal(refusedScout.publication.error, "unavailable");
+    assert.equal(db.prepare("SELECT reason FROM plan_publication_block WHERE ticket='YM-1' AND run_id=?").get(refusedScout.identity.runId)?.reason, "unavailable");
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_TICKET;
+    delete process.env.YOKEMATE_PLAN_RUN_ID;
     const recoveredScout = await runScout("scout-recovery");
     assert.equal(recoveredScout.publication.state, "complete", JSON.stringify(recoveredScout.publication));
     delete process.env.YOKEMATE_RUN_ID;
