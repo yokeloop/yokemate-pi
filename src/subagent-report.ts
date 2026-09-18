@@ -282,6 +282,29 @@ function addChainBody(container: Container, envelope: BatchEnvelope, padding: nu
   }
 }
 
+function aggregateStatus(envelope: BatchEnvelope): string {
+  const failed = envelope.results.filter(failedEnvelope).length;
+  const skipped = envelope.results.filter((result) => result.processOutcome === "not_started").length;
+  return failed ? `${envelope.results.length - failed}/${envelope.results.length} done${skipped ? `, ${skipped} skipped` : ""}` : `${envelope.results.length}/${envelope.results.length} done`;
+}
+
+function addBatchBody(container: Container, envelope: BatchEnvelope, display: SubagentReportDisplayV1 | undefined, padding: number, theme: Parameters<MessageRenderer>[2]): void {
+  for (const [index, result] of envelope.results.entries()) {
+    const member = display?.members?.[index];
+    const duration = member?.durationMs === undefined ? "—" : formatElapsed(member.durationMs);
+    const line = [
+      `member #${index + 1}`,
+      safeAgent(result.identity.agent),
+      result.identity.runId,
+      statusOf(result),
+      duration,
+      member?.taskExcerpt,
+      reportBrief(result.payload),
+    ].filter(Boolean).join(" · ");
+    container.addChild(new Text(theme.fg("dim", line), padding, 0));
+  }
+}
+
 function compactText(message: { content: unknown; details?: unknown }, display: SubagentReportDisplayV1 | undefined, envelope: ReportEnvelope | undefined): string {
   const duration = display?.durationMs === undefined ? "—" : formatElapsed(display.durationMs);
   const hint = keyHint("app.tools.expand", "to expand");
@@ -331,7 +354,7 @@ export const subagentReportRenderer: MessageRenderer = (message, options, theme)
   const identity = envelope?.kind === "result"
     ? `${safeAgent(envelope.identity.agent)} ${envelope.identity.runId} ${statusOf(envelope)}`
     : envelope
-      ? `subagent ${envelope.kind} ${envelope.batchId} (${envelope.results.length})`
+      ? [`subagent ${envelope.kind} ${envelope.batchId} (${envelope.results.length})`, aggregateStatus(envelope), display?.durationMs === undefined ? "—" : formatElapsed(display.durationMs)].join(" · ")
       : display?.kind === "coordinator" && details
         ? `coordinator ${safeAgent(details.mode)} ${String(details.runId ?? "—")} ${safeAgent(details.outcome)}`
         : legacyLabel(canonical);
@@ -340,6 +363,7 @@ export const subagentReportRenderer: MessageRenderer = (message, options, theme)
   container.addChild(new Spacer(1));
   if (envelope?.kind === "result") addResultBody(container, envelope, padding, theme);
   else if (envelope?.kind === "chain") addChainBody(container, envelope, padding, theme);
+  else if (envelope?.kind === "batch") addBatchBody(container, envelope, display, padding, theme);
   else container.addChild(new Text(canonical, padding, 0));
   return container;
 };

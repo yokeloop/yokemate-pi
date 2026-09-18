@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { reportContent, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
+import { reportContent, sha256, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
 import { openDb } from "../src/db.ts";
 
 const root = resolve(import.meta.dirname, "..");
@@ -159,31 +159,27 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
       { deliverAs: "followUp", triggerTurn: true },
       { deliverAs: "followUp", triggerTurn: true },
     ]);
-    for (const { message } of sent) {
-      const envelope = message.details.envelope as ReportEnvelope;
-      const delivery = { deliveryId: message.details.deliveryId, envelopeHash: message.details.envelopeHash } as ReportDelivery;
-      assert.equal(message.content, reportContent(envelope, delivery));
-      assert.equal(message.customType, "subagent-report");
-      assert.equal(message.display, true);
-      assert.equal(message.details.display.version, 1);
-      const llm = convertToLlm([{ role: "custom", timestamp: 0, ...message }]);
-      assert.equal((llm[0]!.content[0] as any).text, message.content);
-    }
+    const assertCanonicalReports = (entries: typeof sent) => {
+      for (const { message, options } of entries) {
+        const envelope = message.details.envelope as ReportEnvelope;
+        const delivery = { deliveryId: message.details.deliveryId, envelopeHash: message.details.envelopeHash } as ReportDelivery;
+        assert.equal(message.content, reportContent(envelope, delivery));
+        assert.equal(message.details.envelopeHash, sha256(JSON.stringify(envelope)));
+        assert.equal(message.customType, "subagent-report");
+        assert.equal(message.display, true);
+        assert.equal(message.details.display.version, 1);
+        assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+        assert.equal(readFileSync(message.details.display.archive.reportPath, "utf8"), message.content);
+        assert.equal(message.details.display.archive.reportBytes, Buffer.byteLength(message.content));
+        assert.equal(message.details.display.archive.reportHash, sha256(message.content));
+        const llm = convertToLlm([{ role: "custom", timestamp: 0, ...message }]);
+        assert.equal((llm[0]!.content[0] as any).text, message.content);
+      }
+    };
+    assertCanonicalReports(sent);
     assert.equal(sent[0]!.message.details.envelope.kind, "result");
     assert.equal(sent[1]!.message.details.envelope.kind, "batch");
     assert.equal(sent[0]!.message.details.envelope.identity.runId, parsedAck.children[0].identity.runId);
-
-    const controlledTask = `${"\0".repeat(24)}visible unknown task`;
-    const unknownAck = await tool.definition.execute("unknown-single", { agent: "missing", task: controlledTask }, undefined, () => undefined, ctx);
-    assert.equal((unknownAck.details as any).display.members[0].taskExcerpt, "visible unknown task");
-    await waitFor(() => sent.length === 4);
-    assert.equal(sent[2]!.message.details.envelope.processOutcome, "not_started");
-    assert.equal(sent[2]!.message.details.display.diagnosticCode, "unknown_agent");
-    await tool.definition.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
-    await waitFor(() => sent.length === 6);
-    assert.equal(sent[4]!.message.details.envelope.kind, "chain");
-    assert.deepEqual(sent[4]!.message.details.envelope.results.map((entry: any) => entry.processOutcome), ["not_started", "not_started"]);
-    assert.equal(sent[4]!.message.details.display.diagnosticCode, "unknown_agent");
 
     initTheme("dark", false);
     const renderer = loaded.extensions.flatMap((entry) => [...entry.messageRenderers.entries()]).find(([name]) => name === "subagent-report")?.[1];
@@ -195,15 +191,56 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     for (const width of [1, 2, 3, 40, 80, 120]) assert.ok(component.render(width).every((line) => visibleWidth(line) <= width));
     const sendsBefore = sent.length;
     component.setExpanded(true);
-    const expanded = component.render(120).map(stripTerminalSequences).join("\n");
-    assert.match(expanded, /canonical tail/);
+    const expanded = component.render(120).map(stripTerminalSequences).map((line) => line.trim()).join("\n");
+    assert.match(expanded, /line one\nline two\ncanonical tail/);
+    assert.doesNotMatch(expanded, /"envelope"/);
     assert.match(expanded, /report\.txt:/);
+    const batchComponent = new CustomMessageComponent({ role: "custom", timestamp: 0, ...sent[1]!.message }, renderer, undefined, 1);
+    batchComponent.setExpanded(true);
+    const expandedBatch = batchComponent.render(160).map(stripTerminalSequences).map((line) => line.trim()).join("\n");
+    assert.match(expandedBatch, /member #1 · worker · .* · done · .*produce multiline canoni · line one/);
+    assert.doesNotMatch(expandedBatch, /canonical tail|"envelope"/);
+    assert.equal(`${expanded}\n${expandedBatch}`.split("canonical tail").length - 1, 1);
     component.setExpanded(false);
     component.setOutputPad(2);
     component.invalidate();
     component.render(40);
+    batchComponent.setExpanded(false);
+    batchComponent.invalidate();
+    batchComponent.render(40);
     assert.equal(sent.length, sendsBefore);
     assert.equal(providerTurns, 0);
+
+    const parallelStart = sent.length;
+    const parallelAck = await tool.definition.execute("loader-parallel", { tasks: [{ agent: "worker", task: "parallel one" }, { agent: "worker", task: "parallel two" }] }, undefined, () => undefined, ctx);
+    await waitFor(() => sent.length === parallelStart + 3);
+    const parallelReports = sent.slice(parallelStart);
+    assert.deepEqual(parallelReports.map((entry) => entry.message.details.envelope.kind), ["result", "result", "batch"]);
+    assert.deepEqual(new Set(parallelReports.slice(0, 2).map((entry) => entry.message.details.envelope.identity.runId)), new Set((parallelAck.details as any).children.map((child: any) => child.identity.runId)));
+    assertCanonicalReports(parallelReports);
+
+    const chainStart = sent.length;
+    await tool.definition.execute("loader-chain", { chain: [{ agent: "worker", task: "chain one" }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
+    await waitFor(() => sent.length === chainStart + 2);
+    const chainReports = sent.slice(chainStart);
+    assert.deepEqual(chainReports.map((entry) => entry.message.details.envelope.kind), ["chain", "batch"]);
+    assert.equal(chainReports[0]!.message.details.envelope.results.length, 2);
+    assertCanonicalReports(chainReports);
+
+    const controlledTask = `${"\0".repeat(24)}visible unknown task`;
+    const unknownSingleStart = sent.length;
+    const unknownAck = await tool.definition.execute("unknown-single", { agent: "missing", task: controlledTask }, undefined, () => undefined, ctx);
+    assert.equal((unknownAck.details as any).display.members[0].taskExcerpt, "visible unknown task");
+    await waitFor(() => sent.length === unknownSingleStart + 2);
+    assert.equal(sent[unknownSingleStart]!.message.details.envelope.processOutcome, "not_started");
+    assert.equal(sent[unknownSingleStart]!.message.details.display.diagnosticCode, "unknown_agent");
+    const unknownChainStart = sent.length;
+    await tool.definition.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
+    await waitFor(() => sent.length === unknownChainStart + 2);
+    assert.equal(sent[unknownChainStart]!.message.details.envelope.kind, "chain");
+    assert.deepEqual(sent[unknownChainStart]!.message.details.envelope.results.map((entry: any) => entry.processOutcome), ["not_started", "not_started"]);
+    assert.equal(sent[unknownChainStart]!.message.details.display.diagnosticCode, "unknown_agent");
+    assertCanonicalReports(sent.slice(unknownSingleStart));
 
     const legacy = { ...sent[0]!.message, details: { envelope: sent[0]!.message.details.envelope } };
     const legacyComponent = new CustomMessageComponent({ role: "custom", timestamp: 0, ...legacy }, renderer, undefined, 1);

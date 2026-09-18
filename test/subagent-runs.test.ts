@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { ChildRuns, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
 import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
@@ -134,6 +134,31 @@ test("metadata snapshots are private, bounded, retain active runs and survive wr
     const limit = new RunSnapshots(root, plan);
     assert.equal(limit.write("owner", "oversize", { tooLarge: "x".repeat(PAYLOAD_LIMIT) }, true), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("result, chain and follow-up batch canonical contracts remain distinct and byte-stable", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("single", [task], cwd);
+  const result = resultEnvelope(ack.children[0]!.identity, task.task, clean, approved);
+  assert.equal(runs.settle(result), true);
+  const batch = runs.batch("single")!;
+  const resultDelivery = deliveryFor(result);
+  const batchDelivery = deliveryFor(batch);
+  const resultCanonical = reportContent(result, resultDelivery);
+  const batchCanonical = reportContent(batch, batchDelivery);
+  assert.notEqual(resultDelivery.deliveryId, batchDelivery.deliveryId);
+  assert.equal(resultCanonical, `[subagent task-reviewer] ${JSON.stringify({ version: 1, deliveryId: resultDelivery.deliveryId, envelopeHash: resultDelivery.envelopeHash, envelope: result })}`);
+  assert.equal(batchCanonical, `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: batchDelivery.deliveryId, envelopeHash: batchDelivery.envelopeHash, envelope: batch })}`);
+
+  const chainRuns = new ChildRuns("owner", "session");
+  const chainAck = chainRuns.admit("chain", [task, task], cwd);
+  for (const child of chainAck.children) assert.equal(chainRuns.settle(resultEnvelope(child.identity, task.task, clean, approved)), true);
+  const chain = chainRuns.batch("chain", "chain")!;
+  const followUp = chainRuns.batch("chain")!;
+  const chainDelivery = deliveryFor(chain);
+  const followUpDelivery = deliveryFor(followUp);
+  assert.equal(reportContent(chain, chainDelivery), `[subagent chain] ${JSON.stringify({ version: 1, deliveryId: chainDelivery.deliveryId, envelopeHash: chainDelivery.envelopeHash, envelope: chain })}`);
+  assert.equal(reportContent(followUp, followUpDelivery), `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: followUpDelivery.deliveryId, envelopeHash: followUpDelivery.envelopeHash, envelope: followUp })}`);
 });
 
 test("aggregate framing budgets account for escaped content and details without changing settled envelopes", async () => {

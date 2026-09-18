@@ -130,6 +130,37 @@ test("expanded result and chain render structured status and multiline payloads 
   assert.doesNotMatch(expandedChain, /chain-delivery|"envelope"/);
 });
 
+test("expanded batches summarize members without repeating result or chain payloads", () => {
+  const runs = new ChildRuns("owner", "session");
+  const singleAck = runs.admit("single", [{ ...task, task: "single task" }], cwd);
+  const single = resultEnvelope(singleAck.children[0]!.identity, "single task", clean, "single summary\nUNIQUE SINGLE TAIL");
+  const chainAck = runs.admit("chain-summary", [{ ...task, task: "chain first" }, { ...task, task: "chain skipped" }], cwd);
+  const chainFirst = resultEnvelope(chainAck.children[0]!.identity, "chain first", clean, "chain summary\nUNIQUE CHAIN TAIL");
+  const chainSkipped = resultEnvelope(chainAck.children[1]!.identity, "chain skipped", { processOutcome: "not_started", exitCode: null, signal: null }, "");
+  const singleBatch = { version: 1 as const, kind: "batch" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "single", results: [single] };
+  const chain = { version: 1 as const, kind: "chain" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "chain-summary", results: [chainFirst, chainSkipped] };
+  const chainBatch = { ...chain, kind: "batch" as const };
+  const admissions = new Map([
+    [single.identity.runId, { startedAt: 0, taskExcerpt: "single task", ordinal: 1 }],
+    [chainFirst.identity.runId, { startedAt: 0, taskExcerpt: "chain first", ordinal: 1 }],
+    [chainSkipped.identity.runId, { startedAt: 0, taskExcerpt: "chain skipped", ordinal: 2 }],
+  ]);
+  const settlements = new Map([[single.identity.runId, 1000], [chainFirst.identity.runId, 2000], [chainSkipped.identity.runId, 3000]]);
+  const expand = (envelope: typeof single | typeof singleBatch | typeof chain) => {
+    const canonical = `[transport] ${JSON.stringify({ envelope })}`;
+    const message = { role: "custom", customType: "subagent-report", content: canonical, display: true, timestamp: 0, details: { envelope, display: buildReportDisplay(envelope, admissions, settlements) } } as any;
+    return subagentReportRenderer(message, { expanded: true, outputPad: 0 }, theme)!.render(160).map((line) => line.trimEnd()).join("\n");
+  };
+  const expanded = [expand(single), expand(singleBatch), expand(chain), expand(chainBatch)].join("\n");
+  assert.equal(expanded.split("UNIQUE SINGLE TAIL").length - 1, 1);
+  assert.equal(expanded.split("UNIQUE CHAIN TAIL").length - 1, 1);
+  assert.match(expand(singleBatch), /member #1 · worker · .* · done · 0:01 · single task · single summary/);
+  assert.match(expand(chainBatch), /member #1 · worker · .* · done · 0:02 · chain first · chain summary/);
+  assert.match(expand(chainBatch), /member #2 · worker · .* · not_started · 0:03 · chain skipped/);
+  assert.doesNotMatch(expand(singleBatch), /UNIQUE SINGLE TAIL|"envelope"/);
+  assert.doesNotMatch(expand(chainBatch), /UNIQUE CHAIN TAIL|"envelope"/);
+});
+
 test("renderer handles typed, legacy and malformed reports without changing canonical content", () => {
   const envelope = result("canonical\nbody\nTAIL");
   const canonical = `[subagent worker] ${JSON.stringify({ envelope })}`;
