@@ -63,12 +63,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
-  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; worker?: ControlOrigin; scoutAcceptance?: number; scoutGeneration?: number }>();
-  const problemPackages = new Map<string, Set<string>>();
+  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; worker?: ControlOrigin; scoutAcceptance?: number; scoutGeneration?: number; scoutRequests?: Map<number, number> }>();
+  const problemPackages = new Map<string, { owner: ControlOrigin; tickets: Set<string> }>();
   const scoutAcceptances = new Map<string, number>();
   const scoutGenerations = new Map<string, number>();
+  const scoutRequests = new Map<string, Map<number, number>>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
-  const processKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pid}\u0000${origin.starttime}\u0000${origin.pane ?? ""}`;
+  const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const origins = new Map<string, ControlOrigin>();
   const paneParents = new Map<string, string | undefined>();
   if (identity.pane) paneParents.set(identity.pane, undefined);
@@ -137,36 +138,57 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
               } else {
                 const registeredWorker = !!planRun?.worker && planRun.ticket === ticket && origin.mode === "plan" && origin.ticket === ticket && origin.pane === planRun.pane && origin.sessionId === planRun.worker.sessionId && descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime);
                 const problemWorker = origin.mode === "plan" && !origin.ticket && origin.role === "coordinator";
-                const packageTickets = problemPackages.get(processKey(origin));
-                if (!main && !registeredWorker && !(problemWorker && (["publish-plan-scout", "reject-plan-scout"].includes(envelope.operation) || packageTickets?.has(ticket)))) throw new Error("plan operation is not from its registered live worker");
+                const packageKey = problemKey(origin);
+                let packageState = problemPackages.get(packageKey);
+                if (packageState && !processMatches(packageState.owner.pid, packageState.owner.starttime)) {
+                  problemPackages.delete(packageKey);
+                  packageState = undefined;
+                }
+                const registeredProblemWorker = problemWorker && (!packageState || sameProcess(packageState.owner, origin) || descendantOf(origin.pid, origin.starttime, packageState.owner.pid, packageState.owner.starttime));
+                const packageTickets = packageState?.tickets;
+                if (!main && !registeredWorker && !(registeredProblemWorker && (["publish-plan-scout", "reject-plan-scout"].includes(envelope.operation) || packageTickets?.has(ticket)))) throw new Error("plan operation is not from its registered live worker");
                 const scoutKey = `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
+                const requestGenerations = planRun ? (planRun.scoutRequests ??= new Map<number, number>()) : scoutRequests.get(scoutKey) ?? new Map<number, number>();
+                if (!planRun && !scoutRequests.has(scoutKey)) scoutRequests.set(scoutKey, requestGenerations);
                 if (envelope.operation === "publish-plan-scout") {
                   if (!Number.isSafeInteger(envelope.acceptanceId) || !parent.publishPlanScout) throw new Error("plan scout publication is unavailable");
                   const generation = planRun ? (planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1) : (scoutGenerations.get(scoutKey) ?? 0) + 1;
                   if (!planRun) scoutGenerations.set(scoutKey, generation);
+                  requestGenerations.set(envelope.acceptanceId!, generation);
                   const outcome = await parent.publishPlanScout(ticket, envelope.acceptanceId!, origin);
                   const currentGeneration = planRun ? planRun.scoutGeneration : scoutGenerations.get(scoutKey);
                   if (currentGeneration !== generation) {
+                    requestGenerations.delete(envelope.acceptanceId!);
                     reply({ requestId: envelope.requestId, state: "accepted", acceptanceId: envelope.acceptanceId, ...outcome, publication: "pending", reason: "scout superseded" });
                     continue;
                   }
+                  requestGenerations.clear();
+                  requestGenerations.set(envelope.acceptanceId!, generation);
                   if (planRun) planRun.scoutAcceptance = envelope.acceptanceId;
                   else scoutAcceptances.set(scoutKey, envelope.acceptanceId!);
-                  if (problemWorker) {
-                    const accepted = packageTickets ?? new Set<string>();
-                    accepted.add(ticket);
-                    problemPackages.set(processKey(origin), accepted);
+                  if (registeredProblemWorker) {
+                    const accepted = packageState ?? { owner: { ...origin }, tickets: new Set<string>() };
+                    accepted.tickets.add(ticket);
+                    problemPackages.set(packageKey, accepted);
                   }
                   reply({ requestId: envelope.requestId, state: "accepted", acceptanceId: envelope.acceptanceId, ...outcome });
                 } else if (envelope.operation === "reject-plan-scout") {
-                  if (planRun) {
-                    planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1;
-                    planRun.scoutAcceptance = undefined;
+                  const currentGeneration = planRun ? planRun.scoutGeneration : scoutGenerations.get(scoutKey);
+                  const ownedGeneration = Number.isSafeInteger(envelope.acceptanceId) ? requestGenerations.get(envelope.acceptanceId!) : currentGeneration;
+                  if (ownedGeneration === currentGeneration) {
+                    requestGenerations.clear();
+                    if (planRun) {
+                      planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1;
+                      planRun.scoutAcceptance = undefined;
+                    } else {
+                      scoutGenerations.set(scoutKey, (scoutGenerations.get(scoutKey) ?? 0) + 1);
+                      scoutAcceptances.delete(scoutKey);
+                    }
+                    reply({ requestId: envelope.requestId, state: "accepted", reason: "scout rejected" });
                   } else {
-                    scoutGenerations.set(scoutKey, (scoutGenerations.get(scoutKey) ?? 0) + 1);
-                    scoutAcceptances.delete(scoutKey);
+                    if (Number.isSafeInteger(envelope.acceptanceId)) requestGenerations.delete(envelope.acceptanceId!);
+                    reply({ requestId: envelope.requestId, state: "accepted", reason: "scout rejection superseded" });
                   }
-                  reply({ requestId: envelope.requestId, state: "accepted", reason: "scout rejected" });
                 } else if (envelope.operation === "prepare-plan-publication") {
                   const acceptanceId = planRun?.scoutAcceptance ?? scoutAcceptances.get(scoutKey);
                   if (!envelope.path || !envelope.contentHash || !Number.isSafeInteger(acceptanceId) || !parent.preparePlanPublication) throw new Error("plan publication preparation requires a current accepted scout");

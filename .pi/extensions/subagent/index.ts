@@ -619,13 +619,10 @@ export default function (pi: ExtensionAPI) {
 		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		let row: PublicationRow | undefined;
 		let bytes;
-		let target;
 		try {
 			row = publicationById(db, publicationId);
 			if (!row) throw new PublicationFailure("artifact_invalid");
 			bytes = readPublicationArtifact(ENGINE_ROOT, row);
-			target = resolvePublicationTarget(db, row.ticket);
-			if (target.target !== row.target || target.targetHash !== row.target_hash) throw new PublicationFailure("binding_changed");
 		} catch (error) {
 			const code = error instanceof PublicationFailure ? error.code : "artifact_invalid";
 			if (row) markPublicationResult(db, row.id, { complete: false, error: code });
@@ -636,10 +633,21 @@ export default function (pi: ExtensionAPI) {
 		const prior = publicationTail.get(key) ?? Promise.resolve();
 		const work = prior.catch(() => undefined).then(async () => {
 			let canonicalUrl: string | undefined;
+			let target: ReturnType<typeof resolvePublicationTarget>;
+			const verifyPublicationBinding = async () => {
+				const binding = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const current = resolvePublicationTarget(binding, publication.ticket);
+					if (current.target !== publication.target || current.targetHash !== publication.target_hash) throw new PublicationFailure("binding_changed");
+					target = current;
+				} finally { binding.close(); }
+				await verifyBinding?.();
+			};
 			try {
-				const resolved = target.type === "github"
-					? { adapter: githubPublicationAdapter(target), canonicalUrl: target.canonicalUrl }
-					: await publicationMcp.youTrackAdapter(target.server, target.issueId);
+				await verifyPublicationBinding();
+				const resolved = target!.type === "github"
+					? { adapter: githubPublicationAdapter(target!), canonicalUrl: target!.canonicalUrl }
+					: await publicationMcp.youTrackAdapter(target!.server, target!.issueId);
 				const binding = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 				try {
 					if (!reserveCanonicalUrl(binding, publication.id, resolved.canonicalUrl)) throw new PublicationFailure("remote_conflict");
@@ -647,7 +655,7 @@ export default function (pi: ExtensionAPI) {
 				} finally { binding.close(); }
 				canonicalUrl = resolved.canonicalUrl;
 				const knowledgePath = publication.plan_path ? path.relative(ENGINE_ROOT, publication.plan_path) : undefined;
-				const result = await publishDocument(publication, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding });
+				const result = await publishDocument(publication, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding: verifyPublicationBinding });
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 				try { markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl }); }
 				finally { update.close(); }
@@ -1232,7 +1240,7 @@ export default function (pi: ExtensionAPI) {
 	const rejectScout = async (result: ResultEnvelope, reason: unknown): Promise<void> => {
 		let safe = safePublicationReason(reason);
 		try {
-			const reply = await requestScoutControl(result, "reject-plan-scout", {});
+			const reply = await requestScoutControl(result, "reject-plan-scout", { acceptanceId: result.publication?.acceptanceId });
 			if (reply.state !== "accepted") safe = "unavailable";
 		} catch { safe = "unavailable"; }
 		persistScoutBlock(result, safe);

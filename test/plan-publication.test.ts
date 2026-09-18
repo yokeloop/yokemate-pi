@@ -77,6 +77,20 @@ test("binding is rechecked after the final remote listing", async () => {
   assert.equal(result.error, "binding_changed");
 });
 
+test("binding changes stop multipart publication before the next remote write", async () => {
+  const text = "# Report\n" + "line value\n".repeat(5000);
+  const document = row(text);
+  const remote: RemoteComment[] = [];
+  let posts = 0;
+  let changed = false;
+  const result = await publishDocument(document.row, document.bytes, {
+    list: async () => remote,
+    add: async (body) => { posts++; remote.push({ id: String(posts), text: body }); changed = true; },
+  }, { canonicalUrl: input(text).canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } });
+  assert.equal(result.error, "binding_changed");
+  assert.equal(posts, 1);
+});
+
 test("classified POST failures survive mandatory response-loss reconciliation", async () => {
   const document = row("# Report\nbody\n");
   for (const code of ["auth", "permission", "rate_limit", "size"] as const) {
