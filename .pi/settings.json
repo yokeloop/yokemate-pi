@@ -4,6 +4,7 @@
   },
   "extensions": [
     "../src/guards.ts",
-    "../src/bus.ts"
+    "../src/bus.ts",
+    "../src/ticket-preview.ts"
   ]
 }
