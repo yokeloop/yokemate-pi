@@ -133,9 +133,9 @@ test("expanded result and chain render structured status and multiline payloads 
 test("expanded batches summarize members without repeating result or chain payloads", () => {
   const runs = new ChildRuns("owner", "session");
   const singleAck = runs.admit("single", [{ ...task, task: "single task" }], cwd);
-  const single = resultEnvelope(singleAck.children[0]!.identity, "single task", clean, "single summary\nUNIQUE SINGLE TAIL");
+  const single = resultEnvelope(singleAck.children[0]!.identity, "single task", clean, "EXACT SINGLE PAYLOAD");
   const chainAck = runs.admit("chain-summary", [{ ...task, task: "chain first" }, { ...task, task: "chain skipped" }], cwd);
-  const chainFirst = resultEnvelope(chainAck.children[0]!.identity, "chain first", clean, "chain summary\nUNIQUE CHAIN TAIL");
+  const chainFirst = resultEnvelope(chainAck.children[0]!.identity, "chain first", clean, "EXACT CHAIN PAYLOAD");
   const chainSkipped = resultEnvelope(chainAck.children[1]!.identity, "chain skipped", { processOutcome: "not_started", exitCode: null, signal: null }, "");
   const singleBatch = { version: 1 as const, kind: "batch" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "single", results: [single] };
   const chain = { version: 1 as const, kind: "chain" as const, ownerRunId: "owner", ownerSessionId: "session", batchId: "chain-summary", results: [chainFirst, chainSkipped] };
@@ -152,13 +152,13 @@ test("expanded batches summarize members without repeating result or chain paylo
     return subagentReportRenderer(message, { expanded: true, outputPad: 0 }, theme)!.render(160).map((line) => line.trimEnd()).join("\n");
   };
   const expanded = [expand(single), expand(singleBatch), expand(chain), expand(chainBatch)].join("\n");
-  assert.equal(expanded.split("UNIQUE SINGLE TAIL").length - 1, 1);
-  assert.equal(expanded.split("UNIQUE CHAIN TAIL").length - 1, 1);
-  assert.match(expand(singleBatch), /member #1 · worker · .* · done · 0:01 · single task · single summary/);
-  assert.match(expand(chainBatch), /member #1 · worker · .* · done · 0:02 · chain first · chain summary/);
-  assert.match(expand(chainBatch), /member #2 · worker · .* · not_started · 0:03 · chain skipped/);
-  assert.doesNotMatch(expand(singleBatch), /UNIQUE SINGLE TAIL|"envelope"/);
-  assert.doesNotMatch(expand(chainBatch), /UNIQUE CHAIN TAIL|"envelope"/);
+  assert.equal(expanded.split("EXACT SINGLE PAYLOAD").length - 1, 1);
+  assert.equal(expanded.split("EXACT CHAIN PAYLOAD").length - 1, 1);
+  assert.match(expand(singleBatch), /member #1 · worker · .* · done · 0:01 · single task$/m);
+  assert.match(expand(chainBatch), /member #1 · worker · .* · done · 0:02 · chain first$/m);
+  assert.match(expand(chainBatch), /member #2 · worker · .* · not_started · 0:03 · chain skipped$/m);
+  assert.doesNotMatch(expand(singleBatch), /EXACT SINGLE PAYLOAD|"envelope"/);
+  assert.doesNotMatch(expand(chainBatch), /EXACT CHAIN PAYLOAD|"envelope"/);
 });
 
 test("renderer handles typed, legacy and malformed reports without changing canonical content", () => {

@@ -198,7 +198,7 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     const batchComponent = new CustomMessageComponent({ role: "custom", timestamp: 0, ...sent[1]!.message }, renderer, undefined, 1);
     batchComponent.setExpanded(true);
     const expandedBatch = batchComponent.render(160).map(stripTerminalSequences).map((line) => line.trim()).join("\n");
-    assert.match(expandedBatch, /member #1 · worker · .* · done · .*produce multiline canoni · line one/);
+    assert.match(expandedBatch, /member #1 · worker · .* · done · .*produce multiline canoni$/m);
     assert.doesNotMatch(expandedBatch, /canonical tail|"envelope"/);
     assert.equal(`${expanded}\n${expandedBatch}`.split("canonical tail").length - 1, 1);
     component.setExpanded(false);

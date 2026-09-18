@@ -299,7 +299,7 @@ function addBatchBody(container: Container, envelope: BatchEnvelope, display: Su
       statusOf(result),
       duration,
       member?.taskExcerpt,
-      reportBrief(result.payload),
+      result.reviewVerdict ? reportBrief(result.payload) : undefined,
     ].filter(Boolean).join(" · ");
     container.addChild(new Text(theme.fg("dim", line), padding, 0));
   }
