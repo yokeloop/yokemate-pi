@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestPlanControl } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -41,8 +41,43 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
   }
 });
 
+test("main pane sidecars canonicalize only the unstamped main mode for plan registration", async () => {
+  const root = mkdtempSync(join(tmpdir(), "main-plan-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "main-plan-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "main", ticket: null }));
+  writeFileSync(join(runtimeDir, "plan-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }),
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main-pane" }, env);
+  try {
+    if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
+    const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root, pane: "main-pane" };
+    const register = await requestPlanControl(root, "register-plan", { ticket: "YM-1" }, main, target, env);
+    assert.equal(register.state, "accepted", register.reason ?? "plan registration refused");
+    assert.ok(register.runId);
+    const payload = { ticket: "YM-1", runId: register.runId };
+    assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan-pane" }, main, target, env)).state, "accepted");
+    const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan-pane", parentPane: "main-pane" };
+    assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 1 }, worker, target, env)).publication, "complete");
+    const stampedMain = await requestPlanControl(root, "register-plan", { ticket: "YM-2" }, { ...main, mode: "main" }, target, env);
+    assert.equal(stampedMain.state, "refused");
+    assert.match(stampedMain.reason ?? "", /panel origin|verified main parent/);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("ticketless problem workers can continue only tickets admitted by their accepted scout", async () => {
-  const { requestPlanControl } = await import("../src/coordinator-control.ts");
   const root = mkdtempSync(join(tmpdir(), "problem-plan-control-"));
   const runtime = mkdtempSync(join(tmpdir(), "problem-plan-runtime-"));
   const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
@@ -77,7 +112,6 @@ test("ticketless problem workers can continue only tickets admitted by their acc
 });
 
 test("plan handoff is bound to the registered pane run and its live worker session", async () => {
-  const { requestPlanControl } = await import("../src/coordinator-control.ts");
   const root = mkdtempSync(join(tmpdir(), "plan-control-"));
   const runtime = mkdtempSync(join(tmpdir(), "plan-runtime-"));
   const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
@@ -116,6 +150,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const prepare = () => requestPlanControl(root, "prepare-plan-publication", { ...payload, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare()).state, "refused");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11 }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: "foreign", acceptanceId: 13 }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 13 }, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: payload.runId, acceptanceId: 13 }, worker, target, env)).state, "refused");
     assert.equal((await prepare()).state, "accepted");
     assert.equal((await requestPlanControl(root, "reject-plan-scout", payload, worker, target, env)).state, "accepted");
     assert.equal((await prepare()).state, "refused");
