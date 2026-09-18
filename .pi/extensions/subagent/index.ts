@@ -1268,6 +1268,11 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (!authority!.record(binding, settings.policy.workflowApproval)) return { reason: "plan-only; ready for /do; a new interactive approval is required", publication: "complete" as const, handoff: "plan-only" as const, target: planResult.target, revision: row.content_hash };
 					try {
+						const modelDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						try {
+							const model = modelForTicket(modelDb, ticket, "do") ?? poolModel(dataRoot(ENGINE_ROOT), "do");
+							resolveCoordinatorModel(model, ctx.modelRegistry);
+						} finally { modelDb.close(); }
 						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
 						if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
 						return { runId: result.details.runId, reason: "advance plan+do authority consumed", publication: "complete" as const, handoff: "started" as const, target: planResult.target, revision: row.content_hash };

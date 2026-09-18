@@ -115,7 +115,6 @@ test("ticketless problem workers can continue only tickets admitted by their acc
       descendant.kill("SIGKILL");
       descendant.unref();
     }
-    server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
