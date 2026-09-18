@@ -167,9 +167,17 @@ function parseOwnComment(text: string): ParsedPart | null | "malformed" {
   if (JSON.stringify(Object.keys(value)) !== JSON.stringify(keys) || value.v !== 1 || typeof value.target !== "string" || !/^[a-f0-9]{64}$/.test(value.target) || typeof value.ticket !== "string" || typeof value.run !== "string" || !["scout", "plan"].includes(String(value.kind)) || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash) || !Number.isInteger(value.part) || !Number.isInteger(value.total) || !Number.isInteger(value.bytes) || typeof value.chunkHash !== "string") return "malformed";
   const split = text.indexOf(separator, firstEnd);
   if (split < 0) return "malformed";
-  const fragment = Buffer.from(text.slice(split + separator.length), "utf8");
+  let fragment = Buffer.from(text.slice(split + separator.length), "utf8");
+  let body = text;
+  if (fragment.length + 1 === value.bytes) {
+    const restored = Buffer.concat([fragment, Buffer.from("\n")]);
+    if (sha256(restored) === value.chunkHash) {
+      fragment = restored;
+      body += "\n";
+    }
+  }
   if (fragment.length !== value.bytes || sha256(fragment) !== value.chunkHash) return "malformed";
-  return { target: value.target, ticket: value.ticket, run: value.run, kind: value.kind as PublicationKind, hash: value.hash, part: value.part as number, total: value.total as number, bytes: value.bytes as number, chunkHash: value.chunkHash, fragment, body: text };
+  return { target: value.target, ticket: value.ticket, run: value.run, kind: value.kind as PublicationKind, hash: value.hash, part: value.part as number, total: value.total as number, bytes: value.bytes as number, chunkHash: value.chunkHash, fragment, body };
 }
 
 export function reconcilePublication(input: PublicationFrameInput, comments: RemoteComment[]): { complete: boolean; parts: PublicationPart[]; missing: PublicationPart[] } {

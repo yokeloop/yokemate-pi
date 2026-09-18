@@ -24,6 +24,17 @@ test("publication framing is lossless, stable and inside the byte budget", () =>
   assert.equal(reconcilePublication({ ...input(bytes.toString()), bytes, hash: sha256(bytes) }, framed.map((part) => ({ id: String(part.part), text: part.body }))).complete, true);
 });
 
+test("remote trimming of one trailing newline is restored only when metadata proves the byte", () => {
+  const value = input("# Plan\nbody\n");
+  const framed = splitPublication(value);
+  const trimmed = framed.map((part) => ({ id: String(part.part), text: part.body.slice(0, -1) }));
+  const restored = reconcilePublication(value, trimmed);
+  assert.equal(restored.complete, true);
+  assert.deepEqual(Buffer.concat(restored.parts.map((part) => part.fragment)), value.bytes);
+  const overtrimmed = framed.map((part) => ({ id: String(part.part), text: part.body.slice(0, -2) }));
+  assert.throws(() => reconcilePublication(value, overtrimmed), (error: unknown) => error instanceof PublicationFailure && error.code === "remote_conflict");
+});
+
 test("same content with a new run reconciles the original framing and partial writes append only missing parts", async () => {
   const text = "# Report\n" + "line value\n".repeat(5000);
   const first = splitPublication(input(text));
