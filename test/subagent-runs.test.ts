@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { ChildRuns, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
 const headSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -145,6 +146,31 @@ test("metadata snapshots are private, bounded, retain active runs and survive wr
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("result, chain and follow-up batch canonical contracts remain distinct and byte-stable", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("single", [task], cwd);
+  const result = resultEnvelope(ack.children[0]!.identity, task.task, clean, approved);
+  assert.equal(runs.settle(result), true);
+  const batch = runs.batch("single")!;
+  const resultDelivery = deliveryFor(result);
+  const batchDelivery = deliveryFor(batch);
+  const resultCanonical = reportContent(result, resultDelivery);
+  const batchCanonical = reportContent(batch, batchDelivery);
+  assert.notEqual(resultDelivery.deliveryId, batchDelivery.deliveryId);
+  assert.equal(resultCanonical, `[subagent task-reviewer] ${JSON.stringify({ version: 1, deliveryId: resultDelivery.deliveryId, envelopeHash: resultDelivery.envelopeHash, envelope: result })}`);
+  assert.equal(batchCanonical, `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: batchDelivery.deliveryId, envelopeHash: batchDelivery.envelopeHash, envelope: batch })}`);
+
+  const chainRuns = new ChildRuns("owner", "session");
+  const chainAck = chainRuns.admit("chain", [task, task], cwd);
+  for (const child of chainAck.children) assert.equal(chainRuns.settle(resultEnvelope(child.identity, task.task, clean, approved)), true);
+  const chain = chainRuns.batch("chain", "chain")!;
+  const followUp = chainRuns.batch("chain")!;
+  const chainDelivery = deliveryFor(chain);
+  const followUpDelivery = deliveryFor(followUp);
+  assert.equal(reportContent(chain, chainDelivery), `[subagent chain] ${JSON.stringify({ version: 1, deliveryId: chainDelivery.deliveryId, envelopeHash: chainDelivery.envelopeHash, envelope: chain })}`);
+  assert.equal(reportContent(followUp, followUpDelivery), `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: followUpDelivery.deliveryId, envelopeHash: followUpDelivery.envelopeHash, envelope: followUp })}`);
+});
+
 test("aggregate framing budgets account for escaped content and details without changing settled envelopes", async () => {
   const { boundBatchResult, deliveryFor, reportContent, JsonlObservation } = await import("../src/subagent-runs.ts");
   for (const character of ["x", '"']) {
@@ -158,7 +184,9 @@ test("aggregate framing budgets account for escaped content and details without 
     const envelope = runs.batch("maximum")!;
     assert.deepEqual(envelope.results, results);
     const delivery = deliveryFor(envelope);
-    const record = JSON.stringify({ type: "message_end", message: { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } } });
+    const admissions = new Map(ack.children.map(({ identity }, ordinal) => [identity.runId, { startedAt: 0, taskExcerpt: `${ordinal} ${character.repeat(200)}`, ordinal: ordinal + 1 }]));
+    const display = buildReportDisplay(envelope, admissions, 10_000, { state: "available", reportPath: `/private/${character.repeat(100)}/report.txt`, diagnosticsPath: `/private/${character.repeat(100)}/diagnostics.json`, reportBytes: 1024, reportHash: "f".repeat(64), retentionDays: 7 });
+    const record = JSON.stringify({ type: "message_end", message: { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } } });
     assert.ok(Buffer.byteLength(record) < 1024 * 1024);
     const observation = new JsonlObservation();
     observation.write(Buffer.from(record + "\n"));

@@ -11,8 +11,8 @@ import { createHash } from "node:crypto";
 import { THINKING_LEVELS } from "./pi-model.ts";
 
 export interface RpcEvent { type: string; id?: string; [key: string]: unknown }
-export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; acceptTerminal(): void; hasLiveDescendants(): boolean; ready: Promise<void>; stop(reason?: string): Promise<void>; childState: OwnedChildState; events: RpcEvent[] }
-export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
+export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; acceptTerminal(): void; hasLiveDescendants(): boolean; diagnosticSnapshot(): Record<string, unknown>; ready: Promise<void>; stop(reason?: string): Promise<void>; childState: OwnedChildState; events: RpcEvent[] }
+export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onDiagnostic?(snapshot: Record<string, unknown>, completed: boolean): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
 export interface CoordinatorRpcOptions { invocation?: { command: string; args: string[] }; readyTimeoutMs?: number; stopGraceMs?: number }
 
 
@@ -53,10 +53,13 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   let snapshots: RunSnapshots | undefined;
   try { if (prepared.plan) snapshots = new RunSnapshots(prepared.resourcesPath, prepared.plan); } catch { console.error("[coordinator] diagnostic initialization failed"); }
   const metadata: Record<string, unknown> = { pid: child.pid, starttime: child.pid ? processStarttime(child.pid) : undefined, cwd: prepared.cwd, spawnAt: new Date().toISOString(), requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown" };
-  const save = (completed: boolean) => { snapshots?.write(identity.runId, identity.runId, metadata, completed); };
-  save(false);
   const stderrHash = createHash("sha256");
   let stderrBytes = 0;
+  let stderrFinalHash: string | undefined;
+  let observation: JsonlObservation | undefined;
+  const diagnosticSnapshot = (): Record<string, unknown> => structuredClone({ ...metadata, stream: observation?.metadata() ?? metadata.stream, stderr: { bytes: stderrBytes, hash: stderrFinalHash ?? stderrHash.copy().digest("hex") } });
+  const save = (completed: boolean) => { snapshots?.write(identity.runId, identity.runId, metadata, completed); callbacks.onDiagnostic?.(diagnosticSnapshot(), completed); };
+  save(false);
   const owned = new Map<number, string>();
   const captureOwned = () => {
     if (child.pid) {
@@ -135,6 +138,10 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const emit = (event: RpcEvent) => {
     if (stopping) return;
     events.push(event);
+    if (event.type === "message_end" && isRecord(event.message) && isRecord(event.message.usage)) {
+      const usage = event.message.usage;
+      metadata.usage = Object.fromEntries(["input", "output", "cacheRead", "cacheWrite", "totalTokens"].filter((key) => typeof usage[key] === "number").map((key) => [key, usage[key]]));
+    }
     if (event.type === "tool_execution_start" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolStart(event.toolCallId, event.args);
     if (event.type === "tool_execution_end" && event.toolName === "subagent" && typeof event.toolCallId === "string") childState.toolEnd(event.toolCallId, isRecord(event.result) ? event.result.details : undefined, event.isError === true);
     if (event.type === "entry_appended" && isRecord(event.entry) && event.entry.type === "custom" && event.entry.customType === "yokemate-child-state") childState.accept(event.entry.data);
@@ -195,10 +202,10 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (event.type === "extension_ui_request") callbacks.onUiRequest?.(event, (response) => { if (!stopping && !closed) send(response); });
     callbacks.onEvent?.(event);
   };
-  const observation = new JsonlObservation((event) => emit(event as RpcEvent));
-  child.stdout.on("data", (chunk: Buffer) => { observation.write(chunk); if (!stopping && observation.protocolError) fail("coordinator RPC protocol_error"); });
+  observation = new JsonlObservation((event) => emit(event as RpcEvent));
+  child.stdout.on("data", (chunk: Buffer) => { observation!.write(chunk); if (!stopping && observation!.protocolError) fail("coordinator RPC protocol_error"); });
   child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; stderrHash.update(chunk); });
-  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.stderr = { bytes: stderrBytes, hash: stderrHash.digest("hex") }; observation.end(); metadata.stream = observation.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (!stopping && observation.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!stopping && !terminal && !blocked) fail("coordinator RPC exited without outcome"); });
+  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; stderrFinalHash = stderrHash.copy().digest("hex"); metadata.stderr = { bytes: stderrBytes, hash: stderrFinalHash }; observation!.end(); metadata.stream = observation!.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (!stopping && observation!.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!stopping && !terminal && !blocked) fail("coordinator RPC exited without outcome"); });
   child.on("error", (error) => { metadata.spawnError = errorMetadata(error); save(false); fail("coordinator RPC spawn error"); });
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = (reason = "parent_rpc_stop") => stopPromise ??= new Promise<void>((resolve) => {
@@ -233,7 +240,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     });
   });
   const hasLiveDescendants = () => liveOwned().some(([pid]) => pid !== child.pid);
-  return { process: child, send, request, acceptTerminal: () => { terminal = true; }, hasLiveDescendants, ready, stop, childState, events };
+  return { process: child, send, request, acceptTerminal: () => { terminal = true; }, hasLiveDescendants, diagnosticSnapshot, ready, stop, childState, events };
 }
 
 export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, reportBlocked: (reason: string) => void): void {

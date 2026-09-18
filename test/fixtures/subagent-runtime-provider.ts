@@ -35,6 +35,10 @@ export default function (pi: ExtensionAPI) {
     const original = fs.renameSync;
     fs.renameSync = ((from: any, to: any) => { if (String(to).includes("reviewer-runs")) throw new Error("private diagnostic fault"); original(from, to); }) as any;
   }
+  if (scenario === "storage_error" && process.env.YOKEMATE_ROLE === "coordinator") {
+    const original = fs.renameSync;
+    fs.renameSync = ((from: any, to: any) => { if (String(to).includes("subagent-reports")) throw Object.assign(new Error("private storage fault"), { code: "EIO" }); original(from, to); }) as any;
+  }
   if (scenario === "nonzero") pi.on("session_shutdown", () => { if (process.env.YOKEMATE_ROLE === "executor") process.exit(7); });
   let calledA = false;
   let calledB = false;

@@ -111,8 +111,14 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     assert.equal((await prepare("YM-2")).state, "refused");
     assert.equal(prepares, 1);
   } finally {
-    if (descendant?.exitCode === null && descendant.signalCode === null) descendant.kill("SIGTERM");
-    if (descendant && descendant.exitCode === null && descendant.signalCode === null) await new Promise<void>((resolve) => descendant!.once("close", () => resolve()));
+    if (descendant && descendant.exitCode === null) {
+      descendant.kill("SIGKILL");
+      descendant.unref();
+    }
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
   }
 });
 
