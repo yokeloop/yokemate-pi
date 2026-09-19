@@ -127,7 +127,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
         return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(value) }] };
       },
     }, ui: { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } } } as unknown as ExtensionContext;
+    process.env.HERDR_PANE_ID = "main-pane";
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    delete process.env.HERDR_PANE_ID;
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const input = async (text: string, source = "interactive", mode = "tui") => {
       let outcome: unknown;
@@ -509,7 +511,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await input("Plan and then do YM-1");
     const noIdPane = "save-only-pane";
     writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), `${noIdPane}.json`), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
-    Object.assign(process.env, { PI_SESSION_FILE: join(dir, "save-only.jsonl"), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: noIdPane, YOKEMATE_PARENT_PANE: "" });
+    Object.assign(process.env, { PI_SESSION_FILE: join(dir, "save-only.jsonl"), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: noIdPane, YOKEMATE_PARENT_PANE: "main-pane" });
     delete process.env.YOKEMATE_PLAN_RUN_ID;
     delete process.env.YOKEMATE_RUN_ID;
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
@@ -519,7 +521,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const noIdScout = await runScout("save-only-scout", noIdLoaded.tool, noIdLoaded.context);
     assert.equal(noIdScout.artifact.state, "accepted", JSON.stringify(noIdScout.artifact));
     process.argv[1] = workflowChild;
-    const noIdRecord = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: noIdPane, YOKEMATE_PARENT_PANE: "" });
+    const noIdRecord = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: noIdPane, YOKEMATE_PARENT_PANE: "main-pane" });
     assert.match(noIdRecord.stdout, /YM-1 → planned/);
     assert.match(noIdRecord.stdout, /plan-only; ready for \/do; automatic handoff unavailable/);
     assert.doesNotMatch(noIdRecord.stdout, /background run/);

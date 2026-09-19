@@ -266,7 +266,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (saveOnly) {
         const ownerOnly = envelope.operation === "publish-plan-scout" || envelope.operation === "reject-plan-scout";
         if (ownerOnly ? !sameProcess(origin, saveOnly.owner) : !ownerOrDescendant(origin, saveOnly.owner, ticket)) throw new Error("plan operation is not from its admitted live save-only worker");
-      } else if (envelope.operation !== "publish-plan-scout" || !paneOwnerMatches(origin, ticket)) throw new Error("plan operation is not from its admitted live save-only worker");
+      } else {
+        const parentKnown = origin.parentPane === identity.pane || (origin.parentPane !== undefined && paneParents.has(origin.parentPane));
+        if (envelope.operation !== "publish-plan-scout" || !paneOwnerMatches(origin, ticket) || !origin.parentPane || !parentKnown) throw new Error("plan operation is not from its admitted live save-only worker");
+      }
       context = { kind: "save-only", admissionId: saveOnly?.admissionId ?? randomUUID() };
     } else throw new Error("plan operation is not from its registered live worker");
 

@@ -414,6 +414,11 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     const worker = { sessionId: "save-session", pid: owner.pid!, starttime: processStarttime(owner.pid!)!, cwd: root, pane, parentPane: "main", mode: "plan", ticket: "YM-7", role: "coordinator" };
     const child = { ...scoutChild(worker, "YM-7", "save"), runId: "scout-save", cwd: root };
     const cli = { ...worker, pid: cliPid, starttime: processStarttime(cliPid)! };
+    const unknownPane = "save-unknown-parent";
+    writeFileSync(join(runtimeDir, `${unknownPane}.json`), JSON.stringify({ pid: owner.pid, cwd: root, mode: "plan", ticket: "YM-7" }));
+    const unknownParent = { ...worker, sessionId: target.sessionId, pane: unknownPane, parentPane: "missing" };
+    const unknownChild = { ...child, ownerSessionId: target.sessionId };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 2, child: unknownChild }, unknownParent, target, env)).state, "refused");
     const initialFailure = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 3, child }, worker, target, env);
     assert.equal(initialFailure.state, "refused");
     assert.match(initialFailure.reason ?? "", /artifact provenance refused/);
