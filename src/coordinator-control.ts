@@ -68,11 +68,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sock, { force: true });
     rmSync(sidecar, { force: true });
   }
-  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; listRunId?: string; pane?: string; worker?: ControlOrigin; terminal?: "recording" | "recorded" | "blocked" | "cancelled"; recordReply?: { runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }; scoutAcceptance?: number; scoutGeneration?: number; scoutRequests?: Map<number, number> }>();
+  const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; listRunId?: string; pane?: string; worker?: ControlOrigin; terminal?: "recording" | "recorded" | "blocked" | "cancelled"; recordReply?: { runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }; scoutAcceptance?: number; scoutGeneration?: number; scoutRequests?: Map<number, number>; finalizedScoutAcceptances?: Set<number> }>();
   const problemPackages = new Map<string, { owner: ControlOrigin; tickets: Set<string> }>();
   const scoutAcceptances = new Map<string, number>();
   const scoutGenerations = new Map<string, number>();
   const scoutRequests = new Map<string, Map<number, number>>();
+  const finalizedScoutAcceptances = new Map<string, Set<number>>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const origins = new Map<string, ControlOrigin>();
@@ -203,8 +204,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 const scoutKey = `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
                 const requestGenerations = planRun ? (planRun.scoutRequests ??= new Map<number, number>()) : scoutRequests.get(scoutKey) ?? new Map<number, number>();
                 if (!planRun && !scoutRequests.has(scoutKey)) scoutRequests.set(scoutKey, requestGenerations);
+                const finalized = planRun ? (planRun.finalizedScoutAcceptances ??= new Set<number>()) : finalizedScoutAcceptances.get(scoutKey) ?? new Set<number>();
+                if (!planRun && !finalizedScoutAcceptances.has(scoutKey)) finalizedScoutAcceptances.set(scoutKey, finalized);
                 if (envelope.operation === "publish-plan-scout") {
                   if (!Number.isSafeInteger(envelope.acceptanceId) || !parent.publishPlanScout) throw new Error("plan scout publication is unavailable");
+                  if (finalized.has(envelope.acceptanceId!)) throw new Error("scout artifact is superseded");
+                  const currentAcceptance = planRun?.scoutAcceptance ?? scoutAcceptances.get(scoutKey);
+                  if (currentAcceptance !== undefined && currentAcceptance !== envelope.acceptanceId) finalized.add(currentAcceptance);
                   const generation = planRun ? (planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1) : (scoutGenerations.get(scoutKey) ?? 0) + 1;
                   if (!planRun) scoutGenerations.set(scoutKey, generation);
                   requestGenerations.set(envelope.acceptanceId!, generation);
@@ -212,6 +218,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   const currentGeneration = planRun ? planRun.scoutGeneration : scoutGenerations.get(scoutKey);
                   if (currentGeneration !== generation) {
                     requestGenerations.delete(envelope.acceptanceId!);
+                    finalized.add(envelope.acceptanceId!);
                     reply({ requestId: envelope.requestId, state: "accepted", acceptanceId: envelope.acceptanceId, ...outcome, artifactAcceptance: "superseded", reason: "scout superseded" });
                     continue;
                   }
@@ -230,6 +237,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   const ownedGeneration = Number.isSafeInteger(envelope.acceptanceId) ? requestGenerations.get(envelope.acceptanceId!) : currentGeneration;
                   if (ownedGeneration === currentGeneration) {
                     requestGenerations.clear();
+                    if (Number.isSafeInteger(envelope.acceptanceId)) finalized.add(envelope.acceptanceId!);
                     if (planRun) {
                       planRun.scoutGeneration = (planRun.scoutGeneration ?? 0) + 1;
                       planRun.scoutAcceptance = undefined;

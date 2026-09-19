@@ -230,9 +230,8 @@ export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): Plan
   if (!acceptance || acceptance.ticket !== input.ticket) throw new Error("artifact_invalid");
   db.prepare(`INSERT INTO plan_record
     (ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance)
-    VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
-    input.ticket, input.publicationId ?? null, input.planPath, input.contentHash, input.scopeHash, input.artifactPath, input.bytes,
-    input.scoutPublication ?? null, input.scoutAcceptance,
+    VALUES (?,NULL,?,?,?,?,?,NULL,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
+    input.ticket, input.planPath, input.contentHash, input.scopeHash, input.artifactPath, input.bytes, input.scoutAcceptance,
   );
   let row = db.prepare(`SELECT * FROM plan_record
     WHERE ticket=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_acceptance=?`).get(
@@ -242,10 +241,15 @@ export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): Plan
   if (input.publicationId !== undefined) {
     if (row.publication_id !== null && row.publication_id !== input.publicationId) throw new Error("artifact_invalid");
     db.prepare("UPDATE plan_record SET publication_id=? WHERE id=? AND publication_id IS NULL").run(input.publicationId, row.id);
+    row = planRecordById(db, row.id)!;
   }
   if (input.scoutPublication !== undefined) {
     if (row.scout_publication !== null && row.scout_publication !== input.scoutPublication) throw new Error("artifact_invalid");
-    db.prepare("UPDATE plan_record SET scout_publication=? WHERE id=? AND scout_publication IS NULL").run(input.scoutPublication, row.id);
+    const collision = row.publication_id === null ? true : db.prepare(`SELECT id FROM plan_record
+      WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=? AND id<>? LIMIT 1`).get(
+      row.ticket, row.publication_id, row.plan_path, row.content_hash, row.scope_hash, input.scoutPublication, row.id,
+    );
+    if (!collision) db.prepare("UPDATE plan_record SET scout_publication=? WHERE id=? AND scout_publication IS NULL").run(input.scoutPublication, row.id);
   }
   row = planRecordById(db, row.id)!;
   return row;

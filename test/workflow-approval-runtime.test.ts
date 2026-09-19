@@ -11,7 +11,8 @@ import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { openDb } from "../src/db.ts";
 import { readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { currentControlOrigin, requestPlanControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { currentControlOrigin, processStarttime, requestPlanControl, requestPlanLaunch, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { socketDir } from "../src/inbox.ts";
 
 const source = join(import.meta.dirname, "..");
 
@@ -81,7 +82,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
     writeFileSync(commentsFile, "[]");
     const shim = join(dir, "shim");
     mkdirSync(shim);
-    writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
+    writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){if(process.env.WORKFLOW_GH_FAIL==="1"){console.error("comment unavailable"); process.exit(1);} let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
+    const ownedPlanReady = join(runtime, "owned-plan-ready");
+    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2);\nif(args[0]==="tab"&&args[1]==="create") console.log(JSON.stringify({result:{tab:{tab_id:"owned-tab"},root_pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="agent"&&args[1]==="prompt"){fs.writeFileSync(process.env.WORKFLOW_OWNED_PLAN_READY,"ready"); console.log(JSON.stringify({result:{}}));}\nelse if(args[0]==="agent"&&args[1]==="wait") setTimeout(()=>console.log(JSON.stringify({result:{state:"done"}})),10000);\nelse console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
+    process.env.WORKFLOW_OWNED_PLAN_READY = ownedPlanReady;
     process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
     process.env.WORKFLOW_COMMENTS = commentsFile;
     const db = openDb(join(dir, "yokemate.db"));
@@ -94,7 +98,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const reports: unknown[] = [];
     let reportReady: (() => void) | undefined;
     const scoutWaiters = new Map<string, () => void>();
-    loaded.runtime.sendMessage = (message: any) => {
+    const receiveReport = (message: any) => {
       reports.push(message);
       reportReady?.();
       const envelope = message?.details?.envelope;
@@ -103,6 +107,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
         scoutWaiters.delete(envelope.identity?.batchId);
       }
     };
+    loaded.runtime.sendMessage = receiveReport;
     const extension = loaded.extensions[0]!;
     const tool = extension.tools.get("subagent")!.definition;
     let extraction: "none" | "advance-plan-do" | "approve-ready-do" = "none";
@@ -124,7 +129,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-    const record = async () => (await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent" } })).stdout;
+    const recordProcess = async (extraEnv: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", ...extraEnv } });
+    const record = async (extraEnv: NodeJS.ProcessEnv = {}) => (await recordProcess(extraEnv)).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
     const triggerReview = async () => {
       if (eventConnections.length === 0) await once(eventServer, "connection");
@@ -134,10 +140,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
       await sent;
       await new Promise<void>((resolve) => setImmediate(resolve));
     };
-    const runScout = async (callId: string) => {
+    const runScout = async (callId: string, scoutTool = tool, scoutContext: ExtensionContext = ctx) => {
       const before = reports.length;
       const delivered = new Promise<void>((resolve) => { scoutWaiters.set(callId, resolve); });
-      const ack = await tool.execute(callId, { agent: "plan-scout", task: "Return the complete fixture investigation.", ticket: "YM-1" }, undefined, () => undefined, ctx);
+      const ack = await scoutTool.execute(callId, { agent: "plan-scout", task: "Return the complete fixture investigation.", ticket: "YM-1" }, undefined, () => undefined, scoutContext);
       assert.match(JSON.stringify(ack), /YM-1/);
       let timer: NodeJS.Timeout | undefined;
       try { await Promise.race([delivered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`scout report timeout: ${JSON.stringify({ ack, reports })}`)), 15000); })]); }
@@ -189,8 +195,25 @@ test("raw interactive authority flows through real plan CLI and parent control w
     delete process.env.YOKEMATE_PLAN_RUN_ID;
     const recoveredScout = await runScout("scout-recovery");
     assert.equal(recoveredScout.publication.state, "complete", JSON.stringify(recoveredScout.publication));
+    db.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
+    const warningsBeforeUnresolved = notifications.length;
+    const unresolvedScout = await runScout("scout-unresolved");
+    assert.equal(unresolvedScout.artifact.state, "accepted");
+    assert.equal(unresolvedScout.publication.state, "pending");
+    assert.equal(unresolvedScout.publication.error, "target_unavailable");
+    assert.equal(unresolvedScout.publication.target, "unresolved/YM-1");
+    assert.match(notifications.slice(warningsBeforeUnresolved).join("\n"), /warning: scout publication → unresolved\/YM-1: target_unavailable/);
     delete process.env.YOKEMATE_RUN_ID;
     process.argv[1] = workflowChild;
+    await input("/plan YM-1");
+    const unresolvedRecord = await recordProcess();
+    assert.match(unresolvedRecord.stdout, /YM-1 → planned/);
+    assert.match(unresolvedRecord.stdout, /plan-only; ready for \/do/);
+    assert.match(unresolvedRecord.stderr, /warning: scout publication → unresolved\/YM-1: target_unavailable/);
+    assert.match(unresolvedRecord.stderr, /warning: plan publication → unresolved\/YM-1: target_unavailable/);
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
+    notifications.length = 0;
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
     await input("/plan YM-1");
     assert.match(await record(), /plan-only; ready for \/do/);
     const firstPublications = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
@@ -209,10 +232,15 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(artifactReply.state, "refused");
     assert.equal(artifactReply.reason, "artifact_invalid");
     writeFileSync(planPublication.artifact_path, planArtifact);
+    db.prepare("UPDATE plan_record SET publication_id=NULL WHERE id=?").run(recorded.id);
+    db.prepare("DELETE FROM plan_publication WHERE id=?").run(recorded.publication_id);
+    const commentsBeforeTargetChange = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
     const targetReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
     assert.equal(targetReply.state, "accepted");
-    assert.deepEqual(targetReply.publications?.map((outcome) => [outcome.kind, outcome.state, outcome.error]), [["scout", "pending", "target_changed"], ["plan", "pending", "target_changed"]]);
+    assert.deepEqual(targetReply.publications?.map((outcome) => [outcome.kind, outcome.state, outcome.error, outcome.publicationId]), [["scout", "pending", "target_changed", recoveredScout.publication.publicationId], ["plan", "pending", "target_changed", undefined]]);
+    assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, commentsBeforeTargetChange);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM plan_publication WHERE kind='plan' AND target='github:other/repo#1'").get()?.count, 0);
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
@@ -288,6 +316,63 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(confirms, 0);
     assert.deepEqual(notifications, []);
     assert.equal(readRecordedPlanBinding(dir, "YM-1").path, plan);
+    writeFileSync(plan, text.replace("## Goal", "## Goal\n\nfailed-send revision"));
+    reset();
+    process.env.WORKFLOW_GH_FAIL = "1";
+    process.env.YM204_FIXTURE_SCENARIO = "plan_scout_failed_send";
+    process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+    process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+    const failedSendScout = await runScout("failed-send-scout");
+    assert.equal(failedSendScout.artifact.state, "accepted");
+    assert.equal(failedSendScout.publication.state, "pending");
+    delete process.env.YOKEMATE_RUN_ID;
+    process.argv[1] = workflowChild;
+    const commentsBeforeFailedSend = JSON.parse(readFileSync(commentsFile, "utf8")).length;
+    const failedSendRecord = await recordProcess();
+    assert.match(failedSendRecord.stdout, /YM-1 → planned/);
+    assert.match(failedSendRecord.stderr, /warning: scout publication .* unavailable/);
+    assert.match(failedSendRecord.stderr, /warning: plan publication .* unavailable/);
+    assert.equal(JSON.parse(readFileSync(commentsFile, "utf8")).length, commentsBeforeFailedSend);
+    delete process.env.WORKFLOW_GH_FAIL;
+    process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
+    writeFileSync(plan, text);
+    reset();
+    const launchTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    assert.equal(ownedLaunch.state, "accepted");
+    const ownedRunId = ownedLaunch.results?.[0]?.keyRunId;
+    assert.ok(ownedRunId);
+    await waitForFile(ownedPlanReady);
+    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
+    process.env.YOKEMATE_MODE = "plan";
+    process.env.YOKEMATE_TICKET = "YM-1";
+    process.env.YOKEMATE_ROLE = "coordinator";
+    process.env.YOKEMATE_PLAN_RUN_ID = ownedRunId;
+    process.env.YOKEMATE_RUN_ID = ownedRunId;
+    process.env.HERDR_PANE_ID = "owned-pane";
+    process.env.YOKEMATE_PARENT_PANE = "";
+    process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+    const ownedLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
+    await ownedLoader.reload();
+    const ownedLoaded = ownedLoader.getExtensions();
+    assert.deepEqual(ownedLoaded.errors, []);
+    ownedLoaded.runtime.appendEntry = () => undefined;
+    ownedLoaded.runtime.sendMessage = receiveReport;
+    const ownedExtension = ownedLoaded.extensions[0]!;
+    const ownedTool = ownedExtension.tools.get("subagent")!.definition;
+    const ownedCtx = { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext;
+    for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
+    const ownedWorker = { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane" };
+    const ownedStarted = await requestPlanControl(dir, "plan-started", { ticket: "YM-1", runId: ownedRunId }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    assert.equal(ownedStarted.state, "accepted", ownedStarted.reason ?? "plan-started refused");
+    const ownedScout = await runScout("owned-scout", ownedTool, ownedCtx);
+    assert.equal(ownedScout.artifact.state, "accepted", JSON.stringify(ownedScout));
+    process.argv[1] = workflowChild;
+    const ownedRecord = await record({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" });
+    assert.match(ownedRecord, /YM-1 → planned/);
+    assert.match(ownedRecord, /plan-only; ready for \/do/);
+    for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
+    for (const key of ["YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
     for (const surface of ["typed", "tool", "cli", "pane", "ordinary", "coordinator"]) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:guardPolicy.workflowApproval:${variant}`);
     db.close();
   } finally {

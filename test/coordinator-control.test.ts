@@ -286,6 +286,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal(superseded.publication, "complete");
     assert.equal(superseded.artifactAcceptance, "superseded");
     assert.equal(superseded.reason, "scout superseded");
+    const staleRetry = await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
+    assert.equal(staleRetry.state, "refused");
+    assert.match(staleRetry.reason ?? "", /superseded/);
     const oldRejection = await requestPlanControl(root, "reject-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
     assert.equal(oldRejection.state, "accepted");
     assert.equal(oldRejection.reason, "scout rejection superseded");

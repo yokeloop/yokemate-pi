@@ -245,6 +245,11 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     assert.equal(planRecordById(db, firstRecord.id)?.scout_publication, first.id);
     assert.equal(planRecordById(db, secondRecord.id)?.successful_record, 0);
     assert.equal(planRecordById(db, secondRecord.id)?.scout_publication, second.id);
+    const repeatedLocalRecord = acceptPlanRecord(db, { ticket: "YM-1", publicationId: planRow.id, planPath: "/plan", contentHash: planRow.content_hash, scopeHash: "scope", artifactPath: planRow.artifact_path, bytes: planRow.bytes, scoutPublication: first.id, scoutAcceptance: restartDelivery.id });
+    assert.notEqual(repeatedLocalRecord.id, firstRecord.id);
+    assert.equal(repeatedLocalRecord.publication_id, planRow.id);
+    assert.equal(repeatedLocalRecord.scout_publication, null, "the legacy remote tuple stays unique while local acceptance identity remains distinct");
+    assert.equal(repeatedLocalRecord.scout_acceptance, restartDelivery.id);
     writeFileSync(first.artifact_path, "tampered");
     assert.throws(() => readPublicationArtifact(root, first), /artifact_invalid/);
     chmodSync(join(root, ".pi", "plan-publications"), 0o700);
