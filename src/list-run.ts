@@ -6,7 +6,8 @@ export type KeyRunState = "reserved" | "starting" | "active" | "refused" | "reco
 export interface ListRunIdentity { readonly listRunId: string; readonly parentSessionId: string; readonly parentRuntimeId: string; readonly mode: ListMode; readonly keys: readonly string[] }
 export interface ListImmediate { state: "accepted" | "refused"; reservation?: "queued" | "ready"; reason?: string; facts?: Record<string, unknown> }
 export interface ListTerminal { outcome: "recorded" | "done" | "blocked" | "cancelled"; reason?: string; facts?: Record<string, unknown> }
-export interface KeyRunEntry { readonly keyRunId: string; readonly key: string; readonly index: number; state: KeyRunState; immediate?: ListImmediate; terminal?: ListTerminal }
+export interface ListStartup { state: "started" | "refused" | "failed" | "cancelled"; reason?: string; runId?: string; facts?: Record<string, unknown> }
+export interface KeyRunEntry { readonly keyRunId: string; readonly key: string; readonly index: number; state: KeyRunState; immediate?: ListImmediate; startup?: ListStartup; terminal?: ListTerminal }
 export interface ListRun { readonly identity: ListRunIdentity; readonly settings: RuntimeSettings; readonly entries: KeyRunEntry[]; immediatePublished: boolean; aggregatePublished: boolean }
 export interface ListAggregate { listRunId: string; mode: ListMode; results: readonly { keyRunId: string; key: string; index: number; immediate: ListImmediate; terminal?: ListTerminal }[] }
 export interface ListAdmission {
@@ -19,7 +20,7 @@ export interface ListAdmission {
   rejectKey?(key: string, index: number): string | undefined;
   rejectDuplicate?: boolean;
 }
-export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
+export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; startup(value: ListStartup): boolean; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
 
 type Listener = (run: ListRun, entry: KeyRunEntry) => void;
 
@@ -36,6 +37,7 @@ export class ListRunRegistry {
   private readonly immediateListeners = new Set<Listener>();
   private readonly terminalListeners = new Set<Listener>();
   private readonly aggregateListeners = new Set<(aggregate: ListAggregate) => void>();
+  private readonly startupWaiters = new Map<string, Set<(startup: ListStartup) => void>>();
   private running = 0;
 
   onImmediate(listener: Listener): () => void { this.immediateListeners.add(listener); return () => this.immediateListeners.delete(listener); }
@@ -69,6 +71,7 @@ export class ListRunRegistry {
       if (reason) {
         entry.state = "refused";
         entry.immediate = { state: "refused", reason };
+        entry.startup = { state: "refused", reason };
         entry.terminal = { outcome: "blocked", reason };
       } else {
         entry.immediate = { state: "accepted", reservation: accepted < subagentConcurrency(input.settings, input.keys.length) ? "ready" : "queued" };
@@ -110,6 +113,25 @@ export class ListRunRegistry {
     const run = this.requiredList(listRunId);
     for (const entry of run.entries) if (entry.immediate?.state === "accepted" && !terminalState(entry.state)) this.starts.set(entry.keyRunId, start);
     this.pump();
+  }
+
+  settleStartup(keyRunId: string, startup: ListStartup): boolean {
+    const found = this.find(keyRunId);
+    if (!found || found.entry.startup) return false;
+    found.entry.startup = { ...startup, ...(startup.facts ? { facts: { ...startup.facts } } : {}) };
+    const waiters = this.startupWaiters.get(keyRunId);
+    if (waiters) {
+      this.startupWaiters.delete(keyRunId);
+      for (const resolvePromise of waiters) resolvePromise(found.entry.startup);
+    }
+    return true;
+  }
+
+  waitForStartup(keyRunId: string): Promise<ListStartup> {
+    const found = this.find(keyRunId);
+    if (!found) return Promise.reject(new Error(`unknown key run ${keyRunId}`));
+    if (found.entry.startup) return Promise.resolve(found.entry.startup);
+    return new Promise((resolvePromise) => (this.startupWaiters.get(keyRunId) ?? this.startupWaiters.set(keyRunId, new Set()).get(keyRunId)!).add(resolvePromise));
   }
 
   markActive(keyRunId: string, facts?: Record<string, unknown>): boolean {
@@ -161,7 +183,7 @@ export class ListRunRegistry {
         this.controllers.set(entry.keyRunId, controller);
         entry.state = "starting";
         this.running++;
-        const context: KeyRunContext = { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, parentRunId: run.identity.listRunId, key: entry.key, index: entry.index, mode: run.identity.mode, settings: run.settings, signal: controller.signal, active: (facts) => this.markActive(entry.keyRunId, facts), terminal: (terminal) => this.settle(run.identity.listRunId, entry.keyRunId, terminal) };
+        const context: KeyRunContext = { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, parentRunId: run.identity.listRunId, key: entry.key, index: entry.index, mode: run.identity.mode, settings: run.settings, signal: controller.signal, startup: (startup) => this.settleStartup(entry.keyRunId, startup), active: (facts) => this.markActive(entry.keyRunId, facts), terminal: (terminal) => this.settle(run.identity.listRunId, entry.keyRunId, terminal) };
         void start(context).then((terminal) => { if (terminal) this.settle(run.identity.listRunId, entry.keyRunId, terminal); }).catch((error) => this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "blocked", reason: error instanceof Error ? error.message : String(error) }));
       }
     }
@@ -172,6 +194,7 @@ export class ListRunRegistry {
     const occupied = (entry.state === "starting" || entry.state === "active") && !this.released.has(entry.keyRunId);
     entry.state = terminalToState(terminal.outcome);
     entry.terminal = { ...terminal, facts: terminal.facts && { ...terminal.facts } };
+    if (!entry.startup) this.settleStartup(entry.keyRunId, terminal.outcome === "cancelled" ? { state: "cancelled", reason: terminal.reason } : { state: "failed", reason: terminal.reason ?? "coordinator ended before startup acknowledgement" });
     this.controllers.delete(entry.keyRunId);
     if (occupied) this.running = Math.max(0, this.running - 1);
     for (const listener of this.terminalListeners) listener(run, entry);
@@ -184,6 +207,7 @@ export class ListRunRegistry {
     if (terminalState(entry.state)) return false;
     this.controllers.get(entry.keyRunId)?.abort(reason);
     this.starts.delete(entry.keyRunId);
+    this.settleStartup(entry.keyRunId, { state: "cancelled", reason });
     return this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "cancelled", reason });
   }
 
