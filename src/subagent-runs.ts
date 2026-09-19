@@ -139,6 +139,33 @@ export class ChildRuns {
 }
 
 const RECORD_LIMIT = 1024 * 1024;
+export type ScoutEvidenceErrorKind = "invalid_json" | "invalid_event" | "record_limit" | "partial_record" | "invalid_utf8" | "lost_source" | "exhausted_evidence";
+export interface ScoutEvidenceHistory {
+  kind: ScoutEvidenceErrorKind;
+  offset: number;
+  count: number;
+  hash: string;
+  eventSequence: number;
+}
+export interface ScoutCompletenessEvidence {
+  stdoutBytes: number;
+  eventCount: number;
+  finalSequence?: number;
+  finalBytes: number;
+  finalHash: string;
+  sessionId?: string;
+  stopReason?: string;
+  errors: readonly ScoutEvidenceHistory[];
+  recordLimit: boolean;
+  partialRecord: boolean;
+  invalidUtf8: boolean;
+  lostSource: boolean;
+  exhaustedEvidence: boolean;
+  activeTools: number;
+  retry: boolean;
+  compaction: boolean;
+  summaryRetry: boolean;
+}
 const eventNames = new Set(["session", "entry_appended", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished", "queue_update", "extension_error", "response", "extension_ui_request"]);
 export class JsonlObservation {
   private prefix?: Buffer;
@@ -149,7 +176,15 @@ export class JsonlObservation {
   private dropping = false;
   private offset = 0;
   private errors = 0;
-  private lastError?: { kind: "invalid_json" | "invalid_event" | "record_limit" | "partial_record"; offset: number };
+  private errorHistory: ScoutEvidenceHistory[] = [];
+  private lastError?: { kind: ScoutEvidenceErrorKind; offset: number };
+  private eventSequence = 0;
+  private finalSequence?: number;
+  private recordLimit = false;
+  private partialRecord = false;
+  private invalidUtf8 = false;
+  private lostSource = false;
+  private exhaustedEvidence = false;
   private tools = new Set<string>();
   private retry = false;
   private compaction = false;
@@ -169,7 +204,21 @@ export class JsonlObservation {
   constructor(onEvent?: (event: Record<string, any>) => void) { this.onEvent = onEvent; }
   get protocolError(): boolean { return this.errors > 0; }
   get incomplete(): boolean { return this.tools.size > 0 || this.retry || this.compaction || this.summaryRetry; }
-  private error(kind: NonNullable<JsonlObservation["lastError"]>["kind"]): void { this.errors++; this.lastError = { kind, offset: this.offset }; }
+  markLostSource(): void { this.error("lost_source"); }
+  markExhaustedEvidence(): void { this.error("exhausted_evidence"); }
+  private error(kind: ScoutEvidenceErrorKind): void {
+    this.errors++;
+    this.lastError = { kind, offset: this.offset };
+    const hash = this.recordHash.copy().digest("hex");
+    const prior = this.errorHistory.at(-1);
+    if (prior?.kind === kind && prior.offset === this.offset && prior.hash === hash) prior.count++;
+    else this.errorHistory.push({ kind, offset: this.offset, count: 1, hash, eventSequence: this.eventSequence });
+    if (kind === "record_limit") this.recordLimit = true;
+    if (kind === "partial_record") this.partialRecord = true;
+    if (kind === "invalid_utf8") this.invalidUtf8 = true;
+    if (kind === "lost_source" || kind === "record_limit" || kind === "partial_record" || kind === "invalid_utf8") this.lostSource = true;
+    if (kind === "exhausted_evidence") this.exhaustedEvidence = true;
+  }
   write(chunk: Buffer): void {
     this.firstByteAt ??= new Date().toISOString();
     this.stdoutBytes += chunk.length;
@@ -188,8 +237,11 @@ export class JsonlObservation {
           this.lastEventAt = new Date().toISOString();
         } else if (!this.dropping) this.error("record_limit");
       } else if (!this.dropping) {
-        const line = (this.prefix ?? Buffer.alloc(0)).subarray(0, this.prefixLength).toString("utf8");
-        this.parse(line.endsWith("\r") ? line.slice(0, -1) : line);
+        const retained = (this.prefix ?? Buffer.alloc(0)).subarray(0, this.prefixLength);
+        let line: string;
+        try { line = new TextDecoder("utf-8", { fatal: true }).decode(retained); }
+        catch { this.error("invalid_utf8"); line = ""; }
+        if (line) this.parse(line.endsWith("\r") ? line.slice(0, -1) : line);
       }
       this.offset += this.recordBytes + 1;
       this.resetRecord();
@@ -239,6 +291,7 @@ export class JsonlObservation {
     try { event = JSON.parse(line); } catch { this.error("invalid_json"); return; }
     if (!event || typeof event !== "object" || typeof event.type !== "string") { this.error("invalid_event"); return; }
     const name = eventNames.has(event.type) ? event.type : "other";
+    this.eventSequence++;
     this.counts[name] = (this.counts[name] ?? 0) + 1;
     this.lastEventAt = new Date().toISOString();
     if (event.type === "session" && typeof event.id === "string" && /^[a-f0-9-]{36}$/.test(event.id)) this.sessionId = event.id;
@@ -253,6 +306,7 @@ export class JsonlObservation {
       this.model = typeof message.model === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.model) ? message.model : undefined;
       this.provider = typeof message.provider === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.provider) ? message.provider : undefined;
       this.finalAt = this.lastEventAt;
+      this.finalSequence = this.eventSequence;
     }
     if (event.type === "tool_execution_start" && typeof event.toolCallId === "string") this.tools.add(sha256(event.toolCallId));
     if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") this.tools.delete(sha256(event.toolCallId));
@@ -264,8 +318,11 @@ export class JsonlObservation {
     if (event.type === "summarization_retry_finished") this.summaryRetry = false;
     this.onEvent?.(event);
   }
+  evidence(): ScoutCompletenessEvidence {
+    return Object.freeze({ stdoutBytes: this.stdoutBytes, eventCount: this.eventSequence, finalSequence: this.finalSequence, finalBytes: Buffer.byteLength(this.finalText), finalHash: sha256(this.finalText), sessionId: this.sessionId, stopReason: this.stopReason, errors: Object.freeze(this.errorHistory.map((entry) => Object.freeze({ ...entry }))), recordLimit: this.recordLimit, partialRecord: this.partialRecord, invalidUtf8: this.invalidUtf8, lostSource: this.lostSource, exhaustedEvidence: this.exhaustedEvidence, activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry });
+  }
   metadata() {
-    return { stdoutBytes: this.stdoutBytes, events: { ...this.counts }, parserErrors: this.errors, lastParserError: this.lastError, partialBytes: this.recordBytes, partialHash: this.recordHash.copy().digest("hex"), activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, phase: this.phase, firstByteAt: this.firstByteAt, lastEventAt: this.lastEventAt, finalAt: this.finalAt };
+    return { stdoutBytes: this.stdoutBytes, events: { ...this.counts }, parserErrors: this.errors, lastParserError: this.lastError, errorHistory: this.errorHistory.map((entry) => ({ ...entry })), partialBytes: this.recordBytes, partialHash: this.recordHash.copy().digest("hex"), activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, phase: this.phase, firstByteAt: this.firstByteAt, lastEventAt: this.lastEventAt, finalAt: this.finalAt };
   }
 }
 
