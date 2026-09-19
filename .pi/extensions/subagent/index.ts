@@ -18,6 +18,8 @@ import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION }
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
+import { persistScoutCandidate } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -93,6 +95,8 @@ let widgetTimer: NodeJS.Timeout | undefined;
 // ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
 // пришёл в execute текущего вызова или в turn_start, а не захваченному.
 let latestCtx: ExtensionContext | undefined;
+const scoutCandidateIds = new Map<string, string>();
+const scoutCandidateGenerations = new Map<string, number>();
 
 // Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
 // срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
@@ -538,6 +542,25 @@ async function runSingleAgent(
 		});
 		currentResult.exitCode = terminal.exitCode;
 		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "protocol_error" && process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID) {
+			try {
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const planningIdentity = process.env.YOKEMATE_PLAN_RUN_ID;
+				const generation = (scoutCandidateGenerations.get(planningIdentity) ?? 0) + 1;
+				scoutCandidateGenerations.set(planningIdentity, generation);
+				const captured = captureScoutCandidate({ root: ENGINE_ROOT, identity, envelope: currentResult.envelope, finalText: observation.finalText, childSessionId: observation.sessionId, evidence: observation.evidence(), planningIdentity, generation, parentRuntimeId: parent.runtimeId, parentSessionId: parent.sessionId });
+				if (captured.state === "captured") {
+					const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let candidateId: string;
+					try { candidateId = persistScoutCandidate(state, ENGINE_ROOT, captured.candidate).id; }
+					finally { state.close(); }
+					const registration = await requestPlanControl(ENGINE_ROOT, "register-scout-candidate", { ticket: identity.ticket, runId: planningIdentity, candidateId, failureHash: captured.candidate.failedEnvelopeHash, generation }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), parent);
+					if (registration.state !== "accepted") throw new Error(registration.reason ?? "candidate lineage registration refused");
+					scoutCandidateIds.set(identity.runId, candidateId);
+					diagnostic.metadata.scoutCandidate = { id: candidateId, hash: captured.candidate.contentHash, bytes: captured.candidate.bytes, failureHash: captured.candidate.failedEnvelopeHash };
+				} else diagnostic.metadata.scoutCandidate = { refusal: captured.reason };
+			} catch (error) { diagnostic.metadata.scoutCandidate = { refusal: "audit-unavailable", error: errorMetadata(error) }; }
+		}
 		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
 			const bytes = normalizeScoutMarkdown(observation.finalText);
 			try {
@@ -1607,6 +1630,8 @@ export default function (pi: ExtensionAPI) {
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
 			if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
+				const candidateId = scoutCandidateIds.get(result.identity.runId);
+				if (candidateId) try { latestCtx?.ui.notify(`plan scout transport failed; audited recovery candidate ${candidateId}`, "warning"); } catch {}
 			} else {
 				let acceptanceId: number | undefined;
 				try {

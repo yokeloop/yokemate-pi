@@ -11,10 +11,10 @@ import { observePlanProcess, type PlanProcessObserver } from "./plan-lifecycle.t
 import type { PublicationOutcome } from "./plan-publication-state.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; candidateId?: string; failureHash?: string; generation?: number; writerRunId?: string }
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
-export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number }
-export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan";
+export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number; candidateId?: string; failureHash?: string; generation?: number; planningIdentity?: string }
+export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan" | "register-scout-candidate" | "read-scout-candidate" | "continue-scout-candidate" | "admit-plan-writer";
 export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string, acceptanceId: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }>; planRecorded?(ticket: string, path: string, recordIdOrOrigin: number | ControlOrigin, originOrRunId?: ControlOrigin | string, legacyOrigin?: ControlOrigin): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
@@ -32,6 +32,8 @@ interface PlanRunState {
   scoutGeneration?: number;
   scoutRequests?: Map<number, number>;
   finalizedScoutAcceptances?: Set<number>;
+  recoveryCandidates?: Map<string, { failureHash: string; generation: number; workerSessionId: string }>;
+  recovery?: { candidateId: string; failureHash: string; generation: number; planningIdentity: string };
 }
 
 export function processStarttime(pid: number): string | undefined {
@@ -182,6 +184,41 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
           continue;
         }
+        if (["register-scout-candidate", "read-scout-candidate", "continue-scout-candidate", "admit-plan-writer"].includes(envelope.operation)) {
+          try {
+            const ticket = envelope.ticket;
+            const planRun = envelope.runId ? planRuns.get(envelope.runId) : undefined;
+            const main = !origin.mode && !origin.role && origin.sessionId === identity.sessionId;
+            if (!ticket || !envelope.runId || !planRun || planRun.ticket !== ticket) throw new Error("unknown plan recovery lineage");
+            const registeredWorker = !!planRun.worker && origin.mode === "plan" && origin.ticket === ticket && origin.pane === planRun.pane && origin.sessionId === planRun.worker.sessionId && descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime);
+            if (envelope.operation === "register-scout-candidate") {
+              if (!registeredWorker || planRun.terminal || !envelope.candidateId || !/^[a-f0-9-]{36}$/.test(envelope.candidateId) || !envelope.failureHash || !/^[a-f0-9]{64}$/.test(envelope.failureHash) || !Number.isSafeInteger(envelope.generation) || envelope.generation! < 1) throw new Error("invalid recovery candidate registration");
+              const candidates = planRun.recoveryCandidates ??= new Map();
+              const prior = candidates.get(envelope.candidateId);
+              const next = { failureHash: envelope.failureHash, generation: envelope.generation!, workerSessionId: origin.sessionId };
+              if (prior && JSON.stringify(prior) !== JSON.stringify(next)) throw new Error("recovery candidate identity changed");
+              candidates.set(envelope.candidateId, next);
+              reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, candidateId: envelope.candidateId, failureHash: envelope.failureHash, generation: envelope.generation });
+            } else if (envelope.operation === "read-scout-candidate") {
+              if (!main || !envelope.candidateId) throw new Error("only the verified main parent can read a recovery candidate");
+              const candidate = planRun.recoveryCandidates?.get(envelope.candidateId);
+              if (!candidate) throw new Error("unknown recovery candidate");
+              reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, candidateId: envelope.candidateId, ...candidate });
+            } else if (envelope.operation === "continue-scout-candidate") {
+              if (!main || planRun.terminal !== "blocked" || !planRun.worker || !processMatches(planRun.worker.pid, planRun.worker.starttime) || !envelope.candidateId || !envelope.failureHash) throw new Error("blocked plan lineage is not recoverable");
+              const candidate = planRun.recoveryCandidates?.get(envelope.candidateId);
+              if (!candidate || candidate.failureHash !== envelope.failureHash || candidate.workerSessionId !== planRun.worker.sessionId || planRun.recovery) throw new Error("recovery candidate is stale, foreign, or already continued");
+              const generation = candidate.generation + 1;
+              const planningIdentity = `${envelope.runId}:${generation}`;
+              planRun.recovery = { candidateId: envelope.candidateId, failureHash: envelope.failureHash, generation, planningIdentity };
+              reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, candidateId: envelope.candidateId, failureHash: envelope.failureHash, generation, planningIdentity });
+            } else {
+              if (!registeredWorker || planRun.terminal !== "blocked" || !planRun.recovery || planRun.recovery.candidateId !== envelope.candidateId || planRun.recovery.failureHash !== envelope.failureHash || planRun.recovery.generation !== envelope.generation || !envelope.writerRunId) throw new Error("plan writer is outside the continued recovery lineage");
+              reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, candidateId: envelope.candidateId, failureHash: envelope.failureHash, generation: envelope.generation, planningIdentity: planRun.recovery.planningIdentity });
+            }
+          } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
+          continue;
+        }
         if (["register-plan", "bind-plan", "plan-started", "publish-plan-scout", "reject-plan-scout", "prepare-plan-publication", "plan-recorded", "plan-finished", "record-plan"].includes(envelope.operation)) {
           try {
             const ticket = envelope.ticket;
@@ -208,7 +245,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 if (["plan-finished", "record-plan"].includes(envelope.operation)) {
                   if (!main && (!planRun?.worker || planRun.ticket !== ticket || origin.mode !== "plan" || origin.ticket !== ticket || origin.pane !== planRun.pane || origin.sessionId !== planRun.worker.sessionId || !descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime))) throw new Error("plan result is not from its registered live worker");
                   if (planRun?.terminal === "recorded" && envelope.operation === "record-plan") { reply({ requestId: envelope.requestId, state: "accepted", ...planRun.recordReply }); continue; }
-                  if (planRun?.terminal || (!main && !planRun)) throw new Error("plan run is no longer active");
+                  const continuedRecovery = envelope.operation === "record-plan" && planRun?.terminal === "blocked" && !!planRun.recovery;
+                  if (planRun?.terminal && !continuedRecovery || (!main && !planRun)) throw new Error("plan run is no longer active");
                   if (envelope.operation === "plan-finished") {
                     if (!planRun || !envelope.runId || !envelope.outcome || !envelope.reason || !parent.planFinished) throw new Error("plan finish handoff is unavailable");
                     await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
@@ -439,7 +477,7 @@ export async function requestPlanLaunch(root: string, planRequest: PlanLaunchReq
   return send(root, { version: 1, operation: "launch-plan", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, planRequest }, env);
 }
 
-export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; candidateId?: string; failureHash?: string; generation?: number; writerRunId?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);
