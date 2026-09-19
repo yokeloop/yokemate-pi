@@ -883,6 +883,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const generation = authority.beginInput(event.text);
 		shipPermits.invalidate();
+		let extractingWorkflow = false;
 		try {
 			readRuntimeSettings(ENGINE_ROOT);
 			const ship = text.match(/^\/ship\s+(.+)$/);
@@ -921,6 +922,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (text.startsWith("/")) return;
+			extractingWorkflow = true;
 			if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("workflow extraction requires a configured model and external authentication");
 			const bindings: PlanBinding[] = [];
 			if (fs.existsSync(path.join(ENGINE_ROOT, "yokemate.db"))) {
@@ -951,6 +953,10 @@ export default function (pi: ExtensionAPI) {
 				}
 			} finally { clearTimeout(timer); controller.abort(); }
 		} catch (error) {
+			if (extractingWorkflow) {
+				ctx.ui.notify(`workflow extraction unavailable: ${(error as Error).message}; continuing without inferred workflow approval`, "warning");
+				return;
+			}
 			ctx.ui.notify((error as Error).message, "error");
 			return { action: "handled" as const };
 		}

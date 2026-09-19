@@ -105,7 +105,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     };
     const extension = loaded.extensions[0]!;
     const tool = extension.tools.get("subagent")!.definition;
-    let extraction: "none" | "advance-plan-do" | "approve-ready-do" = "none";
+    let extraction: "none" | "advance-plan-do" | "approve-ready-do" | "error" = "none";
     let calls = 0;
     let confirms = 0;
     const notifications: string[] = [];
@@ -113,6 +113,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       getAll: () => [{ provider: "ym204-fixture", id: "deterministic", name: "Deterministic", reasoning: true }, { provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true,
       complete: async (_model: unknown, context: { messages: { content: string }[] }) => {
         calls++;
+        if (extraction === "error") throw new Error("workflow extraction timed out");
         const { raw, bindings } = JSON.parse(context.messages[0]!.content);
         const value = extraction === "none" ? { kind: "none" } : { kind: extraction, ticket: "YM-1", binding: extraction === "approve-ready-do" ? bindings[0].contentHash : null, actions: extraction === "approve-ready-do" ? ["do"] : ["plan", "do"], evidence: [{ start: 0, end: raw.length, text: raw }] };
         return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(value) }] };
@@ -120,7 +121,11 @@ test("raw interactive authority flows through real plan CLI and parent control w
     }, ui: { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } } } as unknown as ExtensionContext;
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
-    const input = async (text: string, source = "interactive", mode = "tui") => { for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source, text } as never, { ...ctx, mode } as ExtensionContext); };
+    const input = async (text: string, source = "interactive", mode = "tui") => {
+      let outcome: unknown;
+      for (const handler of extension.handlers.get("input") ?? []) outcome = await handler({ type: "input", source, text } as never, { ...ctx, mode } as ExtensionContext);
+      return outcome;
+    };
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
@@ -214,6 +219,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
+    extraction = "error";
+    assert.equal(await input("Исправь обычный баг"), undefined);
+    assert.match(notifications.pop() ?? "", /workflow extraction unavailable: workflow extraction timed out; continuing without inferred workflow approval/);
+    extraction = "none";
     assert.match(output(await launch()), /current interactive approval/);
     await input("/do YM-1", "extension");
     await input("/do YM-1", "interactive", "rpc");
