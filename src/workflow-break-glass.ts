@@ -77,7 +77,7 @@ export class BreakGlassPermitStore {
   assert(permitId: string, witness: WorkflowIngressWitness, expected: Omit<BreakGlassPreview, "permitId" | "createdAt" | "expiresAt">): BreakGlassPreview {
     const permit = this.permits.get(permitId);
     if (!permit || permit.state !== "preview") throw new Error("break-glass permit is not live");
-    if (this.clock() > permit.expiresAt) { permit.state = "revoked"; throw new Error("break-glass permit expired"); }
+    if (this.clock() > permit.expiresAt) throw new Error("break-glass permit expired");
     if (witness.consumed || witness.id !== permit.witnessId || witness.sessionId !== permit.sessionId || witness.runtimeId !== permit.runtimeId || witness.generation !== permit.inputGeneration || witness.hash !== permit.inputHash) throw new Error("break-glass typed witness changed");
     for (const key of ["ticket", "action", "candidateId", "candidateHash", "candidateBytes", "failureHash", "sourceRunId", "planningRunId", "sourceSessionId", "inputGeneration", "inputHash", "witnessId", "scopeHash", "targetHash", "plan", "reason", "bypassed", "preserved", "blockers"] as const) {
       if (JSON.stringify(permit[key]) !== JSON.stringify(expected[key])) throw new Error(`break-glass ${key} changed`);
@@ -89,7 +89,12 @@ export class BreakGlassPermitStore {
     if (!permit || permit.state !== "preview") throw new Error("break-glass permit is not live");
     permit.state = "consumed";
   }
-  revoke(): void { for (const permit of this.permits.values()) if (permit.state === "preview") permit.state = "revoked"; }
+  active(): BreakGlassPreview[] { return [...this.permits.values()].filter((permit) => permit.state === "preview").map((permit) => this.copy(permit)); }
+  revoke(): BreakGlassPreview[] {
+    const revoked: BreakGlassPreview[] = [];
+    for (const permit of this.permits.values()) if (permit.state === "preview") { revoked.push(this.copy(permit)); permit.state = "revoked"; }
+    return revoked;
+  }
   private copy(permit: StoredPermit): BreakGlassPreview {
     const { sessionId: _sessionId, runtimeId: _runtimeId, state: _state, ...preview } = permit;
     return { ...preview, plan: { ...preview.plan }, bypassed: [...preview.bypassed] as ["plan.scout.transport-input"], preserved: [...preview.preserved], blockers: [...preview.blockers] };
@@ -116,7 +121,7 @@ function exactCandidate(db: DatabaseSync, root: string, command: BreakGlassComma
   if (sha256(bytes) !== candidate.content_hash || bytes.length !== candidate.bytes) throw new Error("recovery candidate artifact changed");
   const terminal = JSON.parse(candidate.terminal_json);
   const evidence = JSON.parse(candidate.evidence_json);
-  if (terminal.processOutcome !== "exited" || terminal.exitCode !== 0 || terminal.signal !== null || terminal.stopReason !== "stop" || terminal.payloadOutcome !== "protocol_error" || evidence.lostSource || evidence.exhaustedEvidence || evidence.activeTools || evidence.retry || evidence.compaction || evidence.summaryRetry) throw new Error("recovery candidate has immutable blockers");
+  if (terminal.processOutcome !== "exited" || terminal.exitCode !== 0 || terminal.signal !== null || terminal.stopReason !== "stop" || terminal.payloadOutcome !== "protocol_error" || evidence.lostSource || evidence.exhaustedEvidence || evidence.activeTools || evidence.retry || evidence.compaction || evidence.summaryRetry || !evidence.agentSettled || !evidence.queueKnown || !evidence.queueEmpty || !evidence.finalSequence || !evidence.settledSequence || evidence.settledSequence <= evidence.finalSequence) throw new Error("recovery candidate has immutable blockers");
   return candidate;
 }
 
@@ -146,10 +151,10 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
   const confirmed = await input.confirm(input.preview);
   input.store.assert(input.preview.permitId, input.witness, await input.recheck());
   if (!confirmed) throw new Error("break-glass confirmation declined");
-  const continuation = await input.continueLineage();
   const current = await input.recheck();
   input.store.assert(input.preview.permitId, input.witness, current);
   const candidate = exactCandidate(input.db, input.root, { ticket: current.ticket, action: current.action, candidateId: current.candidateId, reason: current.reason }, current.planningRunId, current.failureHash);
+  const expectedContinuation = { planningIdentity: `${candidate.planning_identity}:${candidate.generation + 1}`, generation: candidate.generation + 1 };
   const consumed = consumeScoutIncident(input.db, {
     candidateId: candidate.id,
     ticket: current.ticket,
@@ -158,6 +163,7 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
     inputHash: current.inputHash,
     scopeHash: current.scopeHash,
     targetHash: current.targetHash,
+    plan: current.plan,
     reason: current.reason,
     sourceUid: input.sourceUid,
     sourceSessionId: input.witness.sessionId,
@@ -165,7 +171,9 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
     payloadHash: candidate.content_hash,
     bypassed: current.bypassed,
     preserved: current.preserved,
-  }, (incident, row) => acceptRecoveredScoutArtifact(input.db, input.root, incident, row, row.content_hash, ["failed-transport-envelope"], current.preserved, continuation.planningIdentity, continuation.generation));
+  }, (incident, row) => acceptRecoveredScoutArtifact(input.db, input.root, incident, row, row.content_hash, ["failed-transport-envelope"], current.preserved, expectedContinuation.planningIdentity, expectedContinuation.generation));
   input.store.consume(input.preview.permitId);
+  const continuation = await input.continueLineage();
+  if (continuation.planningIdentity !== expectedContinuation.planningIdentity || continuation.generation !== expectedContinuation.generation) throw new Error("recovery continuation identity changed");
   return { acceptance: consumed.value, incidentId: consumed.incident.id, planningIdentity: continuation.planningIdentity, generation: continuation.generation };
 }

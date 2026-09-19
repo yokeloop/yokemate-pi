@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
-import { appendIncidentEvent, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
+import { appendIncidentEvent, appendRecoveryAttempt, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -59,7 +59,7 @@ import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../sr
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 import { finalizeShip } from "../../../src/ship-finalize.ts";
 import { PublicationTargetFailure, publicationTargetLabel, resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationProvenance, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptRecoveredPublication, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationProvenance, type PublicationRow } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
@@ -755,7 +755,7 @@ export default function (pi: ExtensionAPI) {
 	const attemptArtifactPublication = async (input: {
 		kind: "scout" | "plan"; ticket: string; artifact: ArtifactMetadata; runId: string; publicationId?: number;
 		child?: ChildIdentity; planPath?: string; scopeHash?: string; attach(db: DatabaseSync, row: PublicationRow): void;
-		verifyBinding?: () => void | Promise<void>; provenance?: PublicationProvenance;
+		verifyBinding?: () => void | Promise<void>; provenance?: PublicationProvenance; acceptanceId?: number;
 	}): Promise<PublicationOutcome> => {
 		const local = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		let row: PublicationRow | undefined;
@@ -777,7 +777,10 @@ export default function (pi: ExtensionAPI) {
 				markPublicationResult(local, row.id, { complete: false, error: "target_changed" });
 				return { kind: input.kind, state: "pending", target: row.canonical_url ?? publicationTargetLabel(local, input.ticket), revision: row.content_hash, publicationId: row.id, error: "target_changed" };
 			}
-			if (!row) row = acceptPublication(local, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash, provenance: input.provenance });
+			if (!row) {
+				const identity = { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash };
+				row = input.provenance?.source_kind === "engineer-accepted-input" ? acceptRecoveredPublication(local, ENGINE_ROOT, identity, input.acceptanceId!) : acceptPublication(local, ENGINE_ROOT, identity);
+			}
 			input.attach(local, row);
 		} finally { local.close(); }
 		const result = await publishAccepted(row!.id, input.verifyBinding);
@@ -908,6 +911,13 @@ export default function (pi: ExtensionAPI) {
 	};
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
+	const auditRecoveryPreviews = (previews: readonly BreakGlassPreview[], outcome: "refusal" | "revoke" | "expiry"): void => {
+		if (!previews.length || !controlIdentity) return;
+		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		try {
+			for (const preview of previews) appendRecoveryAttempt(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputGeneration: preview.inputGeneration, inputHash: preview.inputHash, scopeHash: preview.scopeHash, targetHash: preview.targetHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, payloadHash: preview.candidateHash, failureHash: preview.failureHash, reason: preview.reason, outcome });
+		} finally { db.close(); }
+	};
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
 	const suppressedCancellationReports = new Set<string>();
@@ -951,7 +961,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	const revokeAuthority = async () => {
 		shipPermits.invalidate();
-		breakGlassPermits.revoke();
+		auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
 		workflowIngress.revoke();
 		ingressWitness = undefined;
 		await fenceListRuns("parent runtime changed");
@@ -987,7 +997,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const witnessed = ingressWitness && !ingressWitness.consumed && ingressWitness.sessionId === sessionId && ingressWitness.runtimeId === controlIdentity.runtimeId && ingressWitness.raw === event.text ? ingressWitness : undefined;
 		const generation = witnessed ? authority.generation() : authority.beginInput(event.text);
-		if (!witnessed) { breakGlassPermits.revoke(); workflowIngress.revoke(); ingressWitness = undefined; }
+		if (!witnessed) { auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke"); workflowIngress.revoke(); ingressWitness = undefined; }
 		shipPermits.invalidate();
 		let extractingWorkflow = false;
 		try {
@@ -1291,7 +1301,7 @@ export default function (pi: ExtensionAPI) {
 		uninstallIngress = undefined;
 		if (ctx.mode === "tui" && typeof ctx.ui.getEditorComponent === "function" && typeof ctx.ui.setEditorComponent === "function") {
 			uninstallIngress = installWorkflowIngress(ctx.ui, (raw) => {
-				breakGlassPermits.revoke();
+				auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
 				shipPermits.invalidate();
 				ingressWitness = workflowIngress.submit(raw, sessionId, runtimeId);
 				authority?.beginInput(raw);
@@ -1332,24 +1342,30 @@ export default function (pi: ExtensionAPI) {
 			} finally { db.close(); }
 			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
-			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, provenance: scout, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
 			const planOutcome: PublicationOutcome = scoutOutcome.error === "target_changed"
 				? { kind: "plan", state: "pending", target: scoutOutcome.target, revision: record.content_hash, ...(record.publication_id ? { publicationId: record.publication_id } : {}), error: "target_changed" }
-				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, provenance: scout, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}), ...(record.writer_run_id && record.writer_task_hash && record.writer_actual_task_hash ? { writer: { runId: record.writer_run_id, taskHash: record.writer_task_hash, actualTaskHash: record.writer_actual_task_hash } } : {}) }); }, verifyBinding: verify });
+				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}), ...(record.writer_run_id && record.writer_task_hash && record.writer_actual_task_hash ? { writer: { runId: record.writer_run_id, taskHash: record.writer_task_hash, actualTaskHash: record.writer_actual_task_hash } } : {}) }); }, verifyBinding: verify });
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
+		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, planRunId?: string, record?: PlanRecordResult) => {
 			const settings = readRuntimeSettings(ENGINE_ROOT);
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
-			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
+			const recovery = planRunId ? listRuns.recovery(planRunId) : undefined;
+			if (planRunId && (!found || !("run" in found) || (["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) && !(found.entry.state === "blocked" && recovery?.state === "active")))) throw new Error("plan run is no longer active");
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
-			if (planRunId && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
+			if (planRunId && !recovery && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
 			let reason = "plan-only; ready for /do; a new interactive approval is required";
 			let handoff: "plan-only" | "started" | "refused" = "plan-only";
-			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
+			const provenanceDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+			let recovered = false;
+			try { recovered = planRecordById(provenanceDb, recordId)?.source_kind === "engineer-accepted-input"; }
+			finally { provenanceDb.close(); }
+			if (recovered) authority!.revoke(ticket);
+			if (!recovered && (!planRunId || !cancelledRecordingPlans.has(planRunId))) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					try {
@@ -1366,9 +1382,13 @@ export default function (pi: ExtensionAPI) {
 						handoff = "started";
 					} catch (error) { reason = (error as Error).message; handoff = "refused"; }
 				}
-			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
+			} else if (recovered) reason = "engineer-accepted-input recorded plan-only; a fresh /do approval is required";
+			else reason = "plan recorded after cancellation; automatic do handoff revoked";
 			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
-			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
+			if (planRunId && found && "run" in found) {
+				const settled = recovery ? listRuns.settleRecovery(planRunId, { outcome: "recorded", facts }) : listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts });
+				if (!settled) throw new Error("plan run lost its terminal claim");
+			}
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
@@ -1382,7 +1402,7 @@ export default function (pi: ExtensionAPI) {
 						assertPublishable(readPublicationArtifact(ENGINE_ROOT, acceptance));
 					} finally { db.close(); }
 					const child: ChildIdentity = { ownerRunId: acceptance.owner_run_id, ownerSessionId: acceptance.owner_session_id, batchId: acceptance.batch_id, runId: acceptance.run_id, agent: "plan-scout", taskHash: acceptance.task_hash, cwd: ENGINE_ROOT, ticket };
-					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
+					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, acceptanceId: acceptance.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
 				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
@@ -1397,7 +1417,7 @@ export default function (pi: ExtensionAPI) {
 					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					return completePlanRecord(ticket, recordedPath, binding, publications, recordIdOrOrigin, typeof originOrRunId === "string" ? originOrRunId : undefined);
 				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
@@ -1441,7 +1461,7 @@ export default function (pi: ExtensionAPI) {
 						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
-						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result);
+						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, prepared.record.id, planRunId, result);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
 							const found = listRuns.get(planRunId);
@@ -1518,6 +1538,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Accept one exact failed plan-scout transport input through an audited incident.",
 		handler: async (args, ctx) => {
 			let state: DatabaseSync | undefined;
+			let preview: BreakGlassPreview | undefined;
 			try {
 				const sessionId = ctx.sessionManager.getSessionId();
 				if (ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE || !controlIdentity || controlIdentity.sessionId !== sessionId || !ingressWitness) throw new Error("break-glass requires a fresh typed submit in verified MAIN TUI");
@@ -1533,32 +1554,35 @@ export default function (pi: ExtensionAPI) {
 				if (live.state !== "accepted" || live.failureHash !== candidate.failed_envelope_hash) throw new Error(live.reason ?? "recovery lineage is not live");
 				const snapshot = (): { scopeHash: string; targetHash: string; plan: PlanSnapshotIdentity } => {
 					const target = resolvePublicationTarget(state!, command.ticket);
-					try {
+					const recorded = state!.prepare("SELECT plan FROM work WHERE ticket=?").get(command.ticket) as { plan?: string | null } | undefined;
+					if (recorded?.plan) {
 						const binding = readRecordedPlanBinding(ENGINE_ROOT, command.ticket);
 						return { scopeHash: binding.scopeHash, targetHash: target.targetHash, plan: { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) } };
-					} catch {
-						const absent = sha256(JSON.stringify([command.ticket, target.targetHash, candidate.content_hash, "plan-absent"]));
-						return { scopeHash: absent, targetHash: target.targetHash, plan: { state: "absent", hash: sha256("absent"), scopeHash: absent, pathHash: sha256("absent") } };
 					}
+					const absent = sha256(JSON.stringify([command.ticket, target.targetHash, candidate.content_hash, "plan-absent"]));
+					return { scopeHash: absent, targetHash: target.targetHash, plan: { state: "absent", hash: sha256("absent"), scopeHash: absent, pathHash: sha256("absent") } };
 				};
 				const initial = snapshot();
-				const preview = previewScoutAcceptance({ db: state, root: ENGINE_ROOT, command, witness: ingressWitness, planningRunId: candidate.planning_identity, liveFailureHash: candidate.failed_envelope_hash, ...initial, store: breakGlassPermits });
+				preview = previewScoutAcceptance({ db: state, root: ENGINE_ROOT, command, witness: ingressWitness, planningRunId: candidate.planning_identity, liveFailureHash: candidate.failed_envelope_hash, ...initial, store: breakGlassPermits });
+				const currentPreview = preview;
 				const recheck = async (): Promise<Omit<BreakGlassPreview, "permitId" | "createdAt" | "expiresAt">> => {
 					const currentLive = await requestPlanControl(ENGINE_ROOT, "read-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId }, mainOrigin, parent);
-					if (currentLive.state !== "accepted" || currentLive.failureHash !== preview.failureHash) throw new Error(currentLive.reason ?? "recovery lineage changed");
+					if (currentLive.state !== "accepted" || currentLive.failureHash !== currentPreview.failureHash) throw new Error(currentLive.reason ?? "recovery lineage changed");
 					const currentCandidate = state!.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
-					if (!currentCandidate || currentCandidate.content_hash !== preview.candidateHash || currentCandidate.bytes !== preview.candidateBytes || currentCandidate.failed_envelope_hash !== preview.failureHash) throw new Error("recovery candidate changed");
+					if (!currentCandidate || currentCandidate.content_hash !== currentPreview.candidateHash || currentCandidate.bytes !== currentPreview.candidateBytes || currentCandidate.failed_envelope_hash !== currentPreview.failureHash) throw new Error("recovery candidate changed");
 					const current = snapshot();
-					const { permitId: _permitId, createdAt: _createdAt, expiresAt: _expiresAt, ...expected } = preview;
+					const { permitId: _permitId, createdAt: _createdAt, expiresAt: _expiresAt, ...expected } = currentPreview;
 					return { ...expected, ...current, plan: { ...current.plan }, bypassed: [...expected.bypassed] as ["plan.scout.transport-input"], preserved: [...expected.preserved], blockers: [] };
 				};
 				const accepted = await resolveScoutAcceptance({
-					db: state, root: ENGINE_ROOT, store: breakGlassPermits, preview, witness: ingressWitness, sourceUid: process.getuid!(),
+					db: state, root: ENGINE_ROOT, store: breakGlassPermits, preview: currentPreview, witness: ingressWitness, sourceUid: process.getuid!(),
 					confirm: async (value) => ctx.hasUI && await ctx.ui.confirm("Audited break-glass", `${value.ticket} accepts candidate ${value.candidateId}\nsource-run: ${value.sourceRunId}\nbytes: ${value.candidateBytes}\npayload-hash: ${value.candidateHash}\nfailure-category: failed-transport-envelope\nfailure-hash: ${value.failureHash}\nreason: ${value.reason}\nstatus: pending engineer confirmation\nresult: plan-only; /do still needs fresh approval`, { timeout: Math.max(1, value.expiresAt - Date.now()) }),
 					recheck,
 					continueLineage: async () => {
 						const continued = await requestPlanControl(ENGINE_ROOT, "continue-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash }, mainOrigin, parent);
 						if (continued.state !== "accepted" || !continued.planningIdentity || !continued.generation) throw new Error(continued.reason ?? "recovery continuation refused");
+						const recovery = listRuns.admitRecovery(candidate.planning_identity, continued.generation);
+						if (recovery.recoveryRunId !== continued.planningIdentity) throw new Error("recovery list identity changed");
 						return { planningIdentity: continued.planningIdentity, generation: continued.generation };
 					},
 				});
@@ -1568,7 +1592,9 @@ export default function (pi: ExtensionAPI) {
 				ingressWitness = undefined;
 				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId}; accepted-input ${accepted.acceptance.id}; source-run ${candidate.run_id}; failure failed-transport-envelope ${candidate.failed_envelope_hash}; status accepted as ${accepted.planningIdentity}; result remains plan-only`, "warning");
 			} catch (error) {
-				breakGlassPermits.revoke();
+				const outcome = /expired/i.test((error as Error).message) ? "expiry" : "refusal";
+				try { auditRecoveryPreviews(breakGlassPermits.revoke(), outcome); }
+				catch (auditError) { ctx.ui.notify(`break-glass audit failed: ${(auditError as Error).message}`, "error"); }
 				ctx.ui.notify(`break-glass refused: ${(error as Error).message}`, "error");
 			} finally { state?.close(); }
 		},
@@ -1635,7 +1661,7 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown = true;
 		uninstallIngress?.();
 		uninstallIngress = undefined;
-		breakGlassPermits.revoke();
+		auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
 		workflowIngress.revoke();
 		ingressWitness = undefined;
 		await fenceListRuns("parent session shutdown");
@@ -1989,6 +2015,11 @@ export default function (pi: ExtensionAPI) {
 						planningIdentity = accepted.continuation_id;
 						incident = incidentById(state, accepted.incident_id);
 						if (!incident) throw new Error("plan-writer incident is missing");
+						const target = resolvePublicationTarget(state, identity.ticket);
+						if (target.targetHash !== incident.target_hash) throw new Error("plan-writer recovery target changed");
+						const recorded = state.prepare("SELECT plan FROM work WHERE ticket=?").get(identity.ticket) as { plan?: string | null } | undefined;
+						const plan = recorded?.plan ? (() => { const binding = readRecordedPlanBinding(ENGINE_ROOT, identity.ticket!); return { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) }; })() : (() => { const scopeHash = sha256(JSON.stringify([identity.ticket, target.targetHash, accepted.content_hash, "plan-absent"])); return { state: "absent", hash: sha256("absent"), scopeHash, pathHash: sha256("absent") }; })();
+						if (incident.scope_hash !== plan.scopeHash || incident.plan_state !== plan.state || incident.plan_hash !== plan.hash || incident.plan_scope_hash !== plan.scopeHash || incident.plan_path_hash !== plan.pathHash) throw new Error("plan-writer recovery plan or scope changed");
 						provenance = `engineer-accepted-input incident=${accepted.incident_id} candidate=${accepted.candidate_id} source-run=${accepted.source_run_id} failure=${accepted.failure_hash} skipped=${accepted.skipped_json} preserved=${accepted.preserved_json} plan-only=true`;
 						markerInstructions = `\n\nThe plan's Assumptions section must preserve these exact audit lines:\nBREAK-GLASS: engineer-accepted-input\nincident: ${accepted.incident_id}\nsource-run: ${accepted.source_run_id}\nsource-hash: ${accepted.content_hash}\nreason: ${accepted.incident_reason}\nskipped: failed-transport-envelope`;
 					} else if (accepted.source_kind !== "normal-transport" || accepted.owner_session_id !== sessionId) throw new Error("plan-writer normal source is not owned by this plan worker");

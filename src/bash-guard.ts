@@ -13,6 +13,7 @@
 import { join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -192,6 +193,7 @@ export function judge(
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
   settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
+  assertMandatoryBoundary("workflow.assigned-scope", !!toolName, "guard call has no tool identity");
   const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
   const paneled = mode !== undefined && mode !== "";

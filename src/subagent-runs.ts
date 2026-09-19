@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { JsonlAggregateValidator } from "./jsonl-aggregate.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
@@ -66,7 +67,7 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
   const ticket = task.ticket ?? defaultTicket;
   if (task.agent === "plan-scout" && !ticket) throw new Error("plan-scout requires an explicit ticket binding");
   if (task.agent === "plan-scout" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-scout ticket differs from the stamped plan ticket");
-  if (task.agent === "plan-writer" && (!ticket || !Number.isSafeInteger(task.acceptedInputId) || task.acceptedInputId! < 1)) throw new Error("plan-writer requires an explicit ticket and acceptedInputId");
+  if (task.agent === "plan-writer") assertMandatoryBoundary("plan.writer.admission", !!ticket && Number.isSafeInteger(task.acceptedInputId) && task.acceptedInputId! > 0, "plan-writer requires an explicit ticket and acceptedInputId");
   if (task.agent === "plan-writer" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-writer ticket differs from the stamped plan ticket");
   if (task.writerRevisionOf && !/^[a-f0-9]{64}$/.test(task.writerRevisionOf)) throw new Error("writerRevisionOf must be a full draft hash");
   if (task.agent === "task-reviewer" && !task.review) throw new Error("task-reviewer requires review.baseSha and review.headSha");
@@ -170,6 +171,10 @@ export interface ScoutCompletenessEvidence {
   retry: boolean;
   compaction: boolean;
   summaryRetry: boolean;
+  agentSettled: boolean;
+  settledSequence?: number;
+  queueKnown: boolean;
+  queueEmpty: boolean;
 }
 const eventNames = new Set(["session", "entry_appended", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished", "queue_update", "extension_error", "response", "extension_ui_request"]);
 export class JsonlObservation {
@@ -194,6 +199,10 @@ export class JsonlObservation {
   private retry = false;
   private compaction = false;
   private summaryRetry = false;
+  private agentSettled = false;
+  private settledSequence?: number;
+  private queueKnown = false;
+  private queueEmpty = false;
   private counts: Record<string, number> = {};
   stdoutBytes = 0;
   sessionId?: string;
@@ -321,13 +330,23 @@ export class JsonlObservation {
     if (event.type === "compaction_end") this.compaction = false;
     if (event.type === "summarization_retry_scheduled" || event.type === "summarization_retry_attempt_start") this.summaryRetry = true;
     if (event.type === "summarization_retry_finished") this.summaryRetry = false;
+    if (event.type === "queue_update") {
+      this.queueKnown = true;
+      this.queueEmpty = !(Array.isArray(event.steering) && event.steering.length) && !(Array.isArray(event.followUp) && event.followUp.length);
+    }
+    if (event.type === "agent_settled") {
+      this.agentSettled = true;
+      this.settledSequence = this.eventSequence;
+      this.queueKnown = true;
+      this.queueEmpty = true;
+    }
     this.onEvent?.(event);
   }
   evidence(): ScoutCompletenessEvidence {
-    return Object.freeze({ stdoutBytes: this.stdoutBytes, eventCount: this.eventSequence, finalSequence: this.finalSequence, finalBytes: Buffer.byteLength(this.finalText), finalHash: sha256(this.finalText), sessionId: this.sessionId, stopReason: this.stopReason, errors: Object.freeze(this.errorHistory.map((entry) => Object.freeze({ ...entry }))), recordLimit: this.recordLimit, partialRecord: this.partialRecord, invalidUtf8: this.invalidUtf8, lostSource: this.lostSource, exhaustedEvidence: this.exhaustedEvidence, activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry });
+    return Object.freeze({ stdoutBytes: this.stdoutBytes, eventCount: this.eventSequence, finalSequence: this.finalSequence, finalBytes: Buffer.byteLength(this.finalText), finalHash: sha256(this.finalText), sessionId: this.sessionId, stopReason: this.stopReason, errors: Object.freeze(this.errorHistory.map((entry) => Object.freeze({ ...entry }))), recordLimit: this.recordLimit, partialRecord: this.partialRecord, invalidUtf8: this.invalidUtf8, lostSource: this.lostSource, exhaustedEvidence: this.exhaustedEvidence, activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, agentSettled: this.agentSettled, settledSequence: this.settledSequence, queueKnown: this.queueKnown, queueEmpty: this.queueEmpty });
   }
   metadata() {
-    return { stdoutBytes: this.stdoutBytes, events: { ...this.counts }, parserErrors: this.errors, lastParserError: this.lastError, errorHistory: this.errorHistory.map((entry) => ({ ...entry })), partialBytes: this.recordBytes, partialHash: this.recordHash.copy().digest("hex"), activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, phase: this.phase, firstByteAt: this.firstByteAt, lastEventAt: this.lastEventAt, finalAt: this.finalAt };
+    return { stdoutBytes: this.stdoutBytes, events: { ...this.counts }, parserErrors: this.errors, lastParserError: this.lastError, errorHistory: this.errorHistory.map((entry) => ({ ...entry })), partialBytes: this.recordBytes, partialHash: this.recordHash.copy().digest("hex"), activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, agentSettled: this.agentSettled, settledSequence: this.settledSequence, queueKnown: this.queueKnown, queueEmpty: this.queueEmpty, phase: this.phase, firstByteAt: this.firstByteAt, lastEventAt: this.lastEventAt, finalAt: this.finalAt };
   }
 }
 

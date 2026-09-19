@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { CustomEditor, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteProvider, EditorComponent, EditorTheme, TUI } from "@earendil-works/pi-tui";
+import type { AutocompleteProvider, EditorComponent, EditorTheme, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { sha256 } from "./subagent-runs.ts";
 
@@ -57,6 +57,10 @@ class DelegatingEditor implements EditorComponent {
   set onSubmit(value: ((text: string) => void) | undefined) { this.submitHandler = value; }
   get onChange(): ((text: string) => void) | undefined { return this.delegate.onChange; }
   set onChange(value: ((text: string) => void) | undefined) { this.delegate.onChange = value; }
+  get focused(): boolean { return "focused" in this.delegate ? Boolean((this.delegate as EditorComponent & { focused: boolean }).focused) : false; }
+  set focused(value: boolean) { if ("focused" in this.delegate) (this.delegate as EditorComponent & { focused: boolean }).focused = value; }
+  get wantsKeyRelease(): boolean | undefined { return this.delegate.wantsKeyRelease; }
+  set wantsKeyRelease(value: boolean | undefined) { this.delegate.wantsKeyRelease = value; }
   get borderColor(): ((str: string) => string) | undefined { return this.delegate.borderColor; }
   set borderColor(value: ((str: string) => string) | undefined) { this.delegate.borderColor = value; }
   getText(): string { return this.delegate.getText(); }
@@ -69,6 +73,7 @@ class DelegatingEditor implements EditorComponent {
     finally { this.handling = false; this.beforeInput = undefined; }
   }
   render(width: number): string[] { return this.delegate.render(width); }
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined { return this.delegate.handleMouse?.(event); }
   invalidate(): void { this.delegate.invalidate(); }
   addToHistory(text: string): void { this.delegate.addToHistory?.(text); }
   insertTextAtCursor(text: string): void { this.delegate.insertTextAtCursor?.(text); }

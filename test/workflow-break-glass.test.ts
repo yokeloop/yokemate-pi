@@ -20,6 +20,7 @@ function setup() {
   const childSession = "11111111-1111-4111-8111-111111111111";
   observation.write(Buffer.from(JSON.stringify({ type: "session", id: childSession }) + "\n"));
   observation.write(Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "# Complete scout\n\nFacts.\n" }], stopReason: "stop" } }) + "\n"));
+  observation.write(Buffer.from(JSON.stringify({ type: "agent_settled" }) + "\n"));
   observation.end();
   const envelope = resultEnvelope(identity, task, { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop", protocolError: true }, observation.finalText);
   const captured = captureScoutCandidate({ root, identity, envelope, finalText: observation.finalText, childSessionId: childSession, evidence: observation.evidence(), planningIdentity: "plan-run", generation: 1, parentRuntimeId: "runtime", parentSessionId: "main-session" });

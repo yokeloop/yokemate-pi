@@ -7,6 +7,7 @@ import { openDb } from "./db.ts";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { ReadyEntry, ReadyReceipt } from "./ready.ts";
 import { requiredJobs, type RequiredJob } from "./required-checks.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface CoordinatorOutcome { outcome: "done" | "blocked"; summary: string; reason?: string; passedTickets?: string[] }
 export interface ShipPartOutcome { repo: string; pr: string; head?: string; state: "merged" | "remaining" | "unknown"; reason?: string }
@@ -52,6 +53,7 @@ export function verifyGate(facts: GateFacts): GateVerdict {
     }
     heads[repo] = pr.headRefOid;
   }
+  assertMandatoryBoundary("workflow.quality-gates", true);
   return { ok: true, heads };
 }
 

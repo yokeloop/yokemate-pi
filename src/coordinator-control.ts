@@ -9,6 +9,7 @@ import type { CoordinatorMergeRequest, CoordinatorMergeResult } from "./coordina
 import type { ShipFinalizeResult } from "./ship-finalize.ts";
 import { observePlanProcess, type PlanProcessObserver } from "./plan-lifecycle.ts";
 import type { PublicationOutcome } from "./plan-publication-state.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
 export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; candidateId?: string; failureHash?: string; generation?: number; writerRunId?: string }
@@ -73,6 +74,7 @@ function descendantOf(pid: number, starttime: string, ancestor: number, ancestor
 }
 
 export function bindCoordinatorControl(root: string, parent: ParentControl, identity: ParentIdentity, env: NodeJS.ProcessEnv = process.env, uid = process.getuid!()): net.Server {
+  assertMandatoryBoundary("workflow.live-owner", identity.pid === process.pid && processMatches(identity.pid, identity.starttime), "coordinator parent identity is not live");
   const canonicalRoot = resolve(root);
   const directory = join(socketDir(env, uid), "coordinators");
   const sock = coordinatorSocketPath(canonicalRoot, env, uid);

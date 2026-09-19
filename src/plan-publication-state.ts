@@ -67,7 +67,6 @@ export interface PublicationIdentityInput {
   child?: ChildIdentity;
   planPath?: string;
   scopeHash?: string;
-  provenance?: PublicationProvenance;
 }
 export type ScoutInputSource = "normal-transport" | "engineer-accepted-input";
 export interface PublicationAcceptanceRow extends ArtifactMetadata {
@@ -166,12 +165,11 @@ export function writePublicationArtifact(root: string, ticket: string, kind: Pub
   return target;
 }
 
-export function acceptPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput): PublicationRow {
+function acceptPublicationWithProvenance(db: DatabaseSync, root: string, input: PublicationIdentityInput, provenance: PublicationProvenance): PublicationRow {
   const contentHash = sha256(input.bytes);
   const artifact = writePublicationArtifact(root, input.ticket, input.kind, contentHash, input.bytes);
-  const provenance = input.provenance ?? { source_kind: "normal-transport", incident_id: null, candidate_id: null, source_run_id: null, failure_hash: null, payload_hash: null, skipped_json: null, preserved_json: null, incident_reason: null };
   if (provenance.source_kind === "engineer-accepted-input" && (!provenance.incident_id || !provenance.candidate_id || !provenance.source_run_id || !provenance.failure_hash || !provenance.payload_hash || !provenance.skipped_json || !provenance.preserved_json || !provenance.incident_reason)) throw new Error("artifact_invalid");
-  const provenanceKey = provenance.source_kind === "normal-transport" ? "normal" : `incident:${provenance.incident_id}:candidate:${provenance.candidate_id}:failure:${provenance.failure_hash}`;
+  const provenanceKey = provenance.source_kind === "normal-transport" ? "normal" : `incident:${provenance.incident_id}`;
   db.prepare(`INSERT INTO plan_publication
     (target,target_hash,ticket,kind,content_hash,provenance_key,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -184,6 +182,23 @@ export function acceptPublication(db: DatabaseSync, root: string, input: Publica
   const row = db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=? AND provenance_key=?").get(input.target, input.ticket, input.kind, contentHash, provenanceKey) as unknown as PublicationRow;
   if (row.target_hash !== input.targetHash || row.artifact_path !== artifact || row.bytes !== input.bytes.length || row.source_kind !== provenance.source_kind || row.incident_id !== provenance.incident_id || row.candidate_id !== provenance.candidate_id || row.failure_hash !== provenance.failure_hash) throw new Error("artifact_invalid");
   return row;
+}
+
+const normalPublicationProvenance = (): PublicationProvenance => ({ source_kind: "normal-transport", incident_id: null, candidate_id: null, source_run_id: null, failure_hash: null, payload_hash: null, skipped_json: null, preserved_json: null, incident_reason: null });
+
+export function acceptPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput): PublicationRow {
+  return acceptPublicationWithProvenance(db, root, input, normalPublicationProvenance());
+}
+
+export function acceptRecoveredPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput, acceptanceId: number): PublicationRow {
+  const acceptance = publicationAcceptanceById(db, acceptanceId);
+  if (!acceptance || acceptance.ticket !== input.ticket || acceptance.source_kind !== "engineer-accepted-input" || !acceptance.incident_id || !acceptance.candidate_id) throw new Error("artifact_invalid");
+  if (input.kind === "scout" && (sha256(input.bytes) !== acceptance.content_hash || input.bytes.length !== acceptance.bytes)) throw new Error("artifact_invalid");
+  if (input.kind === "plan") {
+    const record = db.prepare("SELECT id FROM plan_record WHERE ticket=? AND scout_acceptance=? AND content_hash=? AND successful_record=1").get(input.ticket, acceptance.id, sha256(input.bytes));
+    if (!record) throw new Error("artifact_invalid");
+  }
+  return acceptPublicationWithProvenance(db, root, input, acceptance);
 }
 
 function deliveryRow(db: DatabaseSync, child: ChildIdentity): PublicationAcceptanceRow | undefined {

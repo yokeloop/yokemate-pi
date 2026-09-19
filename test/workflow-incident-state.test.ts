@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { openDb } from "../src/db.ts";
 import { captureScoutCandidate } from "../src/plan-scout-recovery.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptRecoveredScoutArtifact, acceptScoutArtifact, publicationAcceptanceById, writePublicationArtifact } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublicationDelivery, acceptRecoveredPublication, acceptRecoveredScoutArtifact, acceptScoutArtifact, publicationAcceptanceById, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { ChildRuns, JsonlObservation, resultEnvelope, sha256 } from "../src/subagent-runs.ts";
-import { claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, recordWriterDraft, safeIncidentReason } from "../src/workflow-incident-state.ts";
+import { appendRecoveryAttempt, claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, recordWriterDraft, safeIncidentReason } from "../src/workflow-incident-state.ts";
 
 function candidateFixture(root: string) {
   mkdirSync(join(root, ".pi"), { recursive: true });
@@ -19,6 +19,7 @@ function candidateFixture(root: string) {
   observed.write(Buffer.from(JSON.stringify({ type: "session", id: sessionId }) + "\n"));
   const text = "# Exact scout\n\nEvidence.\n";
   observed.write(Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } }) + "\n"));
+  observed.write(Buffer.from(JSON.stringify({ type: "agent_settled" }) + "\n"));
   observed.end();
   const envelope = resultEnvelope(identity, task, { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop", protocolError: true }, observed.finalText);
   const result = captureScoutCandidate({ root, identity, envelope, finalText: observed.finalText, childSessionId: sessionId, evidence: observed.evidence(), planningIdentity: "plan-run:1", generation: 1, parentRuntimeId: "runtime", parentSessionId: "parent-session" });
@@ -34,6 +35,7 @@ const incidentInput = (candidateId: string, contentHash: string) => ({
   inputHash: sha256("typed raw input"),
   scopeHash: sha256("scope"),
   targetHash: sha256("target"),
+  plan: { state: "absent" as const, hash: sha256("absent"), scopeHash: sha256("scope"), pathHash: sha256("absent") },
   reason: "The transport failed after a complete owned final.",
   sourceUid: process.getuid!(),
   sourceSessionId: "parent-session",
@@ -58,7 +60,7 @@ test("candidate consumption, acceptance and audit commit atomically and survive 
     assert.equal(consumed.value.incident_id, consumed.incident.id);
     assert.equal(consumed.value.candidate_id, row.id);
     assert.equal(consumed.value.failure_hash, row.failed_envelope_hash);
-    const publication = acceptPublication(db, root, { target: "github:org/repo#1", targetHash: sha256("github:org/repo#1"), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# Exact scout\n\nEvidence.\n"), runId: row.run_id, provenance: consumed.value });
+    const publication = acceptRecoveredPublication(db, root, { target: "github:org/repo#1", targetHash: sha256("github:org/repo#1"), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# Exact scout\n\nEvidence.\n"), runId: row.run_id }, consumed.value.id);
     const linked = acceptPublicationDelivery(db, publication.id, candidate.child);
     assert.equal(linked.publication_id, publication.id);
     assert.equal(publication.source_kind, "engineer-accepted-input");
@@ -98,6 +100,19 @@ test("recovered plan records require immutable incident and correlated writer pr
     assert.equal(record.source_kind, "engineer-accepted-input");
     assert.equal(record.incident_id, consumed.incident.id);
     assert.equal(record.writer_run_id, "writer-run");
+    db.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("refusal, revoke and expiry attempts are durable append-only audit facts", () => {
+  const root = mkdtempSync(join(tmpdir(), "incident-attempt-"));
+  try {
+    const candidate = candidateFixture(root);
+    const db = openDb(join(root, "yokemate.db"));
+    const row = persistScoutCandidate(db, root, candidate);
+    for (const outcome of ["refusal", "revoke", "expiry"] as const) appendRecoveryAttempt(db, { candidateId: row.id, ticket: row.ticket, action: "accept-plan-scout-input", inputGeneration: 1, inputHash: sha256("input"), scopeHash: sha256("scope"), targetHash: sha256("target"), sourceUid: process.getuid!(), sourceSessionId: "session", sourceRuntimeId: "runtime", payloadHash: row.content_hash, failureHash: row.failed_envelope_hash, reason: "Transport recovery decision.", outcome });
+    assert.equal(db.prepare("SELECT count(*) AS n FROM workflow_recovery_attempt").get()?.n, 3);
+    assert.throws(() => db.prepare("DELETE FROM workflow_recovery_attempt").run(), /append-only/);
     db.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

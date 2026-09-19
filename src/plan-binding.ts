@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseAffected } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface PlanBinding { ticket: string; path: string; contentHash: string; scopeHash: string; repositories: string[] }
 export interface CandidatePlanSnapshot extends PlanBinding { bytes: Buffer; text: string }
@@ -67,7 +68,6 @@ export function readRecordedPlanBinding(root: string, ticket: string): PlanBindi
 }
 
 export function assertPlanBinding(expected: PlanBinding, actual: PlanBinding): void {
-  for (const [key, reason] of [["ticket", "ticket"], ["path", "path"], ["repositories", "repositories"], ["scopeHash", "scope"], ["contentHash", "content hash"]] as const) {
-    if (JSON.stringify(expected[key]) !== JSON.stringify(actual[key])) throw new Error(`do approval ${reason} changed for ${expected.ticket}; approve the current recorded plan again`);
-  }
+  for (const [key, reason] of [["ticket", "ticket"], ["path", "path"], ["repositories", "repositories"], ["scopeHash", "scope"], ["contentHash", "content hash"]] as const)
+    assertMandatoryBoundary("workflow.plan-binding", JSON.stringify(expected[key]) === JSON.stringify(actual[key]), `do approval ${reason} changed for ${expected.ticket}; approve the current recorded plan again`);
 }

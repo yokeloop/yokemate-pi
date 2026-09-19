@@ -208,7 +208,8 @@ export function reconcilePublication(input: PublicationFrameInput, comments: Rem
     if (item === "malformed") throw new PublicationFailure("remote_conflict");
     if (item) parsed.push(item);
   }
-  const revision = parsed.filter((item) => item.target === input.targetHash && item.ticket === input.ticket && item.kind === input.kind && item.hash === input.hash);
+  const provenanceMatches = (item: ParsedPart): boolean => input.provenance ? !!item.provenance && JSON.stringify(item.provenance) === JSON.stringify(input.provenance) : item.provenance === undefined;
+  const revision = parsed.filter((item) => item.target === input.targetHash && item.ticket === input.ticket && item.kind === input.kind && item.hash === input.hash && provenanceMatches(item));
   const runs = new Set(revision.map((item) => item.run));
   if (runs.size > 1) throw new PublicationFailure("remote_conflict");
   const run = revision[0]?.run ?? input.run;

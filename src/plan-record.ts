@@ -8,10 +8,12 @@ import { readRuntimeSettings } from "./guard-policy.ts";
 import { logMoveDetailed } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
-import { assertPlanBinding, readCandidatePlanSnapshot, toPlanBinding, type PlanBinding } from "./plan-binding.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding, toPlanBinding, type PlanBinding } from "./plan-binding.ts";
 import { assertPublishable } from "./plan-publication.ts";
 import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicationAcceptanceById, readPublicationArtifact } from "./plan-publication-state.ts";
 import { appendIncidentEvent, incidentById, writerDraftFor } from "./workflow-incident-state.ts";
+import { resolvePublicationTarget } from "./plan-publication-target.ts";
+import { sha256 } from "./subagent-runs.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
 export interface RecordPlanOptions { expectedBinding: PlanBinding; recordId: number; signal?: AbortSignal; onLocked?(): void }
@@ -38,6 +40,10 @@ function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBi
       incident = incidentById(db, scout.incident_id);
       const draft = writerDraftFor(db, candidate.contentHash);
       if (!incident || !draft || draft.accepted_input_id !== scout.id || draft.planning_identity !== scout.continuation_id || draft.writer_run_id !== record.writer_run_id || draft.writer_task_hash !== record.writer_task_hash || draft.writer_actual_task_hash !== record.writer_actual_task_hash || draft.plan_path !== candidate.path || draft.bytes !== candidate.bytes.length) throw new Error("binding_changed");
+      const target = resolvePublicationTarget(db, ticket);
+      const current = db.prepare("SELECT plan FROM work WHERE ticket=?").get(ticket) as { plan?: string | null } | undefined;
+      const plan = current?.plan ? (() => { const binding = readRecordedPlanBinding(root, ticket); return { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) }; })() : (() => { const scopeHash = sha256(JSON.stringify([ticket, target.targetHash, scout.content_hash, "plan-absent"])); return { state: "absent", hash: sha256("absent"), scopeHash, pathHash: sha256("absent") }; })();
+      if (incident.target_hash !== target.targetHash || incident.scope_hash !== plan.scopeHash || incident.plan_state !== plan.state || incident.plan_hash !== plan.hash || incident.plan_scope_hash !== plan.scopeHash || incident.plan_path_hash !== plan.pathHash) throw new Error("binding_changed");
       const markers = ["BREAK-GLASS: engineer-accepted-input", `incident: ${scout.incident_id}`, `source-run: ${scout.source_run_id}`, `source-hash: ${scout.content_hash}`, `reason: ${scout.incident_reason}`, "skipped: failed-transport-envelope"];
       if (markers.some((marker) => !candidate.text.includes(marker))) throw new Error("binding_changed");
     }

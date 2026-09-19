@@ -5,6 +5,9 @@ import { installWorkflowIngress, WorkflowIngressWitnessStore } from "../src/work
 
 class FakeEditor implements EditorComponent {
   text = "";
+  focused = false;
+  wantsKeyRelease = true;
+  mouseEvents = 0;
   onSubmit?: (text: string) => void;
   onChange?: (text: string) => void;
   getText() { return this.text; }
@@ -20,6 +23,7 @@ class FakeEditor implements EditorComponent {
       this.onChange?.(this.text);
     } else this.text += data;
   }
+  handleMouse() { this.mouseEvents++; return undefined; }
   render() { return [this.text]; }
   invalidate() {}
 }
@@ -33,6 +37,10 @@ test("delegating editor witnesses only an actual host submit and snapshots raw e
   const wrapped = factory({}, {}, {});
   const submitted: string[] = [];
   wrapped.onSubmit = (value: string) => submitted.push(value);
+  wrapped.focused = true;
+  assert.equal(wrapped.focused, true);
+  assert.equal(wrapped.wantsKeyRelease, true);
+  assert.equal(wrapped.handleMouse?.({} as never), undefined);
   wrapped.setText("  exact raw  ");
   wrapped.handleInput("COMPLETE");
   assert.deepEqual(raw, []);

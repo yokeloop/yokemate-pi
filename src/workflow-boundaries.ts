@@ -37,6 +37,8 @@ export interface WorkflowBoundary {
   readonly action?: typeof RECOVERY_ACTION;
 }
 
+export class WorkflowBoundaryError extends Error {}
+
 export interface WorkflowBoundaryEvaluation {
   readonly id: WorkflowBoundaryId;
   readonly applicable: boolean;
@@ -68,6 +70,36 @@ export const MANDATORY_WORKFLOW_BOUNDARIES = Object.freeze({
   "plan.scout.complete-bytes": mandatory("plan.scout.complete-bytes", "plan-scout", ["subagent-runs.JsonlObservation", "plan-scout-recovery", "subagent.runSingleAgent", "plan-publication-state"]),
   "plan.writer.admission": mandatory("plan.writer.admission", "plan-writer", ["subagent.execute", "subagent.runDetachedAgent", "workflow-incident-state.claimWriterDispatch", "plan-record"]),
 } satisfies Record<MandatoryWorkflowBoundaryId, WorkflowBoundary>);
+
+export const WORKFLOW_BOUNDARY_CONSUMER_MANIFEST = Object.freeze({
+  "bash-guard": ["workflow.assigned-scope"],
+  guards: ["workflow.assigned-scope"],
+  "mode-guard": ["workflow.target-identity"],
+  "mode-tab": ["workflow.target-identity", "workflow.explicit-ship"],
+  stage: ["workflow.target-identity"],
+  transitions: ["workflow.target-identity"],
+  "report-guard": ["workflow.ready-pr-report"],
+  bus: ["workflow.target-identity"],
+  inbox: ["workflow.target-identity", "workflow.live-owner"],
+  "guard-policy": [],
+  "coordinator-runtime": ["workflow.live-owner", "workflow.single-use", "workflow.explicit-ship"],
+  "list-run": ["workflow.live-owner", "workflow.terminal-lineage", "workflow.assigned-scope"],
+  "coordinator-control": ["workflow.live-owner", "workflow.terminal-lineage", "workflow.do-authority", "workflow.plan-binding", "workflow.truthful-outcome"],
+  "coordinator-launch": ["workflow.assigned-scope", "workflow.required-data", "workflow.explicit-ship", "workflow.do-authority"],
+  "plan-binding": ["workflow.plan-binding", "workflow.required-data"],
+  "research-guard": ["workflow.required-data", "workflow.external-auth"],
+  "workflow-approval": ["workflow.do-authority", "workflow.live-owner", "workflow.single-use", "workflow.external-auth"],
+  "coordinator-result": ["workflow.quality-gates", "workflow.truthful-outcome", "workflow.terminal-lineage"],
+  "record-report": ["workflow.ready-pr-report", "workflow.quality-gates", "workflow.truthful-outcome"],
+  "coordinator-merge": ["workflow.explicit-ship", "workflow.quality-gates", "workflow.live-owner"],
+  "subagent-runs": ["workflow.assigned-scope", "workflow.live-owner", "workflow.terminal-lineage", "plan.scout.complete-bytes", "plan.writer.admission"],
+  "plan-publication-target": ["workflow.target-identity", "workflow.required-data", "workflow.external-auth"],
+  "workflow-incident-state": ["workflow.audit", "workflow.single-use", "plan.writer.admission"],
+  "workflow-break-glass": ["workflow.audit", "workflow.single-use", "plan.scout.complete-bytes"],
+  "plan-record": ["workflow.audit", "workflow.plan-binding", "workflow.truthful-outcome", "plan.writer.admission"],
+  "plan-publication": ["workflow.audit", "workflow.external-auth"],
+  "subagent-extension": ["workflow.assigned-scope", "workflow.required-data", "workflow.external-auth", "workflow.do-authority", "workflow.explicit-ship", "workflow.live-owner", "workflow.terminal-lineage", "workflow.truthful-outcome", "plan.scout.complete-bytes", "plan.writer.admission"],
+} satisfies Record<string, readonly MandatoryWorkflowBoundaryId[]>);
 
 export const RECOVERABLE_WORKFLOW_BOUNDARY: WorkflowBoundary = Object.freeze({
   id: RECOVERABLE_WORKFLOW_BOUNDARY_ID,
@@ -104,8 +136,14 @@ export function evaluateWorkflowBoundary(
   }
 }
 
+export function assertMandatoryBoundary(id: MandatoryWorkflowBoundaryId, satisfied: boolean, reason?: string): void {
+  const boundary = MANDATORY_WORKFLOW_BOUNDARIES[id];
+  const evaluation = evaluateWorkflowBoundary(boundary, { satisfied, reason });
+  if (evaluation.verdict !== "allow") throw new WorkflowBoundaryError(`${id}: ${evaluation.reason}`);
+}
+
 export function assertRecoveryBoundary(id: string, action: string): void {
-  if (id !== RECOVERABLE_WORKFLOW_BOUNDARY_ID || action !== RECOVERY_ACTION) throw new Error("unknown or immutable workflow boundary");
+  if (id !== RECOVERABLE_WORKFLOW_BOUNDARY_ID || action !== RECOVERY_ACTION) throw new WorkflowBoundaryError("unknown or immutable workflow boundary");
   const verdict = evaluateWorkflowBoundary(RECOVERABLE_WORKFLOW_BOUNDARY, { satisfied: true, action });
-  if (verdict.verdict !== "allow") throw new Error(verdict.reason);
+  if (verdict.verdict !== "allow") throw new WorkflowBoundaryError(verdict.reason);
 }

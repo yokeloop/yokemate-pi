@@ -19,6 +19,7 @@ import { RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRu
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
+import { WorkflowBoundaryError } from "./workflow-boundaries.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -104,7 +105,7 @@ export default function guards(pi: ExtensionAPI) {
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
-      if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
+      if (e instanceof RuntimeSettingsError || e instanceof WorkflowBoundaryError) return { block: true, reason: e.message };
       if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }

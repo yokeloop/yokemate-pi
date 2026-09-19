@@ -38,6 +38,10 @@ export interface WorkflowIncidentRow {
   input_hash: string;
   scope_hash: string;
   target_hash: string;
+  plan_state: "absent" | "recorded";
+  plan_hash: string;
+  plan_scope_hash: string;
+  plan_path_hash: string;
   reason: string;
   source_uid: number;
   source_session_id: string;
@@ -170,6 +174,38 @@ export function appendIncidentEvent(db: DatabaseSync, incident: WorkflowIncident
   return db.prepare("SELECT * FROM workflow_incident_event WHERE id=?").get(Number(result.lastInsertRowid)) as unknown as WorkflowIncidentEventRow;
 }
 
+export interface RecoveryAttemptInput {
+  candidateId: string;
+  ticket: string;
+  action: string;
+  inputGeneration: number;
+  inputHash: string;
+  scopeHash: string;
+  targetHash: string;
+  sourceUid: number;
+  sourceSessionId: string;
+  sourceRuntimeId: string;
+  payloadHash: string;
+  failureHash: string;
+  reason: string;
+  outcome: "refusal" | "revoke" | "expiry";
+}
+
+export function appendRecoveryAttempt(db: DatabaseSync, input: RecoveryAttemptInput): string {
+  assertRecoveryBoundary("plan.scout.transport-input", input.action);
+  for (const [value, label] of [[input.inputHash, "input hash"], [input.scopeHash, "scope hash"], [input.targetHash, "target hash"], [input.payloadHash, "payload hash"], [input.failureHash, "failure hash"]] as const) safeHash(value, label);
+  if (!Number.isSafeInteger(input.inputGeneration) || input.inputGeneration < 1 || !Number.isSafeInteger(input.sourceUid) || input.sourceUid < 0) throw new Error("invalid recovery attempt source");
+  const id = randomUUID();
+  db.prepare(`INSERT INTO workflow_recovery_attempt
+    (id,candidate_id,ticket,action,input_generation,input_hash,scope_hash,target_hash,source_uid,source_session_id,source_runtime_id,payload_hash,failure_hash,reason,outcome)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    id, input.candidateId, input.ticket, RECOVERY_ACTION, input.inputGeneration, input.inputHash, input.scopeHash, input.targetHash,
+    input.sourceUid, safeId(input.sourceSessionId, "source session"), safeId(input.sourceRuntimeId, "source runtime"), input.payloadHash,
+    input.failureHash, safeIncidentReason(input.reason), input.outcome,
+  );
+  return id;
+}
+
 export interface ConsumeScoutIncidentInput {
   candidateId: string;
   ticket: string;
@@ -178,6 +214,7 @@ export interface ConsumeScoutIncidentInput {
   inputHash: string;
   scopeHash: string;
   targetHash: string;
+  plan: { state: "absent" | "recorded"; hash: string; scopeHash: string; pathHash: string };
   reason: string;
   sourceUid: number;
   sourceSessionId: string;
@@ -190,7 +227,7 @@ export interface ConsumeScoutIncidentInput {
 export function consumeScoutIncident<T>(db: DatabaseSync, input: ConsumeScoutIncidentInput, accept: (incident: WorkflowIncidentRow, candidate: ScoutCandidateRow) => T): { incident: WorkflowIncidentRow; value: T } {
   assertRecoveryBoundary("plan.scout.transport-input", RECOVERY_ACTION);
   const reason = safeIncidentReason(input.reason);
-  for (const [value, label] of [[input.inputHash, "input hash"], [input.scopeHash, "scope hash"], [input.targetHash, "target hash"], [input.payloadHash, "payload hash"]] as const) safeHash(value, label);
+  for (const [value, label] of [[input.inputHash, "input hash"], [input.scopeHash, "scope hash"], [input.targetHash, "target hash"], [input.plan.hash, "plan hash"], [input.plan.scopeHash, "plan scope hash"], [input.plan.pathHash, "plan path hash"], [input.payloadHash, "payload hash"]] as const) safeHash(value, label);
   if (!Number.isSafeInteger(input.inputGeneration) || input.inputGeneration < 1 || !Number.isSafeInteger(input.sourceUid) || input.sourceUid < 0) throw new Error("invalid incident source");
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -198,10 +235,10 @@ export function consumeScoutIncident<T>(db: DatabaseSync, input: ConsumeScoutInc
     if (!candidate || candidate.ticket !== input.ticket || candidate.planning_identity !== input.planningIdentity) throw new Error("candidate identity changed");
     const id = randomUUID();
     db.prepare(`INSERT INTO workflow_incident
-      (id,candidate_id,ticket,action,planning_identity,input_generation,input_hash,scope_hash,target_hash,reason,source_uid,source_session_id,source_runtime_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id,candidate_id,ticket,action,planning_identity,input_generation,input_hash,scope_hash,target_hash,plan_state,plan_hash,plan_scope_hash,plan_path_hash,reason,source_uid,source_session_id,source_runtime_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, candidate.id, input.ticket, RECOVERY_ACTION, safeId(input.planningIdentity, "planning identity"), input.inputGeneration,
-      input.inputHash, input.scopeHash, input.targetHash, reason, input.sourceUid,
+      input.inputHash, input.scopeHash, input.targetHash, input.plan.state, input.plan.hash, input.plan.scopeHash, input.plan.pathHash, reason, input.sourceUid,
       safeId(input.sourceSessionId, "source session"), safeId(input.sourceRuntimeId, "source runtime"),
     );
     db.prepare("INSERT INTO workflow_incident_claim(candidate_id,action,incident_id) VALUES (?,?,?)").run(candidate.id, RECOVERY_ACTION, id);

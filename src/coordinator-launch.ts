@@ -10,6 +10,7 @@ import { ticketUrl } from "./ticket-url.ts";
 import { linkTeammates } from "./teammates.ts";
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
@@ -28,7 +29,8 @@ export function validateCoordinatorRequest(request: CoordinatorRequest): void {
   if (request.mode !== "do" && request.mode !== "ship") fail(`unknown coordinator mode ${request.mode}`);
   if (!Array.isArray(request.tickets) || request.tickets.length === 0) fail(`${request.mode} needs at least one ticket`);
   if (new Set(request.tickets).size !== request.tickets.length) fail("ticket list contains duplicates");
-  for (const ticket of request.tickets) if (typeof ticket !== "string" || !KEY.test(ticket) || ticket.includes("..")) fail(`invalid ticket key ${JSON.stringify(ticket)}`);
+  const assigned = request.tickets.every((ticket) => typeof ticket === "string" && KEY.test(ticket) && !ticket.includes(".."));
+  assertMandatoryBoundary("workflow.assigned-scope", assigned, "coordinator ticket scope is invalid");
   if (request.plan && request.mode !== "do") fail("ship does not accept a plan override");
 }
 
@@ -84,6 +86,7 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   const preflight = checkMove("spawn", origin, ticket, expected, { allowFresh: Boolean(request.plan), settings: snapshot });
   if (!preflight.ok) fail(preflight.refuse);
   const parts = partsForPlan(root, ticket, plan);
+  assertMandatoryBoundary("workflow.required-data", parts.length > 0, `${ticket}: no affected repository passports`);
   const model = request.model ?? modelForTicket(db, ticket, "do") ?? poolModel(dataRoot(root), "do");
   mkdirSync(folder, { recursive: true });
   settings(root, folder);

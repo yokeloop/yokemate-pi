@@ -79,7 +79,7 @@ export function evaluateScoutCompleteness(input: CaptureScoutCandidateInput): Sc
   const finalSequence = evidence.finalSequence;
   if (!finalSequence || evidence.errors.some((error) => error.eventSequence >= finalSequence)) return "stale-final";
   if (evidence.recordLimit || evidence.partialRecord || evidence.invalidUtf8 || evidence.lostSource || evidence.exhaustedEvidence) return "lost-source";
-  if (evidence.activeTools || evidence.retry || evidence.compaction || evidence.summaryRetry) return "active-runtime-state";
+  if (evidence.activeTools || evidence.retry || evidence.compaction || evidence.summaryRetry || !evidence.agentSettled || !evidence.settledSequence || evidence.settledSequence <= finalSequence || !evidence.queueKnown || !evidence.queueEmpty) return "active-runtime-state";
   if (!evidence.errors.length || evidence.errors.some((error) => !["invalid_json", "invalid_event"].includes(error.kind))) return "unknown";
   const blocker = input.blockers?.[0];
   if (blocker === "data") return "blocked-data";

@@ -31,7 +31,9 @@ test("recovered publications use incident-v2 markers and cannot reconcile agains
   assert.match(framed[0]!.body, /source: engineer-accepted-input/);
   assert.equal(reconcilePublication(value, framed.map((part) => ({ id: String(part.part), text: part.body }))).complete, true);
   const normal = splitPublication(input("# Recovered\n"));
-  assert.throws(() => reconcilePublication(value, normal.map((part) => ({ id: String(part.part), text: part.body }))), (error: unknown) => error instanceof PublicationFailure && error.code === "remote_conflict");
+  const downgraded = reconcilePublication(value, normal.map((part) => ({ id: String(part.part), text: part.body })));
+  assert.equal(downgraded.complete, false);
+  assert.equal(downgraded.missing.length, framed.length);
 });
 
 test("remote trimming of one trailing newline is restored only when metadata proves the byte", () => {

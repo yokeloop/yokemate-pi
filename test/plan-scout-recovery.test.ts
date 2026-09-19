@@ -20,7 +20,7 @@ function observation(finalText: string, chunks = 1) {
   const observed = new JsonlObservation();
   observed.write(Buffer.from("{failed transport record}\n"));
   const sessionId = "11111111-1111-4111-8111-111111111111";
-  const records = Buffer.from(JSON.stringify({ type: "session", id: sessionId }) + "\n" + JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText.slice(0, 3) }, { type: "text", text: finalText.slice(3) }], stopReason: "stop" } }) + "\n");
+  const records = Buffer.from(JSON.stringify({ type: "session", id: sessionId }) + "\n" + JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText.slice(0, 3) }, { type: "text", text: finalText.slice(3) }], stopReason: "stop" } }) + "\n" + JSON.stringify({ type: "agent_settled" }) + "\n");
   const width = Math.max(1, Math.ceil(records.length / chunks));
   for (let offset = 0; offset < records.length; offset += width) observed.write(records.subarray(offset, offset + width));
   observed.end();

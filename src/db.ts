@@ -154,8 +154,8 @@ function migratePublicationProvenance(db: DatabaseSync): void {
 
 function migrateIncidentColumns(db: DatabaseSync): void {
   addColumn(db, "plan_publication", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
-  addColumn(db, "plan_publication", "incident_id TEXT");
-  addColumn(db, "plan_publication", "candidate_id TEXT");
+  addColumn(db, "plan_publication", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_publication", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
   addColumn(db, "plan_publication", "source_run_id TEXT");
   addColumn(db, "plan_publication", "failure_hash TEXT");
   addColumn(db, "plan_publication", "payload_hash TEXT");
@@ -163,8 +163,8 @@ function migrateIncidentColumns(db: DatabaseSync): void {
   addColumn(db, "plan_publication", "preserved_json TEXT");
   addColumn(db, "plan_publication", "incident_reason TEXT");
   addColumn(db, "plan_publication_acceptance", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
-  addColumn(db, "plan_publication_acceptance", "incident_id TEXT");
-  addColumn(db, "plan_publication_acceptance", "candidate_id TEXT");
+  addColumn(db, "plan_publication_acceptance", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_publication_acceptance", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
   addColumn(db, "plan_publication_acceptance", "source_run_id TEXT");
   addColumn(db, "plan_publication_acceptance", "failure_hash TEXT");
   addColumn(db, "plan_publication_acceptance", "payload_hash TEXT");
@@ -174,11 +174,15 @@ function migrateIncidentColumns(db: DatabaseSync): void {
   addColumn(db, "plan_publication_acceptance", "continuation_id TEXT");
   addColumn(db, "plan_publication_acceptance", "continuation_generation INTEGER");
   addColumn(db, "plan_record", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
-  addColumn(db, "plan_record", "incident_id TEXT");
-  addColumn(db, "plan_record", "candidate_id TEXT");
+  addColumn(db, "plan_record", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_record", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
   addColumn(db, "plan_record", "writer_run_id TEXT");
   addColumn(db, "plan_record", "writer_task_hash TEXT");
   addColumn(db, "plan_record", "writer_actual_task_hash TEXT");
+  addColumn(db, "workflow_incident", "plan_state TEXT NOT NULL DEFAULT 'absent'");
+  addColumn(db, "workflow_incident", "plan_hash TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "workflow_incident", "plan_scope_hash TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "workflow_incident", "plan_path_hash TEXT NOT NULL DEFAULT ''");
 }
 
 export function openDb(path: string): DatabaseSync {
@@ -328,6 +332,25 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (owner_run_id,owner_session_id,batch_id,run_id,task_hash,failed_envelope_hash)
     );
 
+    CREATE TABLE IF NOT EXISTS workflow_recovery_attempt (
+      id TEXT PRIMARY KEY,
+      candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      input_generation INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      scope_hash TEXT NOT NULL,
+      target_hash TEXT NOT NULL,
+      source_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      failure_hash TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS workflow_incident (
       id TEXT PRIMARY KEY,
       candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
@@ -338,6 +361,10 @@ export function openDb(path: string): DatabaseSync {
       input_hash TEXT NOT NULL,
       scope_hash TEXT NOT NULL,
       target_hash TEXT NOT NULL,
+      plan_state TEXT NOT NULL,
+      plan_hash TEXT NOT NULL,
+      plan_scope_hash TEXT NOT NULL,
+      plan_path_hash TEXT NOT NULL,
       reason TEXT NOT NULL,
       source_uid INTEGER NOT NULL,
       source_session_id TEXT NOT NULL,
@@ -411,6 +438,8 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (accepted_input_id,planning_identity,writer_run_id)
     );
 
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_update BEFORE UPDATE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_delete BEFORE DELETE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_update BEFORE UPDATE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_delete BEFORE DELETE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
   `);
