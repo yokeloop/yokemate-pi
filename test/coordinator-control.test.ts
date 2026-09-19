@@ -404,6 +404,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const { role: _role, ...missingRole } = worker;
     for (const invalid of [missingRole, { ...worker, role: "executor" }, { ...worker, role: "unknown" }, { ...worker, sessionId: "foreign" }, { ...worker, starttime: "0" }])
       assert.equal((await requestPlanControl(root, "plan-started", payload, invalid, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "plan-started", { ...payload, runId: "foreign" }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "plan-started", { ...payload, ticket: "YM-2" }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "plan-started", payload, { ...worker, pid: 1, starttime: processStarttime(1)! }, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
     const recordWithoutScout = await requestPlanControl(root, "record-plan", { ...payload, path: "/plan.md" }, worker, target, env);
     assert.equal(recordWithoutScout.state, "refused");

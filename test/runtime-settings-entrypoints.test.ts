@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +36,26 @@ const waitForRunMarker = (file: string, runId: string): Promise<void> => {
     });
     const timer = setTimeout(() => { watcher.close(); reject(new Error(`timed out waiting for run marker ${runId}`)); }, 10000);
   });
+};
+const exerciseLiveModeOwner = async (dir: string, runtime: string, mode: "plan" | "ship", action: "do" | "ship") => {
+  const script = join(dir, `mode-owner-${mode}.mjs`);
+  writeFileSync(script, `import { spawn } from "node:child_process";\nimport { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";\nconst loader = new DefaultResourceLoader({ cwd: process.cwd(), agentDir: process.cwd() + "/agent", settingsManager: SettingsManager.create(process.cwd(), process.cwd() + "/agent"), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [process.cwd() + "/.pi/extensions/subagent/index.ts"] });\nawait loader.reload(); const loaded = loader.getExtensions(); if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors)); loaded.runtime.appendEntry = () => undefined; loaded.runtime.sendMessage = () => undefined;\nconst extension = loaded.extensions[0]; const tool = extension.tools.get("subagent").definition; const base = { mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => process.env.PI_SESSION_ID }, modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true }, ui: { notify() {}, setWidget() {}, confirm: async () => true } };\nfor (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, { ...base, cwd: process.cwd() }); process.send({ ready: true });\nprocess.on("message", async (request) => { if (request.kind === "tool") { const result = await tool.execute(request.id, { coordinator: { mode: request.action, tickets: ["YM-1"] } }, undefined, () => undefined, { ...base, cwd: request.wrongCwd ? process.cwd() + "/foreign" : process.cwd() }); process.send({ id: request.id, result }); return; } const args = request.action === "do" ? ["--experimental-strip-types", "--no-warnings", process.cwd() + "/src/spawn.ts", "YM-1"] : ["--experimental-strip-types", "--no-warnings", process.cwd() + "/src/mode-tab.ts", "ship", "YM-1"]; const child = spawn(process.execPath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = ""; child.stdout.on("data", chunk => stdout += chunk); child.stderr.on("data", chunk => stderr += chunk); child.on("close", code => process.send({ id: request.id, code, stdout, stderr })); });\nsetInterval(() => {}, 1000);\n`);
+  const pane = `${mode}-live-pane`;
+  const session = `${mode}-live-session`;
+  const child = spawn(process.execPath, ["--experimental-strip-types", "--no-warnings", script], { cwd: dir, stdio: ["ignore", "ignore", "ignore", "ipc"], env: { ...process.env, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: session, YOKEMATE_MODE: mode, YOKEMATE_ROLE: "coordinator", YOKEMATE_TICKET: "YM-1", HERDR_PANE_ID: pane, YOKEMATE_PARENT_PANE: "main-pane" } });
+  try {
+    await new Promise<void>((resolve, reject) => { const timer = setTimeout(() => reject(new Error("mode owner startup timeout")), 10000); child.on("message", (message: any) => { if (!message?.ready) return; clearTimeout(timer); resolve(); }); });
+    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), `${pane}.json`), JSON.stringify({ mode, ticket: "YM-1", cwd: dir, pid: child.pid, starttime: processStarttime(child.pid!), sessionId: session, parentPane: "main-pane" }));
+    let id = 0;
+    const request = <T>(payload: Record<string, unknown>) => new Promise<T>((resolve) => { const requestId = String(++id); const listener = (message: any) => { if (message?.id !== requestId) return; child.off("message", listener); resolve(message as T); }; child.on("message", listener); child.send({ ...payload, id: requestId, action }); });
+    const toolResult = await request<{ result: unknown }>({ kind: "tool" });
+    const cliResult = await request<{ code: number; stdout: string; stderr: string }>({ kind: "cli" });
+    const wrongRoot = await request<{ result: unknown }>({ kind: "tool", wrongCwd: true });
+    return { tool: JSON.stringify(toolResult.result), cli: `${cliResult.stdout}\n${cliResult.stderr}`, wrongRoot: JSON.stringify(wrongRoot.result) };
+  } finally {
+    child.kill("SIGKILL");
+    await once(child, "exit").catch(() => undefined);
+  }
 };
 
 test("public guard hook rereads one strict snapshot before any tool and preserves system context", async () => {
@@ -567,6 +589,10 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const packageAllowed = await packageCli();
     const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
     await waitForRunMarker(join(dir, "work", "YM-1", "fixture-runs"), packageId);
+    const liveMode = await exerciseLiveModeOwner(dir, runtime, "plan", "do");
+    assert.match(liveMode.tool, /main chat only/);
+    assert.match(liveMode.cli, /main chat only/);
+    assert.match(liveMode.wrongRoot, /origin root mismatch/);
     writeFileSync(join(socketDir(process.env, process.getuid!()), "plan-pane.json"), JSON.stringify({ mode: "plan", ticket: "YM-1", cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: "main-pane" }));
     const modeStamp = { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: "plan-pane", YOKEMATE_PARENT_PANE: "main-pane" };
     Object.assign(process.env, modeStamp);
@@ -695,6 +721,10 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const packageAllowed = await packageCli();
     const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
     await waitForRunMarker(join(dir, "fixture-runs"), packageId);
+    const liveMode = await exerciseLiveModeOwner(dir, runtime, "ship", "ship");
+    assert.match(liveMode.tool, /current interactive \/ship/);
+    assert.match(liveMode.cli, /current interactive \/ship/);
+    assert.match(liveMode.wrongRoot, /origin root mismatch/);
     await permit();
     const foreign = { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext;
     assert.match(JSON.stringify(await launch(foreign)), /current interactive \/ship/);
