@@ -28,6 +28,13 @@ process.stdin.on("data", (chunk) => {
       const runId = command.id?.replace(/:ready$/, "");
       send({ type: "response", id: command.id, success: true });
       send({ type: "message_end", message: { details: { runId, ok: true } } });
+    } else if (command.type === "oversized-agent-end") {
+      send({ type: "agent_end", messages: ["x".repeat(1024 * 1024)] });
+      send({ type: "agent_settled", marker: "after-aggregate" });
+    } else if (command.type === "oversized-unknown") {
+      send({ type: "fixture_unknown", payload: "x".repeat(1024 * 1024) });
+    } else if (command.type === "oversized-control") {
+      send({ type: "response", id: "forbidden-oversized", success: true, payload: "x".repeat(1024 * 1024) });
     } else if (command.type === "prompt") {
       send({ type: "work_prompt" });
       send({ type: "extension_ui_request", id: "w1", method: "setWidget", widgetKey: "subagent-running", widgetLines: ["task-reviewer 0:05 review"] });

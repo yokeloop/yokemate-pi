@@ -111,6 +111,56 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
   assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
 });
 
+test("coordinator RPC discards oversized aggregate before the next request", async () => {
+  const blocked: string[] = [];
+  const callbacks: unknown[] = [];
+  let release!: () => void;
+  const marker = new Promise<void>((resolve) => { release = resolve; });
+  const rpc = startCoordinatorRpc(prepared, identity, expected, {
+    onEvent(event) { callbacks.push(event); if (event.type === "agent_settled" && event.marker === "after-aggregate") release(); },
+    onBlocked(reason) { blocked.push(reason); },
+  }, {
+    invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture] }, readyTimeoutMs: 1000, stopGraceMs: 100,
+  });
+  try {
+    await rpc.ready;
+    rpc.send({ type: "oversized-agent-end" });
+    await Promise.race([marker, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("oversized aggregate marker timeout")), 2000))]);
+    const stream = rpc.diagnosticSnapshot().stream as any;
+    assert.equal(stream.parserErrors, 0);
+    assert.equal(stream.events.agent_end, 1);
+    assert.equal(rpc.events.some((event) => event.type === "agent_end"), false);
+    assert.equal(callbacks.some((event: any) => event.type === "agent_end"), false);
+    assert.deepEqual(blocked, []);
+    assert.equal(rpc.process.exitCode, null);
+    const response = await rpc.request({ type: "get_state" });
+    assert.equal(response.success, true);
+  } finally { await rpc.stop(); }
+});
+
+test("coordinator RPC blocks valid oversized unknown and control records", async () => {
+  for (const scenario of ["oversized-unknown", "oversized-control"]) {
+    const blocked: string[] = [];
+    let release!: () => void;
+    const failed = new Promise<void>((resolve) => { release = resolve; });
+    const rpc = startCoordinatorRpc(prepared, identity, expected, {
+      onBlocked(reason) { blocked.push(reason); release(); },
+    }, {
+      invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture] }, readyTimeoutMs: 1000, stopGraceMs: 100,
+    });
+    try {
+      await rpc.ready;
+      rpc.send({ type: scenario });
+      await Promise.race([failed, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${scenario} block timeout`)), 2000))]);
+      assert.deepEqual(blocked, ["coordinator RPC protocol_error"]);
+      const stream = rpc.diagnosticSnapshot().stream as any;
+      assert.equal(stream.lastParserError.kind, "record_limit");
+      assert.equal(rpc.events.some((event) => event.type === "fixture_unknown" || event.id === "forbidden-oversized"), false);
+      assert.equal(rpc.process.exitCode, null);
+    } finally { await rpc.stop(); }
+  }
+});
+
 test("RPC stop absorbs expected EPIPE and resolves", async () => {
   let stdinClosed!: () => void;
   const closed = new Promise<void>((resolve) => { stdinClosed = resolve; });
