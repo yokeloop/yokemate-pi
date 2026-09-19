@@ -250,8 +250,9 @@ test("owned review rework records an exact plan and preserves the stand", async 
     assert.equal(recorded.binding.path, plan);
     assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='ACME-9'").get()!.stage, "planned");
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM part WHERE work_id=?").get(work.id)!.count, 1);
-    assert.throws(() => recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, "review"), /changed from review to planned/);
-    const repeated = recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, "planned");
+    assert.throws(() => recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }), /changed from review to planned/);
+    assert.throws(() => recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, { ...recorded.binding, contentHash: "foreign" }), /content hash/);
+    const repeated = recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, recorded.binding);
     assert.equal(repeated.repeat, true);
   } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -21,7 +21,7 @@ function approved(store: ReviewReworkStore, raw = "Отправляй на до�
 test("review rework receipt binds the exact generation, owner and recorded plan", async () => {
   const store = new ReviewReworkStore(owner);
   const generation = approved(store);
-  const outcome = await store.claimHandoff(generation, binding, async (operationId) => {
+  const outcome = await store.claimHandoff(generation, binding.path, async (operationId) => {
     store.bindRecorded(operationId, binding);
     store.consume(operationId, "do-run", binding);
     store.checkCycle("do-run", binding);
@@ -33,7 +33,7 @@ test("review rework receipt binds the exact generation, owner and recorded plan"
   });
   assert.equal(outcome.state, "started");
   assert.throws(() => store.checkCycle("do-run", binding), /cycle/);
-  assert.throws(() => store.claimHandoff(generation, { ...binding, contentHash: "changed" }, async () => ({ state: "refused", recorded: false })), /binding|generation|handoff/);
+  assert.throws(() => store.claimHandoff(generation, "/knowledge/changed.md", async () => ({ state: "refused", recorded: false })), /binding|generation|handoff/);
 });
 
 test("concurrent and repeated handoff retains one promise and refusal outcome", async () => {
@@ -47,12 +47,12 @@ test("concurrent and repeated handoff retains one promise and refusal outcome", 
     await wait;
     return { state: "refused" as const, recorded: true, reason: "model unavailable" };
   };
-  const first = store.claimHandoff(generation, binding, action);
-  const second = store.claimHandoff(generation, { ...binding, repositories: [...binding.repositories] }, action);
+  const first = store.claimHandoff(generation, binding.path, action);
+  const second = store.claimHandoff(generation, binding.path, action);
   assert.equal(first, second);
   release();
   assert.deepEqual(await first, { state: "refused", recorded: true, reason: "model unavailable" });
-  assert.deepEqual(await store.claimHandoff(generation, binding, action), await first);
+  assert.deepEqual(await store.claimHandoff(generation, binding.path, action), await first);
   assert.equal(calls, 1);
 });
 
@@ -60,16 +60,24 @@ test("fresh input after failed handoff creates a new operation and stale complet
   const store = new ReviewReworkStore(owner);
   const firstGeneration = approved(store, "на доработку");
   let release!: () => void;
+  let markRecorded!: () => void;
   const pending = new Promise<void>((resolve) => { release = resolve; });
-  const first = store.claimHandoff(firstGeneration, binding, async () => {
+  const recorded = new Promise<void>((resolve) => { markRecorded = resolve; });
+  const first = store.claimHandoff(firstGeneration, binding.path, async (operationId) => {
+    store.bindRecorded(operationId, binding);
+    markRecorded();
     await pending;
     return { state: "refused" as const, recorded: true, reason: "failed" };
   });
+  await recorded;
   const secondGeneration = store.beginInput("после исправления снова на доработку");
   store.approveRework(secondGeneration);
   release();
   assert.equal((await first).state, "cancelled");
-  const second = await store.claimHandoff(secondGeneration, binding, async () => ({ state: "started" as const, recorded: true, runId: "fresh" }));
+  const second = await store.claimHandoff(secondGeneration, binding.path, async (operationId) => {
+    assert.deepEqual(store.plannedRetryBinding(operationId), binding);
+    return { state: "started" as const, recorded: true, runId: "fresh" };
+  });
   assert.equal(second.state, "started");
   assert.equal(second.runId, "fresh");
 });
@@ -80,11 +88,34 @@ test("mismatch, stale generation and revoked verdict refuse before action", asyn
   const next = store.beginInput("вопрос");
   let calls = 0;
   assert.throws(() => store.approveRework(generation), /stale/);
-  assert.throws(() => store.claimHandoff(generation, binding, async () => { calls++; return { state: "started", recorded: true } as const; }), /stale|approval/);
+  assert.throws(() => store.claimHandoff(generation, binding.path, async () => { calls++; return { state: "started", recorded: true } as const; }), /stale|approval/);
   store.approveRework(next);
   store.revoke();
-  assert.throws(() => store.claimHandoff(next, binding, async () => { calls++; return { state: "started", recorded: true } as const; }), /revoked|approval|stale/);
+  assert.throws(() => store.claimHandoff(next, binding.path, async () => { calls++; return { state: "started", recorded: true } as const; }), /revoked|approval|stale/);
   assert.equal(calls, 0);
+});
+
+test("candidate failure is retained and cannot reuse the old verdict", async () => {
+  const store = new ReviewReworkStore(owner);
+  const generation = approved(store);
+  let calls = 0;
+  const failed = await store.claimHandoff(generation, binding.path, async () => {
+    calls++;
+    throw new Error("candidate invalid");
+  });
+  assert.deepEqual(failed, { state: "refused", recorded: false, reason: "candidate invalid" });
+  assert.deepEqual(await store.claimHandoff(generation, binding.path, async () => {
+    calls++;
+    return { state: "started", recorded: true };
+  }), failed);
+  assert.throws(() => store.claimHandoff(generation, "/knowledge/other.md", async () => ({ state: "started", recorded: true })), /binding|generation|handoff/);
+  assert.equal(calls, 1);
+  const fresh = approved(store, "исправлено, отправляй снова");
+  const outcome = await store.claimHandoff(fresh, binding.path, async (operationId) => {
+    assert.equal(store.plannedRetryBinding(operationId), undefined);
+    return { state: "refused", recorded: false, reason: "still invalid" };
+  });
+  assert.equal(outcome.state, "refused");
 });
 
 test("review extraction accepts literal UTF-16 evidence and rejects foreign tickets or loose schema", () => {

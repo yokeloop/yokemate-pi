@@ -11,7 +11,7 @@ import type { PublicationOutcome } from "./plan-publication-state.ts";
 import type { ReviewHandoffOutcome, ReviewInputGeneration, ReviewReworkExtraction, ReviewSurfaceIdentity } from "./review-rework.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation | ReviewControlOperation; ticket?: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation | ReviewControlOperation; ticket?: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number; generation?: ReviewInputGeneration; rework?: ReviewHandoffOutcome }
 export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan";
@@ -71,7 +71,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     rmSync(sidecar, { force: true });
   }
   const planRuns = new Map<string, { ticket: string; launcher: ControlOrigin; listRunId?: string; pane?: string; worker?: ControlOrigin; terminal?: "recording" | "recorded" | "blocked" | "cancelled"; recordReply?: { runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }; scoutAcceptance?: number; scoutGeneration?: number; scoutRequests?: Map<number, number>; finalizedScoutAcceptances?: Set<number> }>();
-  const reviewRuns = new Map<string, { ticket: string; launcher: ControlOrigin; pane?: string; surface?: "tab" | "split"; tabId?: string; worker?: ControlOrigin; ended?: boolean }>();
+  const reviewRuns = new Map<string, { ticket: string; launcher: ControlOrigin; expectedRuntimeId: string; pane?: string; surface?: "tab" | "split"; tabId?: string; worker?: ControlOrigin; ended?: boolean }>();
   const problemPackages = new Map<string, { owner: ControlOrigin; tickets: Set<string> }>();
   const scoutAcceptances = new Map<string, number>();
   const scoutGenerations = new Map<string, number>();
@@ -155,8 +155,9 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
             const main = !origin.mode && !origin.role && origin.sessionId === identity.sessionId;
             if (envelope.operation === "register-review") {
               if (!main) throw new Error("only the verified main parent can register a review run");
+              if (!envelope.workerRuntimeId || envelope.workerRuntimeId.length > 200) throw new Error("review registration requires its expected worker runtime");
               const runId = randomUUID();
-              reviewRuns.set(runId, { ticket, launcher: { ...origin } });
+              reviewRuns.set(runId, { ticket, launcher: { ...origin }, expectedRuntimeId: envelope.workerRuntimeId });
               reply({ requestId: envelope.requestId, state: "accepted", runId });
               continue;
             }
@@ -171,7 +172,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
               continue;
             }
             const exactWorker = !!reviewRun.worker && sameProcess(reviewRun.worker, origin) && origin.runtimeId === reviewRun.worker.runtimeId;
-            const workerCandidate = origin.mode === "review" && origin.role === "coordinator" && origin.ticket === ticket && origin.pane === reviewRun.pane && typeof origin.runtimeId === "string" && origin.runtimeId.length > 0;
+            let exactPaneRuntime = false;
+            try {
+              const panel = JSON.parse(readFileSync(join(socketDir(env, uid), `${reviewRun.pane}.json`), "utf8")) as { pid?: number };
+              exactPaneRuntime = panel.pid === origin.pid && processStarttime(origin.pid) === origin.starttime;
+            } catch {}
+            const workerCandidate = origin.mode === "review" && origin.role === "coordinator" && origin.ticket === ticket && origin.pane === reviewRun.pane && origin.runtimeId === reviewRun.expectedRuntimeId && exactPaneRuntime;
             const descendant = !!reviewRun.worker && origin.mode === "review" && origin.ticket === ticket && origin.pane === reviewRun.pane && origin.sessionId === reviewRun.worker.sessionId && origin.runtimeId === reviewRun.worker.runtimeId && descendantOf(origin.pid, origin.starttime, reviewRun.worker.pid, reviewRun.worker.starttime);
             if (envelope.operation === "review-started") {
               if (reviewRun.ended || !workerCandidate || reviewRun.worker && !exactWorker || !reviewRun.surface || !reviewRun.pane) throw new Error("invalid review worker identity");
@@ -457,10 +463,32 @@ export async function requestPlanControl(root: string, operation: PlanControlOpe
   return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);
 }
 
-export async function requestReviewControl(root: string, operation: ReviewControlOperation, payload: { ticket: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; runId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; reason?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
-  const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
+export async function requestReviewControl(root: string, operation: ReviewControlOperation, payload: { ticket: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; runId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; reason?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env, timeoutMs = 30_000): Promise<ControlReply> {
+  const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env, timeoutMs);
   if (attach.state !== "accepted" || !attach.originId) return attach;
-  return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);
+  return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env, timeoutMs);
+}
+
+function reviewTransportFailure(reply: ControlReply): boolean {
+  return reply.state === "refused" && /coordinator control (?:timed out|closed|connection closed)|ECONN|EPIPE|socket/i.test(reply.reason ?? "");
+}
+
+export async function requestReviewRecordWithStatus(root: string, payload: { ticket: string; path: string; runId: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env, options: { recordTimeoutMs?: number; statusTimeoutMs?: number; pollMs?: number } = {}): Promise<ControlReply> {
+  const recordTimeoutMs = options.recordTimeoutMs ?? 30_000;
+  const statusTimeoutMs = options.statusTimeoutMs ?? 120_000;
+  const pollMs = options.pollMs ?? 250;
+  const reply = await requestReviewControl(root, "review-record", payload, origin, target, env, recordTimeoutMs);
+  if (!reviewTransportFailure(reply)) return reply;
+  const deadline = Date.now() + statusTimeoutMs;
+  let last = reply;
+  while (Date.now() < deadline) {
+    const status = await requestReviewControl(root, "review-status", { ticket: payload.ticket, runId: payload.runId }, origin, target, env, Math.min(30_000, Math.max(1, deadline - Date.now())));
+    if (status.rework) return { ...status, state: "accepted" };
+    if (status.state === "refused" && !reviewTransportFailure(status)) return status;
+    last = status;
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
+  }
+  return { ...last, state: "refused", reason: `review handoff status timed out after ${statusTimeoutMs}ms; initial transport: ${reply.reason ?? "unavailable"}` };
 }
 
 export function currentControlOrigin(root: string, sessionId = process.env.PI_SESSION_ID): ControlOrigin {

@@ -11,11 +11,10 @@ export type ReviewReworkExtraction = { kind: "none" } | { kind: "rework" | "revo
 export interface ReviewHandoffOutcome { state: "started" | "refused" | "cancelled"; recorded: boolean; runId?: string; model?: string; reason?: string; stage?: string; plan?: string; contentHash?: string; close?: { state: "closed" | "failed"; reason?: string } }
 
 type Receipt = { generation: ReviewInputGeneration; state: "pending" | "bound" | "consumed" | "revoked"; binding?: PlanBinding; cycleId?: string };
-type Operation = { id: string; generation: ReviewInputGeneration; binding: PlanBinding; promise: Promise<ReviewHandoffOutcome>; settled?: ReviewHandoffOutcome };
+type Operation = { id: string; generation: ReviewInputGeneration; candidatePath: string; binding?: PlanBinding; retryBinding?: PlanBinding; promise: Promise<ReviewHandoffOutcome>; settled?: ReviewHandoffOutcome };
 
 const copyBinding = (binding: PlanBinding): PlanBinding => ({ ...binding, repositories: [...binding.repositories] });
 const sameGeneration = (left: ReviewInputGeneration, right: ReviewInputGeneration): boolean => left.serial === right.serial && left.revision === right.revision && left.inputHash === right.inputHash;
-const bindingKey = (binding: PlanBinding): string => JSON.stringify([binding.ticket, binding.path, binding.contentHash, binding.scopeHash, binding.repositories]);
 
 export class ReviewReworkStore {
   readonly owner: ReviewReworkOwner;
@@ -56,25 +55,35 @@ export class ReviewReworkStore {
   }
 
   bindRecorded(operationId: string, binding: PlanBinding): void {
-    const operation = this.assertOperation(operationId, binding);
+    const operation = this.assertOperation(operationId);
+    if (binding.ticket !== this.owner.ticket) throw new Error("review rework binding ticket mismatch");
+    if (operation.binding) assertPlanBinding(operation.binding, binding);
+    operation.binding = copyBinding(binding);
     const receipt = this.requiredReceipt(operation.generation);
     if (receipt.state === "revoked") throw new Error("review rework approval is revoked");
     receipt.binding = copyBinding(binding);
     receipt.state = "bound";
   }
 
-  claimHandoff(generation: ReviewInputGeneration, binding: PlanBinding, action: (operationId: string) => Promise<ReviewHandoffOutcome> | ReviewHandoffOutcome): Promise<ReviewHandoffOutcome> {
+  plannedRetryBinding(operationId: string): PlanBinding | undefined {
+    const operation = this.assertOperation(operationId);
+    return operation.retryBinding && copyBinding(operation.retryBinding);
+  }
+
+  claimHandoff(generation: ReviewInputGeneration, candidatePath: string, action: (operationId: string) => Promise<ReviewHandoffOutcome> | ReviewHandoffOutcome): Promise<ReviewHandoffOutcome> {
     this.assertGeneration(generation);
     const receipt = this.requiredReceipt(generation);
     if (receipt.state === "revoked") throw new Error("review rework approval is revoked");
-    if (binding.ticket !== this.owner.ticket) throw new Error("review rework binding ticket mismatch");
+    if (!candidatePath) throw new Error("review rework candidate path is missing");
+    let retryBinding: PlanBinding | undefined;
     if (this.operation) {
-      if (sameGeneration(this.operation.generation, generation) && bindingKey(this.operation.binding) === bindingKey(binding)) return this.operation.promise;
-      if (!this.operation.settled || this.operation.settled.state === "started") throw new Error("review rework handoff binding or generation mismatch");
+      if (sameGeneration(this.operation.generation, generation) && this.operation.candidatePath === candidatePath) return this.operation.promise;
+      if (!this.operation.settled || this.operation.settled.state === "started" || sameGeneration(this.operation.generation, generation)) throw new Error("review rework handoff binding or generation mismatch");
+      if (this.operation.settled.recorded && this.operation.binding) retryBinding = copyBinding(this.operation.binding);
       this.operation = undefined;
     }
     const id = randomUUID();
-    const operation: Operation = { id, generation: { ...generation }, binding: copyBinding(binding), promise: undefined as unknown as Promise<ReviewHandoffOutcome> };
+    const operation: Operation = { id, generation: { ...generation }, candidatePath, ...(retryBinding ? { retryBinding } : {}), promise: undefined as unknown as Promise<ReviewHandoffOutcome> };
     operation.promise = Promise.resolve().then(async () => {
       if (!sameGeneration(operation.generation, this.generation()) || this.receipt?.state === "revoked") {
         operation.settled = { state: "cancelled", recorded: false, reason: "review verdict was superseded" };
@@ -133,10 +142,13 @@ export class ReviewReworkStore {
     return receipt;
   }
 
-  private assertOperation(operationId: string, binding: PlanBinding): Operation {
+  private assertOperation(operationId: string, binding?: PlanBinding): Operation {
     const operation = this.operation;
     if (!operation || operation.id !== operationId) throw new Error("review rework handoff operation mismatch");
-    assertPlanBinding(operation.binding, binding);
+    if (binding) {
+      if (!operation.binding) throw new Error("review rework handoff is not bound to a recorded plan");
+      assertPlanBinding(operation.binding, binding);
+    }
     if (!sameGeneration(operation.generation, this.generation())) throw new Error("stale review handoff operation");
     return operation;
   }

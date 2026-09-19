@@ -87,7 +87,7 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     for (const handler of main.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, mainCtx);
     mainShutdown = async () => { for (const handler of main.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, mainCtx); };
     const parent = resolveCoordinatorParent(dir, process.env);
-    const registered = await requestReviewControl(dir, "register-review", { ticket: "YM-1" }, currentControlOrigin(dir, "parent-session"), parent, process.env);
+    const registered = await requestReviewControl(dir, "register-review", { ticket: "YM-1", workerRuntimeId: "review-runtime" }, currentControlOrigin(dir, "parent-session"), parent, process.env);
     assert.equal(registered.state, "accepted", registered.reason ?? "review registration refused");
     const reviewRunId = registered.runId!;
     const bound = await requestReviewControl(dir, "bind-review", { ticket: "YM-1", runId: reviewRunId, pane: "review-pane", surface: "tab", tabId: "review-tab" }, currentControlOrigin(dir, "parent-session"), parent, process.env);

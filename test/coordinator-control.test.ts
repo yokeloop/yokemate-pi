@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestReviewRecordWithStatus, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -248,24 +248,61 @@ test("review control separates launcher, worker input and descendant record auth
     mkdirSync(runtimeDir, { recursive: true });
     writeFileSync(join(runtimeDir, "main.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "main", ticket: null }));
     writeFileSync(join(runtimeDir, "review.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "review", ticket: "YM-1" }));
-    const registered = await requestReviewControl(root, "register-review", { ticket: "YM-1" }, main, target, env);
+    const registered = await requestReviewControl(root, "register-review", { ticket: "YM-1", workerRuntimeId: "review-runtime" }, main, target, env);
     assert.equal(registered.state, "accepted");
     const runId = registered.runId!;
     assert.equal((await requestReviewControl(root, "bind-review", { ticket: "YM-1", runId, pane: "review", surface: "tab", tabId: "tab-review" }, main, target, env)).state, "accepted");
     const worker = { ...main, sessionId: "review-session", runtimeId: "review-runtime", mode: "review", ticket: "YM-1", role: "coordinator", pane: "review", parentPane: "main" };
+    const wrongRuntime = { ...worker, runtimeId: "descendant-first" };
+    assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, wrongRuntime, target, env)).state, "refused");
+    descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(descendant, "spawn");
+    const cli = { ...worker, pid: descendant.pid!, starttime: processStarttime(descendant.pid!)! };
+    assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, cli, target, env)).state, "refused");
     assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, worker, target, env)).state, "accepted");
     const input = await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "на доработку" }, worker, target, env);
     assert.equal(input.generation?.serial, 1);
     assert.equal((await requestReviewControl(root, "review-extraction", { ticket: "YM-1", runId, generation: input.generation, extraction: { kind: "rework", evidence: [{ start: 0, end: 12, text: "на доработку" }] } }, worker, target, env)).state, "accepted");
-    descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-    await once(descendant, "spawn");
-    const cli = { ...worker, pid: descendant.pid!, starttime: processStarttime(descendant.pid!)! };
     assert.equal((await requestReviewControl(root, "review-record", { ticket: "YM-1", runId, path: "/plan.md" }, cli, target, env)).rework?.runId, "do-run");
     assert.equal((await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "foreign" }, cli, target, env)).state, "refused");
     assert.equal((await requestReviewControl(root, "review-ended", { ticket: "YM-1", runId, reason: "shutdown" }, worker, target, env)).state, "accepted");
     assert.deepEqual(calls, ["started", "input:на доработку", "extract:rework", "record:/plan.md", "ended"]);
   } finally {
     if (descendant && descendant.exitCode === null) { descendant.kill("SIGKILL"); descendant.unref(); }
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("review record recovers a retained outcome after the first control reply times out", async () => {
+  const root = mkdtempSync(join(tmpdir(), "review-status-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "review-status-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" };
+  const retained = { state: "started" as const, recorded: true, runId: "do-run" };
+  let outcome: typeof retained | undefined;
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    reviewRecord: async () => { await new Promise((resolve) => setTimeout(resolve, 40)); outcome = retained; return retained; },
+    reviewStatus: () => outcome,
+  }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const runtimeDir = socketDir(env, process.getuid!());
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "main.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "main", ticket: null }));
+    writeFileSync(join(runtimeDir, "review.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "review", ticket: "YM-1" }));
+    const registered = await requestReviewControl(root, "register-review", { ticket: "YM-1", workerRuntimeId: "review-runtime" }, main, target, env);
+    const runId = registered.runId!;
+    await requestReviewControl(root, "bind-review", { ticket: "YM-1", runId, pane: "review", surface: "split" }, main, target, env);
+    const worker = { ...main, sessionId: "review-session", runtimeId: "review-runtime", mode: "review", ticket: "YM-1", role: "coordinator", pane: "review", parentPane: "main" };
+    await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, worker, target, env);
+    const reply = await requestReviewRecordWithStatus(root, { ticket: "YM-1", runId, path: "/plan.md" }, worker, target, env, { recordTimeoutMs: 5, statusTimeoutMs: 500, pollMs: 5 });
+    assert.equal(reply.state, "accepted");
+    assert.deepEqual(reply.rework, retained);
+  } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

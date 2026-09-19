@@ -334,10 +334,10 @@ if (import.meta.filename === process.argv[1]) {
         } catch (error) { console.error(`${ticket}: no automatic do handoff: ${(error as Error).message}`); }
       }
       if (mode === "review" && ticket && process.env.PI_SESSION_ID) {
-        const reply = await requestReviewControl(ROOT, "register-review", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+        reviewRuntimeId = randomUUID();
+        const reply = await requestReviewControl(ROOT, "register-review", { ticket, workerRuntimeId: reviewRuntimeId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
         if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "review registration refused");
         reviewRunId = reply.runId;
-        reviewRuntimeId = randomUUID();
         env.push(`YOKEMATE_REVIEW_RUN_ID=${reviewRunId}`, `YOKEMATE_REVIEW_RUNTIME_ID=${reviewRuntimeId}`);
       }
       const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);

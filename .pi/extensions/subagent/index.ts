@@ -913,10 +913,14 @@ export default function (pi: ExtensionAPI) {
 	};
 	const endOwnedReview = async (reason: string) => {
 		if (process.env.YOKEMATE_MODE !== "review" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_REVIEW_RUN_ID || !process.env.PI_SESSION_ID) return;
-		try { await requestReviewControl(ENGINE_ROOT, "review-ended", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID, reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT)); }
-		catch {}
+		const reply = await requestReviewControl(ENGINE_ROOT, "review-ended", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID, reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
+		if (reply.state !== "accepted") throw new Error(reply.reason ?? "review authority fencing was refused");
 	};
-	const fenceOwnedAuthority = async () => { await endOwnedReview("review runtime changed"); await revokeAuthority(); };
+	const fenceOwnedAuthority = async () => {
+		try { await endOwnedReview("review runtime changed"); }
+		catch (error) { latestCtx?.ui.notify(`review runtime change blocked: ${(error as Error).message}`, "error"); throw error; }
+		await revokeAuthority();
+	};
 	pi.on("session_before_switch", fenceOwnedAuthority);
 	pi.on("session_before_fork", fenceOwnedAuthority);
 	pi.on("session_before_tree", fenceOwnedAuthority);
@@ -1395,21 +1399,19 @@ export default function (pi: ExtensionAPI) {
 				reviewRecord: async (ticket, reviewRunId, candidatePath) => {
 					const review = reviewReworks.get(reviewRunId);
 					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
-					const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 					const generation = review.store.generation();
-					return review.store.claimHandoff(generation, snapshot, async (operationId) => {
+					return review.store.claimHandoff(generation, candidatePath, async (operationId) => {
+						const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 						let recorded;
 						try {
 							const stage = (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage;
 							if (stage !== "review" && stage !== "planned") throw new Error(`${ticket} is at ${stage ?? "absent"}; review rework records only review or its owned planned retry`);
-							recorded = recordReviewRework(db, ENGINE_ROOT, ticket, snapshot.path, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: ticket, YOKEMATE_ROLE: "coordinator" }, stage);
+							const previousBinding = stage === "planned" ? review.store.plannedRetryBinding(operationId) : undefined;
+							if (stage === "planned" && !previousBinding) throw new Error(`${ticket}: planned rework retry is not owned by this review run`);
+							recorded = recordReviewRework(db, ENGINE_ROOT, ticket, snapshot.path, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: ticket, YOKEMATE_ROLE: "coordinator" }, previousBinding);
 						} finally { db.close(); }
 						review.store.bindRecorded(operationId, recorded.binding);
-						if (!recorded.repeat) {
-							logMove(dataRoot(ENGINE_ROOT), ticket, "на доработку", path.basename(recorded.binding.path, ".md"));
-							syncPush(dataRoot(ENGINE_ROOT), `${ticket} на доработку`);
-						}
 						const currentStage = () => {
 							const stageDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 							try { return String((stageDb.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage ?? "absent"); }
@@ -1417,6 +1419,10 @@ export default function (pi: ExtensionAPI) {
 						};
 						let details: { runId?: string; listRunId?: string } = {};
 						try {
+							if (!recorded.repeat) {
+								logMove(dataRoot(ENGINE_ROOT), ticket, "на доработку", path.basename(recorded.binding.path, ".md"));
+								syncPush(dataRoot(ENGINE_ROOT), `${ticket} на доработку`);
+							}
 							const settings = readRuntimeSettings(ENGINE_ROOT);
 							const startedAt = Date.now();
 							const launched = await startCoordinator({ mode: "do", tickets: [ticket], plan: recorded.binding.path }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { store: review.store, operationId, binding: recorded.binding });
@@ -1448,7 +1454,9 @@ export default function (pi: ExtensionAPI) {
 							ctx.ui.notify(close.state === "closed" ? started : `${started}; review close failed: ${close.reason}`, close.state === "closed" ? "info" : "warning");
 							return outcome;
 						} catch (error) {
-							return { state: "refused", recorded: true, ...(details.runId ? { runId: details.runId } : {}), reason: error instanceof Error ? error.message : String(error), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash };
+							const outcome: ReviewHandoffOutcome = { state: "refused", recorded: true, ...(details.runId ? { runId: details.runId } : {}), reason: error instanceof Error ? error.message : String(error), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash };
+							ctx.ui.notify(`${ticket}: rework recorded at ${recorded.binding.path} (${recorded.binding.contentHash}), but do startup failed at ${outcome.stage}: ${outcome.reason}`, "warning");
+							return outcome;
 						}
 					});
 				},
@@ -1660,7 +1668,8 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
-		await endOwnedReview("review session shutdown");
+		try { await endOwnedReview("review session shutdown"); }
+		catch (error) { latestCtx?.ui.notify(`review shutdown fencing failed: ${(error as Error).message}`, "error"); }
 		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent session shutdown")));
 		await fenceListRuns("parent session shutdown");
 		authority?.revoke();
