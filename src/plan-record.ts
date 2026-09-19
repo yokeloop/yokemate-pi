@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { commitExact, gitMutationLockPath, pushWithRetryAsync, type ExactSyncResult } from "./git-sync.ts";
@@ -8,32 +8,60 @@ import { readRuntimeSettings } from "./guard-policy.ts";
 import { logMoveDetailed } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, type PlanBinding } from "./plan-binding.ts";
+import { assertPublishable } from "./plan-publication.ts";
+import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicationAcceptanceById, readPublicationArtifact } from "./plan-publication-state.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
+export interface RecordPlanOptions { expectedBinding: PlanBinding; recordId: number; signal?: AbortSignal; onLocked?(): void }
 
 export function recordLockPath(root: string): string { return gitMutationLockPath(root); }
 
-export function recordPlanCore(root: string, ticket: string, planPath: string, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
-  const data = dataRoot(root);
-  const plan = realpathSync(resolve(planPath));
-  const dataRelative = relative(data, plan);
-  if (dataRelative.startsWith("..") || isAbsolute(dataRelative)) throw new Error(`plan is outside the data root: ${plan}`);
-  const settings = readRuntimeSettings(root);
+function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBinding, recordId: number) {
+  const candidate = readCandidatePlanSnapshot(root, ticket, expectedBinding.path);
+  assertPlanBinding(expectedBinding, candidate);
+  assertPublishable(candidate.bytes);
   const db = openDb(join(root, "yokemate.db"));
-  const prior = db.prepare("SELECT stage, plan FROM work WHERE ticket = ?").get(ticket) as { stage?: string; plan?: string | null } | undefined;
-  const out = applyMove(db, "plan", env, ticket, () => {
-    db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
-  }, { settings });
+  try {
+    const record = planRecordById(db, recordId);
+    if (!record || record.ticket !== ticket || record.plan_path !== candidate.path || record.content_hash !== candidate.contentHash || record.scope_hash !== candidate.scopeHash || record.scout_acceptance === null) throw new Error("binding_changed");
+    const snapshot = readPublicationArtifact(root, record);
+    if (!snapshot.equals(candidate.bytes)) throw new Error("binding_changed");
+    assertPublishable(snapshot);
+    const scout = publicationAcceptanceById(db, record.scout_acceptance);
+    if (!scout || scout.ticket !== ticket) throw new Error("artifact_invalid");
+    assertPublishable(readPublicationArtifact(root, scout));
+    return { db, candidate, record };
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+export function recordPlanCore(root: string, ticket: string, expectedBinding: PlanBinding, recordId: number, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
+  const data = dataRoot(root);
+  const { db, candidate, record } = verifyLocalRecord(root, ticket, expectedBinding, recordId);
+  const plan = candidate.path;
+  const dataRelative = relative(data, plan);
+  if (dataRelative.startsWith("..") || isAbsolute(dataRelative)) { db.close(); throw new Error(`plan is outside the data root: ${plan}`); }
+  const settings = readRuntimeSettings(root);
+  let out;
+  let sideEffects = false;
+  try {
+    out = applyMove(db, "plan", env, ticket, () => {
+      db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
+      markSuccessfulRecord(db, record.id);
+    }, { settings });
+    if (out.ok) sideEffects = markSideEffectsStarted(db, record.id);
+  } finally { db.close(); }
   if (!out.ok) throw new Error(out.refuse);
-  const durableRepeat = out.repeat && prior?.plan && resolve(prior.plan) === plan;
-  const logged = durableRepeat ? null : logMoveDetailed(data, ticket, "запланировано", `план ${basename(plan, ".md")}`);
+  const logged = sideEffects ? logMoveDetailed(data, ticket, "запланировано", `план ${basename(plan, ".md")}`) : null;
   const targets = [dataRelative, ...(logged ? [relative(data, logged.path)] : [])];
-  const localSync = durableRepeat ? { state: "unchanged" as const } : commitExact(data, `${ticket} план`, targets);
-  return { ticket, plan, repeat: Boolean(durableRepeat), recorded: true, journal: logged?.path, localSync };
+  const localSync = sideEffects ? commitExact(data, `${ticket} план`, targets) : { state: "unchanged" as const };
+  return { ticket, plan, repeat: !sideEffects, recorded: true, journal: logged?.path, localSync };
 }
 
 const LOCKED_MARKER = "YOKEMATE_RECORD_LOCKED\n";
-export interface RecordPlanOptions { signal?: AbortSignal; onLocked?(): void }
 
 function runRecorder(root: string, lock: string, payload: string, env: NodeJS.ProcessEnv, options: RecordPlanOptions): Promise<string> {
   return new Promise((resolvePromise, reject) => {
@@ -58,8 +86,9 @@ function runRecorder(root: string, lock: string, payload: string, env: NodeJS.Pr
   });
 }
 
-export async function recordPlan(root: string, ticket: string, planPath: string, env: NodeJS.ProcessEnv = process.env, options: RecordPlanOptions = {}): Promise<PlanRecordResult> {
-  const payload = Buffer.from(JSON.stringify({ root, ticket, planPath })).toString("base64");
+export async function recordPlan(root: string, ticket: string, planPath: string, env: NodeJS.ProcessEnv = process.env, options: RecordPlanOptions): Promise<PlanRecordResult> {
+  if (resolve(planPath) !== resolve(options.expectedBinding.path) || options.expectedBinding.ticket !== ticket) throw new Error("binding_changed");
+  const payload = Buffer.from(JSON.stringify({ root, ticket, expectedBinding: options.expectedBinding, recordId: options.recordId })).toString("base64");
   const lock = recordLockPath(dataRoot(root));
   mkdirSync(dirname(lock), { recursive: true });
   const output = await runRecorder(root, lock, payload, env, options);
@@ -70,10 +99,10 @@ export async function recordPlan(root: string, ticket: string, planPath: string,
 
 if (import.meta.filename === process.argv[1] && process.argv[2] === "--locked") {
   try {
-    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; planPath: string };
+    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; expectedBinding: PlanBinding; recordId: number };
     process.on("SIGTERM", () => {});
     process.stdout.write(LOCKED_MARKER);
-    process.stdout.write(JSON.stringify(recordPlanCore(payload.root, payload.ticket, payload.planPath)));
+    process.stdout.write(JSON.stringify(recordPlanCore(payload.root, payload.ticket, payload.expectedBinding, payload.recordId)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);
