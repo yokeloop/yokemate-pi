@@ -20,7 +20,12 @@ export interface ChildIdentity {
   review?: ReviewRevision;
 }
 export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
-export interface PublicationReference { state: "pending" | "complete" | "blocked"; path?: string; hash?: string; bytes?: number; target?: string; targetHash?: string; publicationId?: number; acceptanceId?: number; error?: string }
+export interface PublicationReference { state: "pending" | "complete"; target: string; revision: string; publicationId?: number; error?: string; path?: string; hash?: string; bytes?: number; targetHash?: string; acceptanceId?: number }
+export type ArtifactReference =
+  | { state: "verified"; path: string; hash: string; bytes: number }
+  | { state: "accepted"; path: string; hash: string; bytes: number; acceptanceId: number }
+  | { state: "blocked"; reason: string; path?: string; hash?: string; bytes?: number }
+  | { state: "superseded"; path: string; hash: string; bytes: number; acceptanceId: number };
 export type ProcessOutcome = "exited" | "signaled" | "spawn_error" | "cancelled" | "not_started";
 export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
 export interface ResultEnvelope {
@@ -36,6 +41,7 @@ export interface ResultEnvelope {
   payload: string;
   outputLimit?: "batch_transport";
   reviewVerdict: "approved" | "changes_required" | null;
+  artifact?: ArtifactReference;
   publication?: PublicationReference;
 }
 export interface BatchEnvelope {

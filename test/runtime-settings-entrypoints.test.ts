@@ -213,7 +213,7 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
   const { openDb } = await import("../src/db.ts");
   const { coordinatorSocketPath } = await import("../src/coordinator-control.ts");
   const { readCandidatePlanSnapshot } = await import("../src/plan-binding.ts");
-  const { acceptPlanRecord, acceptPublication } = await import("../src/plan-publication-state.ts");
+  const { acceptPlanRecord, acceptPublication, acceptPublicationDelivery } = await import("../src/plan-publication-state.ts");
   const { sha256 } = await import("../src/subagent-runs.ts");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-cli-"));
   const runtime = mkdtempSync(join(tmpdir(), "runtime-cli-control-"));
@@ -239,11 +239,12 @@ test("public CLI decisions reread settings and refuse malformed blocks before re
     const publicationDb = openDb(join(dir, "yokemate.db"));
     const target = "github:org/repo#1";
     const scout = acceptPublication(publicationDb, dir, { target, targetHash: sha256(target), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# Scout\n"), runId: "scout" });
+    const acceptance = acceptPublicationDelivery(publicationDb, scout.id, { ownerRunId: "owner", ownerSessionId: "parent", batchId: "batch", runId: "scout", agent: "plan-scout", taskHash: "a".repeat(64), cwd: dir, ticket: "YM-1" });
     const publication = acceptPublication(publicationDb, dir, { target, targetHash: sha256(target), ticket: "YM-1", kind: "plan", bytes: snapshot.bytes, runId: "plan" });
-    const record = acceptPlanRecord(publicationDb, { ticket: "YM-1", publicationId: publication.id, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, scoutPublication: scout.id });
+    const record = acceptPlanRecord(publicationDb, { ticket: "YM-1", publicationId: publication.id, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: publication.artifact_path, bytes: publication.bytes, scoutPublication: scout.id, scoutAcceptance: acceptance.id });
     publicationDb.close();
     const socket = coordinatorSocketPath(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    parent = spawn(process.execPath, [join(root, "test/fixtures/plan-control-server.mjs")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLAN_CONTROL_SOCKET: socket, PLAN_CONTROL_ROOT: dir, PLAN_PUBLICATION_ID: String(publication.id), PLAN_RECORD_ID: String(record.id), PLAN_SCOUT_ID: String(scout.id), PLAN_SNAPSHOT: publication.artifact_path, PLAN_REVISION: publication.content_hash } });
+    parent = spawn(process.execPath, [join(root, "test/fixtures/plan-control-server.mjs")], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PLAN_CONTROL_SOCKET: socket, PLAN_CONTROL_ROOT: dir, PLAN_PUBLICATION_ID: String(publication.id), PLAN_RECORD_ID: String(record.id), PLAN_SCOUT_ID: String(scout.id), PLAN_SCOUT_ACCEPTANCE: String(acceptance.id), PLAN_SNAPSHOT: publication.artifact_path, PLAN_REVISION: publication.content_hash } });
     await once(parent.stdout!, "data");
     const review = { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "YM-1" };
     set({});

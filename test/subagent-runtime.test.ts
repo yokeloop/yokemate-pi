@@ -65,13 +65,13 @@ test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when paren
     let timer: NodeJS.Timeout | undefined;
     try {
       await Promise.race([
-        new Promise<void>((resolve) => stdoutStream.on("data", () => { if (/"publication":\{"state":"blocked"/.test(stdout)) resolve(); })),
+        new Promise<void>((resolve) => stdoutStream.on("data", () => { if (/"artifact":\{"state":"blocked"/.test(stdout)) resolve(); })),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`scout terminal timeout: ${JSON.stringify({ stdout: stdout.slice(-12000), stderr })}`)), 20000); }),
       ]);
     } finally { clearTimeout(timer); }
     assert.match(stdout, /"batchId":"scout-terminal"/);
-    assert.match(stdout, /"publication":\{"state":"blocked"/);
-    assert.match(stdout, /"error":"unavailable"/);
+    assert.match(stdout, /"artifact":\{"state":"blocked"/);
+    assert.match(stdout, /"reason":"unavailable"/);
     const state = openDb(join(sandbox, "yokemate.db"));
     try { assert.equal(state.prepare("SELECT reason FROM plan_publication_block WHERE ticket='YM-1' ORDER BY id DESC LIMIT 1").get()?.reason, "unavailable"); }
     finally { state.close(); }
