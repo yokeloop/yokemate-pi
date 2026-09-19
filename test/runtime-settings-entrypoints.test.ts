@@ -398,13 +398,15 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     assert.deepEqual(loaded.errors, []);
     loaded.runtime.appendEntry = () => undefined;
     const completed = new Map<string, () => void>();
+    const ordinaryReports: any[] = [];
     loaded.runtime.sendMessage = (message) => {
+      ordinaryReports.push(message);
       const envelope = (message.details as { envelope?: { kind: string; batchId: string } })?.envelope;
       if (envelope?.kind === "batch") completed.get(envelope.batchId)?.();
     };
     const tool = loaded.extensions[0]!.tools.get("subagent")!.definition;
     let confirmations = 0;
-    const ctx = { cwd: dir, mode: "rpc", hasUI: true, isProjectTrusted: () => false, ui: { setWidget() {}, confirm: async () => { confirmations++; return false; } } } as unknown as ExtensionContext;
+    const ctx = { cwd: dir, mode: "rpc", hasUI: true, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "caps-owner" }, ui: { setWidget() {}, confirm: async () => { confirmations++; return false; } } } as unknown as ExtensionContext;
     shutdown = async () => { for (const handler of loaded.extensions[0]!.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     let serial = 0;
     const task = { agent: "worker", task: "fixture" };
@@ -427,6 +429,40 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     assert.equal(confirmations, 1);
     await finish(one, [0]);
     set();
+    const queuedStart = connections.length;
+    const queued = await dispatch({ tasks: [{ ...task, task: "running sibling" }, { ...task, task: "queued selected" }] });
+    await count(queuedStart + 1);
+    const queuedRunId = (queued.result.details as any).children[1].identity.runId;
+    const foreignQueued = await tool.execute("foreign-queued", { cancelRun: queuedRunId }, undefined, () => undefined, { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext);
+    assert.equal((foreignQueued.details as any).status, "not_owned");
+    const queuedCancellation = await tool.execute("cancel-queued", { cancelRun: queuedRunId }, undefined, () => undefined, ctx);
+    assert.equal((queuedCancellation.details as any).status, "cancelled");
+    assert.equal((queuedCancellation.details as any).signal, null);
+    assert.equal(connections.length, queuedStart + 1);
+    assert.ok(ordinaryReports.some((message) => message.details?.envelope?.identity?.runId === queuedRunId && message.details.envelope.processOutcome === "cancelled"));
+    connections[queuedStart]!.write("finish");
+    await queued.done;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(connections.length, queuedStart + 1);
+    const queuedBatch = ordinaryReports.findLast((message) => message.details?.envelope?.kind === "batch" && message.details.envelope.batchId === (queued.result.details as any).batchId).details.envelope;
+    assert.deepEqual(queuedBatch.results.map((result: any) => result.identity.runId), (queued.result.details as any).children.map((child: any) => child.identity.runId));
+
+    const chainStart = connections.length;
+    const chain = await dispatch({ chain: [{ ...task, task: "chain first" }, { ...task, task: "after {previous}" }] });
+    await count(chainStart + 1);
+    const deferredRunId = (chain.result.details as any).children[1].identity.runId;
+    const deferredCancellation = await tool.execute("cancel-deferred", { cancelRun: deferredRunId }, undefined, () => undefined, ctx);
+    assert.equal((deferredCancellation.details as any).status, "cancellation_requested");
+    assert.equal("actualTaskHash" in (deferredCancellation.details as any), false);
+    connections[chainStart]!.write("finish");
+    await chain.done;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(connections.length, chainStart + 1);
+    const chainEnvelope = ordinaryReports.findLast((message) => message.details?.envelope?.kind === "chain" && message.details.envelope.batchId === (chain.result.details as any).batchId).details.envelope;
+    assert.deepEqual(chainEnvelope.results.map((result: any) => result.processOutcome), ["exited", "cancelled"]);
+    assert.notEqual(chainEnvelope.results[1].actualTaskHash, chainEnvelope.results[1].identity.taskHash);
+    connections.splice(queuedStart, 2);
+
     const pinned = await dispatch({ tasks: [task, task] });
     await count(2);
     set({ parallelConcurrencyLimit: false });
