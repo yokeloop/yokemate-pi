@@ -377,7 +377,12 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
-    publishPlanScout: async (_ticket, _acceptanceId, child) => { publications++; assert.equal(child.runId, "scout-save"); return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) }; },
+    publishPlanScout: async (_ticket, acceptanceId, child) => {
+      if (acceptanceId === 3 || acceptanceId === 5) throw new Error("artifact provenance refused");
+      publications++;
+      assert.match(child.runId, /^scout-save/);
+      return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) };
+    },
     preparePlanPublication: async (ticket, path, hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "b".repeat(64), repositories: ["org/repo"] } }; },
     planRecorded: async (_ticket, _path, recordId, _origin, context) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
@@ -393,10 +398,23 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     writeFileSync(join(runtimeDir, `${pane}.json`), JSON.stringify({ pid: owner.pid, cwd: root, mode: "plan", ticket: "YM-7" }));
     const worker = { sessionId: "save-session", pid: owner.pid!, starttime: processStarttime(owner.pid!)!, cwd: root, pane, parentPane: "main", mode: "plan", ticket: "YM-7", role: "coordinator" };
     const child = { ...scoutChild(worker, "YM-7", "save"), runId: "scout-save", cwd: root };
+    const cli = { ...worker, pid: cliPid, starttime: processStarttime(cliPid)! };
+    const initialFailure = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 3, child }, worker, target, env);
+    assert.equal(initialFailure.state, "refused");
+    assert.match(initialFailure.reason ?? "", /artifact provenance refused/);
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 4, child }, cli, target, env)).state, "refused");
     const accepted = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 4, child }, worker, target, env);
     assert.equal(accepted.state, "accepted", accepted.reason ?? "save-only scout refused");
     assert.equal(accepted.publication, "pending");
-    const cli = { ...worker, pid: cliPid, starttime: processStarttime(cliPid)! };
+    const foreignOwner = { ...child, ownerRunId: "foreign-owner", runId: "scout-save-foreign", batchId: "batch-foreign" };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child: foreignOwner }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child }, cli, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env)).state, "accepted");
+    const supersedingFailure = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 5, child: { ...child, runId: "scout-save-failed", batchId: "batch-save-failed" } }, worker, target, env);
+    assert.equal(supersedingFailure.state, "refused");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env)).state, "refused");
+    const nextChild = { ...scoutChild(worker, "YM-7", "save-next"), ownerRunId: child.ownerRunId, runId: "scout-save-next", cwd: root };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child: nextChild }, worker, target, env)).state, "accepted");
     const prepared = await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env);
     assert.equal(prepared.state, "accepted", prepared.reason ?? "save-only preparation refused");
     const recorded = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
@@ -405,8 +423,8 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     const repeat = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
     assert.equal(repeat.state, "accepted", repeat.reason ?? "save-only repeat refused");
     assert.equal(completions, 1);
-    assert.equal(publications, 1);
-    assert.equal(preparations, 1);
+    assert.equal(publications, 2);
+    assert.equal(preparations, 2);
     const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 9 }, cli, target, env);
     assert.equal(foreign.state, "refused");
   } finally {

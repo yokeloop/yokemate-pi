@@ -59,6 +59,8 @@ interface SaveOnlyWorker {
   admissionId: string;
   ticket: string;
   owner: ControlOrigin;
+  admitted: boolean;
+  childOwner: Pick<ChildIdentity, "ownerRunId" | "ownerSessionId">;
   scoutAcceptance?: number;
   scoutGeneration: number;
   scoutRequests: Map<number, number>;
@@ -138,6 +140,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const saveOnlyKey = (origin: ControlOrigin, ticket: string) => `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
   const childMatches = (a: ChildIdentity, b: ChildIdentity) => a.ownerRunId === b.ownerRunId && a.ownerSessionId === b.ownerSessionId && a.batchId === b.batchId && a.runId === b.runId && a.agent === b.agent && a.taskHash === b.taskHash && resolve(a.cwd) === resolve(b.cwd) && a.ticket === b.ticket;
+  const childOwnerMatches = (owner: Pick<ChildIdentity, "ownerRunId" | "ownerSessionId">, child: ChildIdentity) => owner.ownerRunId === child.ownerRunId && owner.ownerSessionId === child.ownerSessionId;
   const validScoutChild = (child: ChildIdentity | undefined, ticket: string, origin: ControlOrigin) => !!child && child.agent === "plan-scout" && child.ticket === ticket && child.ownerSessionId === origin.sessionId && resolve(child.cwd) === canonicalRoot;
   const paneOwnerMatches = (origin: ControlOrigin, ticket: string): boolean => {
     if (!origin.pane || origin.mode !== "plan" || origin.role !== "coordinator" || origin.ticket !== ticket || resolve(origin.cwd) !== canonicalRoot) return false;
@@ -260,7 +263,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     else if (registeredProblemWorker && (envelope.operation === "publish-plan-scout" || envelope.operation === "reject-plan-scout" || packageState?.tickets.has(ticket))) context = { kind: "problem", packageKey };
     else if (origin.mode === "plan" && origin.role === "coordinator" && origin.ticket === ticket && origin.pane) {
       if (saveOnly) {
-        if (!ownerOrDescendant(origin, saveOnly.owner, ticket)) throw new Error("plan operation is not from its admitted live save-only worker");
+        const ownerOnly = envelope.operation === "publish-plan-scout" || envelope.operation === "reject-plan-scout";
+        if (ownerOnly ? !sameProcess(origin, saveOnly.owner) : !ownerOrDescendant(origin, saveOnly.owner, ticket)) throw new Error("plan operation is not from its admitted live save-only worker");
       } else if (envelope.operation !== "publish-plan-scout" || !paneOwnerMatches(origin, ticket)) throw new Error("plan operation is not from its admitted live save-only worker");
       context = { kind: "save-only", admissionId: saveOnly?.admissionId ?? randomUUID() };
     } else throw new Error("plan operation is not from its registered live worker");
@@ -291,14 +295,26 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (finalized.has(acceptanceId)) throw new Error("scout artifact is superseded");
       const priorChild = children.get(acceptanceId);
       if (priorChild && !childMatches(priorChild, envelope.child!)) throw new Error("accepted scout identity does not match its delivery");
-      let createdSaveOnly = false;
       if (context.kind === "save-only" && !saveOnly) {
-        saveOnly = { admissionId: context.admissionId, ticket, owner: { ...origin }, scoutGeneration: 0, scoutRequests: requestGenerations, finalizedScoutAcceptances: finalized, scoutChildren: children };
+        saveOnly = { admissionId: context.admissionId, ticket, owner: { ...origin }, admitted: false, childOwner: { ownerRunId: envelope.child!.ownerRunId, ownerSessionId: envelope.child!.ownerSessionId }, scoutGeneration: 0, scoutRequests: requestGenerations, finalizedScoutAcceptances: finalized, scoutChildren: children };
         saveOnlyWorkers.set(saveKey, saveOnly);
-        createdSaveOnly = true;
       }
+      if (context.kind === "save-only" && !childOwnerMatches(saveOnly!.childOwner, envelope.child!)) throw new Error("accepted scout owner does not match its save-only worker");
       const currentAcceptance = context.kind === "registered" ? planRun!.scoutAcceptance : context.kind === "save-only" ? saveOnly!.scoutAcceptance : scoutAcceptances.get(scoutKey);
-      if (currentAcceptance !== undefined && currentAcceptance !== acceptanceId) finalized.add(currentAcceptance);
+      if (currentAcceptance !== undefined && currentAcceptance !== acceptanceId) {
+        finalized.add(currentAcceptance);
+        requestGenerations.delete(currentAcceptance);
+        if (context.kind === "registered") {
+          planRun!.scoutAcceptance = undefined;
+          planRun!.prepared = undefined;
+        } else if (context.kind === "save-only") {
+          saveOnly!.scoutAcceptance = undefined;
+          saveOnly!.prepared = undefined;
+        } else {
+          scoutAcceptances.delete(scoutKey);
+          preparedPlans.delete(scoutKey);
+        }
+      }
       const generation = context.kind === "registered" ? (planRun!.scoutGeneration = (planRun!.scoutGeneration ?? 0) + 1) : context.kind === "save-only" ? ++saveOnly!.scoutGeneration : (scoutGenerations.get(scoutKey) ?? 0) + 1;
       if (context.kind !== "registered" && context.kind !== "save-only") scoutGenerations.set(scoutKey, generation);
       requestGenerations.set(acceptanceId, generation);
@@ -308,14 +324,14 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       catch (error) {
         requestGenerations.delete(acceptanceId);
         children.delete(acceptanceId);
-        if (createdSaveOnly && saveOnlyWorkers.get(saveKey) === saveOnly && saveOnly!.scoutGeneration === generation) saveOnlyWorkers.delete(saveKey);
+        if (context.kind === "save-only" && !saveOnly!.admitted && requestGenerations.size === 0 && saveOnlyWorkers.get(saveKey) === saveOnly) saveOnlyWorkers.delete(saveKey);
         throw error;
       }
       const ownerStillValid = context.kind === "registered" ? !!planRun!.worker && ownerLive(planRun!.worker, ticket) : context.kind === "save-only" ? ownerLive(saveOnly!.owner, ticket) : context.kind === "problem" ? problemOwnerMatches(packageState?.owner ?? origin) : processMatches(origin.pid, origin.starttime);
       if (!ownerStillValid) {
         requestGenerations.delete(acceptanceId);
         children.delete(acceptanceId);
-        if (createdSaveOnly) saveOnlyWorkers.delete(saveKey);
+        if (context.kind === "save-only") saveOnlyWorkers.delete(saveKey);
         throw new Error("plan scout owner is no longer live");
       }
       const currentGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
@@ -327,8 +343,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       requestGenerations.clear();
       requestGenerations.set(acceptanceId, generation);
       if (context.kind === "registered") planRun!.scoutAcceptance = acceptanceId;
-      else if (context.kind === "save-only") saveOnly!.scoutAcceptance = acceptanceId;
-      else scoutAcceptances.set(scoutKey, acceptanceId);
+      else if (context.kind === "save-only") {
+        saveOnly!.admitted = true;
+        saveOnly!.scoutAcceptance = acceptanceId;
+      } else scoutAcceptances.set(scoutKey, acceptanceId);
       if (context.kind === "problem") {
         const accepted = packageState ?? { owner: { ...origin }, tickets: new Set<string>() };
         accepted.tickets.add(ticket);
@@ -351,6 +369,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           saveOnly!.scoutGeneration += 1;
           saveOnly!.scoutAcceptance = undefined;
           saveOnly!.prepared = undefined;
+          if (!saveOnly!.admitted) saveOnlyWorkers.delete(saveKey);
         } else {
           scoutGenerations.set(scoutKey, (scoutGenerations.get(scoutKey) ?? 0) + 1);
           scoutAcceptances.delete(scoutKey);
