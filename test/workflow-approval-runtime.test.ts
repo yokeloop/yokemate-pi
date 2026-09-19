@@ -12,7 +12,7 @@ import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@
 import { openDb } from "../src/db.ts";
 import { acceptScoutArtifact } from "../src/plan-publication-state.ts";
 import { readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { currentControlOrigin, processStarttime, requestPlanControl, requestPlanLaunch, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { currentControlOrigin, processStarttime, requestPlanControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 const source = join(import.meta.dirname, "..");
@@ -57,6 +57,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.env.XDG_RUNTIME_DIR = runtime;
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(source, "package.json"), join(dir, "package.json"));
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
@@ -86,7 +87,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{const kind=/\"kind\":\"(scout|plan)\"/.exec(body)?.[1]; if(process.env.WORKFLOW_GH_CONFLICT_KIND===kind){const metadata=JSON.parse(body.slice("<!-- yokemate-plan-publication:".length,body.indexOf(" -->"))); const conflict=body.slice(0,"<!-- yokemate-plan-publication:".length)+JSON.stringify({...metadata,run:metadata.run+"-conflict"})+body.slice(body.indexOf(" -->")); for(const text of [body,conflict]) rows.push({id:rows.length+1,body:text,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.error("comment conflict"); process.exit(1);} if(process.env.WORKFLOW_GH_FAIL==="1"||process.env.WORKFLOW_GH_FAIL_KIND===kind){console.error("comment unavailable"); process.exit(1);} rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
     const ownedPlanReady = join(runtime, "owned-plan-ready");
     const ownedPlanFinished = join(runtime, "owned-plan-finished");
-    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs";\nimport path from "node:path";\nconst args=process.argv.slice(2);\nif(args[0]==="tab"&&args[1]==="create") console.log(JSON.stringify({result:{tab:{tab_id:"owned-tab"},root_pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="agent"&&args[1]==="prompt"){fs.writeFileSync(process.env.WORKFLOW_OWNED_PLAN_READY,"ready"); console.log(JSON.stringify({result:{}}));}\nelse if(args[0]==="agent"&&args[1]==="wait"){const file=process.env.WORKFLOW_OWNED_PLAN_FINISHED; const done=()=>{console.log(JSON.stringify({result:{state:"done"}})); process.exit(0);}; if(fs.existsSync(file)) done(); else {const watcher=fs.watch(path.dirname(file),(_event,name)=>{if(name===path.basename(file)&&fs.existsSync(file)){watcher.close(); done();}});}}\nelse console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
+    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs";\nimport path from "node:path";\nconst args=process.argv.slice(2);\nif(args[0]==="tab"&&args[1]==="create") console.log(JSON.stringify({result:{tab:{tab_id:"owned-tab"},root_pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="pane"&&args[1]==="split") console.log(JSON.stringify({result:{pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="agent"&&args[1]==="prompt"){fs.writeFileSync(process.env.WORKFLOW_OWNED_PLAN_READY,"ready"); console.log(JSON.stringify({result:{}}));}\nelse if(args[0]==="agent"&&args[1]==="wait"){const file=process.env.WORKFLOW_OWNED_PLAN_FINISHED; const done=()=>{console.log(JSON.stringify({result:{state:"done"}})); process.exit(0);}; if(fs.existsSync(file)) done(); else {const watcher=fs.watch(path.dirname(file),(_event,name)=>{if(name===path.basename(file)&&fs.existsSync(file)){watcher.close(); done();}});}}\nelse console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
     process.env.WORKFLOW_OWNED_PLAN_READY = ownedPlanReady;
     process.env.WORKFLOW_OWNED_PLAN_FINISHED = ownedPlanFinished;
     process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
@@ -130,6 +131,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.env.HERDR_PANE_ID = "main-pane";
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     delete process.env.HERDR_PANE_ID;
+    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "main-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "main", ticket: null }));
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const input = async (text: string, source = "interactive", mode = "tui") => {
       let outcome: unknown;
@@ -425,7 +427,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       const extension = ownedLoaded.extensions[0]!;
       return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext };
     };
-    const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none") => {
+    const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none", surface: "tab" | "split" = "tab") => {
       configurePublication(`owned-${label}`, scoutExpected, planExpected);
       if (authority === "plain") {
         set(false);
@@ -438,10 +440,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
       }
       rmSync(ownedPlanReady, { force: true });
       rmSync(ownedPlanFinished, { force: true });
-      const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
-      assert.equal(ownedLaunch.state, "accepted", label);
-      const ownedRunId = ownedLaunch.results?.[0]?.keyRunId;
-      assert.ok(ownedRunId, label);
+      const launched = await promisify(execFile)("pnpm", ["split", "plan", ...(surface === "split" ? ["--split"] : []), "YM-1"], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "parent", HERDR_ENV: "1", HERDR_PANE_ID: "main-pane", HERDR_WORKSPACE_ID: "workspace", XDG_RUNTIME_DIR: runtime } });
+      const ownedRunId = launched.stdout.match(/run ([a-f0-9-]+)/)?.[1];
+      assert.ok(ownedRunId, launched.stdout + launched.stderr);
       await waitForFile(ownedPlanReady);
       writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
       Object.assign(process.env, { PI_SESSION_FILE: join(dir, `owned-${label}.jsonl`), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" });
@@ -498,8 +499,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       extraction = "none";
       clearPublication();
     };
-    await runOwnedPublicationCase("scout-pending", "unavailable", "complete", "advance");
-    await runOwnedPublicationCase("plan-pending", "complete", "unavailable", "guarded");
+    await runOwnedPublicationCase("scout-pending", "unavailable", "complete", "advance", "tab");
+    await runOwnedPublicationCase("plan-pending", "complete", "unavailable", "guarded", "split");
     await runOwnedPublicationCase("both-pending", "unavailable", "unavailable", "plain");
     await runOwnedPublicationCase("conflict", "complete", "remote_conflict");
     await runOwnedPublicationCase("target-unavailable", "target_unavailable", "target_unavailable");
