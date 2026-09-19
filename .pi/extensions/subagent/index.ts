@@ -880,14 +880,14 @@ export default function (pi: ExtensionAPI) {
 		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
 		return operation;
 	};
-	const revokeReviewRun = async (reviewRunId: string, reason: string) => {
+	const revokeReviewRun = async (reviewRunId: string, reason: string, stopObserver = true) => {
 		const review = reviewReworks.get(reviewRunId);
 		if (!review) return;
 		for (const runId of review.store.revoke()) {
 			listRuns.cancel(runId, reason);
 			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run", true).catch(() => {});
 		}
-		review.stopObserver();
+		if (stopObserver) review.stopObserver();
 	};
 	const fenceListRuns = async (reason: string) => {
 		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
@@ -1071,7 +1071,10 @@ export default function (pi: ExtensionAPI) {
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: reportTaskExcerpt(request.tickets.join("+")) });
-			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
+			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => {
+				if (lane?.review) lane.review.store.finish(ownedRun.identity.runId);
+				return lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
+			};
 			if (!lane) coordinatorUnits.add(ownedRun.identity.runId);
 			if (doBinding && !lane) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
 			let cleanup: Promise<void> | undefined;
@@ -1216,6 +1219,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
+			if (lane?.review) lane.review.store.startCycle(ownedRun.identity.runId);
 			lane?.context.startup({ state: "started", runId: ownedRun.identity.runId, facts: { model: prepared.model, cwd: prepared.cwd } });
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
@@ -1386,7 +1390,7 @@ export default function (pi: ExtensionAPI) {
 					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
 					const checked = validateReviewReworkExtraction(extraction, review.store.rawInput(generation), ticket);
 					if (checked.kind === "rework") review.store.approveRework(generation);
-					else if (checked.kind === "revoke") await revokeReviewRun(reviewRunId, "review verdict revoked before do startup");
+					else if (checked.kind === "revoke") await revokeReviewRun(reviewRunId, "review verdict revoked before do startup", false);
 				},
 				reviewRecord: async (ticket, reviewRunId, candidatePath) => {
 					const review = reviewReworks.get(reviewRunId);
@@ -1406,39 +1410,46 @@ export default function (pi: ExtensionAPI) {
 							logMove(dataRoot(ENGINE_ROOT), ticket, "на доработку", path.basename(recorded.binding.path, ".md"));
 							syncPush(dataRoot(ENGINE_ROOT), `${ticket} на доработку`);
 						}
-						const settings = readRuntimeSettings(ENGINE_ROOT);
-						const startedAt = Date.now();
-						const launched = await startCoordinator({ mode: "do", tickets: [ticket], plan: recorded.binding.path }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { store: review.store, operationId, binding: recorded.binding });
-						const details = launched.details as { runId?: string; listRunId?: string };
-						if (("isError" in launched && launched.isError) || !details.runId) throw new Error(launched.content.map((part) => part.text).join("\n") || "review do admission refused");
-						if (details.listRunId) setImmediate(() => flushListDelivery(details.listRunId!));
-						const remaining = Math.max(1, 120_000 - (Date.now() - startedAt));
-						let timer: NodeJS.Timeout | undefined;
-						let startup;
+						const currentStage = () => {
+							const stageDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+							try { return String((stageDb.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage ?? "absent"); }
+							finally { stageDb.close(); }
+						};
+						let details: { runId?: string; listRunId?: string } = {};
 						try {
-							startup = await Promise.race([
-								listRuns.waitForStartup(details.runId),
-								new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("review do startup timed out after 120000ms")), remaining); }),
-							]);
+							const settings = readRuntimeSettings(ENGINE_ROOT);
+							const startedAt = Date.now();
+							const launched = await startCoordinator({ mode: "do", tickets: [ticket], plan: recorded.binding.path }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { store: review.store, operationId, binding: recorded.binding });
+							details = launched.details as { runId?: string; listRunId?: string };
+							if (("isError" in launched && launched.isError) || !details.runId) throw new Error(launched.content.map((part) => part.text).join("\n") || "review do admission refused");
+							if (details.listRunId) setImmediate(() => flushListDelivery(details.listRunId!));
+							const remaining = Math.max(1, 120_000 - (Date.now() - startedAt));
+							let timer: NodeJS.Timeout | undefined;
+							let startup;
+							try {
+								startup = await Promise.race([
+									listRuns.waitForStartup(details.runId),
+									new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("review do startup timed out after 120000ms")), remaining); }),
+								]);
+							} catch (error) {
+								listRuns.cancel(details.runId, (error as Error).message);
+								if (coordinators.get(details.runId)) await cancelCoordinator(details.runId, "parent_cancel_run", true).catch(() => {});
+								throw error;
+							} finally { clearTimeout(timer); }
+							const model = typeof startup.facts?.model === "string" ? startup.facts.model : undefined;
+							if (startup.state !== "started") {
+								review.store.finish(details.runId);
+								return { state: startup.state === "cancelled" ? "cancelled" : "refused", recorded: true, runId: details.runId, ...(model ? { model } : {}), reason: startup.reason, stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash } as ReviewHandoffOutcome;
+							}
+							review.stopObserver();
+							const close = await closeModeSurface({ ...review.store.owner.surface, cleanup() {} });
+							const outcome: ReviewHandoffOutcome = { state: "started", recorded: true, runId: details.runId, ...(model ? { model } : {}), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash, close };
+							const started = `${ticket}: rework ${recorded.binding.path} (${recorded.binding.contentHash}) recorded; do ${details.runId} started${model ? ` with ${model}` : ""}`;
+							ctx.ui.notify(close.state === "closed" ? started : `${started}; review close failed: ${close.reason}`, close.state === "closed" ? "info" : "warning");
+							return outcome;
 						} catch (error) {
-							listRuns.cancel(details.runId, (error as Error).message);
-							if (coordinators.get(details.runId)) await cancelCoordinator(details.runId, "parent_cancel_run", true).catch(() => {});
-							throw error;
-						} finally { clearTimeout(timer); }
-						if (startup.state !== "started") {
-							review.store.finish(details.runId);
-							return { state: startup.state === "cancelled" ? "cancelled" : "refused", recorded: true, runId: details.runId, reason: startup.reason, stage: "planned", plan: recorded.binding.path, contentHash: recorded.binding.contentHash } as ReviewHandoffOutcome;
+							return { state: "refused", recorded: true, ...(details.runId ? { runId: details.runId } : {}), reason: error instanceof Error ? error.message : String(error), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash };
 						}
-						review.store.finish(details.runId);
-						review.stopObserver();
-						const close = await closeModeSurface({ ...review.store.owner.surface, cleanup() {} });
-						const stageDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-						let actualStage = "unknown";
-						try { actualStage = String((stageDb.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage ?? "absent"); }
-						finally { stageDb.close(); }
-						const outcome: ReviewHandoffOutcome = { state: "started", recorded: true, runId: details.runId, stage: actualStage, plan: recorded.binding.path, contentHash: recorded.binding.contentHash, close };
-						ctx.ui.notify(close.state === "closed" ? `${ticket}: rework recorded; do ${details.runId} started` : `${ticket}: do ${details.runId} started; review close failed: ${close.reason}`, close.state === "closed" ? "info" : "warning");
-						return outcome;
 					});
 				},
 				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),

@@ -25,6 +25,9 @@ test("review rework receipt binds the exact generation, owner and recorded plan"
     store.bindRecorded(operationId, binding);
     store.consume(operationId, "do-run", binding);
     store.checkCycle("do-run", binding);
+    store.startCycle("do-run");
+    assert.deepEqual(store.revoke(), []);
+    store.checkCycle("do-run", binding);
     store.finish("do-run");
     return { state: "started" as const, recorded: true, runId: "do-run" };
   });

@@ -5,7 +5,7 @@ argument-hint: "[--split] <TICKET> [note]"
 
 # /review — launcher
 
-Open a new tab by default; only `--split` before the first `--` opens a split of the calling pane. The work runs there as `review-worker`; the engineer closes the conversational mode surface.
+Open a new tab by default; only `--split` before the first `--` opens a split of the calling pane. The work runs there as `review-worker`. A clean acceptance remains conversational and the engineer closes it; an owned final rework verdict records the exact rework plan, starts `/do` without another confirmation, and closes only this surface after its work ACK.
 
 Before anything else run `pnpm where review <ticket>`, using the first ordinary word before `--`, not a control or its value. Preserve the full input separately.
 

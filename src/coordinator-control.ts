@@ -464,8 +464,8 @@ export async function requestReviewControl(root: string, operation: ReviewContro
 }
 
 export function currentControlOrigin(root: string, sessionId = process.env.PI_SESSION_ID): ControlOrigin {
-  if (!sessionId) throw new Error("PI_SESSION_ID is required for parent plan handoff");
+  if (!sessionId) throw new Error("PI_SESSION_ID is required for parent control handoff");
   const starttime = processStarttime(process.pid);
-  if (!starttime) throw new Error("cannot read plan origin process starttime");
+  if (!starttime) throw new Error("cannot read control origin process starttime");
   return { sessionId, runtimeId: process.env.YOKEMATE_REVIEW_RUNTIME_ID, pid: process.pid, starttime, cwd: root, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE };
 }
