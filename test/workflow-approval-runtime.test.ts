@@ -97,7 +97,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await loader.reload();
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []);
-    loaded.runtime.appendEntry = () => undefined;
+    const appended: Array<{ type: string; data: unknown }> = [];
+    loaded.runtime.appendEntry = (type, data) => { appended.push({ type, data }); };
     const reports: unknown[] = [];
     let reportReady: (() => void) | undefined;
     const scoutWaiters = new Map<string, () => void>();
@@ -114,6 +115,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const extension = loaded.extensions[0]!;
     const tool = extension.tools.get("subagent")!.definition;
     let extraction: "none" | "advance-plan-do" | "approve-ready-do" | "error" = "none";
+    let holdExtraction = false;
+    let extractionEntered: (() => void) | undefined;
+    let releaseExtraction: (() => void) | undefined;
     let calls = 0;
     let confirms = 0;
     const notifications: string[] = [];
@@ -121,6 +125,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
       getAll: () => [{ provider: "ym204-fixture", id: "deterministic", name: "Deterministic", reasoning: true }, { provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true,
       complete: async (_model: unknown, context: { messages: { content: string }[] }) => {
         calls++;
+        if (holdExtraction) {
+          extractionEntered?.();
+          await new Promise<void>((resolve) => { releaseExtraction = resolve; });
+        }
         if (extraction === "error") throw new Error("workflow extraction timed out");
         const { raw, bindings } = JSON.parse(context.messages[0]!.content);
         const value = extraction === "none" ? { kind: "none" } : { kind: extraction, ticket: "YM-1", binding: extraction === "approve-ready-do" ? bindings[0].contentHash : null, actions: extraction === "approve-ready-do" ? ["do"] : ["plan", "do"], evidence: [{ start: 0, end: raw.length, text: raw }] };
@@ -253,10 +261,50 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
     extraction = "error";
+    const callsBeforeOrdinary = calls;
+    const notificationsBeforeOrdinary = notifications.length;
     assert.equal(await input("Исправь обычный баг"), undefined);
-    assert.match(notifications.pop() ?? "", /workflow extraction unavailable: workflow extraction timed out; continuing without inferred workflow approval/);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls, callsBeforeOrdinary);
+    assert.equal(notifications.length, notificationsBeforeOrdinary);
+    extraction = "approve-ready-do";
+    holdExtraction = true;
+    const entered = new Promise<void>((resolve) => { extractionEntered = resolve; });
+    assert.equal(await input("План согласован, запускай YM-1"), undefined);
+    await entered;
+    const earlyLaunch = launch();
+    let earlySettled = false;
+    void earlyLaunch.then(() => { earlySettled = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(earlySettled, false);
+    assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
+    releaseExtraction?.();
+    holdExtraction = false;
+    extractionEntered = undefined;
+    const earlyApproved = await earlyLaunch;
+    const earlyApprovedId = (earlyApproved.details as { runId?: string }).runId;
+    assert.ok(earlyApprovedId, output(earlyApproved));
+    await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
+    await cancel(earlyApprovedId!);
+    rmSync(join(dir, "work", "YM-1", "fixture-runs"), { force: true });
+    const workflowEntries = appended.filter((entry) => entry.type === "yokemate-workflow-extraction" || entry.type === "yokemate-workflow-consumer");
+    assert.ok(workflowEntries.some((entry: any) => entry.type === "yokemate-workflow-extraction" && entry.data?.phase === "start" && entry.data?.bindingCount === 0 && entry.data?.bindingBytes === 0));
+    assert.ok(workflowEntries.some((entry: any) => entry.type === "yokemate-workflow-extraction" && entry.data?.phase === "terminal" && entry.data?.outcome === "approval"));
+    assert.ok(workflowEntries.some((entry: any) => entry.type === "yokemate-workflow-consumer" && entry.data?.phase === "wait"));
+    assert.ok(workflowEntries.some((entry: any) => entry.type === "yokemate-workflow-consumer" && entry.data?.phase === "decision"));
+    assert.doesNotMatch(JSON.stringify(workflowEntries), /План согласован|запускай|evidence|\/home\/.*plan\.md/);
+    for (const socket of eventConnections.splice(0)) socket.destroy();
+    reset();
+    extraction = "error";
+    await input("План согласован, запускай YM-1");
+    const failedExtraction = await launch();
+    assert.match(output(failedExtraction), /workflow extraction unavailable: outcome=model_error/);
+    assert.match(notifications.at(-1) ?? "", /workflow extraction unavailable: outcome=model_error, elapsedMs=\d+; no inferred workflow approval/);
+    assert.doesNotMatch(`${JSON.stringify(workflowEntries)}\n${notifications.join("\n")}\n${output(failedExtraction)}`, /workflow extraction timed out|SENTINEL/);
+    notifications.length = 0;
+    await input("ordinary replacement");
     extraction = "none";
-    assert.match(output(await launch()), /current interactive approval/);
+    assert.match(output(await launch()), /consumed|current interactive approval/);
     await input("/do YM-1", "extension");
     await input("/do YM-1", "interactive", "rpc");
     assert.match(output(await launch()), /current interactive approval/);
@@ -272,7 +320,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount + 1);
     const autoId = auto.match(/background run ([a-f0-9-]+)/)![1]!;
     await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
-    assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), autoId);
+    assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim().split("\n").at(-1), autoId);
     assert.match(output(await launch()), /already consumed/);
     await cancel(autoId);
     await new Promise<void>((resolve) => setImmediate(resolve));

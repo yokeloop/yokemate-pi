@@ -13,8 +13,8 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, toPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
-import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
+import { readCandidatePlanSnapshot, readRecordedPlanBinding, readWorkflowBindingSnapshot, assertPlanBinding, toPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
+import { DoAuthorityStore, isWorkflowCandidate, PendingWorkflowExtraction, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION, type ApprovalParent, type InputGeneration, type WorkflowCancellationReason, type WorkflowExtractionTerminal } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
@@ -31,7 +31,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Container, getKeybindings, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { buildCoordinatorDisplay, buildReportDisplay, reportTaskExcerpt, subagentReportRenderer, type ReportAdmissionDisplay, type ReportDiagnosticFacts, type SubagentReportDisplayV1 } from "../../../src/subagent-report.ts";
 import { coordinatorArtifactId, SubagentReportStore } from "../../../src/subagent-report-store.ts";
 import { Type } from "typebox";
@@ -798,6 +798,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const listRuns = new ListRunRegistry();
+	const authorityByCycle = new Map<string, DoAuthorityStore>();
 	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => {
 		const deliveryId = createHash("sha256").update(`${message.customType}\u0000${JSON.stringify(message.details)}`).digest("hex");
 		const delivery = listDeliveries.get(deliveryId) ?? { state: "pending" as const, customType: message.customType, content: message.content };
@@ -827,6 +828,10 @@ export default function (pi: ExtensionAPI) {
 		listRuns.flushAggregate(listRunId);
 	};
 	listRuns.onTerminal((run, entry) => {
+		if (run.identity.mode === "do") {
+			authorityByCycle.get(entry.keyRunId)?.finish(entry.keyRunId);
+			authorityByCycle.delete(entry.keyRunId);
+		}
 		if (entry.immediate?.state === "accepted" && !listRuns.wasLifetimeReleased(entry.keyRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 		if (entry.terminal?.outcome === "cancelled" && typeof entry.immediate?.facts?.agentName === "string") void herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
 		deliverListMessage(run.identity.listRunId, { customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
@@ -838,11 +843,49 @@ export default function (pi: ExtensionAPI) {
 	const cancelledRecordingPlans = new Set<string>();
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
+	let workflowExtraction: PendingWorkflowExtraction | undefined;
+	let removeTerminalInputListener: (() => void) | undefined;
+	const observedTurnSignals = new WeakSet<AbortSignal>();
+	const warnedWorkflowExtractions = new WeakSet<PendingWorkflowExtraction>();
+	interface WorkflowGenerationCapture { parent: ApprovalParent; store: DoAuthorityStore; generation: InputGeneration; operation?: PendingWorkflowExtraction }
+	const captureWorkflowGeneration = (): WorkflowGenerationCapture | undefined => {
+		if (!authority || !controlIdentity) return;
+		const generation = authority.generation();
+		const operation = workflowExtraction?.matches(controlIdentity, authority, generation) ? workflowExtraction : undefined;
+		return { parent: { ...controlIdentity }, store: authority, generation, operation };
+	};
+	const safeWorkflowId = (value: unknown): string | undefined => {
+		if (typeof value !== "string") return;
+		return /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : createHash("sha256").update(value).digest("hex");
+	};
+	const appendWorkflowEntry = (type: "yokemate-workflow-extraction" | "yokemate-workflow-consumer", data: Record<string, unknown>): void => {
+		try { pi.appendEntry(type, data); } catch {}
+	};
+	const assertWorkflowCapture = (capture: WorkflowGenerationCapture): void => {
+		if (!authority || !controlIdentity || capture.store !== authority || capture.parent.sessionId !== controlIdentity.sessionId || capture.parent.runtimeId !== controlIdentity.runtimeId) throw new Error("stale do approval input generation");
+		authority.assertGeneration(capture.generation);
+	};
+	const awaitWorkflowGeneration = async (capture: WorkflowGenerationCapture | undefined, ctx: ExtensionContext, consumer: Record<string, unknown>, blocking = true): Promise<WorkflowExtractionTerminal | undefined> => {
+		if (!capture?.operation) return;
+		appendWorkflowEntry("yokemate-workflow-consumer", { phase: "wait", parentSessionId: capture.parent.sessionId, parentRuntimeId: capture.parent.runtimeId, serial: capture.generation.serial, revision: capture.generation.revision, inputHash: capture.generation.inputHash, decisionCode: "pending", ...consumer });
+		const terminal = await capture.operation.wait();
+		assertWorkflowCapture(capture);
+		appendWorkflowEntry("yokemate-workflow-consumer", { phase: "decision", parentSessionId: capture.parent.sessionId, parentRuntimeId: capture.parent.runtimeId, serial: capture.generation.serial, revision: capture.generation.revision, inputHash: capture.generation.inputHash, outcome: terminal.outcome, decisionCode: terminal.outcome, elapsedMs: terminal.elapsedMs, ...consumer });
+		if (blocking && ["timeout", "model_error", "invalid"].includes(terminal.outcome)) {
+			if (!warnedWorkflowExtractions.has(capture.operation)) {
+				warnedWorkflowExtractions.add(capture.operation);
+				ctx.ui.notify(`workflow extraction unavailable: outcome=${terminal.outcome}, elapsedMs=${terminal.elapsedMs}; no inferred workflow approval`, "warning");
+			}
+			throw new Error(`workflow extraction unavailable: outcome=${terminal.outcome}; no inferred workflow approval`);
+		}
+		return terminal;
+	};
 	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
 		if (coordinatorUnits.delete(runId)) activeUnits -= 1;
-		authority?.finish(runId);
+		authorityByCycle.get(runId)?.finish(runId);
+		authorityByCycle.delete(runId);
 	};
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
@@ -887,17 +930,20 @@ export default function (pi: ExtensionAPI) {
 			if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
 		}));
 	};
-	const revokeAuthority = async () => {
+	const revokeAuthority = async (reason: WorkflowCancellationReason = "parent_cancel") => {
 		shipPermits.invalidate();
+		workflowExtraction?.cancel(reason);
+		const stopped = authority?.revoke() ?? [];
+		for (const runId of stopped) authorityByCycle.delete(runId);
 		await fenceListRuns("parent runtime changed");
-		for (const runId of authority?.revoke() ?? []) {
+		for (const runId of stopped) {
 			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run");
 			else listRuns.cancel(runId, "parent runtime changed");
 		}
 	};
-	pi.on("session_before_switch", revokeAuthority);
-	pi.on("session_before_fork", revokeAuthority);
-	pi.on("session_before_tree", revokeAuthority);
+	pi.on("session_before_switch", () => revokeAuthority("session_switch"));
+	pi.on("session_before_fork", () => revokeAuthority("session_fork"));
+	pi.on("session_before_tree", () => revokeAuthority("session_tree"));
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
 	const sendCoordinatorTerminal = (run: CoordinatorRun, outcome: "done" | "blocked", summary: string, reason: string | undefined, verification: unknown, rpcDiagnostic?: Record<string, unknown>, awaitLateDiagnostics = false): void => {
@@ -912,7 +958,56 @@ export default function (pi: ExtensionAPI) {
 		if (!awaitLateDiagnostics) reportArchives.delete(artifactId);
 		pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome, verification, display } }, { deliverAs: "followUp", triggerTurn: true });
 	};
-	pi.on("input", async (event, ctx) => {
+	const startWorkflowExtraction = (raw: string, ctx: ExtensionContext, parent: ApprovalParent, store: DoAuthorityStore, generation: InputGeneration): void => {
+		const operation = new PendingWorkflowExtraction(parent, store, generation);
+		workflowExtraction = operation;
+		appendWorkflowEntry("yokemate-workflow-extraction", { phase: "start", parentSessionId: parent.sessionId, parentRuntimeId: parent.runtimeId, serial: generation.serial, revision: generation.revision, inputHash: generation.inputHash, startedAt: new Date(operation.startedAtWall).toISOString(), provider: ctx.model?.provider, model: ctx.model?.id, bindingCount: 0, bindingBytes: 0 });
+		void operation.wait().then((terminal) => appendWorkflowEntry("yokemate-workflow-extraction", { phase: "terminal", parentSessionId: parent.sessionId, parentRuntimeId: parent.runtimeId, serial: generation.serial, revision: generation.revision, inputHash: generation.inputHash, ...terminal }));
+		setImmediate(() => operation.start(async (signal) => {
+			const model = ctx.model;
+			const provider = model?.provider;
+			const modelId = model?.id;
+			if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return { outcome: "model_error", provider, model: modelId };
+			let bindings: PlanBinding[];
+			try { bindings = await readWorkflowBindingSnapshot(ENGINE_ROOT, signal); }
+			catch { return { outcome: signal.aborted ? "none" : "model_error", provider, model: modelId }; }
+			if (!operation.isCurrent(parent, store, generation)) return { outcome: "none", provider, model: modelId };
+			const bindingCount = bindings.length;
+			const bindingBytes = Buffer.byteLength(JSON.stringify(bindings), "utf8");
+			let message: Awaited<ReturnType<typeof ctx.modelRegistry.complete>>;
+			try {
+				message = await ctx.modelRegistry.complete(model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw, bindings }), timestamp: Date.now() }] }, { signal, maxTokens: 1024 });
+			} catch { return { outcome: signal.aborted ? "none" : "model_error", provider, model: modelId, bindingCount, bindingBytes }; }
+			if (!operation.isCurrent(parent, store, generation)) return { outcome: "none", provider, model: modelId, bindingCount, bindingBytes };
+			if (message.stopReason === "error" || message.stopReason === "aborted") return { outcome: "model_error", provider, model: modelId, bindingCount, bindingBytes };
+			if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+			const response = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+			if (Buffer.byteLength(response, "utf8") > 16 * 1024) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+			let extraction;
+			try { extraction = validateExtraction(JSON.parse(response), raw, bindings); }
+			catch { return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes }; }
+			if (extraction.kind === "none") return { outcome: "none", provider, model: modelId, bindingCount, bindingBytes };
+			if (extraction.kind === "advance-plan-do") return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => store.approve("advance-plan-do", extraction.ticket, undefined, generation) };
+			if (extraction.kind === "approve-ready-do") {
+				let current: PlanBinding;
+				try {
+					current = readRecordedPlanBinding(ENGINE_ROOT, extraction.ticket);
+					const snapshotted = bindings.find((binding) => binding.ticket === extraction.ticket);
+					if (!snapshotted) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+					assertPlanBinding(snapshotted, current);
+				} catch { return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes }; }
+				return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => store.approve("post-plan-approval", extraction.ticket, current, generation) };
+			}
+			return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => {
+				const stopped = store.revoke(extraction.ticket);
+				setImmediate(() => { for (const runId of stopped) {
+					if (coordinators.get(runId)) void cancelCoordinator(runId, "parent_cancel_run").catch(() => {});
+					else listRuns.cancel(runId, "workflow revoked");
+				} });
+			} };
+		}));
+	};
+	pi.on("input", (event, ctx) => {
 		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const text = event.text.trim();
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -920,11 +1015,10 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("workflow approval unavailable: no verified main parent runtime", "error");
 			return { action: "handled" as const };
 		}
+		workflowExtraction?.cancel("new_input");
 		const generation = authority.beginInput(event.text);
 		shipPermits.invalidate();
-		let extractingWorkflow = false;
 		try {
-			readRuntimeSettings(ENGINE_ROOT);
 			const ship = text.match(/^\/ship\s+(.+)$/);
 			if (ship) {
 				const tickets = ship[1]!.split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
@@ -960,52 +1054,28 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { ctx.ui.notify(`${ticket}: ${(error as Error).message}`, "error"); }
 				return;
 			}
-			if (text.startsWith("/")) return;
-			extractingWorkflow = true;
-			if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("workflow extraction requires a configured model and external authentication");
-			const bindings: PlanBinding[] = [];
-			if (fs.existsSync(path.join(ENGINE_ROOT, "yokemate.db"))) {
-				const db = new DatabaseSync(path.join(ENGINE_ROOT, "yokemate.db"), { readOnly: true });
-				try {
-					for (const row of db.prepare("SELECT ticket FROM work WHERE plan IS NOT NULL ORDER BY ticket").all()) {
-						try { bindings.push(readRecordedPlanBinding(ENGINE_ROOT, String(row.ticket))); } catch {}
-					}
-				} finally { db.close(); }
-			}
-			const controller = new AbortController();
-			let timer: NodeJS.Timeout | undefined;
-			try {
-				const message = await Promise.race([
-					ctx.modelRegistry.complete(ctx.model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, bindings }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 1024 }),
-					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("workflow extraction timed out")); }, 15000); }),
-				]);
-				authority.assertGeneration(generation);
-				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("workflow extraction did not return a clean no-tools result");
-				const extraction = validateExtraction(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, bindings);
-				if (extraction.kind === "revoke") {
-					for (const runId of authority.revoke(extraction.ticket)) await cancelCoordinator(runId, "parent_cancel_run");
-				} else if (extraction.kind === "advance-plan-do") authority.approve("advance-plan-do", extraction.ticket, undefined, generation);
-				else if (extraction.kind === "approve-ready-do") {
-					const binding = readRecordedPlanBinding(ENGINE_ROOT, extraction.ticket);
-					if (binding.contentHash !== extraction.binding) throw new Error("workflow extraction ready binding changed");
-					authority.approve("post-plan-approval", extraction.ticket, binding, generation);
-				}
-			} finally { clearTimeout(timer); controller.abort(); }
+			if (text.startsWith("/") || !isWorkflowCandidate(event.text)) return;
+			startWorkflowExtraction(event.text, ctx, controlIdentity, authority, generation);
 		} catch (error) {
-			if (extractingWorkflow) {
-				ctx.ui.notify(`workflow extraction unavailable: ${(error as Error).message}; continuing without inferred workflow approval`, "warning");
-				return;
-			}
 			ctx.ui.notify((error as Error).message, "error");
 			return { action: "handled" as const };
 		}
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), lane?: { context: KeyRunContext; doBinding?: PlanBinding }) => {
+	type WorkflowConsumerMetadata = { requestId?: string; toolCallId?: string; listRunId?: string; keyRunId?: string };
+	const workflowConsumerFacts = (kind: string, metadata: WorkflowConsumerMetadata, ticket?: string): Record<string, unknown> => ({ consumerKind: kind, ...(ticket ? { ticket } : {}), ...(safeWorkflowId(metadata.requestId) ? { requestId: safeWorkflowId(metadata.requestId) } : {}), ...(safeWorkflowId(metadata.toolCallId) ? { toolCallId: safeWorkflowId(metadata.toolCallId) } : {}), ...(safeWorkflowId(metadata.listRunId) ? { listRunId: safeWorkflowId(metadata.listRunId) } : {}), ...(safeWorkflowId(metadata.keyRunId) ? { keyRunId: safeWorkflowId(metadata.keyRunId) } : {}) });
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings | undefined, lane?: { context: KeyRunContext; doBinding?: PlanBinding }, metadata: WorkflowConsumerMetadata = {}) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
+		let checks = coordinatorChecks(settings ?? readRuntimeSettings(ENGINE_ROOT));
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
+		const workflowCapture = request.mode === "do" && !lane ? captureWorkflowGeneration() : undefined;
+		if (request.mode === "do" && !lane) await awaitWorkflowGeneration(workflowCapture, ctx, workflowConsumerFacts("do", metadata, request.tickets[0]));
+		if (workflowCapture) assertWorkflowCapture(workflowCapture);
+		settings = readRuntimeSettings(ENGINE_ROOT);
+		checks = coordinatorChecks(settings);
+		const currentRefusal = checks.checkCaller(origin, request);
+		if (currentRefusal) throw new Error(currentRefusal);
 		if (request.mode === "ship" && !lane) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
@@ -1032,7 +1102,10 @@ export default function (pi: ExtensionAPI) {
 			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: reportTaskExcerpt(request.tickets.join("+")) });
 			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
 			if (!lane) coordinatorUnits.add(ownedRun.identity.runId);
-			if (doBinding && !lane) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
+			if (doBinding && !lane) {
+				authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
+				authorityByCycle.set(ownedRun.identity.runId, authority!);
+			}
 			let cleanup: Promise<void> | undefined;
 			cleanupReservation = (reason) => cleanup ??= (async () => {
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
@@ -1164,12 +1237,20 @@ export default function (pi: ExtensionAPI) {
 			throw error;
 		}
 	};
-	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
+	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings | undefined, metadata: WorkflowConsumerMetadata = {}, workflowCaptureOverride?: WorkflowGenerationCapture) => {
 		if (!request || !["do", "ship"].includes(request.mode) || !Array.isArray(request.tickets) || !request.tickets.length) throw new Error("coordinator request needs ordered tickets");
 		if (new Set(request.tickets).size !== request.tickets.length) throw new Error("ticket list contains duplicates");
-		const checks = coordinatorChecks(settings);
+		if (request.tickets.every((ticket) => !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket))) throw new Error(`invalid ticket key ${JSON.stringify(request.tickets[0])}`);
+		let checks = coordinatorChecks(settings ?? readRuntimeSettings(ENGINE_ROOT));
 		const caller = checks.checkCaller(origin, request);
 		if (caller) throw new Error(caller);
+		const workflowCapture = request.mode === "do" ? workflowCaptureOverride ?? captureWorkflowGeneration() : undefined;
+		if (request.mode === "do") await awaitWorkflowGeneration(workflowCapture, ctx, workflowConsumerFacts("do-list", metadata));
+		if (workflowCapture) assertWorkflowCapture(workflowCapture);
+		settings = readRuntimeSettings(ENGINE_ROOT);
+		checks = coordinatorChecks(settings);
+		const currentCaller = checks.checkCaller(origin, request);
+		if (currentCaller) throw new Error(currentCaller);
 		if (request.mode === "ship") {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
@@ -1188,7 +1269,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
 		const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
-		if (request.mode === "do") for (const entry of accepted) authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+		if (request.mode === "do") for (const entry of accepted) {
+			authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+			authorityByCycle.set(entry.keyRunId, authority!);
+		}
 		listUnits += accepted.length;
 		activeUnits += accepted.length;
 		deferredListDeliveries.add(run.identity.listRunId);
@@ -1197,7 +1281,7 @@ export default function (pi: ExtensionAPI) {
 			listRuns.start(run.identity.listRunId, async (lane) => {
 				lane.signal.addEventListener("abort", () => { void cancelCoordinator(lane.keyRunId, "parent_cancel_run", true).catch(() => {}); }, { once: true });
 				const part = { ...request, tickets: [lane.key] };
-				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key) });
+				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key) }, { ...metadata, listRunId: lane.listRunId, keyRunId: lane.keyRunId });
 				lane.active({ identity: result.details.identity, model: result.details.identity?.model, cwd: result.details.identity?.cwd });
 			});
 		});
@@ -1215,12 +1299,26 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
-		await revokeAuthority();
+		await revokeAuthority("session_reload");
+		workflowExtraction = undefined;
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
 		if (controlServer) await new Promise<void>((resolve) => controlServer!.close(() => resolve()));
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
-		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin) => {
+		if (ctx.mode === "tui" && typeof ctx.ui.onTerminalInput === "function") removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
+			const keybindings = getKeybindings();
+			if (!keybindings.matches(data, "app.interrupt") && !keybindings.matches(data, "app.clear")) return;
+			workflowExtraction?.cancel("interrupt");
+			authority?.invalidateUnconsumed();
+			shipPermits.invalidate();
+			return undefined;
+		});
+		const planRunGenerations = new Map<string, WorkflowGenerationCapture>();
+		const planRunMetadata = new Map<string, WorkflowConsumerMetadata>();
+		const planRecordGenerations = new Map<number, WorkflowGenerationCapture>();
+		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin, planRunId?: string) => {
 			const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 			assertPublishable(snapshot.bytes);
 			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
@@ -1230,6 +1328,8 @@ export default function (pi: ExtensionAPI) {
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
 				const snapshotPath = writePublicationArtifact(ENGINE_ROOT, ticket, "plan", snapshot.contentHash, snapshot.bytes);
 				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}) });
+				const capture = planRunId ? planRunGenerations.get(planRunId) : !origin.mode && origin.sessionId === sessionId ? captureWorkflowGeneration() : undefined;
+				if (capture && !planRecordGenerations.has(record.id)) planRecordGenerations.set(record.id, capture);
 				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
@@ -1253,27 +1353,38 @@ export default function (pi: ExtensionAPI) {
 				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
-			const settings = readRuntimeSettings(ENGINE_ROOT);
+		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult, recordId?: number) => {
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
 			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
+			const capture = recordId ? planRecordGenerations.get(recordId) ?? (planRunId ? planRunGenerations.get(planRunId) : undefined) : planRunId ? planRunGenerations.get(planRunId) : undefined;
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
 			if (planRunId && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
 			let reason = "plan-only; ready for /do; a new interactive approval is required";
 			let handoff: "plan-only" | "started" | "refused" = "plan-only";
-			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
-				const advance = authority!.record(binding, settings.policy.workflowApproval);
-				if (advance) {
+			let terminal: WorkflowExtractionTerminal | undefined;
+			let captureCurrent = false;
+			if (capture) try {
+				terminal = await awaitWorkflowGeneration(capture, ctx, workflowConsumerFacts("plan-record", planRunId ? planRunMetadata.get(planRunId) ?? { keyRunId: planRunId } : {}, ticket), false);
+				assertWorkflowCapture(capture);
+				captureCurrent = true;
+			} catch { reason = "plan-only; workflow approval became stale; use a new /do"; }
+			const settings = readRuntimeSettings(ENGINE_ROOT);
+			if (terminal && ["timeout", "model_error", "invalid"].includes(terminal.outcome)) reason = `plan-only; workflow extraction unavailable: outcome=${terminal.outcome}; use a new /do`;
+			else if (terminal?.outcome === "none") reason = "plan-only; no inferred workflow approval; use a new /do";
+			if ((!planRunId || !cancelledRecordingPlans.has(planRunId)) && capture && captureCurrent && terminal?.outcome === "approval" && terminal.action === "advance-plan-do") {
+				const advance = capture.store.record(binding, settings.policy.workflowApproval);
+				if (settings.policy.workflowApproval) reason = "plan-only; ready for /do; workflowApproval requires a new interactive approval";
+				else if (advance) {
 					try {
 						const modelDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 						try {
 							const model = modelForTicket(modelDb, ticket, "do") ?? poolModel(dataRoot(ENGINE_ROOT), "do");
 							resolveCoordinatorModel(model, ctx.modelRegistry);
 						} finally { modelDb.close(); }
-						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { keyRunId: planRunId }, capture);
 						if (result.details.listRunId) setImmediate(() => flushListDelivery(result.details.listRunId));
 						if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
 						runId = result.details.runId;
@@ -1281,9 +1392,14 @@ export default function (pi: ExtensionAPI) {
 						handoff = "started";
 					} catch (error) { reason = (error as Error).message; handoff = "refused"; }
 				}
-			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
+			} else if (planRunId && cancelledRecordingPlans.has(planRunId)) reason = "plan recorded after cancellation; automatic do handoff revoked";
 			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
 			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
+			if (recordId) planRecordGenerations.delete(recordId);
+			if (planRunId) {
+				planRunGenerations.delete(planRunId);
+				planRunMetadata.delete(planRunId);
+			}
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
@@ -1300,8 +1416,13 @@ export default function (pi: ExtensionAPI) {
 					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
-				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
-					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
+				planRegistered: (_ticket, planRunId, _origin, dispatch) => {
+					const capture = captureWorkflowGeneration();
+					if (capture && !planRunGenerations.has(planRunId)) planRunGenerations.set(planRunId, capture);
+					planRunMetadata.set(planRunId, { ...dispatch, keyRunId: planRunId });
+				},
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin, planRunId) => {
+					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin, planRunId);
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
 					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
@@ -1312,12 +1433,17 @@ export default function (pi: ExtensionAPI) {
 					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined, undefined, recordIdOrOrigin);
 				},
-				launchPlan: async (request, controlOrigin) => {
+				launchPlan: async (request, controlOrigin, dispatch) => {
+					const launchCapture = captureWorkflowGeneration();
 					const settings = readRuntimeSettings(ENGINE_ROOT);
 					const run = listRuns.admit({ mode: "plan", keys: request.targets.map((target) => target.ticket), parentSessionId: sessionId, parentRuntimeId: runtimeId, settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: settings.policy.guards.duplicateMode, rejectKey: (key) => /^[A-Z][A-Z0-9]*-\d+$/.test(key) ? undefined : `invalid ticket key ${JSON.stringify(key)}` });
 					const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
+					for (const entry of accepted) {
+						if (launchCapture) planRunGenerations.set(entry.keyRunId, launchCapture);
+						planRunMetadata.set(entry.keyRunId, { ...dispatch, listRunId: run.identity.listRunId, keyRunId: entry.keyRunId });
+					}
 					listUnits += accepted.length;
 					activeUnits += accepted.length;
 					setImmediate(() => {
@@ -1340,6 +1466,8 @@ export default function (pi: ExtensionAPI) {
 				planFinished: async (_ticket, planRunId, outcome, reason) => {
 					const found = listRuns.get(planRunId);
 					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+					planRunGenerations.delete(planRunId);
+					planRunMetadata.delete(planRunId);
 				},
 				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
 					const controller = new AbortController();
@@ -1347,7 +1475,7 @@ export default function (pi: ExtensionAPI) {
 					recorderControllers.set(planRunId, controller);
 					let locallyRecorded = false;
 					try {
-						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin);
+						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin, planRunId);
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
@@ -1356,7 +1484,7 @@ export default function (pi: ExtensionAPI) {
 						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
-						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result);
+						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result, prepared.record.id);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
 							const found = listRuns.get(planRunId);
@@ -1378,9 +1506,9 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 				},
-				launch: async (request, controlOrigin) => {
+				launch: async (request, controlOrigin, dispatch) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
-					const result = await startCoordinator(request, ctx, origin);
+					const result = await startCoordinator(request, ctx, origin, undefined, dispatch);
 					const details = result.details as { runId?: string; listRunId?: string; results?: import("../../../src/coordinator-control.ts").ControlResult[] };
 					return { ...details, afterAck: () => details.listRunId && flushListDelivery(details.listRunId) };
 				},
@@ -1392,20 +1520,31 @@ export default function (pi: ExtensionAPI) {
 				},
 				cancel: async (runId, _origin) => {
 					const target = listRuns.get(runId);
+					const direct = coordinators.get(runId);
+					if (!target && !direct) throw new Error(`unknown coordinator run ${runId}`);
+					workflowExtraction?.cancel("parent_cancel");
+					shipPermits.invalidate();
 					let cancelled = false;
 					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
 					for (const entry of entries) {
+						planRunGenerations.delete(entry.keyRunId);
+						planRunMetadata.delete(entry.keyRunId);
+						const stopped = authority?.revoke(entry.key) ?? [];
 						if (recordingPlans.has(entry.keyRunId)) {
 							cancelledRecordingPlans.add(entry.keyRunId);
 							recorderControllers.get(entry.keyRunId)?.abort();
-							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 							cancelled = true;
 						} else {
 							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
 							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
 						}
+						for (const coordinatorRunId of stopped) if (coordinatorRunId !== entry.keyRunId && coordinators.get(coordinatorRunId)) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 					}
-					if (!target && coordinators.get(runId)) { await cancelCoordinator(runId, "parent_control_cancel", cancelled); cancelled = true; }
+					if (!target && direct) {
+						for (const coordinatorRunId of authority?.revoke(direct.identity.ticket) ?? []) if (coordinatorRunId !== runId && coordinators.get(coordinatorRunId)) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
+						await cancelCoordinator(runId, "parent_control_cancel", cancelled);
+						cancelled = true;
+					}
 					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
 				},
 				merge: async (runId, request, mergeOrigin) => {
@@ -1486,10 +1625,12 @@ export default function (pi: ExtensionAPI) {
 			for (const mark of cancellationByProcess.values()) mark(payload.reason);
 		},
 	});
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		shuttingDown = true;
-		await fenceListRuns("parent session shutdown");
-		authority?.revoke();
+		await revokeAuthority(event.reason === "reload" ? "session_reload" : event.reason === "fork" ? "session_fork" : "session_shutdown");
+		workflowExtraction = undefined;
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
 		authority = undefined;
 		shipPermits.invalidate();
 		controlServer?.close();
@@ -1523,6 +1664,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		shuttingDown = false;
 		latestCtx = ctx;
+		const signal = ctx.signal;
+		const capture = captureWorkflowGeneration();
+		if (signal && capture && !observedTurnSignals.has(signal)) {
+			observedTurnSignals.add(signal);
+			signal.addEventListener("abort", () => {
+				if (!capture.operation?.isCurrent(capture.parent, capture.store)) return;
+				capture.operation.cancel("interrupt");
+				if (authority === capture.store) capture.store.invalidateUnconsumed();
+				shipPermits.invalidate();
+			}, { once: true });
+		}
 		renderRunningWidget();
 	});
 
@@ -1732,9 +1884,19 @@ export default function (pi: ExtensionAPI) {
 			if (params.cancelRun) {
 				try {
 					if (coordinators.get(params.cancelRun)) {
+						workflowExtraction?.cancel("parent_cancel");
+						shipPermits.invalidate();
+						const target = coordinators.get(params.cancelRun)!;
+						authority?.revoke(target.identity.ticket);
 						const cancelled = listRuns.cancel(params.cancelRun);
 						const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run", cancelled);
 						return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] };
+					}
+					const listTarget = listRuns.get(params.cancelRun);
+					if (listTarget) {
+						workflowExtraction?.cancel("parent_cancel");
+						shipPermits.invalidate();
+						for (const entry of "run" in listTarget ? [listTarget.entry] : listTarget.entries) authority?.revoke(entry.key);
 					}
 					if (listRuns.cancel(params.cancelRun)) return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
 					throw new Error(`unknown coordinator run ${params.cancelRun}`);
@@ -1764,7 +1926,7 @@ export default function (pi: ExtensionAPI) {
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: reply.results?.map((result) => ({ type: "text" as const, text: result.state === "accepted" ? `accepted ${result.keyRunId}, key ${result.key}, reserved` : `refused ${result.key}: ${result.reason}` })) ?? [{ type: "text" as const, text: `accepted ${reply.runId}` }], details: { runId: reply.runId, listRunId: reply.listRunId, identity: reply.identity, results: reply.results } };
 					}
-					const result = await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
+					const result = await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings, { toolCallId });
 					if (result.details.listRunId) flushListDelivery(result.details.listRunId);
 					return result;
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }

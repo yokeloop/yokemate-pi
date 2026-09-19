@@ -709,9 +709,17 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
     assert.equal(await input({ type: "input", source: "interactive", text: "запусти готовый план YM-1" } as never, ctx), undefined);
-    assert.match(notifications.at(-1) ?? "", /workflow extraction unavailable: .*configured model and external authentication.*continuing without inferred workflow approval/);
+    assert.deepEqual(notifications, []);
     const malformedRequest = await tool.execute("invalid", { coordinator: { mode: "do", tickets: ["../YM-1"] } }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(malformedRequest), /invalid ticket key/);
+    assert.deepEqual(notifications, []);
+    const missingModel = await tool.execute("missing-model", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(missingModel), /workflow extraction unavailable: outcome=model_error/);
+    assert.match(notifications.at(-1) ?? "", /workflow extraction unavailable: outcome=model_error, elapsedMs=\d+; no inferred workflow approval/);
+    const warningCount = notifications.length;
+    await tool.execute("missing-model-repeat", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.equal(notifications.length, warningCount);
+    assert.equal(await input({ type: "input", source: "interactive", text: "replace candidate" } as never, ctx), undefined);
     const launch = async (tickets = ["YM-1"]) => {
       const result = await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx);
       for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: "ship", result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
@@ -731,8 +739,9 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     set(false);
     await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
     writeFileSync(file, JSON.stringify({ subagent: { maxDetached: 0 } }));
-    assert.deepEqual(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), { action: "handled" });
-    assert.match(notifications.at(-1) ?? "", /subagent.maxDetached/);
+    const notificationsBeforeSkippedInput = notifications.length;
+    assert.equal(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), undefined);
+    assert.equal(notifications.length, notificationsBeforeSkippedInput);
     set(false);
     assert.match(await launch(), /current interactive \/ship/);
     for (const enabled of [true, false]) {

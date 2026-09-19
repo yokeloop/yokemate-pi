@@ -11,11 +11,11 @@ import { observePlanProcess, type PlanProcessObserver } from "./plan-lifecycle.t
 import type { PublicationOutcome } from "./plan-publication-state.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; toolCallId?: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string }
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number }
 export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan";
-export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string, acceptanceId: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }>; planRecorded?(ticket: string, path: string, recordIdOrOrigin: number | ControlOrigin, originOrRunId?: ControlOrigin | string, legacyOrigin?: ControlOrigin): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
+export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, runId?: string): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string, acceptanceId: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }>; planRecorded?(ticket: string, path: string, recordIdOrOrigin: number | ControlOrigin, originOrRunId?: ControlOrigin | string, legacyOrigin?: ControlOrigin): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; planRegistered?(ticket: string, runId: string, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): void; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 interface PlanRunState {
@@ -96,7 +96,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const origins = new Map<string, ControlOrigin>();
   const paneParents = new Map<string, string | undefined>();
   if (identity.pane) paneParents.set(identity.pane, undefined);
-  const replies = new Map<string, ControlReply>();
+  const launchRequests = new Map<string, { origin: ControlOrigin; fingerprint: string; promise: Promise<{ reply: ControlReply; afterAck?: () => void }> }>();
   const requestOrigins = new Map<string, string>();
   const requestRuns = new Map<string, string[]>();
   const requestLists = new Map<string, string>();
@@ -140,7 +140,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   };
   const server = net.createServer((connection) => {
     let buffer = "";
-    const reply = (value: ControlReply) => { replies.set(value.requestId, value); connection.write(JSON.stringify(value) + "\n"); };
+    const reply = (value: ControlReply) => { connection.write(JSON.stringify(value) + "\n"); };
     connection.on("data", async (chunk) => {
       buffer += chunk.toString("utf8");
       for (;;) {
@@ -163,7 +163,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           try {
             const main = !origin.mode && !origin.role && origin.sessionId === identity.sessionId;
             if (!main || !envelope.planRequest || !parent.launchPlan) throw new Error("only the verified main parent can launch a plan list");
-            const accepted = await parent.launchPlan(envelope.planRequest, origin);
+            const accepted = await parent.launchPlan(envelope.planRequest, origin, { requestId: envelope.requestId, toolCallId: envelope.toolCallId });
             const originId = envelope.originId!;
             const acceptedIds: string[] = [];
             for (const result of accepted.results) if (result.state === "accepted") {
@@ -191,6 +191,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
               if (!main) throw new Error("only the verified main parent can register a plan run");
               const runId = randomUUID();
               planRuns.set(runId, { ticket, launcher: { ...origin } });
+              parent.planRegistered?.(ticket, runId, origin, { requestId: envelope.requestId, toolCallId: envelope.toolCallId });
               reply({ requestId: envelope.requestId, state: "accepted", runId });
             } else {
               const planRun = envelope.runId ? planRuns.get(envelope.runId) : undefined;
@@ -305,7 +306,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 } else if (envelope.operation === "prepare-plan-publication") {
                   const acceptanceId = planRun?.scoutAcceptance ?? scoutAcceptances.get(scoutKey);
                   if (!envelope.path || !envelope.contentHash || !Number.isSafeInteger(acceptanceId) || !parent.preparePlanPublication) throw new Error("plan publication preparation requires a current accepted scout");
-                  const outcome = await parent.preparePlanPublication(ticket, envelope.path, envelope.contentHash, acceptanceId!, origin);
+                  const outcome = await parent.preparePlanPublication(ticket, envelope.path, envelope.contentHash, acceptanceId!, origin, envelope.runId);
                   reply({ requestId: envelope.requestId, state: "accepted", ...outcome });
                 } else {
                   if (!envelope.path || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
@@ -355,27 +356,42 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           continue;
         }
         if (envelope.operation !== "launch" || !envelope.request) { reply({ requestId: envelope.requestId, state: "refused", reason: "invalid coordinator operation" }); continue; }
-        const cached = replies.get(envelope.requestId);
-        if (cached) { reply(cached); continue; }
+        const originId = envelope.originId!;
+        const fingerprint = createHash("sha256").update(JSON.stringify({ request: envelope.request, toolCallId: envelope.toolCallId ?? null })).digest("hex");
+        const existing = launchRequests.get(envelope.requestId);
+        if (existing && (!sameProcess(existing.origin, origin) || existing.fingerprint !== fingerprint)) { reply({ requestId: envelope.requestId, state: "refused", reason: "coordinator request id collision" }); continue; }
         reply({ requestId: envelope.requestId, state: "received" });
-        try {
-          const accepted = await parent.launch(envelope.request, origin);
-          const { afterAck, ...acceptedReply } = accepted;
-          const originId = envelope.originId!;
-          const runIds = accepted.results?.filter((result) => result.state === "accepted").map((result) => result.keyRunId) ?? (accepted.runId ? [accepted.runId] : []);
-          if (!runIds.length) {
-            const reason = accepted.results?.map((result) => `${result.key}: ${result.reason ?? "refused"}`).join("; ") || "coordinator launch accepted no keys";
-            reply({ requestId: envelope.requestId, state: "refused", reason, listRunId: accepted.listRunId, results: accepted.results });
-            afterAck?.();
-            continue;
-          }
-          requestOrigins.set(envelope.requestId, originId);
-          requestRuns.set(envelope.requestId, runIds);
-          if (accepted.listRunId) { requestLists.set(envelope.requestId, accepted.listRunId); runOrigins.set(accepted.listRunId, originId); }
-          for (const runId of runIds) runOrigins.set(runId, originId);
-          reply({ requestId: envelope.requestId, state: "accepted", ...acceptedReply, runId: accepted.runId ?? runIds[0] });
-          afterAck?.();
-        } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
+        const ownsDispatch = !existing;
+        let owned = existing;
+        if (!owned) {
+          const request = envelope.request;
+          const requestId = envelope.requestId;
+          const toolCallId = envelope.toolCallId;
+          const promise = (async (): Promise<{ reply: ControlReply; afterAck?: () => void }> => {
+            try {
+              const accepted = await parent.launch(request, origin, { requestId, toolCallId });
+              const { afterAck, ...acceptedReply } = accepted;
+              const runIds = accepted.results?.filter((result) => result.state === "accepted").map((result) => result.keyRunId) ?? (accepted.runId ? [accepted.runId] : []);
+              let terminal: ControlReply;
+              if (!runIds.length) {
+                const reason = accepted.results?.map((result) => `${result.key}: ${result.reason ?? "refused"}`).join("; ") || "coordinator launch accepted no keys";
+                terminal = { requestId, state: "refused", reason, listRunId: accepted.listRunId, results: accepted.results };
+              } else {
+                requestOrigins.set(requestId, originId);
+                requestRuns.set(requestId, runIds);
+                if (accepted.listRunId) { requestLists.set(requestId, accepted.listRunId); runOrigins.set(accepted.listRunId, originId); }
+                for (const runId of runIds) runOrigins.set(runId, originId);
+                terminal = { requestId, state: "accepted", ...acceptedReply, runId: accepted.runId ?? runIds[0] };
+              }
+              return { reply: terminal, afterAck };
+            } catch (error) { return { reply: { requestId, state: "refused", reason: (error as Error).message } }; }
+          })();
+          owned = { origin: { ...origin }, fingerprint, promise };
+          launchRequests.set(requestId, owned);
+        }
+        const result = await owned.promise;
+        reply(result.reply);
+        if (ownsDispatch) result.afterAck?.();
       }
     });
   });
@@ -415,10 +431,10 @@ export function resolveCoordinatorParent(root: string, env: NodeJS.ProcessEnv = 
   return parsed;
 }
 
-export async function requestCoordinator(root: string, request: CoordinatorRequest, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+export async function requestCoordinator(root: string, request: CoordinatorRequest, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env, dispatch: { requestId?: string; toolCallId?: string } = {}): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
-  return send(root, { version: 1, operation: "launch", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, request }, env);
+  return send(root, { version: 1, operation: "launch", requestId: dispatch.requestId ?? randomUUID(), toolCallId: dispatch.toolCallId, originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, request }, env);
 }
 
 export async function requestCoordinatorMerge(root: string, runId: string, mergeRequest: CoordinatorMergeRequest, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {

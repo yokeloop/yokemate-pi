@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseAffected } from "./adopt.ts";
@@ -28,16 +29,7 @@ function validateSections(ticket: string, path: string, text: string, repository
   }
 }
 
-export function readCandidatePlanSnapshot(root: string, ticket: string, candidatePath: string): CandidatePlanSnapshot {
-  if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error(`invalid approval ticket ${ticket}`);
-  const path = resolve(root, candidatePath);
-  const knowledge = resolve(dataRoot(root), "knowledge");
-  if (!contained(knowledge, path)) throw new Error(`${ticket}: plan is not contained in ${knowledge}`);
-  if (!existsSync(path) || !lstatSync(path).isFile()) throw new Error(`${ticket}: plan must be a regular file, not a symlink: ${path}`);
-  const canonicalKnowledge = realpathSync(knowledge);
-  const canonical = realpathSync(path);
-  if (!contained(canonicalKnowledge, canonical)) throw new Error(`${ticket}: plan symlink escape from knowledge: ${path}`);
-  const bytes = readFileSync(canonical);
+function snapshotFromBytes(ticket: string, path: string, bytes: Buffer): CandidatePlanSnapshot {
   let text: string;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { throw new Error(`${ticket}: plan is not valid UTF-8: ${path}`); }
@@ -52,11 +44,44 @@ export function readCandidatePlanSnapshot(root: string, ticket: string, candidat
     const title = /^##\s+(.+?)\s*$/m.exec(section)?.[1];
     return title !== undefined && sectionNames.has(title);
   }).map((section) => section.replace(/\r\n?/g, "\n").trim());
-  return { ticket, path: canonical, bytes, text, contentHash: hash(bytes), scopeHash: hash(JSON.stringify([ticket, repositories, scope])), repositories };
+  return { ticket, path, bytes, text, contentHash: hash(bytes), scopeHash: hash(JSON.stringify([ticket, repositories, scope])), repositories };
+}
+
+function assertTicket(ticket: string): void {
+  if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error(`invalid approval ticket ${ticket}`);
+}
+
+export function readCandidatePlanSnapshot(root: string, ticket: string, candidatePath: string): CandidatePlanSnapshot {
+  assertTicket(ticket);
+  const path = resolve(root, candidatePath);
+  const knowledge = resolve(dataRoot(root), "knowledge");
+  if (!contained(knowledge, path)) throw new Error(`${ticket}: plan is not contained in ${knowledge}`);
+  if (!existsSync(path) || !lstatSync(path).isFile()) throw new Error(`${ticket}: plan must be a regular file, not a symlink: ${path}`);
+  const canonicalKnowledge = realpathSync(knowledge);
+  const canonical = realpathSync(path);
+  if (!contained(canonicalKnowledge, canonical)) throw new Error(`${ticket}: plan symlink escape from knowledge: ${path}`);
+  return snapshotFromBytes(ticket, canonical, readFileSync(canonical));
+}
+
+async function readCandidatePlanSnapshotAsync(root: string, ticket: string, candidatePath: string, signal: AbortSignal): Promise<CandidatePlanSnapshot> {
+  assertTicket(ticket);
+  signal.throwIfAborted();
+  const path = resolve(root, candidatePath);
+  const knowledge = resolve(dataRoot(root), "knowledge");
+  if (!contained(knowledge, path)) throw new Error(`${ticket}: plan is not contained in ${knowledge}`);
+  const status = await lstat(path);
+  signal.throwIfAborted();
+  if (!status.isFile()) throw new Error(`${ticket}: plan must be a regular file, not a symlink: ${path}`);
+  const [canonicalKnowledge, canonical] = await Promise.all([realpath(knowledge), realpath(path)]);
+  signal.throwIfAborted();
+  if (!contained(canonicalKnowledge, canonical)) throw new Error(`${ticket}: plan symlink escape from knowledge: ${path}`);
+  const bytes = await readFile(canonical);
+  signal.throwIfAborted();
+  return snapshotFromBytes(ticket, canonical, bytes);
 }
 
 export function readRecordedPlanBinding(root: string, ticket: string): PlanBinding {
-  if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error(`invalid approval ticket ${ticket}`);
+  assertTicket(ticket);
   if (!existsSync(join(root, "yokemate.db"))) throw new Error(`${ticket}: no current recorded plan for approval: ${join(root, "yokemate.db")} is missing`);
   const db = new DatabaseSync(join(root, "yokemate.db"), { readOnly: true });
   let recorded: string | undefined;
@@ -64,6 +89,36 @@ export function readRecordedPlanBinding(root: string, ticket: string): PlanBindi
   finally { db.close(); }
   if (!recorded) throw new Error(`${ticket}: no current recorded plan for approval`);
   return toPlanBinding(readCandidatePlanSnapshot(root, ticket, recorded));
+}
+
+const yieldTurn = () => new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+export async function readWorkflowBindingSnapshot(root: string, signal: AbortSignal): Promise<PlanBinding[]> {
+  signal.throwIfAborted();
+  const databasePath = join(root, "yokemate.db");
+  if (!existsSync(databasePath)) return [];
+  const db = new DatabaseSync(databasePath, { readOnly: true });
+  let iterator: Iterator<unknown> | undefined;
+  const bindings: PlanBinding[] = [];
+  try {
+    iterator = db.prepare("SELECT ticket, plan FROM work WHERE plan IS NOT NULL ORDER BY ticket").iterate();
+    for (;;) {
+      signal.throwIfAborted();
+      const next = iterator.next();
+      if (next.done) break;
+      const row = next.value as { ticket?: unknown; plan?: unknown };
+      await yieldTurn();
+      signal.throwIfAborted();
+      try {
+        if (typeof row.ticket !== "string" || typeof row.plan !== "string") continue;
+        bindings.push(toPlanBinding(await readCandidatePlanSnapshotAsync(root, row.ticket, row.plan, signal)));
+      } catch (error) {
+        if (signal.aborted) throw signal.reason ?? error;
+      }
+    }
+    return bindings;
+  } finally {
+    try { iterator?.return?.(); } finally { db.close(); }
+  }
 }
 
 export function assertPlanBinding(expected: PlanBinding, actual: PlanBinding): void {
