@@ -30,6 +30,8 @@ test("recipeFor maps each lockfile to its frozen install and blocks the rest", (
   try {
     assert.match((recipeFor(dir) as { blocker: string }).blocker, /^no lockfile/);
     writeFileSync(join(dir, "pnpm-lock.yaml"), "");
+    assert.deepEqual(recipeFor(dir), { manager: "pnpm", lockfile: "pnpm-lock.yaml", command: ["pnpm", "install", "--ignore-workspace", "--frozen-lockfile", "--prod=false"] });
+    writeFileSync(join(dir, "pnpm-workspace.yaml"), "packages: []\n");
     assert.deepEqual(recipeFor(dir), { manager: "pnpm", lockfile: "pnpm-lock.yaml", command: ["pnpm", "install", "--frozen-lockfile", "--prod=false"] });
     writeFileSync(join(dir, "package-lock.json"), "");
     assert.match((recipeFor(dir) as { blocker: string }).blocker, /^several lockfiles \(pnpm-lock.yaml, package-lock.json\)/);
@@ -39,6 +41,35 @@ test("recipeFor maps each lockfile to its frozen install and blocks the rest", (
     writeFileSync(join(dir, "yarn.lock"), "");
     assert.deepEqual(recipeFor(dir), { manager: "yarn", lockfile: "yarn.lock", command: ["yarn", "install", "--immutable"] });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const ownWorkspace of [false, true]) test(`real pnpm installs inside nested worktree (own workspace: ${ownWorkspace})`, () => {
+  const s = stand();
+  try {
+    writeFileSync(join(s.root, "package.json"), '{"name":"ancestor","private":true}\n');
+    writeFileSync(join(s.root, "pnpm-workspace.yaml"), "packages: []\n");
+    const ancestorManifest = readFileSync(join(s.root, "package.json"), "utf8");
+    writeFileSync(join(s.worktree, ".gitignore"), "node_modules/\n");
+    mkdirSync(join(s.worktree, "fixture-tool"));
+    writeFileSync(join(s.worktree, "fixture-tool", "package.json"), JSON.stringify({ name: "typescript", version: "1.0.0", bin: { tsc: "tsc.cjs" } }));
+    writeFileSync(join(s.worktree, "fixture-tool", "tsc.cjs"), '#!/usr/bin/env node\nconsole.log("fixture tsc");\n', { mode: 0o755 });
+    writeFileSync(join(s.worktree, "package.json"), JSON.stringify({ name: "nested", private: true, devDependencies: { typescript: "file:./fixture-tool" } }));
+    if (ownWorkspace) writeFileSync(join(s.worktree, "pnpm-workspace.yaml"), "packages: []\n");
+    const lock = spawnSync("pnpm", ["install", "--ignore-workspace", "--lockfile-only", "--no-frozen-lockfile", "--offline", "--ignore-scripts"], { cwd: s.worktree, encoding: "utf8" });
+    assert.equal(lock.status, 0, lock.stdout + lock.stderr);
+    git(s.worktree, "add", ".");
+    git(s.worktree, "commit", "-m", "offline local dependency fixture");
+    const before = git(s.worktree, "status", "--porcelain");
+    const out = ready(s.root, s.ticket, [{ repo: s.repo, worktree: s.worktree }]);
+    assert.ok(out.ok, JSON.stringify(out));
+    const tool = spawnSync(join(s.worktree, "node_modules", ".bin", "tsc"), [], { cwd: s.worktree, encoding: "utf8" });
+    assert.equal(tool.status, 0, tool.stderr);
+    assert.match(tool.stdout, /fixture tsc/);
+    assert.equal(git(s.worktree, "status", "--porcelain"), before);
+    assert.equal(readFileSync(join(s.root, "package.json"), "utf8"), ancestorManifest);
+    assert.equal(existsSync(join(s.root, "node_modules")), false);
+    assert.equal(existsSync(join(s.root, "pnpm-lock.yaml")), false);
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
 });
 
 test("a poisoned ancestor node_modules does not make the worktree ready", () => {
@@ -62,7 +93,7 @@ test("the worktree's own environment yields a receipt", () => {
     assert.ok(entry.packages.typescript!.startsWith(join(realpathSync(s.worktree), "node_modules") + "/"));
     assert.equal(entry.head, git(s.worktree, "rev-parse", "HEAD"));
     assert.equal(entry.lockHash, sha256(join(s.worktree, "pnpm-lock.yaml")));
-    assert.equal(entry.command, "pnpm install --frozen-lockfile --prod=false");
+    assert.equal(entry.command, "pnpm install --ignore-workspace --frozen-lockfile --prod=false");
     assert.equal(entry.exit, 0);
     const written = JSON.parse(readFileSync(join(s.root, "work", s.ticket, "ready.json"), "utf8")) as ReadyReceipt;
     assert.deepEqual(written, out.receipt);
@@ -76,7 +107,7 @@ test("a lockfile mismatch blocks with the literal output and no second install",
     let calls = 0;
     const out = ready(s.root, s.ticket, [{ repo: s.repo, worktree: s.worktree }], { run: () => { calls++; return { exit: 1, output: "ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with frozen-lockfile" }; } });
     assert.equal(out.ok, false);
-    assert.equal(out.ok ? "" : out.reason, "org/repo: pnpm install --frozen-lockfile --prod=false exited 1");
+    assert.equal(out.ok ? "" : out.reason, "org/repo: pnpm install --ignore-workspace --frozen-lockfile --prod=false exited 1");
     assert.match(out.ok ? "" : out.output, /ERR_PNPM_OUTDATED_LOCKFILE/);
     assert.equal(calls, 1);
     assert.equal(existsSync(join(s.root, "work", s.ticket, "ready.json")), false);

@@ -33,24 +33,34 @@ The plan is one document for the whole ticket, however many repositories it touc
 Every part passes through the same stages, in order:
 
 ```
-worktree → read → implement step by step → checks → review → fix → re-check → format → PR
+read plan → worktree → prepare / repair environment → read code → implement step by step → checks → review → fix → re-check → format → PR
 ```
 
 A stage is passed by its named condition, with the command output as evidence — never by «looks done». A condition you cannot meet becomes an open point in the report, quoted with its literal failing output — and the same check still red after three fix attempts is an open point, not a fourth attempt. And never a weakened check, in any stage: no deleted or skipped tests, no lint-ignores, no lowered assertions.
 
 ### 1. Worktrees
 
-For every affected repository listed in the plan (its clone path is in the launch prompt's project passports):
+Read the complete plan first. For every affected repository, inspect its instructions, documented setup, CI and working-tree status; its clone path is in the launch prompt's project passports. The model owns environment preparation and repair, not just the first install attempt.
+
+For a new ticket branch, fetch the intended remote before choosing the base. Honor the engineer's or plan's explicit base; otherwise discover the remote default branch with `git ls-remote --symref <remote> HEAD`. Do not assume `main`, trust a stale `origin/HEAD`, or fall back to the clone's current HEAD after a failed fetch. Resolve the fetched base to an exact commit and record remote, base ref and SHA in `progress.md`.
 
 ```bash
-git -C <clone-path> worktree add <cwd>/<repo> -b <TICKET>
+git -C <clone-path> fetch <remote>
+git -C <clone-path> rev-parse --verify refs/remotes/<remote>/<base-branch>
+git -C <clone-path> worktree add <cwd>/<repo> -b <TICKET> <verified-base-sha>
 ```
 
-The clone is the engineer's workplace: never switch branches there, never commit there. If the branch `<TICKET>` already exists (rework round), add the worktree on the existing branch — same branch, same future PR.
+Fetching objects/remote refs and registering a worktree are allowed; never switch branches, pull, commit or change working files in the engineer's clone. If the ticket branch already exists locally or remotely, inspect its history and PR first and reuse it. Preserve unfinished work and the PR's base; never recreate/reset/rebase a ticket branch just to make setup pass. If a previous preparation-only attempt left a clean branch with no task commits and no PR, an ancestor check followed by `git merge --ff-only <verified-base-sha>` inside that task worktree may bring it to the intended base without discarding anything.
 
-Right after every worktree stands, from the task folder root: `pnpm ready <TICKET>`. Success prints one line per repository with the install command, its exit and the path of `tsc`. A blocker — its literal output goes into `progress.md` and `coordinator_finish` is called with `outcome: "blocked"` and that output as the reason, before the plan is read and before any edit. No `pnpm install` by hand, no global compiler, no links to another tree's `node_modules`: the task's environment is set up by `pnpm ready` alone.
+Prepare the environment using the project's actual stack, versions, lockfiles and documented commands. Do not assume every repository uses Node or TypeScript. Run `pnpm ready <TICKET>` from the task folder root. For its supported Node recipes it installs dependencies and verifies their provenance. A red result starts diagnosis, not immediate `coordinator_finish`:
 
-On a resumed round inspect `progress.md`, `git status --porcelain` and the diff before changing anything. Preserve unfinished work. Restore only a clearly identified temporary acceptance-stand override (such as `link:` in package.json), and record that fact in `progress.md`; unknown dirt is a blocked outcome, not something to erase. A ticked «Worktree» box does not prove the environment: on every resume `pnpm ready <TICKET>` runs first, and again after any commit that touched `package.json` or a lockfile.
+1. Save the literal output in `progress.md`; inspect the failing command, selected package/workspace root, tool versions and dependency resolution.
+2. Correct the identified setup problem inside the owned task worktree. Documented install/bootstrap commands are allowed, including isolated frozen installs and project-local environments. Preserve manifests and lockfiles unless changing them is part of the approved implementation; do not regenerate them merely to bypass a setup refusal.
+3. Re-run `pnpm ready <TICKET>` and the relevant project-local tool check. Continue implementation when readiness passes. Never manufacture a receipt, use another tree's `node_modules`, or substitute a global compiler for a required local dependency.
+
+For a non-Node project, use its own documented setup and checks, not an invented JS lockfile or `tsc`. If the current readiness/gate implementation does not support that stack, report that concrete engine limitation after diagnosis; do not claim a successful receipt or skip a mandatory gate. Do not edit the engine from a task worker to bypass it.
+
+On resume inspect `progress.md`, `git status --porcelain`, the diff and history before any repair. Preserve unknown changes; restore only a clearly identified temporary acceptance-stand override and record why. Re-run readiness on every resume and after manifest/lockfile changes. Stop with the exact remaining blocker only when safe diagnosed repairs cannot proceed (for example unavailable credentials/data, an ambiguous base, a required engineer decision or an unsupported gate). Do not blindly repeat the same failed install; report attempted repairs and their results.
 
 ### 2. Read, then keep score
 
@@ -102,7 +112,7 @@ When a part is a library consumed by another part (`role: library` in the plan):
 
 ### 6. Checks
 
-You run the project's own quality gates yourself, per worktree: its lint, its typecheck, its tests, its build — from its own package scripts or CI config, all of them, fast checks first; only commands that finish on their own, never a watcher or a dev server. Checks run only through the worktree's own scripts or `pnpm exec`, and only after `pnpm ready` on the current HEAD; `progress.md` gets the receipt line (`head`, `at`). Record the literal results in `progress.md`: command, exit code, failing output trimmed to what matters. Red → fix and run again; the stage exits green. A check the diff itself weakened — a skipped test, a lint-ignore, a lowered assertion — is not a green, it is a defect to undo.
+You run the project's own quality gates yourself, per worktree: its lint, its typecheck, its tests, its build — from its own package scripts or CI config, all of them, fast checks first; only commands that finish on their own, never a watcher or a dev server. Checks use the project's documented tools/environment (for Node, the worktree's own scripts or `pnpm exec`), and only after `pnpm ready` on the current HEAD; `progress.md` gets the receipt line (`head`, `at`). Record the literal results in `progress.md`: command, exit code, failing output trimmed to what matters. Red → fix and run again; the stage exits green. A check the diff itself weakened — a skipped test, a lint-ignore, a lowered assertion — is not a green, it is a defect to undo.
 
 ### 7. Review
 
