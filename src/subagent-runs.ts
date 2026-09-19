@@ -133,18 +133,21 @@ export function failedEnvelope(result: ResultEnvelope): boolean { return result.
 
 interface ChildRecord {
   identity: ChildIdentity;
-  templateTask: string;
+  templateTask?: string;
   resolvedTask?: string;
   state: ChildLifecycleState;
-  intent?: { initiator: string };
+  intent?: { initiator: string; reason?: string };
   process?: { pid: number; starttime: string };
   claim?: ResultEnvelope;
   result?: ResultEnvelope;
   cleanupDone: boolean;
-  cleanupPromise: Promise<void>;
-  cleanupResolve(): void;
-  finalizationPromise: Promise<ResultEnvelope>;
-  finalizationResolve(result: ResultEnvelope): void;
+  cleanupError?: string;
+  cleanupPromise?: Promise<void>;
+  cleanupResolve?: () => void;
+  cancellationPromise?: Promise<CancellationResult>;
+  cancellationResolve?: (result: CancellationResult) => void;
+  finalizationPromise?: Promise<ResultEnvelope>;
+  finalizationResolve?: (result: ResultEnvelope) => void;
 }
 
 export class ChildRuns {
@@ -161,10 +164,12 @@ export class ChildRuns {
     this.batches.set(batchId, Object.freeze([...identities]));
     identities.forEach((identity, index) => {
       let cleanupResolve!: () => void;
+      let cancellationResolve!: (result: CancellationResult) => void;
       let finalizationResolve!: (result: ResultEnvelope) => void;
       const cleanupPromise = new Promise<void>((resolve) => { cleanupResolve = resolve; });
+      const cancellationPromise = new Promise<CancellationResult>((resolve) => { cancellationResolve = resolve; });
       const finalizationPromise = new Promise<ResultEnvelope>((resolve) => { finalizationResolve = resolve; });
-      this.children.set(identity.runId, { identity, templateTask: tasks[index]!.task, resolvedTask: tasks[index]!.task, state: "queued", cleanupDone: false, cleanupPromise, cleanupResolve, finalizationPromise, finalizationResolve });
+      this.children.set(identity.runId, { identity, templateTask: tasks[index]!.task, resolvedTask: tasks[index]!.task, state: "queued", cleanupDone: false, cleanupPromise, cleanupResolve, cancellationPromise, cancellationResolve, finalizationPromise, finalizationResolve });
     });
     return { version: 1, kind: "ack", terminal: false, batchId, children: identities.map((identity) => ({ identity, state: "queued" })) };
   }
@@ -207,6 +212,11 @@ export class ChildRuns {
       const result = cancellationResult(runId, "unknown", "unknown", false);
       return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
     }
+    if (child.intent?.reason || child.cleanupError) {
+      child.intent ??= Object.freeze({ initiator });
+      const result = this.cancellationResult(child, "cancellation_requested", false, child.intent.reason ?? child.cleanupError);
+      return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
+    }
     if (child.claim || child.result) {
       const result = this.cancellationResult(child, "already_terminal", true);
       return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
@@ -215,8 +225,20 @@ export class ChildRuns {
     child.intent ??= Object.freeze({ initiator });
     if (child.state === "queued" && child.resolvedTask !== undefined) this.claimNoSpawn(child.identity);
     const immediate = child.claim && child.cleanupDone ? this.cancellationResult(child, "cancelled", true) : this.cancellationResult(child, "cancellation_requested", false);
-    const completion = child.cleanupPromise.then(() => child.claim ? this.cancellationResult(child, "cancelled", true) : this.cancellationResult(child, "cancellation_requested", false));
+    const completion = Promise.race([
+      child.cleanupPromise!.then(() => child.claim ? this.cancellationResult(child, "cancelled", true) : this.cancellationResult(child, "cancellation_requested", false)),
+      child.cancellationPromise!,
+    ]);
     return { result: immediate, first, shouldSignal: first && child.state === "running", waitForCleanup: child.resolvedTask !== undefined, completion };
+  }
+  markCancellationUnconfirmed(runId: string, reason: string): CancellationResult {
+    const child = this.children.get(runId);
+    if (!child) return cancellationResult(runId, "unknown", "unknown", false);
+    if (!child.intent) child.cleanupError = reason;
+    else child.intent = Object.freeze({ initiator: child.intent.initiator, reason });
+    const result = this.cancellationResult(child, "cancellation_requested", false, reason);
+    child.cancellationResolve?.(result);
+    return result;
   }
   claimNoSpawn(identity: ChildIdentity): ResultEnvelope | undefined {
     const child = this.valid(identity);
@@ -242,7 +264,7 @@ export class ChildRuns {
     if (!child || child.cleanupDone) return false;
     child.cleanupDone = true;
     child.process = undefined;
-    child.cleanupResolve();
+    child.cleanupResolve?.();
     return true;
   }
   cleanup(identity: ChildIdentity): Promise<void> { return this.valid(identity)?.cleanupPromise ?? Promise.resolve(); }
@@ -253,10 +275,23 @@ export class ChildRuns {
     child.claim ??= result;
     child.result = Object.freeze(result);
     child.state = "finalized";
-    child.finalizationResolve(child.result);
+    child.finalizationResolve?.(child.result);
     return true;
   }
-  finalized(identity: ChildIdentity): Promise<ResultEnvelope> | undefined { return this.valid(identity)?.finalizationPromise; }
+  finalized(identity: ChildIdentity): Promise<ResultEnvelope> | undefined {
+    const child = this.valid(identity);
+    return child?.result ? Promise.resolve(child.result) : child?.finalizationPromise;
+  }
+  compactBatch(batchId: string): boolean {
+    const identities = this.batches.get(batchId);
+    if (!identities || identities.some((identity) => !this.children.get(identity.runId)?.result)) return false;
+    this.batches.delete(batchId);
+    for (const identity of identities) {
+      const child = this.children.get(identity.runId)!;
+      this.children.set(identity.runId, { identity: child.identity, state: "finalized", intent: child.intent, claim: child.result, result: child.result, cleanupDone: child.cleanupDone, cleanupError: child.cleanupError });
+    }
+    return true;
+  }
   batch(batchId: string, kind: "batch" | "chain" = "batch"): BatchEnvelope | undefined {
     const identities = this.batches.get(batchId);
     if (!identities) return;
@@ -275,9 +310,9 @@ export class ChildRuns {
     const child = this.children.get(identity.runId);
     return child && JSON.stringify(child.identity) === JSON.stringify(identity) ? child : undefined;
   }
-  private cancellationResult(child: ChildRecord, status: CancellationStatus, terminal: boolean): CancellationResult {
+  private cancellationResult(child: ChildRecord, status: CancellationStatus, terminal: boolean, reason?: string): CancellationResult {
     const result = child.claim ?? child.result;
-    return cancellationResult(child.identity.runId, "ordinary", status, terminal, undefined, child.identity, result, child.intent?.initiator);
+    return cancellationResult(child.identity.runId, "ordinary", status, terminal, reason, child.identity, result, child.intent?.initiator);
   }
 }
 

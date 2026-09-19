@@ -217,7 +217,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 const cases = [
   ["parallel_max", "output_limit"], ["chain_max", "output_limit"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
-  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
+  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
 
 async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1], signal: AbortSignal): Promise<void> {
@@ -227,9 +227,15 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const folder = join(sandbox, "home/knowledge/org/repo/ai/task");
   mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
   mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
+  mkdirSync(join(sandbox, ".pi/extensions"), { recursive: true });
   mkdirSync(join(sandbox, "tmp"), { recursive: true });
   mkdirSync(folder, { recursive: true });
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  const scenarioExtension = join(sandbox, ".pi/extensions/subagent/index.ts");
+  cpSync(join(root, ".pi/extensions/subagent"), join(sandbox, ".pi/extensions/subagent"), { recursive: true });
+  symlinkSync(join(root, "src"), join(sandbox, "src"));
+  symlinkSync(join(root, ".pi/skills"), join(sandbox, ".pi/skills"));
+  symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
   symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
   writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
   writeFileSync(join(cwd, ".pi/agents/worker.md"), "---\nname: worker\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn the requested output.\n");
@@ -245,6 +251,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const childWorking = new Promise<void>((resolve) => { working = resolve; });
   const server = createServer((socket) => {
     sockets.add(socket);
+    socket.on("error", () => undefined);
     socket.once("close", () => sockets.delete(socket));
     let buffer = "";
     socket.on("data", (chunk) => {
@@ -283,7 +290,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
           if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
-      { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
+      { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", scenarioExtension, "--skill", join(sandbox, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
     await untilAborted(rpc.ready, signal);
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
@@ -338,7 +345,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
-    if (scenario === "spawn_error") assert.equal(results[0].processOutcome, "spawn_error");
+    if (["spawn_error", "write_cleanup_error"].includes(scenario)) assert.equal(results[0].processOutcome, "spawn_error");
     if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
@@ -358,14 +365,14 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     const fs = await import("node:fs");
     const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
     assert.doesNotMatch(JSON.stringify(snapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-    if (!["diagnostic_error", "spawn_error"].includes(scenario)) {
+    if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario)) {
       const childSnapshot = snapshots.find((snapshot) => snapshot.identity?.runId === results[0].identity.runId);
       assert.equal(childSnapshot.terminal.exitCode, results[0].exitCode, scenario);
       assert.equal(childSnapshot.guard.path, join(root, "src/guards.ts"));
-      assert.equal(childSnapshot.extension.path, extension);
+      assert.equal(childSnapshot.extension.path, scenarioExtension);
       assert.equal(childSnapshot.effective.thinking, "unknown");
     }
-    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(extension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
+    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(scenarioExtension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
     rpc.acceptTerminal();
   } finally {
     clearTimeout(timeout);

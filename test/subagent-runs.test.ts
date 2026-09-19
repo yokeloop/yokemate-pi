@@ -207,6 +207,42 @@ test("ordinary lifecycle reserves before dispatch and cancellation keeps the fir
   assert.deepEqual(runs.active(), []);
 });
 
+test("unconfirmed process identity releases cancellation wait and compact repeats retain only terminal facts", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("mismatch", [{ agent: "worker", task: "sensitive prompt" }], cwd).children[0]!.identity;
+  assert.equal(runs.start(identity), true);
+  assert.equal(runs.attachProcess(identity, process.pid, "stale-starttime"), true);
+  const requested = runs.requestCancel(identity.runId, "tool_cancel");
+  const unconfirmed = runs.markCancellationUnconfirmed(identity.runId, "process identity could not be verified for cancellation");
+  assert.equal(unconfirmed.status, "cancellation_requested");
+  assert.equal(unconfirmed.terminal, false);
+  assert.match(unconfirmed.reason ?? "", /could not be verified/);
+  assert.deepEqual(await requested.completion, unconfirmed);
+  assert.equal(runs.requestCancel(identity.runId, "repeat").result.status, "cancellation_requested");
+  const terminal = runs.claimTerminal(identity, "sensitive prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  assert.equal(runs.settle(terminal), true);
+  assert.ok(runs.batch("mismatch"));
+  assert.equal(runs.compactBatch("mismatch"), true);
+  assert.equal(runs.batches.has("mismatch"), false);
+  const retained = runs.children.get(identity.runId)! as any;
+  assert.equal(retained.templateTask, undefined);
+  assert.equal(retained.resolvedTask, undefined);
+  assert.equal(retained.cleanupPromise, undefined);
+  assert.equal(runs.requestCancel(identity.runId, "after-terminal").result.status, "cancellation_requested");
+
+  const cleanupRuns = new ChildRuns("owner", "session");
+  const cleanupIdentity = cleanupRuns.admit("cleanup", [{ agent: "worker", task: "prompt" }], cwd).children[0]!.identity;
+  cleanupRuns.start(cleanupIdentity);
+  const cleanupTerminal = cleanupRuns.claimTerminal(cleanupIdentity, "prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  cleanupRuns.markCancellationUnconfirmed(cleanupIdentity.runId, "temporary prompt cleanup could not be verified");
+  cleanupRuns.settle(cleanupTerminal);
+  cleanupRuns.compactBatch("cleanup");
+  const cleanupRepeat = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel").result;
+  assert.equal(cleanupRepeat.status, "cancellation_requested");
+  assert.equal(cleanupRepeat.cancellationInitiator, "late-cancel");
+  assert.match(cleanupRepeat.reason ?? "", /cleanup could not be verified/);
+});
+
 test("deferred chain cancellation waits for the actual resolved task and protocol errors win payload classification", async () => {
   const runs = new ChildRuns("owner", "session");
   const identity = runs.admit("chain-cancel", [{ agent: "worker", task: "after {previous}" }], cwd).children[0]!.identity;

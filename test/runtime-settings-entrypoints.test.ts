@@ -496,6 +496,15 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     assert.match(text((await dispatch(task)).result), /subagent.maxDetached/);
     await finish(live, [8]);
     await finish(second, [9]);
+    set({}, { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 });
+    const shutdownStart = connections.length;
+    await dispatch({ tasks: [{ ...task, task: "shutdown running" }, { ...task, task: "shutdown queued" }] });
+    await count(shutdownStart + 1);
+    await shutdown();
+    shutdown = undefined;
+    assert.equal(connections.length, shutdownStart + 1);
+    const afterShutdown = await tool.execute("after-shutdown", task, undefined, () => undefined, ctx);
+    assert.match(text(afterShutdown), /shutting down/);
     runtimeCases(["guards.projectAgentConfirmation", "guards.parallelTaskLimit", "guards.parallelConcurrencyLimit", "subagent.maxParallelTasks", "subagent.maxConcurrency"], ["tool", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["tool", "pane", "ordinary"]);
   } finally {

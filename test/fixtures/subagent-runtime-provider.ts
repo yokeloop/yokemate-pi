@@ -28,8 +28,14 @@ export default function (pi: ExtensionAPI) {
     fs.promises.mkdtemp = ((prefix: string, ...args: any[]) => prefix.includes("pi-subagent-") ? Promise.reject(Object.assign(new Error("private fixture ENOSPC"), { code: "ENOSPC" })) : (original as any)(prefix, ...args)) as any;
   }
   if (scenario === "cleanup_error" && process.env.YOKEMATE_ROLE === "coordinator") {
-    const original = fs.unlinkSync;
-    fs.unlinkSync = ((file: any) => { if (String(file).includes("pi-subagent-")) throw new Error("private cleanup fault"); original(file); }) as any;
+    const original = fs.rmSync;
+    fs.rmSync = ((file: any, options: any) => { if (String(file).includes("pi-subagent-")) throw new Error("private cleanup fault"); original(file, options); }) as any;
+  }
+  if (scenario === "write_cleanup_error" && process.env.YOKEMATE_ROLE === "coordinator") {
+    const write = fs.promises.writeFile;
+    const remove = fs.promises.rm;
+    fs.promises.writeFile = ((file: any, ...args: any[]) => String(file).includes("pi-subagent-") ? Promise.reject(new Error("private write fault")) : (write as any)(file, ...args)) as any;
+    fs.promises.rm = ((file: any, ...args: any[]) => String(file).includes("pi-subagent-") ? Promise.reject(new Error("private cleanup fault")) : (remove as any)(file, ...args)) as any;
   }
   if (scenario === "diagnostic_error") {
     const original = fs.renameSync;

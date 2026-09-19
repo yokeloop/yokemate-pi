@@ -88,8 +88,6 @@ let activeUnits = 0;
 // (задачи сверх maxConcurrency) и следующий шаг цепочки поднимаются позже — в
 // те миллисекунды, что pi ещё дочитывает ввод, — и осиротели бы. Флаг
 // закрывает очередь; turn_start снимает его, если сессия вернулась.
-let shuttingDown = false;
-
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
 const batches = new Set<string>();
@@ -298,6 +296,7 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	cleanupError?: string;
 	step?: number;
 }
 
@@ -372,7 +371,8 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 		});
 		return { dir: tmpDir, filePath };
 	} catch (error) {
-		try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch {}
+		try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); }
+		catch { throw new Error("temporary prompt write and cleanup failed", { cause: error }); }
 		throw error;
 	}
 }
@@ -581,18 +581,14 @@ async function runSingleAgent(
 		diagnostic.save(true);
 		return currentResult;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
+		if (tmpPromptDir) {
+			try { fs.rmSync(tmpPromptDir, { recursive: true, force: true }); }
+			catch {
+				currentResult.cleanupError = "temporary prompt cleanup could not be verified";
+				diagnostic.metadata.cleanupError = currentResult.cleanupError;
+				diagnostic.save(true);
 			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+		}
 	}
 }
 
@@ -647,6 +643,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
 	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
+	let shuttingDown = false;
+	let sessionGeneration = 0;
+	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
 	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
 	const publicationTail = new Map<string, Promise<unknown>>();
 	const localPublicationErrors = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
@@ -1230,6 +1229,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		sessionGeneration += 1;
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
@@ -1364,7 +1364,13 @@ export default function (pi: ExtensionAPI) {
 				},
 				planFinished: async (_ticket, planRunId, outcome, reason) => {
 					const found = listRuns.get(planRunId);
-					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
+					if (recordingPlans.has(planRunId)) {
+						if (lockedRecordingPlans.has(planRunId)) throw new Error("plan recorder already acquired its write lock");
+						cancelledRecordingPlans.add(planRunId);
+						recorderControllers.get(planRunId)?.abort();
+					}
+					if (!listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
 				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
 					const controller = new AbortController();
@@ -1524,6 +1530,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		sessionGeneration += 1;
 		const sessionId = latestCtx?.sessionManager?.getSessionId?.();
 		const ordinaryStops = sessionId && runs ? runs.active().map((child) => requestOrdinaryCancellation(child.identity.runId, "session_shutdown", runs!.ownerRunId, sessionId)) : [];
 		await fenceListRuns("parent session shutdown");
@@ -1542,12 +1549,14 @@ export default function (pi: ExtensionAPI) {
 		rpcByRun.clear();
 		coordinatorChildren.clear();
 		await Promise.all(ordinaryStops);
+		await Promise.all([...batchCompletions.values()].map((completion) => completion.promise));
 		await Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity)));
 		await Promise.all(coordinatorStops);
 		detached.clear();
 		ordinaryProcesses.clear();
 		batches.clear();
 		batchModes.clear();
+		batchCompletions.clear();
 		sentBatches.clear();
 		deliveries.clear();
 		diagnostics.clear();
@@ -1610,6 +1619,7 @@ export default function (pi: ExtensionAPI) {
 			reportSettledAt.delete(result.identity.runId);
 		}
 		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
+		runs?.compactBatch(batchId);
 	};
 	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "target_unavailable", "target_changed", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
 	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
@@ -1699,17 +1709,25 @@ export default function (pi: ExtensionAPI) {
 		if (request.shouldSignal) {
 			const owned = ordinaryProcesses.get(runId);
 			const attached = identity ? runs.process(identity) : undefined;
-			if (owned && attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !runs.claimed(owned.identity) && !owned.termSent) {
-				owned.termSent = true;
-				try { owned.process.kill("SIGTERM"); } catch {}
-				owned.killTimer = setTimeout(() => {
-					const current = ordinaryProcesses.get(runId);
-					if (current !== owned || current.closed || current.killSent || runs?.claimed(current.identity) || processStarttime(current.pid) !== current.starttime || current.process.pid !== current.pid) return;
-					current.killSent = true;
-					try { current.process.kill("SIGKILL"); } catch {}
-				}, 5000);
-				owned.killTimer.unref();
-			}
+			const verified = !!owned && !!attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !runs.claimed(owned.identity) && !owned.termSent;
+			if (!verified) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			let sent = false;
+			try { sent = owned.process.kill("SIGTERM"); } catch {}
+			if (!sent) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			owned.termSent = true;
+			owned.killTimer = setTimeout(() => {
+				const current = ordinaryProcesses.get(runId);
+				if (current !== owned || current.closed || current.killSent || runs?.claimed(current.identity)) return;
+				if (processStarttime(current.pid) !== current.starttime || current.process.pid !== current.pid) {
+					runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+					return;
+				}
+				let killed = false;
+				try { killed = current.process.kill("SIGKILL"); } catch {}
+				if (killed) current.killSent = true;
+				else runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			}, 5000);
+			owned.killTimer.unref();
 		}
 		return request.waitForCleanup ? await request.completion : request.result;
 	};
@@ -1810,7 +1828,9 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
+			const admittedGeneration = sessionGeneration;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
+			if (!params.cancelRun && shuttingDown) return { content: [{ type: "text", text: "parent session is shutting down; only cancellation remains available" }], isError: true };
 			if (!params.cancelRun && process.env.YOKEMATE_PLAN_RUN_ID && stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID)) return { content: [{ type: "text", text: "plan run is stopped; only cancellation and conversation remain available" }], isError: true };
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 			const currentSessionId = ctx.sessionManager?.getSessionId?.();
@@ -1850,7 +1870,7 @@ export default function (pi: ExtensionAPI) {
 						const parent = resolveCoordinatorParent(root);
 						const reply = await requestCoordinatorCancel(root, params.cancelRun, currentControlOrigin(root, sessionId), parent);
 						if (reply.state === "accepted" && reply.cancellation) return resultResponse(reply.cancellation, reply.cancellation.status === "cancelled" ? `${params.cancelRun} cancelled` : JSON.stringify(reply.cancellation));
-						if (reply.state === "refused") return resultResponse(cancellationResult(params.cancelRun, "unknown", "not_owned", false, reply.reason ?? "parent cancellation refused"));
+						if (reply.state === "refused") return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false, reply.reason ?? "parent cancellation refused"));
 					}
 					return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false));
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
@@ -1914,6 +1934,7 @@ export default function (pi: ExtensionAPI) {
 				let child: ChildProcess | undefined;
 				let envelope: ResultEnvelope | undefined;
 				let output = "";
+				let cleanupError: string | undefined;
 				try {
 					runs!.resolveTask(identity, task);
 					if (shuttingDown) runs!.requestCancel(identity.runId, "parent_session_shutdown");
@@ -1929,6 +1950,7 @@ export default function (pi: ExtensionAPI) {
 						trackRunning(proc, identity.agent, task);
 					}, identity, runs!, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
+					cleanupError = result.cleanupError;
 					envelope = boundBatchResult(result.envelope ?? runs!.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
@@ -1938,6 +1960,7 @@ export default function (pi: ExtensionAPI) {
 					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes, retainedHash, truncated: originalPayload === undefined ? false : originalPayload.bytes !== retainedBytes || originalPayload.hash !== retainedHash, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
+					if ((error as Error).message === "temporary prompt write and cleanup failed") cleanupError = "temporary prompt cleanup could not be verified";
 					const diagnostic = diagnostics.get(identity.runId);
 					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
 					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
@@ -1946,11 +1969,13 @@ export default function (pi: ExtensionAPI) {
 					if (child) detached.delete(child);
 					untrackRunning(child);
 					ordinaryProcesses.delete(identity.runId);
-					runs!.completeCleanup(identity);
+					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupError);
+					else runs!.completeCleanup(identity);
 				}
 				return { envelope: envelope!, output };
 			};
 			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string } }[]) => {
+				if (shuttingDown || sessionGeneration !== admittedGeneration) throw new Error("parent session changed before subagent admission");
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
@@ -1967,6 +1992,9 @@ export default function (pi: ExtensionAPI) {
 				activeUnits += units;
 				batches.add(toolCallId);
 				batchModes.set(toolCallId, mode);
+				let resolveCompletion!: () => void;
+				const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+				batchCompletions.set(toolCallId, { promise: completion, resolve: resolveCompletion });
 				emitChildState();
 				const execute = async () => {
 					try {
@@ -1996,7 +2024,11 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 						settleBatch(toolCallId);
-					} finally { activeUnits -= units; }
+					} finally {
+						activeUnits -= units;
+						batchCompletions.get(toolCallId)?.resolve();
+						batchCompletions.delete(toolCallId);
+					}
 				};
 				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
 				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack, display: { version: 1, members: ack.children.map(({ identity }) => ({ taskExcerpt: reportAdmissions.get(identity.runId)?.taskExcerpt ?? "" })) } } };

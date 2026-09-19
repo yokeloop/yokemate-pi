@@ -214,11 +214,17 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 if (["plan-finished", "record-plan"].includes(envelope.operation)) {
                   if (!main && (!planRun?.worker || planRun.ticket !== ticket || origin.mode !== "plan" || origin.ticket !== ticket || origin.pane !== planRun.pane || origin.sessionId !== planRun.worker.sessionId || !descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime))) throw new Error("plan result is not from its registered live worker");
                   if (planRun?.terminal === "recorded" && envelope.operation === "record-plan") { reply({ requestId: envelope.requestId, state: "accepted", ...planRun.recordReply }); continue; }
-                  if (planRun?.terminal || (!main && !planRun)) throw new Error("plan run is no longer active");
+                  const finishingRecording = envelope.operation === "plan-finished" && planRun?.terminal === "recording";
+                  if (planRun?.terminal && !finishingRecording || !main && !planRun) throw new Error("plan run is no longer active");
                   if (envelope.operation === "plan-finished") {
                     if (!planRun || !envelope.runId || !envelope.outcome || !envelope.reason || !parent.planFinished) throw new Error("plan finish handoff is unavailable");
-                    fencePlanRun(planRun, envelope.outcome);
-                    await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
+                    if (finishingRecording) {
+                      await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
+                      fencePlanRun(planRun, envelope.outcome);
+                    } else {
+                      fencePlanRun(planRun, envelope.outcome);
+                      await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
+                    }
                     reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
                   } else {
                   if (!envelope.path || !envelope.runId || !parent.recordPlan) throw new Error("plan record handoff is unavailable");
@@ -227,6 +233,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                     const acceptanceId = planRun?.scoutAcceptance;
                     if (!Number.isSafeInteger(acceptanceId)) throw new Error("plan record requires a current accepted scout");
                     const outcome = await parent.recordPlan(ticket, envelope.path, origin, envelope.runId, acceptanceId!);
+                    if (planRun?.terminal !== "recording") throw new Error("plan recorder was superseded by logical stop");
                     if (planRun) {
                       planRun.terminal = "recorded";
                       planRun.recordReply = outcome;
@@ -351,8 +358,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           continue;
         }
         if (envelope.operation === "cancel" && envelope.runId) {
-          const registeredOrigin = origins.get(runOrigins.get(envelope.runId) ?? "");
-          if (!registeredOrigin || !sameProcess(registeredOrigin, origin)) { reply({ requestId: envelope.requestId, state: "refused", reason: "origin does not own this coordinator run" }); continue; }
+          const registeredOriginId = runOrigins.get(envelope.runId);
+          if (!registeredOriginId) { reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, cancellation: cancellationResult(envelope.runId, "unknown", "unknown", false) }); continue; }
+          const registeredOrigin = origins.get(registeredOriginId);
+          if (!registeredOrigin || !sameProcess(registeredOrigin, origin)) { reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, cancellation: cancellationResult(envelope.runId, "coordinator", "not_owned", false, "coordinator run belongs to another owner") }); continue; }
           for (const [planRunId, planRun] of planRuns) if ((planRunId === envelope.runId || planRun.listRunId === envelope.runId) && planRun.terminal !== "recording" && !planRun.terminal) {
             planRun.terminal = "cancelled";
             planRun.observer?.stop();

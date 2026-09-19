@@ -72,14 +72,16 @@ test("coordinator cancellation keeps exact registered origin ownership and typed
     assert.equal(first.cancellation?.status, "cancelled");
     const repeat = await requestCoordinatorCancel(root, launched.runId!, origin, target, env);
     assert.equal(repeat.cancellation?.status, "already_terminal");
-    for (const forged of [
-      { ...origin, sessionId: "foreign" },
-      { ...origin, starttime: "0" },
-      { ...origin, mode: "do", role: "coordinator" },
-    ]) {
+    const unknown = await requestCoordinatorCancel(root, "22222222-2222-4222-8222-222222222222", origin, target, env);
+    assert.equal(unknown.state, "accepted");
+    assert.equal(unknown.cancellation?.status, "unknown");
+    for (const forged of [{ ...origin, sessionId: "foreign" }, { ...origin, starttime: "0" }]) {
       const refused = await requestCoordinatorCancel(root, launched.runId!, forged, target, env);
       assert.equal(refused.state, "refused");
     }
+    const foreign = await requestCoordinatorCancel(root, launched.runId!, { ...origin, mode: "do", role: "coordinator" }, target, env);
+    assert.equal(foreign.state, "accepted");
+    assert.equal(foreign.cancellation?.status, "not_owned");
     assert.equal(calls, 2);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -406,6 +408,54 @@ test("logical plan finish fences publication record and handoff before parent ca
     }
   } finally {
     releasePublication?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("logical plan finish supersedes an admitted recorder before its parent commit returns", async () => {
+  const root = mkdtempSync(join(tmpdir(), "plan-record-stop-"));
+  const runtime = mkdtempSync(join(tmpdir(), "plan-record-stop-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+  let recordStarted!: () => void;
+  let releaseRecord!: () => void;
+  const started = new Promise<void>((resolve) => { recordStarted = resolve; });
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }),
+    cancel: async () => {},
+    publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }),
+    planFinished: async () => {},
+    recordPlan: async () => {
+      recordStarted();
+      await new Promise<void>((resolve) => { releaseRecord = resolve; });
+      return { reason: "recorded" };
+    },
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const register = await requestPlanControl(root, "register-plan", { ticket: "YM-1" }, main, target, env);
+    assert.ok(register.runId);
+    assert.equal((await requestPlanControl(root, "bind-plan", { ticket: "YM-1", runId: register.runId, pane: "plan" }, main, target, env)).state, "accepted");
+    const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: register.runId }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: register.runId, acceptanceId: 1 }, worker, target, env)).artifactAcceptance, "accepted");
+    const record = requestPlanControl(root, "record-plan", { ticket: "YM-1", runId: register.runId, path: "/plan.md" }, worker, target, env);
+    await started;
+    assert.equal((await requestPlanControl(root, "plan-finished", { ticket: "YM-1", runId: register.runId, outcome: "cancelled", reason: "engineer stopped" }, worker, target, env)).state, "accepted");
+    releaseRecord();
+    const superseded = await record;
+    assert.equal(superseded.state, "refused");
+    assert.match(superseded.reason ?? "", /superseded|no longer active/);
+  } finally {
+    releaseRecord?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
