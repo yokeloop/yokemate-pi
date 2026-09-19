@@ -1,0 +1,85 @@
+import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer, type Socket } from "node:net";
+import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { openDb } from "../src/db.ts";
+import { acceptScoutArtifact } from "../src/plan-publication-state.ts";
+
+const source = join(import.meta.dirname, "..");
+
+test("production subagent admission injects an owned exact scout and claims one initial writer dispatch", { timeout: 30000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "plan-writer-runtime-"));
+  const runtime = mkdtempSync(join(tmpdir(), "plan-writer-socket-"));
+  const priorEnv = { ...process.env };
+  const priorArgv = process.argv[1];
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => { if (chunk.toString().includes("\n")) socket.end("release\n"); });
+  });
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    const sock = join(runtime, "provider.sock");
+    server.listen(sock);
+    await once(server, "listening");
+    cpSync(join(source, "src"), join(root, "src"), { recursive: true });
+    cpSync(join(source, ".pi/extensions/subagent"), join(root, ".pi/extensions/subagent"), { recursive: true });
+    symlinkSync(join(source, "node_modules"), join(root, "node_modules"));
+    mkdirSync(join(root, ".pi/agents"), { recursive: true });
+    writeFileSync(join(root, ".pi/agents/plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read\n---\nWrite a plan.\n");
+    writeFileSync(join(root, ".pi/settings.json"), "{}");
+    writeFileSync(join(root, ".env.local"), "");
+    const clone = join(root, "clone");
+    mkdirSync(clone);
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe" });
+    execFileSync("git", ["-C", clone, "remote", "add", "origin", "https://github.com/org/repo.git"]);
+    const db = openDb(join(root, "yokemate.db"));
+    db.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('org','repo',?,'github','YM','ym204-fixture/deterministic')").run(clone);
+    const identity = { ownerRunId: "plan-run", ownerSessionId: "plan-session", batchId: "scout", runId: "scout-run", agent: "plan-scout", taskHash: "a".repeat(64), cwd: root, ticket: "YM-1" } as const;
+    const scout = acceptScoutArtifact(db, root, identity, Buffer.from("# Exact scout\n\nFacts and decisions.\n"));
+    db.close();
+    const agentDir = join(root, "agent");
+    mkdirSync(join(agentDir, "extensions"), { recursive: true });
+    symlinkSync(join(source, "test/fixtures/subagent-runtime-provider.ts"), join(agentDir, "extensions/provider.ts"));
+    Object.assign(process.env, { PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: sock, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_PLAN_RUN_ID: "plan-run" });
+    delete process.env.YOKEMATE_ROLE;
+    process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+    const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager: SettingsManager.create(root, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(root, ".pi/extensions/subagent/index.ts")] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = () => undefined;
+    let resolveReport!: () => void;
+    const report = new Promise<void>((resolve) => { resolveReport = resolve; });
+    loaded.runtime.sendMessage = (message) => { if ((message.details as any)?.envelope?.identity?.agent === "plan-writer") resolveReport(); };
+    const extension = loaded.extensions[0]!;
+    const tool = extension.tools.get("subagent")!.definition;
+    const ctx = { cwd: root, mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => "plan-session" }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { hasConfiguredAuth: () => true }, ui: { setWidget() {}, notify() {} } } as unknown as ExtensionContext;
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    await assert.rejects(() => tool.execute("missing", { agent: "plan-writer", task: "write", ticket: "YM-1" }, undefined, () => undefined, ctx), /acceptedInputId/);
+    const launched = await tool.execute("writer", { agent: "plan-writer", task: "Write from the accepted source.", ticket: "YM-1", acceptedInputId: scout.id }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(launched), /Detached, not terminal/);
+    await report;
+    const state = openDb(join(root, "yokemate.db"));
+    const dispatch = state.prepare("SELECT * FROM workflow_writer_dispatch WHERE accepted_input_id=?").get(String(scout.id)) as any;
+    assert.equal(dispatch.dispatch_kind, "initial");
+    assert.notEqual(dispatch.task_hash, dispatch.actual_task_hash);
+    state.close();
+  } finally {
+    await shutdown?.();
+    process.argv[1] = priorArgv;
+    for (const key of Object.keys(process.env)) if (!(key in priorEnv)) delete process.env[key];
+    Object.assign(process.env, priorEnv);
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});

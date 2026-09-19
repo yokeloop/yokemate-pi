@@ -38,6 +38,17 @@ test("plan scouts require an explicit or stamped ticket and keep it in correlati
   assert.equal(problem.children[0]!.identity.ticket, "YM-3");
 });
 
+test("plan writers require an explicit accepted scout binding and preserve it in child identity", () => {
+  const runs = new ChildRuns("owner", "session", "YM-1");
+  assert.throws(() => runs.admit("missing-input", [{ agent: "plan-writer", task: "write" }], cwd), /acceptedInputId/);
+  assert.throws(() => new ChildRuns("owner", "session").admit("missing-ticket", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /explicit ticket/);
+  const identity = runs.admit("writer", [{ agent: "plan-writer", task: "write", ticket: "YM-1", acceptedInputId: 7 }], cwd).children[0]!.identity;
+  assert.equal(identity.ticket, "YM-1");
+  assert.equal(identity.acceptedInputId, 7);
+  assert.throws(() => runs.admit("foreign", [{ agent: "plan-writer", task: "write", ticket: "YM-2", acceptedInputId: 8 }], cwd), /differs/);
+  assert.throws(() => runs.admit("bad-revision", [{ agent: "plan-writer", task: "revise", ticket: "YM-1", acceptedInputId: 7, writerRevisionOf: "short" }], cwd), /full draft hash/);
+});
+
 test("review revisions are validated before admission and template hashes survive chain substitution", () => {
   const runs = new ChildRuns("owner", "session");
   assert.throws(() => runs.admit("bad", [{ agent: "task-reviewer", task: "task" }], cwd), /requires review/);

@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
-import { persistScoutCandidate } from "../../../src/workflow-incident-state.ts";
+import { claimWriterDispatch, incidentById, persistScoutCandidate } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -99,6 +99,7 @@ let widgetTimer: NodeJS.Timeout | undefined;
 let latestCtx: ExtensionContext | undefined;
 const scoutCandidateIds = new Map<string, string>();
 const scoutCandidateGenerations = new Map<string, number>();
+const verifiedWriterDrafts = new Map<string, { acceptedInputId: number; planningIdentity: string; runId: string }>();
 
 // Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
 // срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
@@ -604,6 +605,8 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -612,6 +615,8 @@ const ChainItem = Type.Object({
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -630,6 +635,8 @@ const CoordinatorRequestSchema = Type.Object({
 
 const SubagentParams = Type.Object({
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
 	cancelRun: Type.Optional(Type.String()),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
@@ -1711,6 +1718,22 @@ export default function (pi: ExtensionAPI) {
 	};
 	const settleResult = async (result: ResultEnvelope, report: boolean) => {
 		if (!runs?.settle(result)) return;
+		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash !== result.identity.taskHash) {
+			try {
+				const draft = readCandidatePlanSnapshot(ENGINE_ROOT, result.identity.ticket, result.payload.trim());
+				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const dispatch = state.prepare("SELECT planning_identity FROM workflow_writer_dispatch WHERE writer_run_id=? AND accepted_input_id=? AND actual_task_hash=?").get(result.identity.runId, String(result.identity.acceptedInputId), result.actualTaskHash) as { planning_identity?: string } | undefined;
+					if (!dispatch?.planning_identity) throw new Error("writer dispatch correlation is missing");
+					verifiedWriterDrafts.set(draft.contentHash, { acceptedInputId: result.identity.acceptedInputId, planningIdentity: dispatch.planning_identity, runId: result.identity.runId });
+				} finally { state.close(); }
+			} catch (error) {
+				result.payloadOutcome = "protocol_error";
+				result.payload = "";
+				const diagnostic = diagnostics.get(result.identity.runId);
+				if (diagnostic) diagnostic.metadata.writerDraft = { refusal: "invalid-or-uncorrelated-draft", error: errorMetadata(error) };
+			}
+		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
 			if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
@@ -1904,6 +1927,42 @@ export default function (pi: ExtensionAPI) {
 			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
 			if (!runs) runs = new ChildRuns(ownerRunId, sessionId, process.env.YOKEMATE_MODE === "plan" ? process.env.YOKEMATE_TICKET : undefined);
 			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
+			const admitPlanWriter = async (identity: ChildIdentity, requestedTask: string, expandedTask: string, claim: boolean): Promise<string> => {
+				if (identity.agent !== "plan-writer") return expandedTask;
+				if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_PLAN_RUN_ID || !identity.ticket || !identity.acceptedInputId) throw new Error("plan-writer requires its owned live plan worker");
+				if (!identity.writerRevisionOf && requestedTask.includes("{previous}")) throw new Error("initial plan-writer input cannot come from {previous}");
+				if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("plan-writer requires configured external authentication");
+				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const accepted = publicationAcceptanceById(state, identity.acceptedInputId);
+					if (!accepted || accepted.ticket !== identity.ticket) throw new Error("plan-writer accepted input is missing or foreign");
+					const exact = readPublicationArtifact(ENGINE_ROOT, accepted);
+					assertPublishable(exact);
+					resolvePublicationTarget(state, identity.ticket);
+					let planningIdentity = process.env.YOKEMATE_PLAN_RUN_ID;
+					let incident;
+					let provenance = "normal-transport";
+					if (accepted.source_kind === "engineer-accepted-input") {
+						if (!accepted.incident_id || !accepted.candidate_id || !accepted.failure_hash || !accepted.continuation_id || !accepted.continuation_generation) throw new Error("plan-writer recovery provenance is incomplete");
+						const candidate = state.prepare("SELECT planning_identity FROM plan_scout_candidate WHERE id=?").get(accepted.candidate_id) as { planning_identity?: string } | undefined;
+						if (!candidate?.planning_identity || candidate.planning_identity !== process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("plan-writer recovery lineage is foreign");
+						const reply = await requestPlanControl(ENGINE_ROOT, "admit-plan-writer", { ticket: identity.ticket, runId: candidate.planning_identity, candidateId: accepted.candidate_id, failureHash: accepted.failure_hash, generation: accepted.continuation_generation, writerRunId: identity.runId }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						if (reply.state !== "accepted" || reply.planningIdentity !== accepted.continuation_id) throw new Error(reply.reason ?? "plan-writer recovery admission refused");
+						planningIdentity = accepted.continuation_id;
+						incident = incidentById(state, accepted.incident_id);
+						if (!incident) throw new Error("plan-writer incident is missing");
+						provenance = `engineer-accepted-input incident=${accepted.incident_id} candidate=${accepted.candidate_id} source-run=${accepted.source_run_id} failure=${accepted.failure_hash} skipped=${accepted.skipped_json} preserved=${accepted.preserved_json} plan-only=true`;
+					} else if (accepted.source_kind !== "normal-transport" || accepted.owner_session_id !== sessionId) throw new Error("plan-writer normal source is not owned by this plan worker");
+					if (identity.writerRevisionOf) {
+						const draft = verifiedWriterDrafts.get(identity.writerRevisionOf);
+						if (!draft || draft.acceptedInputId !== accepted.id || draft.planningIdentity !== planningIdentity) throw new Error("plan-writer revision draft is unknown or foreign");
+					}
+					const source = new TextDecoder("utf-8", { fatal: true }).decode(exact);
+					const injected = `${expandedTask}\n\nAccepted scout input (${provenance}; hash=${accepted.content_hash}; bytes=${accepted.bytes}):\n\n${source}`;
+					if (claim) claimWriterDispatch(state, incident, { acceptedInputId: String(accepted.id), planningIdentity, kind: identity.writerRevisionOf ? "revision" : "initial", revisionOf: identity.writerRevisionOf, writerRunId: identity.runId, taskHash: identity.taskHash, actualTaskHash: sha256(injected) });
+					return injected;
+				} finally { state.close(); }
+			};
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
 				let completeChild: (() => void) | undefined;
@@ -1911,6 +1970,7 @@ export default function (pi: ExtensionAPI) {
 				let output = "";
 				try {
 					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
+					task = await admitPlanWriter(identity, diagnostics.get(identity.runId)?.metadata.requestedTask as string ?? task, task, true);
 					runs!.start(identity);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
@@ -1940,15 +2000,16 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { envelope, output };
 			};
-			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string } }[]) => {
+			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				for (const [index, child] of ack.children.entries()) await admitPlanWriter(child.identity, tasks[index]!.task, tasks[index]!.task, false);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, requestedTask: tasks[index]!.task, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
 					diagnostics.set(identity.runId, diagnostic);
 					diagnostic.save(false);
@@ -2029,7 +2090,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain?.length) return launch("chain", params.chain);
 			if (params.tasks?.length) return launch("parallel", params.tasks);
-			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, ticket: params.ticket, review: params.review }]);
+			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, ticket: params.ticket, review: params.review, acceptedInputId: params.acceptedInputId, writerRevisionOf: params.writerRevisionOf }]);
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {

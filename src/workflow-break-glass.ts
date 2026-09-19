@@ -165,7 +165,7 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
     payloadHash: candidate.content_hash,
     bypassed: current.bypassed,
     preserved: current.preserved,
-  }, (incident, row) => acceptRecoveredScoutArtifact(input.db, input.root, incident, row, row.content_hash, ["failed-transport-envelope"], current.preserved));
+  }, (incident, row) => acceptRecoveredScoutArtifact(input.db, input.root, incident, row, row.content_hash, ["failed-transport-envelope"], current.preserved, continuation.planningIdentity, continuation.generation));
   input.store.consume(input.preview.permitId);
   return { acceptance: consumed.value, incidentId: consumed.incident.id, planningIdentity: continuation.planningIdentity, generation: continuation.generation };
 }

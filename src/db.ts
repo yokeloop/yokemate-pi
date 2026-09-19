@@ -162,6 +162,8 @@ function migrateIncidentColumns(db: DatabaseSync): void {
   addColumn(db, "plan_publication_acceptance", "skipped_json TEXT");
   addColumn(db, "plan_publication_acceptance", "preserved_json TEXT");
   addColumn(db, "plan_publication_acceptance", "incident_reason TEXT");
+  addColumn(db, "plan_publication_acceptance", "continuation_id TEXT");
+  addColumn(db, "plan_publication_acceptance", "continuation_generation INTEGER");
   addColumn(db, "plan_record", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
   addColumn(db, "plan_record", "incident_id TEXT");
   addColumn(db, "plan_record", "candidate_id TEXT");

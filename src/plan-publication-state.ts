@@ -60,6 +60,8 @@ export interface PublicationAcceptanceRow extends ArtifactMetadata {
   skipped_json: string | null;
   preserved_json: string | null;
   incident_reason: string | null;
+  continuation_id: string | null;
+  continuation_generation: number | null;
   publication_id: number | null;
   ticket: string;
   run_id: string;
@@ -162,14 +164,14 @@ function deliveryRow(db: DatabaseSync, child: ChildIdentity): PublicationAccepta
 
 type DeliveryProvenance =
   | { source: "normal-transport" }
-  | { source: "engineer-accepted-input"; incident: WorkflowIncidentRow; candidate: ScoutCandidateRow; payloadHash: string; skipped: readonly string[]; preserved: readonly string[] };
+  | { source: "engineer-accepted-input"; incident: WorkflowIncidentRow; candidate: ScoutCandidateRow; payloadHash: string; skipped: readonly string[]; preserved: readonly string[]; continuationId: string; continuationGeneration: number };
 
 function acceptDelivery(db: DatabaseSync, child: ChildIdentity, artifact: ArtifactMetadata, publicationId: number | undefined, provenance: DeliveryProvenance): PublicationAcceptanceRow {
   if (child.agent !== "plan-scout" || !child.ticket) throw new Error("artifact_invalid");
   if (provenance.source === "engineer-accepted-input" && (provenance.candidate.ticket !== child.ticket || provenance.incident.candidate_id !== provenance.candidate.id || provenance.incident.ticket !== child.ticket || provenance.candidate.run_id !== child.runId)) throw new Error("artifact_invalid");
   db.prepare(`INSERT INTO plan_publication_acceptance
-    (publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash,artifact_path,content_hash,bytes,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_run_id,owner_session_id,batch_id,run_id,task_hash) DO NOTHING`).run(
+    (publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash,artifact_path,content_hash,bytes,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason,continuation_id,continuation_generation)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_run_id,owner_session_id,batch_id,run_id,task_hash) DO NOTHING`).run(
     publicationId ?? null, child.ticket, child.runId, child.ownerRunId, child.ownerSessionId, child.batchId, child.taskHash,
     artifact.artifact_path, artifact.content_hash, artifact.bytes, provenance.source,
     provenance.source === "engineer-accepted-input" ? provenance.incident.id : null,
@@ -180,10 +182,12 @@ function acceptDelivery(db: DatabaseSync, child: ChildIdentity, artifact: Artifa
     provenance.source === "engineer-accepted-input" ? JSON.stringify(provenance.skipped) : null,
     provenance.source === "engineer-accepted-input" ? JSON.stringify(provenance.preserved) : null,
     provenance.source === "engineer-accepted-input" ? provenance.incident.reason : null,
+    provenance.source === "engineer-accepted-input" ? provenance.continuationId : null,
+    provenance.source === "engineer-accepted-input" ? provenance.continuationGeneration : null,
   );
   let row = deliveryRow(db, child);
   if (!row || row.ticket !== child.ticket || row.run_id !== child.runId || row.artifact_path !== artifact.artifact_path || row.content_hash !== artifact.content_hash || row.bytes !== artifact.bytes || row.source_kind !== provenance.source) throw new Error("artifact_invalid");
-  if (provenance.source === "engineer-accepted-input" && (row.incident_id !== provenance.incident.id || row.candidate_id !== provenance.candidate.id || row.failure_hash !== provenance.candidate.failed_envelope_hash || row.payload_hash !== provenance.payloadHash)) throw new Error("artifact_invalid");
+  if (provenance.source === "engineer-accepted-input" && (row.incident_id !== provenance.incident.id || row.candidate_id !== provenance.candidate.id || row.failure_hash !== provenance.candidate.failed_envelope_hash || row.payload_hash !== provenance.payloadHash || row.continuation_id !== provenance.continuationId || row.continuation_generation !== provenance.continuationGeneration)) throw new Error("artifact_invalid");
   if (publicationId !== undefined) {
     if (row.publication_id !== null && row.publication_id !== publicationId) throw new Error("artifact_invalid");
     db.prepare("UPDATE plan_publication_acceptance SET publication_id=? WHERE id=? AND publication_id IS NULL").run(publicationId, row.id);
@@ -205,11 +209,11 @@ export function acceptPublicationDelivery(db: DatabaseSync, publicationId: numbe
   return acceptDelivery(db, child, publication, publicationId, { source: "normal-transport" });
 }
 
-export function acceptRecoveredScoutArtifact(db: DatabaseSync, root: string, incident: WorkflowIncidentRow, candidate: ScoutCandidateRow, payloadHash: string, skipped: readonly string[], preserved: readonly string[]): PublicationAcceptanceRow {
+export function acceptRecoveredScoutArtifact(db: DatabaseSync, root: string, incident: WorkflowIncidentRow, candidate: ScoutCandidateRow, payloadHash: string, skipped: readonly string[], preserved: readonly string[], continuationId = incident.planning_identity, continuationGeneration = candidate.generation + 1): PublicationAcceptanceRow {
   const bytes = readPublicationArtifact(root, candidate);
   if (sha256(bytes) !== candidate.content_hash || payloadHash !== candidate.content_hash) throw new Error("artifact_invalid");
   const child: ChildIdentity = { ownerRunId: candidate.owner_run_id, ownerSessionId: candidate.owner_session_id, batchId: candidate.batch_id, runId: candidate.run_id, agent: "plan-scout", taskHash: candidate.task_hash, cwd: candidate.cwd, ticket: candidate.ticket };
-  return acceptDelivery(db, child, candidate, undefined, { source: "engineer-accepted-input", incident, candidate, payloadHash, skipped, preserved });
+  return acceptDelivery(db, child, candidate, undefined, { source: "engineer-accepted-input", incident, candidate, payloadHash, skipped, preserved, continuationId, continuationGeneration });
 }
 
 export function publicationAcceptanceById(db: DatabaseSync, id: number): PublicationAcceptanceRow | undefined {

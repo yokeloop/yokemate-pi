@@ -227,7 +227,7 @@ export interface WriterDispatchInput {
   actualTaskHash: string;
 }
 
-export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncidentRow, input: WriterDispatchInput): string {
+export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncidentRow | undefined, input: WriterDispatchInput): string {
   const id = randomUUID();
   const revisionOf = input.revisionOf ?? "";
   if (input.kind === "revision" && !revisionOf || input.kind === "initial" && revisionOf) throw new Error("invalid writer dispatch revision");
@@ -237,7 +237,7 @@ export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncident
   db.prepare(`INSERT INTO workflow_writer_dispatch
     (id,accepted_input_id,planning_identity,dispatch_kind,revision_of,writer_run_id,task_hash,actual_task_hash)
     VALUES (?,?,?,?,?,?,?,?)`).run(id, input.acceptedInputId, input.planningIdentity, input.kind, revisionOf, input.writerRunId, input.taskHash, input.actualTaskHash);
-  appendIncidentEvent(db, incident, { kind: "dispatch", code: input.kind, continuationId: input.planningIdentity, writerId: input.writerRunId, payloadHash: input.actualTaskHash, failureHash: scoutCandidateById(db, incident.candidate_id)?.failed_envelope_hash, effect: "plan-writer", outcome: "claimed" });
+  if (incident) appendIncidentEvent(db, incident, { kind: "dispatch", code: input.kind, continuationId: input.planningIdentity, writerId: input.writerRunId, payloadHash: input.actualTaskHash, failureHash: scoutCandidateById(db, incident.candidate_id)?.failed_envelope_hash, effect: "plan-writer", outcome: "claimed" });
   return id;
 }
 

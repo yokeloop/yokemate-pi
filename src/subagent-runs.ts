@@ -18,8 +18,10 @@ export interface ChildIdentity {
   cwd: string;
   ticket?: string;
   review?: ReviewRevision;
+  acceptedInputId?: number;
+  writerRevisionOf?: string;
 }
-export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
+export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision; acceptedInputId?: number; writerRevisionOf?: string }
 export interface PublicationReference { state: "pending" | "complete"; target: string; revision: string; publicationId?: number; error?: string; path?: string; hash?: string; bytes?: number; targetHash?: string; acceptanceId?: number }
 export type ArtifactReference =
   | { state: "verified"; path: string; hash: string; bytes: number }
@@ -64,6 +66,9 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
   const ticket = task.ticket ?? defaultTicket;
   if (task.agent === "plan-scout" && !ticket) throw new Error("plan-scout requires an explicit ticket binding");
   if (task.agent === "plan-scout" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-scout ticket differs from the stamped plan ticket");
+  if (task.agent === "plan-writer" && (!ticket || !Number.isSafeInteger(task.acceptedInputId) || task.acceptedInputId! < 1)) throw new Error("plan-writer requires an explicit ticket and acceptedInputId");
+  if (task.agent === "plan-writer" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-writer ticket differs from the stamped plan ticket");
+  if (task.writerRevisionOf && !/^[a-f0-9]{64}$/.test(task.writerRevisionOf)) throw new Error("writerRevisionOf must be a full draft hash");
   if (task.agent === "task-reviewer" && !task.review) throw new Error("task-reviewer requires review.baseSha and review.headSha");
   if (task.review) {
     for (const sha of [task.review.baseSha, task.review.headSha]) {
@@ -73,7 +78,7 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
     if (head !== task.review.headSha) throw new Error("review.headSha does not match HEAD in cwd");
   }
-  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}) };
+  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}), ...(task.acceptedInputId ? { acceptedInputId: task.acceptedInputId } : {}), ...(task.writerRevisionOf ? { writerRevisionOf: task.writerRevisionOf } : {}) };
 }
 export function reviewerVerdict(text: string): "approved" | "changes_required" | null {
   try {
@@ -474,7 +479,7 @@ export class OwnedChildState {
     return !!tasks?.some((task) => {
       let cwd: string;
       try { cwd = realpathSync(task.cwd ?? identity.cwd); } catch { return false; }
-      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && (task.ticket ?? (task.agent === "plan-scout" ? identity.ticket : undefined)) === identity.ticket && JSON.stringify(task.review) === JSON.stringify(identity.review);
+      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && (task.ticket ?? (["plan-scout", "plan-writer"].includes(task.agent) ? identity.ticket : undefined)) === identity.ticket && JSON.stringify(task.review) === JSON.stringify(identity.review) && task.acceptedInputId === identity.acceptedInputId && task.writerRevisionOf === identity.writerRevisionOf;
     });
   }
   accept(value: unknown): boolean {
