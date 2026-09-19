@@ -27,11 +27,13 @@ function reportPublications(publications: PublicationOutcome[] | undefined): voi
 function reportReady(reply: ControlReply): void {
   reportPublications(reply.publications);
   if (reply.handoff === "refused") fail(`${ticket}: handoff refused: ${reply.reason ?? "unavailable"}`);
-  console.log(`${ticket}: ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
+  if (reply.handoff === "unavailable") console.log(`${ticket}: ${reply.reason ?? "plan-only; ready for /do; automatic handoff unavailable"}`);
+  else console.log(`${ticket}: ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
 }
 
-if (process.env.YOKEMATE_PLAN_RUN_ID) {
+if (process.env.YOKEMATE_PLAN_RUN_ID !== undefined) {
   try {
+    if (!process.env.YOKEMATE_PLAN_RUN_ID) fail(`${ticket}: empty plan run id`);
     const reply = await requestPlanControl(ROOT, "record-plan", { ticket, path: planPath, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
     if (reply.state !== "accepted") fail(reply.reason ?? "plan record refused");
     console.log(`${ticket} → planned, plan: ${planPath}`);

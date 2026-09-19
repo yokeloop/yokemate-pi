@@ -42,7 +42,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent, type PlanCompletionContext } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -1207,11 +1207,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
-		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
+		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID !== undefined && process.env.YOKEMATE_TICKET) {
 			try {
+				if (!process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("empty plan run id");
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan worker registration refused");
-			} catch (error) { ctx.ui.notify(`no automatic do handoff: ${(error as Error).message}`, "warning"); }
+			} catch (error) { ctx.ui.notify(`plan registration refused: ${(error as Error).message}`, "warning"); }
 		}
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
@@ -1253,18 +1254,19 @@ export default function (pi: ExtensionAPI) {
 				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
+		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], context: PlanCompletionContext, record?: PlanRecordResult) => {
 			const settings = readRuntimeSettings(ENGINE_ROOT);
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
-			const found = planRunId ? listRuns.get(planRunId) : undefined;
-			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
+			const listed = context.kind === "registered" && context.listRunId ? listRuns.get(context.runId) : undefined;
+			if (context.kind === "registered" && context.listRunId && (!listed || !("run" in listed) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(listed.entry.state))) throw new Error("plan run is no longer active");
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
-			if (planRunId && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
+			if (context.kind === "registered" && context.listRunId && listRuns.releaseLifetime(context.runId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
-			let reason = "plan-only; ready for /do; a new interactive approval is required";
-			let handoff: "plan-only" | "started" | "refused" = "plan-only";
-			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
+			let reason = context.kind === "save-only" ? "plan-only; ready for /do; automatic handoff unavailable" : "plan-only; ready for /do; a new interactive approval is required";
+			let handoff: "plan-only" | "unavailable" | "started" | "refused" = context.kind === "save-only" ? "unavailable" : "plan-only";
+			const cancelled = context.kind === "registered" && cancelledRecordingPlans.has(context.runId);
+			if (context.kind !== "save-only" && !cancelled) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					try {
@@ -1281,38 +1283,36 @@ export default function (pi: ExtensionAPI) {
 						handoff = "started";
 					} catch (error) { reason = (error as Error).message; handoff = "refused"; }
 				}
-			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
+			} else if (cancelled) reason = "plan recorded after cancellation; automatic do handoff revoked";
 			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
-			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
+			if (context.kind === "registered" && context.listRunId && listed && "run" in listed && !listRuns.settle(context.listRunId, context.runId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
-				publishPlanScout: async (ticket, acceptanceId, origin) => {
+				publishPlanScout: async (ticket, acceptanceId, child, origin) => {
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let acceptance;
 					try {
 						acceptance = publicationAcceptanceById(db, acceptanceId);
-						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_session_id !== origin.sessionId || !acceptance.owner_run_id || !acceptance.batch_id || !acceptance.task_hash) throw new Error("accepted scout identity does not match its live plan worker");
+						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_run_id !== child.ownerRunId || acceptance.owner_session_id !== child.ownerSessionId || acceptance.batch_id !== child.batchId || acceptance.run_id !== child.runId || acceptance.task_hash !== child.taskHash || child.agent !== "plan-scout" || child.ticket !== ticket || path.resolve(child.cwd) !== path.resolve(ENGINE_ROOT) || child.ownerSessionId !== origin.sessionId) throw new Error("accepted scout identity does not match its delivery");
 						assertPublishable(readPublicationArtifact(ENGINE_ROOT, acceptance));
 					} finally { db.close(); }
-					const child: ChildIdentity = { ownerRunId: acceptance.owner_run_id, ownerSessionId: acceptance.owner_session_id, batchId: acceptance.batch_id, runId: acceptance.run_id, agent: "plan-scout", taskHash: acceptance.task_hash, cwd: ENGINE_ROOT, ticket };
 					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
 				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
 					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
-					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
+					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, binding: prepared.binding, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
-				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, originOrRunId) => {
-					if (typeof recordIdOrOrigin !== "number") throw new Error("legacy plan record needs a local record id");
+				planRecorded: async (ticket, recordedPath, recordId, _origin, context) => {
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
-					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
+					const publications = await publishRecordedArtifacts(recordId, binding);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					return completePlanRecord(ticket, recordedPath, binding, publications, context);
 				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
@@ -1337,11 +1337,14 @@ export default function (pi: ExtensionAPI) {
 					});
 					return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
 				},
-				planFinished: async (_ticket, planRunId, outcome, reason) => {
-					const found = listRuns.get(planRunId);
-					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+				planFinished: async (_ticket, context, outcome, reason) => {
+					if (context.kind !== "registered" || !context.listRunId) return;
+					const found = listRuns.get(context.runId);
+					if (!found || !("run" in found) || !listRuns.settle(context.listRunId, context.runId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
-				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
+				recordPlan: async (ticket, planPath, origin, context, acceptanceId) => {
+					if (context.kind !== "registered") throw new Error("owned plan record requires a registered run");
+					const planRunId = context.runId;
 					const controller = new AbortController();
 					recordingPlans.add(planRunId);
 					recorderControllers.set(planRunId, controller);
@@ -1356,7 +1359,7 @@ export default function (pi: ExtensionAPI) {
 						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
-						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result);
+						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, context, result);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
 							const found = listRuns.get(planRunId);
@@ -1590,7 +1593,7 @@ export default function (pi: ExtensionAPI) {
 	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
 		ENGINE_ROOT,
 		operation,
-		{ ticket: result.identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, ...payload },
+		{ ticket: result.identity.ticket!, ...(process.env.YOKEMATE_PLAN_RUN_ID !== undefined ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), child: result.identity, ...payload },
 		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
 		resolveCoordinatorParent(ENGINE_ROOT),
 	);
@@ -1644,7 +1647,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Finish the owned plan run as blocked or cancelled.",
 		parameters: Type.Object({ outcome: StringEnum(["blocked", "cancelled"] as const), reason: Type.String() }),
 		async execute(_id, params): Promise<any> {
-			if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_PLAN_RUN_ID) return { content: [{ type: "text", text: "plan_finish is available only to an owned plan worker" }], isError: true };
+			if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_TICKET || process.env.YOKEMATE_PLAN_RUN_ID === undefined || !process.env.YOKEMATE_PLAN_RUN_ID) return { content: [{ type: "text", text: "plan_finish is available only to an owned plan worker" }], isError: true };
 			try {
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan finish refused");

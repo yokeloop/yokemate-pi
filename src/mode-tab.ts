@@ -323,13 +323,11 @@ if (import.meta.filename === process.argv[1]) {
       }
 
       let planRunId: string | undefined;
-      if (mode === "plan" && ticket) {
-        try {
-          const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
-          if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
-          planRunId = reply.runId;
-          env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
-        } catch (error) { console.error(`${ticket}: no automatic do handoff: ${(error as Error).message}`); }
+      if (mode === "plan" && ticket && explicitPlanKeys.tail.length === 0 && process.env.PI_SESSION_ID !== undefined) {
+        const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+        if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
+        planRunId = reply.runId;
+        env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
       }
       const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
       const { paneId } = opened;
