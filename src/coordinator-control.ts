@@ -137,6 +137,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const preparedPlans = new Map<string, PreparedPlanRecord>();
   const numericRecords = new Map<string, { owner: ControlOrigin; path: string; recordId: number; binding?: PlanBinding; promise?: Promise<PlanRecordOutcome>; reply?: PlanRecordOutcome }>();
   const completedNumericRecords = new Map<string, { path: string; binding: PlanBinding; contextKind: PlanCompletionContext["kind"]; reply: PlanRecordOutcome }>();
+  const inflightNumericRecords = new Map<string, { path: string; contextKind: PlanCompletionContext["kind"]; promise: Promise<{ outcome: PlanRecordOutcome; binding: PlanBinding }> }>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const saveOnlyKey = (origin: ControlOrigin, ticket: string) => `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
@@ -464,6 +465,13 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       }
       const numericKey = `${context.kind}\u0000${scoutKey}`;
       const completedKey = `${ticket}\u0000${envelope.recordId}`;
+      const globalInflight = inflightNumericRecords.get(completedKey);
+      if (context.kind === "main" && !prepared && globalInflight) {
+        if (globalInflight.path !== envelope.path) throw new Error("recorded plan retry binding changed");
+        const result = await globalInflight.promise;
+        verifyRecordedRetry(ticket, result.binding);
+        return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...result.outcome };
+      }
       const prior = context.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
       let numeric = numericRecords.get(numericKey);
       if (!state && numeric && context.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
@@ -493,7 +501,21 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         if (prior) assertPlanBinding(prior.binding, binding);
         completedBinding = { ...binding, repositories: [...binding.repositories] };
       };
-      const promise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, context, verifyCompletion, prior?.reply);
+      let resolveGlobal!: (value: { outcome: PlanRecordOutcome; binding: PlanBinding }) => void;
+      let rejectGlobal!: (reason: unknown) => void;
+      const globalPromise = new Promise<{ outcome: PlanRecordOutcome; binding: PlanBinding }>((resolve, reject) => { resolveGlobal = resolve; rejectGlobal = reject; });
+      void globalPromise.catch(() => {});
+      const globalEntry = { path: envelope.path, contextKind: prior?.contextKind ?? context.kind, promise: globalPromise };
+      const ownsGlobalEntry = !inflightNumericRecords.has(completedKey);
+      if (ownsGlobalEntry) inflightNumericRecords.set(completedKey, globalEntry);
+      const parentPromise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, context, verifyCompletion, prior?.reply);
+      const verifiedPromise = parentPromise.then((outcome) => {
+        const binding = completedBinding;
+        if (!binding) throw new Error("plan completion was not verified");
+        return { outcome, binding };
+      });
+      void verifiedPromise.then(resolveGlobal, rejectGlobal);
+      const promise = verifiedPromise.then(({ outcome }) => outcome);
       if (state) {
         state.recordPath = envelope.path;
         state.recordId = envelope.recordId;
@@ -505,18 +527,19 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       }
       try {
         const outcome = await promise;
-        if (!completedBinding) throw new Error("plan completion was not verified");
+        const binding = completedBinding;
+        if (!binding) throw new Error("plan completion was not verified");
         if (state) {
           state.recordReply = outcome;
-          state.recordBinding = completedBinding;
+          state.recordBinding = binding;
           state.terminal = "recorded";
           state.recordPromise = undefined;
         } else {
-          numeric!.binding = completedBinding;
+          numeric!.binding = binding;
           numeric!.reply = outcome;
           numeric!.promise = undefined;
         }
-        completedNumericRecords.set(completedKey, { path: envelope.path, binding: completedBinding, contextKind: prior?.contextKind ?? context.kind, reply: outcome });
+        completedNumericRecords.set(completedKey, { path: envelope.path, binding, contextKind: prior?.contextKind ?? context.kind, reply: outcome });
         if (context.kind === "main" || context.kind === "problem") preparedPlans.delete(scoutKey);
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...outcome };
       } catch (error) {
@@ -525,6 +548,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           state.terminal = undefined;
         } else numericRecords.delete(numericKey);
         throw error;
+      } finally {
+        if (ownsGlobalEntry && inflightNumericRecords.get(completedKey) === globalEntry) inflightNumericRecords.delete(completedKey);
       }
     }
     throw new Error("invalid plan control operation");

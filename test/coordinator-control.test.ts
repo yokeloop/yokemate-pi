@@ -389,6 +389,10 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
   let publications = 0;
   let preparations = 0;
   let completions = 0;
+  let releaseCompletion!: () => void;
+  let markCompletionStarted!: () => void;
+  const completionStarted = new Promise<void>((resolve) => { markCompletionStarted = resolve; });
+  const completionBarrier = new Promise<void>((resolve) => { releaseCompletion = resolve; });
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
@@ -399,7 +403,7 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
       return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) };
     },
     preparePlanPublication: async (_ticket, _path, _hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }; },
-    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
+    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); markCompletionStarted(); await completionBarrier; verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
   const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
   let cliPid = 0;
@@ -437,9 +441,16 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child: nextChild }, worker, target, env)).state, "accepted");
     const prepared = await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: binding.path, contentHash: binding.contentHash }, cli, target, env);
     assert.equal(prepared.state, "accepted", prepared.reason ?? "save-only preparation refused");
-    const recorded = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
+    const recording = requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
+    await completionStarted;
+    const mainReconciliation = requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, target, env);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    releaseCompletion();
+    const [recorded, reconciled] = await Promise.all([recording, mainReconciliation]);
     assert.equal(recorded.state, "accepted", recorded.reason ?? "save-only completion refused");
     assert.equal(recorded.handoff, "unavailable");
+    assert.equal(reconciled.state, "accepted", reconciled.reason ?? "in-flight reconciliation refused");
+    assert.equal(reconciled.handoff, "unavailable");
     const repeat = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
     assert.equal(repeat.state, "accepted", repeat.reason ?? "save-only repeat refused");
     assert.equal(completions, 1);
@@ -452,6 +463,7 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 9 }, cli, target, env);
     assert.equal(foreign.state, "refused");
   } finally {
+    releaseCompletion?.();
     if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}
     if (owner.exitCode === null) owner.kill("SIGKILL");
     await new Promise<void>((resolve) => server.close(() => resolve()));
