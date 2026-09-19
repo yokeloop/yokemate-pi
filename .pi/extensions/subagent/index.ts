@@ -630,7 +630,7 @@ const CoordinatorRequestSchema = Type.Object({
 const SubagentParams = Type.Object({
 	review: Type.Optional(ReviewRevisionSchema),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
-	cancelRun: Type.Optional(Type.String()),
+	cancelRun: Type.Optional(Type.String({ description: "Exact ordinary ACK, coordinator, list, or list-key run UUID to cancel", pattern: "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89aAbB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$" })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
@@ -1802,8 +1802,8 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Delegate tasks to specialized subagents with isolated context, or cancel one exact owned run UUID.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder), cancel (cancelRun only).",
 			`Agents come from the nearest ${CONFIG_DIR_NAME}/agents — the yokemate root in the main chat, work/<TICKET>/${CONFIG_DIR_NAME}/agents in the task tab.`,
 		].join(" "),
 		parameters: SubagentParams,
@@ -2059,6 +2059,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			if (args.cancelRun) return new Text(theme.fg("toolTitle", theme.bold("subagent cancel ")) + theme.fg("accent", args.cancelRun), 0, 0);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
