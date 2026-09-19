@@ -319,7 +319,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(confirms, 0);
     assert.deepEqual(notifications, []);
     assert.equal(readRecordedPlanBinding(dir, "YM-1").path, plan);
-    type ExpectedPublication = "complete" | "unavailable" | "remote_conflict";
+    type ExpectedPublication = "complete" | "unavailable" | "remote_conflict" | "target_unavailable" | "target_changed";
     const configurePublication = (label: string, scout: ExpectedPublication, planOutcome: ExpectedPublication) => {
       for (const key of ["WORKFLOW_GH_FAIL", "WORKFLOW_GH_FAIL_KIND", "WORKFLOW_GH_CONFLICT_KIND"]) delete process.env[key];
       process.env.WORKFLOW_SCOUT_REVISION = `-${label}`;
@@ -381,6 +381,17 @@ test("raw interactive authority flows through real plan CLI and parent control w
         assert.match(output(refused), /approval|consumed|workflowApproval/, label);
         assert.equal((refused.details as { runId?: string }).runId, undefined, label);
       }
+      if (authority === "guarded") {
+        await input("/do YM-1");
+        writeFileSync(plan, readFileSync(plan, "utf8") + "\nstale");
+        assert.match(output(await launch()), /approval.*changed/, label);
+        writeFileSync(plan, text.replace("Exercise authority.", `Exercise authority for legacy-${label}.`));
+        await input("/do YM-2");
+        assert.match(output(await launch()), /approval/, label);
+        await input("/do YM-1");
+        await input("/plan YM-1");
+        assert.match(output(await launch()), /approval|consumed/, label);
+      }
       set(false);
       extraction = "none";
       const after = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
@@ -403,8 +414,17 @@ test("raw interactive authority flows through real plan CLI and parent control w
       const extension = ownedLoaded.extensions[0]!;
       return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext };
     };
-    const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication) => {
+    const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none") => {
       configurePublication(`owned-${label}`, scoutExpected, planExpected);
+      if (authority === "plain") {
+        set(false);
+        extraction = "none";
+        await input("/plan YM-1");
+      } else if (authority === "advance" || authority === "guarded") {
+        set(authority === "guarded");
+        extraction = "advance-plan-do";
+        await input("Plan and then do YM-1");
+      }
       rmSync(ownedPlanReady, { force: true });
       rmSync(ownedPlanFinished, { force: true });
       const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
@@ -417,6 +437,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       const ownedWorker = { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane" };
       const ownedStarted = await requestPlanControl(dir, "plan-started", { ticket: "YM-1", runId: ownedRunId }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
       assert.equal(ownedStarted.state, "accepted", ownedStarted.reason ?? label);
+      if (scoutExpected === "target_unavailable") db.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
+      const initialScoutExpected: ExpectedPublication = scoutExpected === "target_changed" ? "complete" : scoutExpected;
       let ownedExtension: Awaited<ReturnType<typeof ownedLoaderExtensions>>["extension"] | undefined;
       let ownedCtx: ExtensionContext | undefined;
       if (label === "scout-pending") {
@@ -425,31 +447,52 @@ test("raw interactive authority flows through real plan CLI and parent control w
         ownedExtension = loadedOwned.extension;
         ownedCtx = loadedOwned.context;
         for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
+        const warningsBeforeOwnedScout = notifications.length;
         const ownedScout = await runScout(`owned-${label}-scout`, loadedOwned.tool, ownedCtx);
         assert.equal(ownedScout.artifact.state, "accepted", label);
-        assert.equal(ownedScout.publication.state, scoutExpected === "complete" ? "complete" : "pending", label);
+        assert.equal(ownedScout.publication.state, initialScoutExpected === "complete" ? "complete" : "pending", label);
+        if (initialScoutExpected !== "complete") assert.match(notifications.slice(warningsBeforeOwnedScout).join("\n"), new RegExp(`warning: scout publication .* ${initialScoutExpected}`), label);
       } else {
         const identity = { ownerRunId: ownedRunId, ownerSessionId: "parent", batchId: `owned-${label}-batch`, runId: `owned-${label}-run`, agent: "plan-scout", taskHash: "a".repeat(64), cwd: dir, ticket: "YM-1" } as const;
         const acceptance = acceptScoutArtifact(db, dir, identity, Buffer.from(`# Scout\n\n## Facts and sources\n${"owned evidence\n".repeat(5000)}${label}\n\n## Assumptions\n- Fixture.\n\n## Forks and recommendations\n- Fixture.\n`));
         const accepted = await requestPlanControl(dir, "publish-plan-scout", { ticket: "YM-1", runId: ownedRunId, acceptanceId: acceptance.id }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
         assert.equal(accepted.state, "accepted", accepted.reason ?? label);
         assert.equal(accepted.artifactAcceptance, "accepted", label);
-        assert.equal(accepted.publication, scoutExpected === "complete" ? "complete" : "pending", label);
-        if (scoutExpected !== "complete") assert.equal(accepted.reason, scoutExpected, label);
+        assert.equal(accepted.publication, initialScoutExpected === "complete" ? "complete" : "pending", label);
+        if (initialScoutExpected !== "complete") assert.equal(accepted.reason, initialScoutExpected, label);
       }
+      const commentsBeforeOwnedRecord = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
+      if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
       process.argv[1] = workflowChild;
       let result: Awaited<ReturnType<typeof recordProcess>>;
       try { result = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" }); }
       finally { writeFileSync(ownedPlanFinished, "done"); }
-      assertPublicationResult(`owned-${label}`, result, scoutExpected, planExpected);
+      assertPublicationResult(`owned-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
+      if (scoutExpected === "target_changed" || scoutExpected === "target_unavailable") assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, commentsBeforeOwnedRecord, label);
       if (ownedExtension && ownedCtx) for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
       for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+      if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
+      if (scoutExpected === "target_unavailable") db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
+      if (authority === "advance") {
+        const runId = result.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+        await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
+        await cancel(runId);
+        for (const socket of eventConnections.splice(0)) socket.destroy();
+      } else if (authority === "plain" || authority === "guarded") {
+        const refused = await launch();
+        assert.match(output(refused), /approval|consumed|workflowApproval/, label);
+        assert.equal((refused.details as { runId?: string }).runId, undefined, label);
+      }
+      set(false);
+      extraction = "none";
       clearPublication();
     };
-    await runOwnedPublicationCase("scout-pending", "unavailable", "complete");
-    await runOwnedPublicationCase("plan-pending", "complete", "unavailable");
-    await runOwnedPublicationCase("both-pending", "unavailable", "unavailable");
+    await runOwnedPublicationCase("scout-pending", "unavailable", "complete", "advance");
+    await runOwnedPublicationCase("plan-pending", "complete", "unavailable", "guarded");
+    await runOwnedPublicationCase("both-pending", "unavailable", "unavailable", "plain");
     await runOwnedPublicationCase("conflict", "complete", "remote_conflict");
+    await runOwnedPublicationCase("target-unavailable", "target_unavailable", "target_unavailable");
+    await runOwnedPublicationCase("target-changed", "target_changed", "target_changed");
     writeFileSync(plan, text);
     reset();
     for (const surface of ["typed", "tool", "cli", "pane", "ordinary", "coordinator"]) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:guardPolicy.workflowApproval:${variant}`);
