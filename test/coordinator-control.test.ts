@@ -5,7 +5,8 @@ import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { cancellationResult } from "../src/subagent-runs.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -36,6 +37,50 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
     const brokenChain = await requestCoordinator(root, { mode: "do", tickets: ["YM-5"] }, { ...origin, sessionId: "other-panel", pane: "plan", parentPane: "missing", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
     assert.equal(brokenChain.state, "refused");
     assert.equal(launches, 2);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("coordinator cancellation keeps exact registered origin ownership and typed repeats", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-cancel-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-cancel-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const origin = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+  let calls = 0;
+  let terminal = false;
+  const server = bindCoordinatorControl(root, {
+    async launch() { return { runId: "11111111-1111-4111-8111-111111111111" }; },
+    status(requestId) { return { requestId, state: "status" }; },
+    async cancel(runId) {
+      calls++;
+      if (terminal) return cancellationResult(runId, "coordinator", "already_terminal", true);
+      terminal = true;
+      return cancellationResult(runId, "coordinator", "cancelled", true);
+    },
+  }, { root, ...target, pid: process.pid, starttime, cwd: root }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const launched = await requestCoordinator(root, { mode: "do", tickets: ["YM-1"] }, origin, target, env);
+    assert.equal(launched.state, "accepted");
+    const first = await requestCoordinatorCancel(root, launched.runId!, origin, target, env);
+    assert.equal(first.state, "accepted");
+    assert.equal(first.cancellation?.status, "cancelled");
+    const repeat = await requestCoordinatorCancel(root, launched.runId!, origin, target, env);
+    assert.equal(repeat.cancellation?.status, "already_terminal");
+    for (const forged of [
+      { ...origin, sessionId: "foreign" },
+      { ...origin, starttime: "0" },
+      { ...origin, mode: "do", role: "coordinator" },
+    ]) {
+      const refused = await requestCoordinatorCancel(root, launched.runId!, forged, target, env);
+      assert.equal(refused.state, "refused");
+    }
+    assert.equal(calls, 2);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });

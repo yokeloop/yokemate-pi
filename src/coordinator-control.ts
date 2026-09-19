@@ -92,7 +92,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const scoutGenerations = new Map<string, number>();
   const scoutRequests = new Map<string, Map<number, number>>();
   const finalizedScoutAcceptances = new Map<string, Set<number>>();
-  const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
+  const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane && a.parentPane === b.parentPane && a.mode === b.mode && a.ticket === b.ticket && a.role === b.role && resolve(a.cwd) === resolve(b.cwd);
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const origins = new Map<string, ControlOrigin>();
   const paneParents = new Map<string, string | undefined>();
