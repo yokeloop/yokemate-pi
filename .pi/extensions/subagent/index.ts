@@ -1669,7 +1669,7 @@ export default function (pi: ExtensionAPI) {
 		if (signal && capture && !observedTurnSignals.has(signal)) {
 			observedTurnSignals.add(signal);
 			signal.addEventListener("abort", () => {
-				if (!capture.operation?.isCurrent(capture.parent, capture.store)) return;
+				if (!capture.operation?.matches(capture.parent, capture.store)) return;
 				capture.operation.cancel("interrupt");
 				if (authority === capture.store) capture.store.invalidateUnconsumed();
 				shipPermits.invalidate();

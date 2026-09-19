@@ -66,6 +66,9 @@ try:
         elif action == "snapshot":
             read_pty(0)
             emit({"id": ident, "contains": [needle in buffer for needle in request.get("needles", [])], "bytes": len(buffer.encode("utf-8"))})
+        elif action == "signal":
+            os.kill(pid, signal.SIGTERM)
+            emit({"id": ident, "ok": True})
         elif action == "terminate":
             try:
                 os.kill(pid, signal.SIGTERM)
