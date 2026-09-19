@@ -2,7 +2,7 @@ import { appendFileSync } from "node:fs";
 import net from "node:net";
 import readline from "node:readline";
 const send = (event) => process.stdout.write(JSON.stringify(event) + "\n");
-appendFileSync("fixture-runs", `${process.env.YOKEMATE_RUN_ID}\n`);
+let recorded = false;
 if (process.env.WORKFLOW_EVENT_SOCKET) {
   const eventSocket = net.createConnection(process.env.WORKFLOW_EVENT_SOCKET);
   eventSocket.on("data", () => {
@@ -17,5 +17,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   else if (command.type === "prompt") {
     send({ type: "response", id: command.id, success: true });
     if (command.message.startsWith("/yokemate-coordinator-ready")) send({ type: "message_end", message: { details: { runId: process.env.YOKEMATE_RUN_ID, ok: true } } });
+    else if (!recorded && command.id === `${process.env.YOKEMATE_RUN_ID}:work`) {
+      recorded = true;
+      appendFileSync("fixture-runs", `${process.env.YOKEMATE_RUN_ID}\n`);
+    }
   } else if (command.type === "abort") process.exit(0);
 });

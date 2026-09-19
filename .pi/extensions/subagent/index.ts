@@ -1328,7 +1328,7 @@ export default function (pi: ExtensionAPI) {
 							try { model = request.model ?? modelForTicket(db, key.key, "plan") ?? poolModel(dataRoot(ENGINE_ROOT), "plan"); }
 							finally { db.close(); }
 							const facts = await launchPlanKey(ENGINE_ROOT, request, target, key.keyRunId, model, async (pane) => {
-								const reply = await requestPlanControl(ENGINE_ROOT, "bind-plan", { ticket: key.key, runId: key.keyRunId, pane }, { sessionId: controlOrigin.sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ENGINE_ROOT }, controlIdentity!);
+								const reply = await requestPlanControl(ENGINE_ROOT, "bind-plan", { ticket: key.key, runId: key.keyRunId, pane }, currentControlOrigin(ctx.cwd, controlOrigin.sessionId), controlIdentity!);
 								if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
 							});
 							key.active({ ...facts });
@@ -1617,7 +1617,7 @@ export default function (pi: ExtensionAPI) {
 					try { acceptanceId = acceptScoutArtifact(db, ENGINE_ROOT, result.identity, bytes).id; }
 					finally { db.close(); }
 					const reply = await requestScoutControl(result, "publish-plan-scout", { acceptanceId });
-					if (reply.state !== "accepted" || !reply.artifactAcceptance) throw new Error("parent control refused");
+					if (reply.state !== "accepted" || !reply.artifactAcceptance) throw new Error(reply.reason ?? "parent control refused");
 					result.artifact = reply.artifactAcceptance === "accepted"
 						? { ...reference, state: "accepted", acceptanceId }
 						: { ...reference, state: "superseded", acceptanceId };
@@ -1756,11 +1756,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					if (process.env.YOKEMATE_MODE) {
 						const parent = resolveCoordinatorParent(root);
-						const reply = await requestCoordinator(root, params.coordinator as CoordinatorRequest, {
-							sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd,
-							pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE,
-							mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE,
-						}, parent);
+						const reply = await requestCoordinator(root, params.coordinator as CoordinatorRequest, currentControlOrigin(ctx.cwd, sessionId), parent);
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: reply.results?.map((result) => ({ type: "text" as const, text: result.state === "accepted" ? `accepted ${result.keyRunId}, key ${result.key}, reserved` : `refused ${result.key}: ${result.reason}` })) ?? [{ type: "text" as const, text: `accepted ${reply.runId}` }], details: { runId: reply.runId, listRunId: reply.listRunId, identity: reply.identity, results: reply.results } };
 					}

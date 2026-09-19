@@ -49,12 +49,15 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.env.YM204_FIXTURE_SOCKET = providerSocket;
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
     delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_TICKET;
     delete process.env.YOKEMATE_ROLE;
     delete process.env.YOKEMATE_RUN_ID;
     delete process.env.YOKEMATE_PARENT_RUN_ID;
-    delete process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "main-pane";
     delete process.env.YOKEMATE_PARENT_PANE;
     process.env.XDG_RUNTIME_DIR = runtime;
+    mkdirSync(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), { recursive: true });
+    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "main-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), cwd: dir, mode: "main", ticket: null, sessionId: "parent", parentPane: null }));
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
@@ -137,7 +140,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-    const recordProcess = async (extraEnv: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", ...extraEnv } });
+    const recordProcess = async (extraEnv: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", HERDR_PANE_ID: "main-pane", ...extraEnv } });
     const record = async (extraEnv: NodeJS.ProcessEnv = {}) => (await recordProcess(extraEnv)).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
     const triggerReview = async () => {
@@ -413,7 +416,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await runLegacyPublicationCase("both-pending", "unavailable", "unavailable", "guarded");
     await runLegacyPublicationCase("conflict", "complete", "remote_conflict");
     const launchTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    const ownedLoaderExtensions = async () => {
+    const ownedLoaderExtensions = async (workerSession = "parent") => {
       const ownedLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
       await ownedLoader.reload();
       const ownedLoaded = ownedLoader.getExtensions();
@@ -421,7 +424,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       ownedLoaded.runtime.appendEntry = () => undefined;
       ownedLoaded.runtime.sendMessage = receiveReport;
       const extension = ownedLoaded.extensions[0]!;
-      return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext };
+      return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => workerSession } } as unknown as ExtensionContext };
     };
     const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none") => {
       configurePublication(`owned-${label}`, scoutExpected, planExpected);
@@ -436,14 +439,15 @@ test("raw interactive authority flows through real plan CLI and parent control w
       }
       rmSync(ownedPlanReady, { force: true });
       rmSync(ownedPlanFinished, { force: true });
-      const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+      const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "main-pane", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, pane: "main-pane" }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
       assert.equal(ownedLaunch.state, "accepted", label);
       const ownedRunId = ownedLaunch.results?.[0]?.keyRunId;
       assert.ok(ownedRunId, label);
       await waitForFile(ownedPlanReady);
-      writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
-      Object.assign(process.env, { PI_SESSION_FILE: join(dir, `owned-${label}.jsonl`), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" });
-      const ownedWorker = { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane" };
+      const ownedSession = "owned-plan-session";
+      writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), cwd: dir, mode: "plan", ticket: "YM-1", sessionId: ownedSession, parentPane: "main-pane" }));
+      Object.assign(process.env, { PI_SESSION_FILE: join(dir, `owned-${label}.jsonl`), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "main-pane" });
+      const ownedWorker = { sessionId: ownedSession, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane", parentPane: "main-pane" };
       const ownedStarted = await requestPlanControl(dir, "plan-started", { ticket: "YM-1", runId: ownedRunId }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
       assert.equal(ownedStarted.state, "accepted", ownedStarted.reason ?? label);
       if (scoutExpected === "target_unavailable") db.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
@@ -452,7 +456,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       let ownedCtx: ExtensionContext | undefined;
       if (label === "scout-pending") {
         process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
-        const loadedOwned = await ownedLoaderExtensions();
+        const loadedOwned = await ownedLoaderExtensions(ownedSession);
         ownedExtension = loadedOwned.extension;
         ownedCtx = loadedOwned.context;
         for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
@@ -462,7 +466,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
         assert.equal(ownedScout.publication.state, initialScoutExpected === "complete" ? "complete" : "pending", label);
         if (initialScoutExpected !== "complete") assert.match(notifications.slice(warningsBeforeOwnedScout).join("\n"), new RegExp(`warning: scout publication .* ${initialScoutExpected}`), label);
       } else {
-        const identity = { ownerRunId: ownedRunId, ownerSessionId: "parent", batchId: `owned-${label}-batch`, runId: `owned-${label}-run`, agent: "plan-scout", taskHash: "a".repeat(64), cwd: dir, ticket: "YM-1" } as const;
+        const identity = { ownerRunId: ownedRunId, ownerSessionId: ownedSession, batchId: `owned-${label}-batch`, runId: `owned-${label}-run`, agent: "plan-scout", taskHash: "a".repeat(64), cwd: dir, ticket: "YM-1" } as const;
         const acceptance = acceptScoutArtifact(db, dir, identity, Buffer.from(`# Scout\n\n## Facts and sources\n${"owned evidence\n".repeat(5000)}${label}\n\n## Assumptions\n- Fixture.\n\n## Forks and recommendations\n- Fixture.\n`));
         const accepted = await requestPlanControl(dir, "publish-plan-scout", { ticket: "YM-1", runId: ownedRunId, acceptanceId: acceptance.id }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
         assert.equal(accepted.state, "accepted", accepted.reason ?? label);
@@ -474,12 +478,13 @@ test("raw interactive authority flows through real plan CLI and parent control w
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
       process.argv[1] = workflowChild;
       let result: Awaited<ReturnType<typeof recordProcess>>;
-      try { result = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" }); }
+      try { result = await recordProcess({ PI_SESSION_ID: ownedSession, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "main-pane" }); }
       finally { writeFileSync(ownedPlanFinished, "done"); }
       assertPublicationResult(`owned-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
       if (scoutExpected === "target_changed" || scoutExpected === "target_unavailable") assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, commentsBeforeOwnedRecord, label);
       if (ownedExtension && ownedCtx) for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
-      for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+      for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+      process.env.HERDR_PANE_ID = "main-pane";
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
       if (scoutExpected === "target_unavailable") db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
       if (authority === "advance") {

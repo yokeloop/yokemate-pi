@@ -2,11 +2,32 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { createConnection } from "node:net";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, coordinatorSocketPath, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
+
+function writePane(env: NodeJS.ProcessEnv, pane: string, root: string, mode: string, ticket: string | null, sessionId: string, pid = process.pid, parentPane: string | null = null): void {
+  writeFileSync(join(socketDir(env, process.getuid!()), `${pane}.json`), JSON.stringify({ pid, starttime: processStarttime(pid), cwd: root, mode, ticket, sessionId, parentPane }));
+}
+
+function rawControl(root: string, env: NodeJS.ProcessEnv, value: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const connection = createConnection(coordinatorSocketPath(root, env));
+    let buffer = "";
+    connection.on("connect", () => connection.write(JSON.stringify(value) + "\n"));
+    connection.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      connection.end();
+      resolve(JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>);
+    });
+    connection.on("error", reject);
+  });
+}
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
   const root = mkdtempSync(join(tmpdir(), "coordinator-control-"));
@@ -30,7 +51,8 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
     assert.equal(reusedPid.state, "refused");
     const runtimeDir = socketDir(env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: null }));
+    writePane(env, "main", root, "main", null, "session");
+    writePane(env, "plan", root, "plan", null, "plan-session", process.pid, "main");
     const panel = await requestCoordinator(root, { mode: "do", tickets: ["YM-4"] }, { ...origin, sessionId: "plan-session", pane: "plan", parentPane: "main", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
     assert.equal(panel.state, "accepted");
     const brokenChain = await requestCoordinator(root, { mode: "do", tickets: ["YM-5"] }, { ...origin, sessionId: "other-panel", pane: "plan", parentPane: "missing", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
@@ -38,6 +60,120 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
     assert.equal(launches, 2);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("coordinator origin provenance returns distinct refusals before launch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-provenance-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-provenance-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  mkdirSync(socketDir(env, process.getuid!()), { recursive: true });
+  writePane(env, "main", root, "main", null, target.sessionId);
+  let launches = 0;
+  let foreignOwner: ChildProcess | undefined;
+  const server = bindCoordinatorControl(root, {
+    async launch() { launches++; return { runId: "unexpected" }; },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);
+  const request = { mode: "do" as const, tickets: ["YM-1"] };
+  const base = { sessionId: "pane-session", pid: process.pid, starttime, cwd: root, pane: "pane", parentPane: "main", mode: "plan", ticket: "YM-1", role: "coordinator" };
+  const refusal = async (origin: typeof base, reason: string) => assert.equal((await requestCoordinator(root, request, origin, target, env)).reason, reason);
+  try {
+    if (!server.listening) await once(server, "listening");
+    await refusal({ ...base, mode: "main" }, "invalid coordinator origin");
+    await refusal({ ...base, cwd: join(root, "foreign") }, "origin root mismatch");
+    await refusal({ ...base, starttime: "0" }, "origin process is stale");
+    await refusal(base, "pane sidecar is missing");
+    writeFileSync(join(socketDir(env, process.getuid!()), "pane.json"), "{");
+    await refusal(base, "pane sidecar is invalid");
+    writeFileSync(join(socketDir(env, process.getuid!()), "pane.json"), JSON.stringify({ pid: process.pid, starttime: "0", cwd: root, mode: "plan", ticket: "YM-1", sessionId: "pane-session", parentPane: "main" }));
+    await refusal(base, "pane sidecar is stale");
+    writeFileSync(join(socketDir(env, process.getuid!()), "pane.json"), JSON.stringify({ pid: process.pid, starttime, cwd: join(root, "foreign"), mode: "plan", ticket: "YM-1", sessionId: "pane-session", parentPane: "main" }));
+    await refusal(base, "pane root mismatch");
+    foreignOwner = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(foreignOwner, "spawn");
+    writePane(env, "pane", root, "plan", "YM-1", "pane-session", foreignOwner.pid!, "main");
+    await refusal(base, "origin process is not descended from pane");
+    foreignOwner.kill("SIGKILL");
+    await once(foreignOwner, "exit");
+    foreignOwner = undefined;
+    writePane(env, "pane", root, "review", "YM-1", "pane-session", process.pid, "main");
+    await refusal(base, "pane mode mismatch");
+    writePane(env, "pane", root, "plan", "YM-2", "pane-session", process.pid, "main");
+    await refusal(base, "pane ticket mismatch");
+    writePane(env, "pane", root, "plan", "YM-1", "pane-session", process.pid, "unknown");
+    await refusal({ ...base, parentPane: "unknown" }, "origin pane chain is not registered with this parent");
+    assert.equal(launches, 0);
+  } finally {
+    if (foreignOwner && foreignOwner.exitCode === null) foreignOwner.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("registered pane chains are immutable and revalidated after ancestor death", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-chain-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-chain-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  mkdirSync(socketDir(env, process.getuid!()), { recursive: true });
+  writePane(env, "main", root, "main", null, target.sessionId);
+  let launches = 0;
+  const server = bindCoordinatorControl(root, {
+    async launch() { launches++; return { runId: "run" }; },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
+  let owner: ChildProcess | undefined;
+  let workerPid: number | undefined;
+  try {
+    if (!server.listening) await once(server, "listening");
+    owner = spawn(process.execPath, ["-e", "const{spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+    await once(owner, "spawn");
+    const [chunk] = await once(owner.stdout!, "data") as [Buffer];
+    workerPid = Number(chunk.toString().trim());
+    assert.ok(workerPid && processStarttime(workerPid));
+    const ownerOrigin = { sessionId: "owner-session", pid: owner.pid!, starttime: processStarttime(owner.pid!)!, cwd: root, pane: "owner", parentPane: "main", mode: "plan", role: "coordinator" };
+    writePane(env, "owner", root, "plan", null, "owner-session", owner.pid!, "main");
+    assert.equal((await requestCoordinator(root, { mode: "do", tickets: ["YM-1"] }, ownerOrigin, target, env)).state, "accepted");
+    const workerOrigin = { sessionId: "worker-session", pid: workerPid, starttime: processStarttime(workerPid)!, cwd: root, pane: "worker", parentPane: "owner", mode: "plan", role: "coordinator" };
+    writePane(env, "worker", root, "plan", null, "worker-session", workerPid, "owner");
+    const attach = await rawControl(root, env, { version: 1, operation: "attach-origin", requestId: "attach", origin: workerOrigin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId });
+    assert.equal(attach.state, "accepted");
+    owner.kill("SIGKILL");
+    await once(owner, "exit");
+    const reused = await rawControl(root, env, { version: 1, operation: "launch", requestId: "launch", originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, request: { mode: "do", tickets: ["YM-2"] } });
+    assert.equal(reused.state, "refused");
+    assert.equal(reused.reason, "origin pane chain is not registered with this parent");
+    assert.equal(launches, 1);
+  } finally {
+    if (owner && owner.exitCode === null) owner.kill("SIGKILL");
+    if (workerPid) try { process.kill(workerPid, "SIGKILL"); } catch {}
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("coordinator parent resolver distinguishes sidecar failures", () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-parent-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-parent-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const sidecar = `${coordinatorSocketPath(root, env)}.json`;
+  mkdirSync(join(socketDir(env, process.getuid!()), "coordinators"), { recursive: true });
+  try {
+    assert.throws(() => resolveCoordinatorParent(root, env), /coordinator parent sidecar is missing/);
+    writeFileSync(sidecar, "{");
+    assert.throws(() => resolveCoordinatorParent(root, env), /coordinator parent sidecar is invalid/);
+    writeFileSync(sidecar, JSON.stringify({ root, sessionId: "session", runtimeId: "runtime", pid: process.pid, starttime: "0", cwd: root }));
+    assert.throws(() => resolveCoordinatorParent(root, env), /coordinator parent is stale/);
+    writeFileSync(sidecar, JSON.stringify({ root: join(root, "foreign"), sessionId: "session", runtimeId: "runtime", pid: process.pid, starttime: processStarttime(process.pid), cwd: root }));
+    assert.throws(() => resolveCoordinatorParent(root, env), /coordinator parent root mismatch/);
+  } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });
   }
@@ -51,8 +187,8 @@ test("main pane sidecars canonicalize only the unstamped main mode for plan regi
   const starttime = processStarttime(process.pid)!;
   const runtimeDir = socketDir(env, process.getuid!());
   mkdirSync(runtimeDir, { recursive: true });
-  writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "main", ticket: null }));
-  writeFileSync(join(runtimeDir, "plan-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+  writePane(env, "main-pane", root, "main", null, target.sessionId);
+  writePane(env, "plan-pane", root, "plan", "YM-1", "plan-session", process.pid, "main-pane");
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
@@ -71,7 +207,7 @@ test("main pane sidecars canonicalize only the unstamped main mode for plan regi
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 1 }, worker, target, env)).publication, "complete");
     const stampedMain = await requestPlanControl(root, "register-plan", { ticket: "YM-2" }, { ...main, mode: "main" }, target, env);
     assert.equal(stampedMain.state, "refused");
-    assert.match(stampedMain.reason ?? "", /panel origin|verified main parent/);
+    assert.equal(stampedMain.reason, "invalid coordinator origin");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
@@ -97,7 +233,8 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
     const runtimeDir = socketDir(env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "problem.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: null }));
+    writePane(env, "main", root, "main", null, target.sessionId);
+    writePane(env, "problem", root, "plan", null, "problem-session", process.pid, "main");
     const worker = { ...main, sessionId: "problem-session", mode: "plan", role: "coordinator", pane: "problem", parentPane: "main" };
     const prepare = (ticket: string) => requestPlanControl(root, "prepare-plan-publication", { ticket, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare("YM-1")).state, "refused");
@@ -144,7 +281,7 @@ test("real main pane sidecar admits an unstamped child plan list without widenin
     if (!server.listening) await once(server, "listening");
     const runtimeDir = socketDir(env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: root, pid: process.pid }));
+    writePane(env, "main-pane", root, "main", null, target.sessionId);
     const request = { targets: ["YM-1", "YM-2"].map((ticket) => ({ ticket, workerWords: [ticket] })), surface: "tab" as const, literal: [], parentPane: "main-pane", parentWorkspace: "workspace" };
     const origin = { sessionId: target.sessionId, pid: child.pid!, starttime: childStarttime, cwd: root, pane: "main-pane" };
     const accepted = await requestPlanLaunch(root, request, origin, target, env);
@@ -259,10 +396,14 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.ok(register.runId);
     const payload = { ticket: "YM-1", runId: register.runId };
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
-    writeFileSync(join(socketDir(env, process.getuid!()), "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+    writePane(env, "main", root, "main", null, target.sessionId);
+    writePane(env, "plan", root, "plan", "YM-1", "plan-session", process.pid, "main");
     const handoff = { ...payload, path: "/recorded.md", recordId: 7 };
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
+    const { role: _role, ...missingRole } = worker;
+    for (const invalid of [missingRole, { ...worker, role: "executor" }, { ...worker, role: "unknown" }, { ...worker, sessionId: "foreign" }, { ...worker, starttime: "0" }])
+      assert.equal((await requestPlanControl(root, "plan-started", payload, invalid, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
     const recordWithoutScout = await requestPlanControl(root, "record-plan", { ...payload, path: "/plan.md" }, worker, target, env);
     assert.equal(recordWithoutScout.state, "refused");
@@ -339,7 +480,8 @@ test("plan worker process exit settles once without using herdr agent status", {
     child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     await once(child, "spawn");
     const worker = { sessionId: "plan-session", pid: child.pid!, starttime: processStarttime(child.pid!)!, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-1", role: "coordinator" };
-    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: child.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+    writePane(env, "main", root, "main", null, target.sessionId);
+    writePane(env, "plan", root, "plan", "YM-1", "plan-session", child.pid!, "main");
     assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: registered.runId }, worker, target, env)).state, "accepted");
     child.kill("SIGKILL");
     await once(child, "exit");
@@ -391,7 +533,8 @@ test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }
     child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     await once(child, "spawn");
     const worker = { sessionId: "plan-session", pid: child.pid!, starttime: processStarttime(child.pid!)!, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-2", role: "coordinator" };
-    writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: child.pid, cwd: root, mode: "plan", ticket: "YM-2" }));
+    writePane(env, "main", root, "main", null, target.sessionId);
+    writePane(env, "plan", root, "plan", "YM-2", "plan-session", child.pid!, "main");
     assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-2", runId: registered.runId }, worker, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: registered.runId, acceptanceId: 1 }, worker, target, env)).state, "accepted");
     const recording = requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, worker, target, env);
@@ -406,7 +549,7 @@ test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }
     assert.equal(records, 1);
     assert.equal(finishes, 0);
     const replay = await requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, main, target, env);
-    assert.equal(replay.state, "accepted");
+    assert.equal(replay.state, "refused");
     assert.equal(records, 1);
   } finally {
     releaseRecord?.();
