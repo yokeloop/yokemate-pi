@@ -7,6 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
+import type { ChildIdentity } from "../src/subagent-runs.ts";
+
+const scoutChild = (origin: { sessionId: string }, ticket: string, suffix: string): ChildIdentity => ({ ownerRunId: `owner-${suffix}`, ownerSessionId: origin.sessionId, batchId: `batch-${suffix}`, runId: `run-${suffix}`, agent: "plan-scout", taskHash: suffix.padEnd(64, "a").slice(0, 64), cwd: "", ticket });
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
   const root = mkdtempSync(join(tmpdir(), "coordinator-control-"));
@@ -67,8 +70,10 @@ test("main pane sidecars canonicalize only the unstamped main mode for plan regi
     const payload = { ticket: "YM-1", runId: register.runId };
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan-pane" }, main, target, env)).state, "accepted");
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan-pane", parentPane: "main-pane" };
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: "" }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: "removed" }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 1 }, worker, target, env)).publication, "complete");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 1, child: { ...scoutChild(worker, "YM-1", "main"), cwd: root } }, worker, target, env)).publication, "complete");
     const stampedMain = await requestPlanControl(root, "register-plan", { ticket: "YM-2" }, { ...main, mode: "main" }, target, env);
     assert.equal(stampedMain.state, "refused");
     assert.match(stampedMain.reason ?? "", /panel origin|verified main parent/);
@@ -91,7 +96,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
     publishPlanScout: async (ticket, acceptanceId) => ({ reason: `${ticket}/${acceptanceId}`, publication: "complete", target: "fixture", revision: "a".repeat(64) }),
-    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepares++; assert.equal(acceptanceId, 1); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: "b".repeat(64) }; },
+    preparePlanPublication: async (ticket, path, hash, acceptanceId) => { prepares++; assert.equal(acceptanceId, 1); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "d".repeat(64), repositories: ["org/repo"] } }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -101,7 +106,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     const worker = { ...main, sessionId: "problem-session", mode: "plan", role: "coordinator", pane: "problem", parentPane: "main" };
     const prepare = (ticket: string) => requestPlanControl(root, "prepare-plan-publication", { ticket, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare("YM-1")).state, "refused");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", acceptanceId: 1 }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", acceptanceId: 1, child: { ...scoutChild(worker, "YM-1", "problem"), cwd: root } }, worker, target, env)).state, "accepted");
     descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     await new Promise<void>((resolve, reject) => { descendant!.once("spawn", resolve); descendant!.once("error", reject); });
     const descendantOrigin = { ...worker, pid: descendant.pid!, starttime: processStarttime(descendant.pid!)! };
@@ -248,9 +253,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
       }
       return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) };
     },
-    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: "b".repeat(64) }; },
+    preparePlanPublication: async (ticket, path, hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "d".repeat(64), repositories: ["org/repo"] } }; },
     recordPlan: async () => { ownedRecords++; return { reason: "recorded" }; },
-    planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(recordId, 7); return { reason: "recorded" }; },
+    planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/plan.md"); assert.equal(recordId, 3); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -260,7 +265,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const payload = { ticket: "YM-1", runId: register.runId };
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
     writeFileSync(join(socketDir(env, process.getuid!()), "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
-    const handoff = { ...payload, path: "/recorded.md", recordId: 7 };
+    const handoff = { ...payload, path: "/plan.md", recordId: 3 };
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
@@ -270,23 +275,24 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal(ownedRecords, 0);
     const prepare = () => requestPlanControl(root, "prepare-plan-publication", { ...payload, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare()).state, "refused");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11 }, worker, target, env)).state, "accepted");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: "foreign", acceptanceId: 13 }, worker, target, env)).state, "refused");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 13 }, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: payload.runId, acceptanceId: 13 }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11, child: { ...scoutChild(worker, "YM-1", "eleven"), cwd: root } }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11, child: { ...scoutChild(worker, "YM-1", "other-delivery"), cwd: root } }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: "foreign", acceptanceId: 13, child: { ...scoutChild(worker, "YM-1", "foreign"), cwd: root } }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 13, child: { ...scoutChild(worker, "YM-1", "session"), cwd: root } }, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: payload.runId, acceptanceId: 13, child: { ...scoutChild(worker, "YM-2", "ticket"), cwd: root } }, worker, target, env)).state, "refused");
     assert.equal((await prepare()).state, "accepted");
     assert.equal((await requestPlanControl(root, "reject-plan-scout", { ...payload, acceptanceId: 11 }, worker, target, env)).state, "accepted");
     assert.equal((await prepare()).state, "refused");
-    const delayed = requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
+    const delayed = requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12, child: { ...scoutChild(worker, "YM-1", "twelve"), cwd: root } }, worker, target, env);
     await delayedStarted;
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 13 }, worker, target, env)).publication, "complete");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 13, child: { ...scoutChild(worker, "YM-1", "thirteen"), cwd: root } }, worker, target, env)).publication, "complete");
     assert.equal((await prepare()).state, "accepted");
     releaseDelayed!();
     const superseded = await delayed;
     assert.equal(superseded.publication, "complete");
     assert.equal(superseded.artifactAcceptance, "superseded");
     assert.equal(superseded.reason, "scout superseded");
-    const staleRetry = await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
+    const staleRetry = await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 12, child: { ...scoutChild(worker, "YM-1", "twelve"), cwd: root } }, worker, target, env);
     assert.equal(staleRetry.state, "refused");
     assert.match(staleRetry.reason ?? "", /superseded/);
     const oldRejection = await requestPlanControl(root, "reject-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
@@ -296,6 +302,10 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal((await requestPlanControl(root, "plan-recorded", { ...handoff, runId: "foreign" }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "plan-recorded", { ticket: "YM-1", path: "/plan.md", recordId: 3 }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: "", acceptanceId: 14, child: { ...scoutChild(worker, "YM-1", "empty"), cwd: root } }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", runId: "removed", path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env)).state, "refused");
     assert.equal(records, 1);
     assert.deepEqual(prepareAcceptances, [11, 13, 13]);
   } finally {
@@ -354,6 +364,60 @@ test("plan worker process exit settles once without using herdr agent status", {
   }
 });
 
+test("a correlated scout admits one live save-only worker and its CLI descendant", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "save-only-plan-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "save-only-plan-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  let publications = 0;
+  let preparations = 0;
+  let completions = 0;
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    publishPlanScout: async (_ticket, _acceptanceId, child) => { publications++; assert.equal(child.runId, "scout-save"); return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) }; },
+    preparePlanPublication: async (ticket, path, hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "b".repeat(64), repositories: ["org/repo"] } }; },
+    planRecorded: async (_ticket, _path, recordId, _origin, context) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
+  const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
+  let cliPid = 0;
+  try {
+    if (!server.listening) await once(server, "listening");
+    await once(owner, "spawn");
+    owner.stdout!.setEncoding("utf8");
+    cliPid = Number(String((await once(owner.stdout!, "data"))[0]).trim());
+    assert.ok(cliPid > 0);
+    const pane = "save-pane";
+    writeFileSync(join(runtimeDir, `${pane}.json`), JSON.stringify({ pid: owner.pid, cwd: root, mode: "plan", ticket: "YM-7" }));
+    const worker = { sessionId: "save-session", pid: owner.pid!, starttime: processStarttime(owner.pid!)!, cwd: root, pane, parentPane: "main", mode: "plan", ticket: "YM-7", role: "coordinator" };
+    const child = { ...scoutChild(worker, "YM-7", "save"), runId: "scout-save", cwd: root };
+    const accepted = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 4, child }, worker, target, env);
+    assert.equal(accepted.state, "accepted", accepted.reason ?? "save-only scout refused");
+    assert.equal(accepted.publication, "pending");
+    const cli = { ...worker, pid: cliPid, starttime: processStarttime(cliPid)! };
+    const prepared = await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env);
+    assert.equal(prepared.state, "accepted", prepared.reason ?? "save-only preparation refused");
+    const recorded = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
+    assert.equal(recorded.state, "accepted", recorded.reason ?? "save-only completion refused");
+    assert.equal(recorded.handoff, "unavailable");
+    const repeat = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
+    assert.equal(repeat.state, "accepted", repeat.reason ?? "save-only repeat refused");
+    assert.equal(completions, 1);
+    assert.equal(publications, 1);
+    assert.equal(preparations, 1);
+    const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 9 }, cli, target, env);
+    assert.equal(foreign.state, "refused");
+  } finally {
+    if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}
+    if (owner.exitCode === null) owner.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "plan-record-exit-"));
   const runtime = mkdtempSync(join(tmpdir(), "plan-record-runtime-"));
@@ -393,7 +457,7 @@ test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }
     const worker = { sessionId: "plan-session", pid: child.pid!, starttime: processStarttime(child.pid!)!, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-2", role: "coordinator" };
     writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: child.pid, cwd: root, mode: "plan", ticket: "YM-2" }));
     assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-2", runId: registered.runId }, worker, target, env)).state, "accepted");
-    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: registered.runId, acceptanceId: 1 }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-2", runId: registered.runId, acceptanceId: 1, child: { ...scoutChild(worker, "YM-2", "exit"), cwd: root } }, worker, target, env)).state, "accepted");
     const recording = requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, worker, target, env);
     await recordStarted;
     child.kill("SIGKILL");
@@ -406,7 +470,7 @@ test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }
     assert.equal(records, 1);
     assert.equal(finishes, 0);
     const replay = await requestPlanControl(root, "record-plan", { ticket: "YM-2", runId: registered.runId, path: "/plan.md" }, main, target, env);
-    assert.equal(replay.state, "accepted");
+    assert.equal(replay.state, "refused");
     assert.equal(records, 1);
   } finally {
     releaseRecord?.();
