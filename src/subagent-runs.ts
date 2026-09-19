@@ -9,17 +9,42 @@ export const PAYLOAD_LIMIT = 50 * 1024;
 export const sha256 = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 export interface ReviewRevision { baseSha: string; headSha: string }
 export interface ChildIdentity {
-  ownerRunId: string;
-  ownerSessionId: string;
-  batchId: string;
-  runId: string;
-  agent: string;
-  taskHash: string;
-  cwd: string;
-  ticket?: string;
-  review?: ReviewRevision;
+  readonly ownerRunId: string;
+  readonly ownerSessionId: string;
+  readonly batchId: string;
+  readonly runId: string;
+  readonly agent: string;
+  readonly taskHash: string;
+  readonly cwd: string;
+  readonly ticket?: string;
+  readonly review?: ReviewRevision;
 }
 export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
+export type ChildLifecycleState = "queued" | "preparing" | "running" | "terminal_claimed" | "finalized";
+export type CancellationTargetKind = "ordinary" | "coordinator" | "list" | "unknown";
+export type CancellationStatus = "cancellation_requested" | "cancelled" | "already_terminal" | "not_owned" | "unknown";
+export interface CancellationResult {
+  version: 1;
+  kind: "cancellation";
+  runId: string;
+  targetKind: CancellationTargetKind;
+  status: CancellationStatus;
+  terminal: boolean;
+  reason?: string;
+  identity?: ChildIdentity;
+  processOutcome?: ProcessOutcome;
+  exitCode?: number | null;
+  signal?: string | null;
+  cancellationInitiator?: string;
+  actualTaskHash?: string;
+}
+export interface CancellationRequest {
+  result: CancellationResult;
+  first: boolean;
+  shouldSignal: boolean;
+  waitForCleanup: boolean;
+  completion: Promise<CancellationResult>;
+}
 export interface PublicationReference { state: "pending" | "complete"; target: string; revision: string; publicationId?: number; error?: string; path?: string; hash?: string; bytes?: number; targetHash?: string; acceptanceId?: number }
 export type ArtifactReference =
   | { state: "verified"; path: string; hash: string; bytes: number }
@@ -43,6 +68,7 @@ export interface ResultEnvelope {
   reviewVerdict: "approved" | "changes_required" | null;
   artifact?: ArtifactReference;
   publication?: PublicationReference;
+  cancellationInitiator?: string;
 }
 export interface BatchEnvelope {
   version: 1;
@@ -50,7 +76,7 @@ export interface BatchEnvelope {
   ownerRunId: string;
   ownerSessionId: string;
   batchId: string;
-  results: ResultEnvelope[];
+  results: readonly ResultEnvelope[];
 }
 export interface LaunchAck {
   version: 1;
@@ -73,7 +99,8 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
     if (head !== task.review.headSha) throw new Error("review.headSha does not match HEAD in cwd");
   }
-  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}) };
+  const review = task.review ? Object.freeze({ ...task.review }) : undefined;
+  return Object.freeze({ ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(review ? { review } : {}) });
 }
 export function reviewerVerdict(text: string): "approved" | "changes_required" | null {
   try {
@@ -94,48 +121,168 @@ export function boundedText(text: string): string {
   while ((bytes[end]! & 0xc0) === 0x80) end--;
   return bytes.subarray(0, end).toString("utf8") + "\n[Output truncated]";
 }
-export function resultEnvelope(identity: ChildIdentity, task: string, terminal: { processOutcome: ProcessOutcome; exitCode: number | null; signal: string | null; stopReason?: string; protocolError?: boolean; incomplete?: boolean }, text: string): ResultEnvelope {
+export function resultEnvelope(identity: ChildIdentity, task: string, terminal: { processOutcome: ProcessOutcome; exitCode: number | null; signal: string | null; stopReason?: string; protocolError?: boolean; incomplete?: boolean; cancellationInitiator?: string }, text: string): ResultEnvelope {
   const clean = terminal.processOutcome === "exited" && terminal.exitCode === 0 && terminal.signal === null && terminal.stopReason === "stop" && !terminal.incomplete;
   const reviewer = identity.agent === "task-reviewer";
   const verdict = reviewer ? reviewerVerdict(text) : null;
   const overflow = reviewer && Buffer.byteLength(text) > PAYLOAD_LIMIT;
   const payloadOutcome: PayloadOutcome = terminal.protocolError ? "protocol_error" : !clean ? "incomplete" : overflow ? "output_limit" : !text.trim() ? "missing_final" : reviewer && !verdict ? "invalid_reviewer_json" : "valid";
-  return { version: 1, kind: "result", identity, actualTaskHash: sha256(task), processOutcome: terminal.processOutcome, exitCode: terminal.exitCode, signal: terminal.signal, stopReason: terminal.stopReason, payloadOutcome, payload: overflow ? "" : boundedText(text), reviewVerdict: payloadOutcome === "valid" ? verdict : null };
+  return { version: 1, kind: "result", identity, actualTaskHash: sha256(task), processOutcome: terminal.processOutcome, exitCode: terminal.exitCode, signal: terminal.signal, stopReason: terminal.stopReason, payloadOutcome, payload: overflow ? "" : boundedText(text), reviewVerdict: payloadOutcome === "valid" ? verdict : null, ...(terminal.cancellationInitiator ? { cancellationInitiator: terminal.cancellationInitiator } : {}) };
 }
 export function failedEnvelope(result: ResultEnvelope): boolean { return result.payloadOutcome !== "valid"; }
+
+interface ChildRecord {
+  identity: ChildIdentity;
+  templateTask: string;
+  resolvedTask?: string;
+  state: ChildLifecycleState;
+  intent?: { initiator: string };
+  process?: { pid: number; starttime: string };
+  claim?: ResultEnvelope;
+  result?: ResultEnvelope;
+  cleanupDone: boolean;
+  cleanupPromise: Promise<void>;
+  cleanupResolve(): void;
+  finalizationPromise: Promise<ResultEnvelope>;
+  finalizationResolve(result: ResultEnvelope): void;
+}
+
 export class ChildRuns {
   readonly ownerRunId: string;
   readonly ownerSessionId: string;
-  readonly children = new Map<string, { identity: ChildIdentity; state: "queued" | "running"; result?: ResultEnvelope }>();
-  readonly batches = new Map<string, ChildIdentity[]>();
+  readonly children = new Map<string, ChildRecord>();
+  readonly batches = new Map<string, readonly ChildIdentity[]>();
   private defaultTicket?: string;
   constructor(ownerRunId: string, ownerSessionId: string, defaultTicket?: string) { this.ownerRunId = ownerRunId; this.ownerSessionId = ownerSessionId; this.defaultTicket = defaultTicket; }
   admit(batchId: string, tasks: ChildTask[], cwd: string): LaunchAck {
     if (this.batches.has(batchId)) throw new Error("duplicate subagent batch admission");
     const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd, this.defaultTicket));
     batchPayloadQuota(identities);
-    this.batches.set(batchId, identities);
-    for (const identity of identities) this.children.set(identity.runId, { identity, state: "queued" });
+    this.batches.set(batchId, Object.freeze([...identities]));
+    identities.forEach((identity, index) => {
+      let cleanupResolve!: () => void;
+      let finalizationResolve!: (result: ResultEnvelope) => void;
+      const cleanupPromise = new Promise<void>((resolve) => { cleanupResolve = resolve; });
+      const finalizationPromise = new Promise<ResultEnvelope>((resolve) => { finalizationResolve = resolve; });
+      this.children.set(identity.runId, { identity, templateTask: tasks[index]!.task, resolvedTask: tasks[index]!.task, state: "queued", cleanupDone: false, cleanupPromise, cleanupResolve, finalizationPromise, finalizationResolve });
+    });
     return { version: 1, kind: "ack", terminal: false, batchId, children: identities.map((identity) => ({ identity, state: "queued" })) };
   }
-  start(identity: ChildIdentity): void {
-    const child = this.children.get(identity.runId);
-    if (child && !child.result && sha256(JSON.stringify(child.identity)) === sha256(JSON.stringify(identity))) child.state = "running";
-  }
-  settle(result: ResultEnvelope): boolean {
-    const child = this.children.get(result.identity.runId);
-    if (!child || child.result || sha256(JSON.stringify(child.identity)) !== sha256(JSON.stringify(result.identity))) return false;
-    child.result = result;
+  defer(identity: ChildIdentity): boolean {
+    const child = this.valid(identity);
+    if (!child || child.state !== "queued" || child.intent) return false;
+    child.resolvedTask = undefined;
     return true;
   }
+  resolveTask(identity: ChildIdentity, task: string): boolean {
+    const child = this.valid(identity);
+    if (!child || child.state === "finalized") return false;
+    child.resolvedTask = task;
+    return true;
+  }
+  start(identity: ChildIdentity): boolean {
+    const child = this.valid(identity);
+    if (!child || child.state !== "queued" || child.intent) return false;
+    child.state = "preparing";
+    return true;
+  }
+  canSpawn(identity: ChildIdentity): boolean {
+    const child = this.valid(identity);
+    return !!child && child.state === "preparing" && !child.intent && !child.claim;
+  }
+  attachProcess(identity: ChildIdentity, pid: number, starttime: string): boolean {
+    const child = this.valid(identity);
+    if (!child || child.state !== "preparing" || child.intent || child.claim || !Number.isSafeInteger(pid) || pid < 1 || !starttime) return false;
+    child.process = Object.freeze({ pid, starttime });
+    child.state = "running";
+    return true;
+  }
+  process(identity: ChildIdentity): Readonly<{ pid: number; starttime: string }> | undefined {
+    const child = this.valid(identity);
+    return child?.process;
+  }
+  requestCancel(runId: string, initiator: string): CancellationRequest {
+    const child = this.children.get(runId);
+    if (!child) {
+      const result = cancellationResult(runId, "unknown", "unknown", false);
+      return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
+    }
+    if (child.claim || child.result) {
+      const result = this.cancellationResult(child, "already_terminal", true);
+      return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
+    }
+    const first = !child.intent;
+    child.intent ??= Object.freeze({ initiator });
+    if (child.state === "queued" && child.resolvedTask !== undefined) this.claimNoSpawn(child.identity);
+    const immediate = child.claim && child.cleanupDone ? this.cancellationResult(child, "cancelled", true) : this.cancellationResult(child, "cancellation_requested", false);
+    const completion = child.cleanupPromise.then(() => child.claim ? this.cancellationResult(child, "cancelled", true) : this.cancellationResult(child, "cancellation_requested", false));
+    return { result: immediate, first, shouldSignal: first && child.state === "running", waitForCleanup: child.resolvedTask !== undefined, completion };
+  }
+  claimNoSpawn(identity: ChildIdentity): ResultEnvelope | undefined {
+    const child = this.valid(identity);
+    if (!child || child.claim || child.resolvedTask === undefined) return child?.claim;
+    const result = resultEnvelope(child.identity, child.resolvedTask, { processOutcome: child.intent ? "cancelled" : "not_started", exitCode: null, signal: null, ...(child.intent ? { cancellationInitiator: child.intent.initiator } : {}) }, "");
+    child.claim = result;
+    child.state = "terminal_claimed";
+    return result;
+  }
+  claimTerminal(identity: ChildIdentity, task: string, terminal: { processOutcome: Exclude<ProcessOutcome, "not_started">; exitCode: number | null; signal: string | null; stopReason?: string; protocolError?: boolean; incomplete?: boolean }, text: string): { claimed: boolean; result: ResultEnvelope } | undefined {
+    const child = this.valid(identity);
+    if (!child) return;
+    if (child.claim) return { claimed: false, result: child.claim };
+    child.resolvedTask = task;
+    const result = resultEnvelope(child.identity, task, { ...terminal, processOutcome: child.intent ? "cancelled" : terminal.processOutcome, ...(child.intent ? { cancellationInitiator: child.intent.initiator } : {}) }, text);
+    child.claim = result;
+    child.state = "terminal_claimed";
+    return { claimed: true, result };
+  }
+  claimed(identity: ChildIdentity): ResultEnvelope | undefined { return this.valid(identity)?.claim; }
+  completeCleanup(identity: ChildIdentity): boolean {
+    const child = this.valid(identity);
+    if (!child || child.cleanupDone) return false;
+    child.cleanupDone = true;
+    child.process = undefined;
+    child.cleanupResolve();
+    return true;
+  }
+  cleanup(identity: ChildIdentity): Promise<void> { return this.valid(identity)?.cleanupPromise ?? Promise.resolve(); }
+  settle(result: ResultEnvelope): boolean {
+    const child = this.valid(result.identity);
+    if (!child || child.result) return false;
+    if (child.claim && ["identity", "actualTaskHash", "processOutcome", "exitCode", "signal", "cancellationInitiator"].some((key) => JSON.stringify((child.claim as any)[key]) !== JSON.stringify((result as any)[key]))) return false;
+    child.claim ??= result;
+    child.result = Object.freeze(result);
+    child.state = "finalized";
+    child.finalizationResolve(child.result);
+    return true;
+  }
+  finalized(identity: ChildIdentity): Promise<ResultEnvelope> | undefined { return this.valid(identity)?.finalizationPromise; }
   batch(batchId: string, kind: "batch" | "chain" = "batch"): BatchEnvelope | undefined {
     const identities = this.batches.get(batchId);
     if (!identities) return;
     const results = identities.map((identity) => this.children.get(identity.runId)?.result);
     if (results.some((result) => !result)) return;
-    return { version: 1, kind, ownerRunId: this.ownerRunId, ownerSessionId: this.ownerSessionId, batchId, results: results as ResultEnvelope[] };
+    return Object.freeze({ version: 1, kind, ownerRunId: this.ownerRunId, ownerSessionId: this.ownerSessionId, batchId, results: Object.freeze(results as ResultEnvelope[]) });
   }
-  active(): { identity: ChildIdentity; state: "queued" | "running" }[] { return [...this.children.values()].filter((child) => !child.result).map(({ identity, state }) => ({ identity, state })); }
+  active(): { identity: ChildIdentity; state: "queued" | "running" }[] {
+    return [...this.children.values()].filter((child) => child.state !== "finalized").map(({ identity, state }) => ({ identity, state: state === "queued" ? "queued" : "running" }));
+  }
+  owns(runId: string, ownerRunId: string, ownerSessionId: string): boolean {
+    const child = this.children.get(runId);
+    return !!child && child.identity.ownerRunId === ownerRunId && child.identity.ownerSessionId === ownerSessionId;
+  }
+  private valid(identity: ChildIdentity): ChildRecord | undefined {
+    const child = this.children.get(identity.runId);
+    return child && JSON.stringify(child.identity) === JSON.stringify(identity) ? child : undefined;
+  }
+  private cancellationResult(child: ChildRecord, status: CancellationStatus, terminal: boolean): CancellationResult {
+    const result = child.claim ?? child.result;
+    return cancellationResult(child.identity.runId, "ordinary", status, terminal, undefined, child.identity, result, child.intent?.initiator);
+  }
+}
+
+export function cancellationResult(runId: string, targetKind: CancellationTargetKind, status: CancellationStatus, terminal: boolean, reason?: string, identity?: ChildIdentity, result?: ResultEnvelope, initiator?: string): CancellationResult {
+  return Object.freeze({ version: 1, kind: "cancellation", runId, targetKind, status, terminal, ...(reason ? { reason } : {}), ...(identity ? { identity } : {}), ...(result ? { processOutcome: result.processOutcome, exitCode: result.exitCode, signal: result.signal, actualTaskHash: result.actualTaskHash } : {}), ...(initiator ? { cancellationInitiator: initiator } : {}) });
 }
 
 const RECORD_LIMIT = 1024 * 1024;
@@ -481,7 +628,7 @@ function resultWireCost(result: ResultEnvelope): number {
   const json = JSON.stringify(result);
   return Buffer.byteLength(json) + Buffer.byteLength(JSON.stringify(json));
 }
-function batchPayloadQuota(identities: ChildIdentity[]): number {
+function batchPayloadQuota(identities: readonly ChildIdentity[]): number {
   const first = identities[0]!;
   const envelope: BatchEnvelope = { version: 1, kind: "batch", ownerRunId: first.ownerRunId, ownerSessionId: first.ownerSessionId, batchId: first.batchId, results: identities.map(emptyBatchResult) };
   const delivery = deliveryFor(envelope);
@@ -491,7 +638,7 @@ function batchPayloadQuota(identities: ChildIdentity[]): number {
   if (quota < 0) throw new Error("subagent batch identity exceeds JSONL transport budget");
   return quota;
 }
-export function boundBatchResult(result: ResultEnvelope, identities: ChildIdentity[]): ResultEnvelope {
+export function boundBatchResult(result: ResultEnvelope, identities: readonly ChildIdentity[]): ResultEnvelope {
   const budget = resultWireCost(emptyBatchResult(result.identity)) + batchPayloadQuota(identities);
   if (resultWireCost(result) <= budget) return result;
   if (result.identity.agent === "task-reviewer") return { ...result, payloadOutcome: "output_limit", payload: "", reviewVerdict: null, outputLimit: "batch_transport" };

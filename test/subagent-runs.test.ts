@@ -171,6 +171,69 @@ test("result, chain and follow-up batch canonical contracts remain distinct and 
   assert.equal(reportContent(followUp, followUpDelivery), `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: followUpDelivery.deliveryId, envelopeHash: followUpDelivery.envelopeHash, envelope: followUp })}`);
 });
 
+test("ordinary lifecycle reserves before dispatch and cancellation keeps the first terminal claim", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("cancel", [{ agent: "worker", task: "work" }, { agent: "worker", task: "queued" }], cwd);
+  const active = ack.children[0]!.identity;
+  const queued = ack.children[1]!.identity;
+  assert.deepEqual(runs.active().map((child) => child.identity.runId), [active.runId, queued.runId]);
+  assert.equal(runs.start(active), true);
+  assert.equal(runs.attachProcess(active, process.pid, "start"), true);
+  const first = runs.requestCancel(active.runId, "tool_cancel");
+  const repeat = runs.requestCancel(active.runId, "later_cancel");
+  assert.equal(first.first, true);
+  assert.equal(first.shouldSignal, true);
+  assert.equal(repeat.first, false);
+  assert.equal(repeat.result.cancellationInitiator, "tool_cancel");
+  const claimed = runs.claimTerminal(active, "work", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "late clean output")!;
+  assert.equal(claimed.claimed, true);
+  assert.equal(claimed.result.processOutcome, "cancelled");
+  assert.equal(claimed.result.exitCode, 0);
+  assert.equal(claimed.result.cancellationInitiator, "tool_cancel");
+  assert.equal(claimed.result.payloadOutcome, "incomplete");
+  assert.equal(runs.claimTerminal(active, "work", { processOutcome: "signaled", exitCode: null, signal: "SIGKILL", protocolError: true }, "bad")!.claimed, false);
+  runs.completeCleanup(active);
+  assert.equal((await first.completion).status, "cancelled");
+  assert.equal(runs.settle(claimed.result), true);
+  assert.equal(runs.requestCancel(active.runId, "third").result.status, "already_terminal");
+
+  const queuedCancel = runs.requestCancel(queued.runId, "parent_cancel");
+  assert.equal(queuedCancel.result.status, "cancellation_requested");
+  assert.equal(runs.claimed(queued)?.processOutcome, "cancelled");
+  runs.completeCleanup(queued);
+  assert.equal((await queuedCancel.completion).terminal, true);
+  assert.equal(runs.settle(runs.claimed(queued)!), true);
+  assert.deepEqual(runs.batch("cancel")?.results.map((result) => result.identity.runId), [active.runId, queued.runId]);
+  assert.deepEqual(runs.active(), []);
+});
+
+test("deferred chain cancellation waits for the actual resolved task and protocol errors win payload classification", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("chain-cancel", [{ agent: "worker", task: "after {previous}" }], cwd).children[0]!.identity;
+  assert.equal(runs.defer(identity), true);
+  const request = runs.requestCancel(identity.runId, "tool_cancel");
+  assert.equal(request.waitForCleanup, false);
+  assert.equal(request.result.status, "cancellation_requested");
+  assert.equal(runs.claimed(identity), undefined);
+  const resolved = "after actual predecessor output";
+  assert.equal(runs.resolveTask(identity, resolved), true);
+  const result = runs.claimNoSpawn(identity)!;
+  assert.equal(result.actualTaskHash, (await import("../src/subagent-runs.ts")).sha256(resolved));
+  assert.notEqual(result.actualTaskHash, identity.taskHash);
+  runs.completeCleanup(identity);
+  assert.equal(runs.settle(result), true);
+
+  const protocolRuns = new ChildRuns("owner", "session");
+  const protocolIdentity = protocolRuns.admit("protocol", [{ agent: "worker", task: "work" }], cwd).children[0]!.identity;
+  protocolRuns.start(protocolIdentity);
+  const cancel = protocolRuns.requestCancel(protocolIdentity.runId, "shutdown");
+  const protocol = protocolRuns.claimTerminal(protocolIdentity, "work", { processOutcome: "signaled", exitCode: null, signal: "SIGTERM", protocolError: true }, "late")!.result;
+  assert.equal(protocol.processOutcome, "cancelled");
+  assert.equal(protocol.payloadOutcome, "protocol_error");
+  protocolRuns.completeCleanup(protocolIdentity);
+  assert.equal((await cancel.completion).status, "cancelled");
+});
+
 test("aggregate framing budgets account for escaped content and details without changing settled envelopes", async () => {
   const { boundBatchResult, deliveryFor, reportContent, JsonlObservation } = await import("../src/subagent-runs.ts");
   for (const character of ["x", '"']) {
