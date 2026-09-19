@@ -13,7 +13,7 @@ import { assertPlanBinding, readRecordedPlanBinding, type PlanBinding } from "./
 import type { ChildIdentity } from "./subagent-runs.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation; ticket?: string; path?: string; pane?: string; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number }
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
 export type PlanHandoff = "plan-only" | "unavailable" | "started" | "refused";
 export interface PlanRecordOutcome { runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: PlanHandoff; target?: string; revision?: string }
@@ -306,22 +306,29 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       }
       if (context.kind === "save-only" && !childOwnerMatches(saveOnly!.childOwner, envelope.child!)) throw new Error("accepted scout owner does not match its save-only worker");
       const currentAcceptance = context.kind === "registered" ? planRun!.scoutAcceptance : context.kind === "save-only" ? saveOnly!.scoutAcceptance : scoutAcceptances.get(scoutKey);
-      if (currentAcceptance !== undefined && currentAcceptance !== acceptanceId) {
-        finalized.add(currentAcceptance);
-        requestGenerations.delete(currentAcceptance);
+      const observedGeneration = context.kind === "registered" ? planRun!.scoutGeneration ?? 0 : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey) ?? 0;
+      const suppliedSequence = Number.isSafeInteger(envelope.scoutSequence) && envelope.scoutSequence! > 0 ? envelope.scoutSequence : undefined;
+      const generation = suppliedSequence ?? observedGeneration + 1;
+      const staleSequence = suppliedSequence !== undefined && generation <= observedGeneration;
+      if (!staleSequence) {
+        if (currentAcceptance !== undefined && currentAcceptance !== acceptanceId) {
+          finalized.add(currentAcceptance);
+          requestGenerations.delete(currentAcceptance);
+        }
         if (context.kind === "registered") {
+          planRun!.scoutGeneration = generation;
           planRun!.scoutAcceptance = undefined;
           planRun!.prepared = undefined;
         } else if (context.kind === "save-only") {
+          saveOnly!.scoutGeneration = generation;
           saveOnly!.scoutAcceptance = undefined;
           saveOnly!.prepared = undefined;
         } else {
+          scoutGenerations.set(scoutKey, generation);
           scoutAcceptances.delete(scoutKey);
           preparedPlans.delete(scoutKey);
         }
       }
-      const generation = context.kind === "registered" ? (planRun!.scoutGeneration = (planRun!.scoutGeneration ?? 0) + 1) : context.kind === "save-only" ? ++saveOnly!.scoutGeneration : (scoutGenerations.get(scoutKey) ?? 0) + 1;
-      if (context.kind !== "registered" && context.kind !== "save-only") scoutGenerations.set(scoutKey, generation);
       requestGenerations.set(acceptanceId, generation);
       children.set(acceptanceId, { ...envelope.child! });
       let outcome: Awaited<ReturnType<NonNullable<ParentControl["publishPlanScout"]>>>;
@@ -340,7 +347,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         throw new Error("plan scout owner is no longer live");
       }
       const currentGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
-      if (currentGeneration !== generation) {
+      if (staleSequence || currentGeneration !== generation) {
         requestGenerations.delete(acceptanceId);
         finalized.add(acceptanceId);
         return { requestId: envelope.requestId, state: "accepted", acceptanceId, ...outcome, artifactAcceptance: "superseded", reason: "scout superseded" };
@@ -361,8 +368,27 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     }
 
     if (envelope.operation === "reject-plan-scout") {
-      const currentGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
-      const ownedGeneration = Number.isSafeInteger(envelope.acceptanceId) ? requestGenerations.get(envelope.acceptanceId!) : currentGeneration;
+      const currentGeneration = context.kind === "registered" ? planRun!.scoutGeneration ?? 0 : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey) ?? 0;
+      if (!Number.isSafeInteger(envelope.acceptanceId)) {
+        const sequence = Number.isSafeInteger(envelope.scoutSequence) && envelope.scoutSequence! > 0 ? envelope.scoutSequence! : undefined;
+        if (sequence === undefined || sequence <= currentGeneration) return { requestId: envelope.requestId, state: "accepted", reason: "uncorrelated scout rejection ignored" };
+        requestGenerations.clear();
+        if (context.kind === "registered") {
+          planRun!.scoutGeneration = sequence;
+          planRun!.scoutAcceptance = undefined;
+          planRun!.prepared = undefined;
+        } else if (context.kind === "save-only") {
+          saveOnly!.scoutGeneration = sequence;
+          saveOnly!.scoutAcceptance = undefined;
+          saveOnly!.prepared = undefined;
+        } else {
+          scoutGenerations.set(scoutKey, sequence);
+          scoutAcceptances.delete(scoutKey);
+          preparedPlans.delete(scoutKey);
+        }
+        return { requestId: envelope.requestId, state: "accepted", reason: "scout rejected" };
+      }
+      const ownedGeneration = requestGenerations.get(envelope.acceptanceId!);
       if (ownedGeneration === currentGeneration) {
         requestGenerations.clear();
         if (Number.isSafeInteger(envelope.acceptanceId)) finalized.add(envelope.acceptanceId!);
@@ -724,7 +750,7 @@ export async function requestPlanLaunch(root: string, planRequest: PlanLaunchReq
   return send(root, { version: 1, operation: "launch-plan", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, planRequest }, env);
 }
 
-export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);

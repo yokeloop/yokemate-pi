@@ -124,7 +124,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     await new Promise<void>((resolve, reject) => { descendant!.once("spawn", resolve); descendant!.once("error", reject); });
     const descendantOrigin = { ...worker, pid: descendant.pid!, starttime: processStarttime(descendant.pid!)! };
     assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", path: "/plan.md", contentHash: "c".repeat(64) }, descendantOrigin, target, env)).state, "accepted");
-    assert.equal((await requestPlanControl(root, "reject-plan-scout", { ticket: "YM-1" }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "reject-plan-scout", { ticket: "YM-1", scoutSequence: 2 }, worker, target, env)).state, "accepted");
     assert.equal((await prepare("YM-1")).state, "refused");
     assert.equal((await prepare("YM-2")).state, "refused");
     assert.equal(prepares, 1);
@@ -312,6 +312,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const oldRejection = await requestPlanControl(root, "reject-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
     assert.equal(oldRejection.state, "accepted");
     assert.equal(oldRejection.reason, "scout rejection superseded");
+    const uncorrelatedRejection = await requestPlanControl(root, "reject-plan-scout", { ...payload, scoutSequence: 1, child: { ...scoutChild(worker, "YM-1", "late-invalid"), cwd: root } }, worker, target, env);
+    assert.equal(uncorrelatedRejection.state, "accepted");
+    assert.equal(uncorrelatedRejection.reason, "uncorrelated scout rejection ignored");
     assert.equal((await prepare()).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-recorded", { ...handoff, runId: "foreign" }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, { ...worker, sessionId: "foreign" }, target, env)).state, "refused");

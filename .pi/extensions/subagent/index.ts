@@ -623,6 +623,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
 	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
+	let nextScoutSequence = 0;
+	const scoutSequenceByRunId = new Map<string, number>();
 	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
 	const publicationTail = new Map<string, Promise<unknown>>();
 	const localPublicationErrors = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
@@ -1205,6 +1207,7 @@ export default function (pi: ExtensionAPI) {
 		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID !== undefined && process.env.YOKEMATE_TICKET) {
@@ -1596,7 +1599,7 @@ export default function (pi: ExtensionAPI) {
 	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
 		ENGINE_ROOT,
 		operation,
-		{ ticket: result.identity.ticket!, ...(process.env.YOKEMATE_PLAN_RUN_ID !== undefined ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), child: result.identity, ...payload },
+		{ ticket: result.identity.ticket!, ...(process.env.YOKEMATE_PLAN_RUN_ID !== undefined ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), child: result.identity, scoutSequence: scoutSequenceByRunId.get(result.identity.runId), ...payload },
 		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
 		resolveCoordinatorParent(ENGINE_ROOT),
 	);
@@ -1844,6 +1847,7 @@ export default function (pi: ExtensionAPI) {
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
+					if (identity.agent === "plan-scout") scoutSequenceByRunId.set(identity.runId, ++nextScoutSequence);
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
 					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
