@@ -323,7 +323,7 @@ if (import.meta.filename === process.argv[1]) {
       }
 
       let planRunId: string | undefined;
-      if (mode === "plan" && ticket && explicitPlanKeys.tail.length === 0 && process.env.PI_SESSION_ID !== undefined) {
+      if (mode === "plan" && ticket && process.env.PI_SESSION_ID !== undefined) {
         const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
         if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
         planRunId = reply.runId;

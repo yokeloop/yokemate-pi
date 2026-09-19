@@ -2,12 +2,25 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
+import { openDb } from "../src/db.ts";
+import { readCandidatePlanSnapshot, type PlanBinding } from "../src/plan-binding.ts";
 import type { ChildIdentity } from "../src/subagent-runs.ts";
+
+function recordedPlan(root: string, ticket: string): PlanBinding {
+  const folder = join(root, "home", "knowledge", "org", "repo", "ai", `${ticket}-fixture`);
+  mkdirSync(folder, { recursive: true });
+  const path = join(folder, `${ticket}-fixture-plan.md`);
+  writeFileSync(path, `# ${ticket} — fixture\n\n## Goal\nVerify completion.\n\n## Affected repositories\n\n- \`org/repo\` — app.\n\n## Steps\n\n1. Verify.\n\n## Assumptions\n\n- Fixture.\n\n## Out of scope\n\n- Production.\n\n## Acceptance\n\n- Completion is exact.\n`);
+  const db = openDb(join(root, "yokemate.db"));
+  db.prepare("INSERT INTO work(ticket,url,stage,plan) VALUES (?,?,?,?)").run(ticket, `https://example.invalid/${ticket}`, "planned", path);
+  db.close();
+  return readCandidatePlanSnapshot(root, ticket, path);
+}
 
 const scoutChild = (origin: { sessionId: string }, ticket: string, suffix: string): ChildIdentity => ({ ownerRunId: `owner-${suffix}`, ownerSessionId: origin.sessionId, batchId: `batch-${suffix}`, runId: `run-${suffix}`, agent: "plan-scout", taskHash: suffix.padEnd(64, "a").slice(0, 64), cwd: "", ticket });
 
@@ -233,6 +246,7 @@ test("merge control passes trusted live origin and structured result to the pare
 
 test("plan handoff is bound to the registered pane run and its live worker session", async () => {
   const root = mkdtempSync(join(tmpdir(), "plan-control-"));
+  const binding = recordedPlan(root, "YM-1");
   const runtime = mkdtempSync(join(tmpdir(), "plan-runtime-"));
   const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
   const target = { sessionId: "main-session", runtimeId: "main-runtime" };
@@ -253,9 +267,9 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
       }
       return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) };
     },
-    preparePlanPublication: async (ticket, path, hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "d".repeat(64), repositories: ["org/repo"] } }; },
-    recordPlan: async () => { ownedRecords++; return { reason: "recorded" }; },
-    planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/plan.md"); assert.equal(recordId, 3); return { reason: "recorded" }; },
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: binding.contentHash, binding }; },
+    recordPlan: async (_ticket, _path, _origin, _context, _acceptance, verify) => { ownedRecords++; verify(binding); return { reason: "recorded" }; },
+    planRecorded: async (ticket, path, recordId, _origin, _context, verify) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, binding.path); assert.equal(recordId, 3); verify(binding); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -265,15 +279,15 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     const payload = { ticket: "YM-1", runId: register.runId };
     const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
     writeFileSync(join(socketDir(env, process.getuid!()), "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
-    const handoff = { ...payload, path: "/plan.md", recordId: 3 };
+    const handoff = { ...payload, path: binding.path, recordId: 3 };
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
-    const recordWithoutScout = await requestPlanControl(root, "record-plan", { ...payload, path: "/plan.md" }, worker, target, env);
+    const recordWithoutScout = await requestPlanControl(root, "record-plan", { ...payload, path: binding.path }, worker, target, env);
     assert.equal(recordWithoutScout.state, "refused");
     assert.match(recordWithoutScout.reason ?? "", /current accepted scout/);
     assert.equal(ownedRecords, 0);
-    const prepare = () => requestPlanControl(root, "prepare-plan-publication", { ...payload, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
+    const prepare = () => requestPlanControl(root, "prepare-plan-publication", { ...payload, path: binding.path, contentHash: binding.contentHash }, worker, target, env);
     assert.equal((await prepare()).state, "refused");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11, child: { ...scoutChild(worker, "YM-1", "eleven"), cwd: root } }, worker, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11, child: { ...scoutChild(worker, "YM-1", "other-delivery"), cwd: root } }, worker, target, env)).state, "refused");
@@ -305,7 +319,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-recorded", { ticket: "YM-1", path: "/plan.md", recordId: 3 }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: "", acceptanceId: 14, child: { ...scoutChild(worker, "YM-1", "empty"), cwd: root } }, worker, target, env)).state, "refused");
-    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", runId: "removed", path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", runId: "removed", path: binding.path, contentHash: binding.contentHash }, worker, target, env)).state, "refused");
     assert.equal(records, 1);
     assert.deepEqual(prepareAcceptances, [11, 13, 13]);
   } finally {
@@ -366,6 +380,7 @@ test("plan worker process exit settles once without using herdr agent status", {
 
 test("a correlated scout admits one live save-only worker and its CLI descendant", { timeout: 10000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "save-only-plan-control-"));
+  const binding = recordedPlan(root, "YM-7");
   const runtime = mkdtempSync(join(tmpdir(), "save-only-plan-runtime-"));
   const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
   const target = { sessionId: "main-session", runtimeId: "main-runtime" };
@@ -383,8 +398,8 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
       assert.match(child.runId, /^scout-save/);
       return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) };
     },
-    preparePlanPublication: async (ticket, path, hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: hash, binding: { ticket, path, contentHash: hash, scopeHash: "b".repeat(64), repositories: ["org/repo"] } }; },
-    planRecorded: async (_ticket, _path, recordId, _origin, context) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }; },
+    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
   const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
   let cliPid = 0;
@@ -409,25 +424,80 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     const foreignOwner = { ...child, ownerRunId: "foreign-owner", runId: "scout-save-foreign", batchId: "batch-foreign" };
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child: foreignOwner }, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child }, cli, target, env)).state, "refused");
-    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: binding.path, contentHash: binding.contentHash }, cli, target, env)).state, "accepted");
     const supersedingFailure = await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 5, child: { ...child, runId: "scout-save-failed", batchId: "batch-save-failed" } }, worker, target, env);
     assert.equal(supersedingFailure.state, "refused");
-    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: binding.path, contentHash: binding.contentHash }, cli, target, env)).state, "refused");
     const nextChild = { ...scoutChild(worker, "YM-7", "save-next"), ownerRunId: child.ownerRunId, runId: "scout-save-next", cwd: root };
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 6, child: nextChild }, worker, target, env)).state, "accepted");
-    const prepared = await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: "/plan.md", contentHash: "c".repeat(64) }, cli, target, env);
+    const prepared = await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: binding.path, contentHash: binding.contentHash }, cli, target, env);
     assert.equal(prepared.state, "accepted", prepared.reason ?? "save-only preparation refused");
-    const recorded = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
+    const recorded = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
     assert.equal(recorded.state, "accepted", recorded.reason ?? "save-only completion refused");
     assert.equal(recorded.handoff, "unavailable");
-    const repeat = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/plan.md", recordId: 9 }, cli, target, env);
+    const repeat = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
     assert.equal(repeat.state, "accepted", repeat.reason ?? "save-only repeat refused");
     assert.equal(completions, 1);
     assert.equal(publications, 2);
     assert.equal(preparations, 2);
+    writeFileSync(binding.path, readFileSync(binding.path, "utf8").replace("Verify completion.", "Verify changed completion."));
+    const changed = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
+    assert.equal(changed.state, "refused");
+    assert.match(changed.reason ?? "", /retry binding changed/);
     const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 9 }, cli, target, env);
     assert.equal(foreign.state, "refused");
   } finally {
+    if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}
+    if (owner.exitCode === null) owner.kill("SIGKILL");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("save-only completion is unconfirmed when its owner dies during publication", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "save-only-death-control-"));
+  const binding = recordedPlan(root, "YM-8");
+  const runtime = mkdtempSync(join(tmpdir(), "save-only-death-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  let release!: () => void;
+  let started!: () => void;
+  const callbackStarted = new Promise<void>((resolve) => { started = resolve; });
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: binding.contentHash }),
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => ({ reason: "prepared", recordId: 10, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }),
+    planRecorded: async (_ticket, _path, _recordId, _origin, _context, verify) => { started(); await barrier; verify(binding); return { reason: "ready", handoff: "unavailable" }; },
+  }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
+  const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
+  let cliPid = 0;
+  try {
+    if (!server.listening) await once(server, "listening");
+    await once(owner, "spawn");
+    owner.stdout!.setEncoding("utf8");
+    cliPid = Number(String((await once(owner.stdout!, "data"))[0]).trim());
+    const pane = "save-death-pane";
+    writeFileSync(join(runtimeDir, `${pane}.json`), JSON.stringify({ pid: owner.pid, cwd: root, mode: "plan", ticket: "YM-8" }));
+    const worker = { sessionId: "save-death-session", pid: owner.pid!, starttime: processStarttime(owner.pid!)!, cwd: root, pane, parentPane: "main", mode: "plan", ticket: "YM-8", role: "coordinator" };
+    const child = { ...scoutChild(worker, "YM-8", "death"), cwd: root };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-8", acceptanceId: 8, child }, worker, target, env)).state, "accepted");
+    const cli = { ...worker, pid: cliPid, starttime: processStarttime(cliPid)! };
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-8", path: binding.path, contentHash: binding.contentHash }, cli, target, env)).state, "accepted");
+    const completion = requestPlanControl(root, "plan-recorded", { ticket: "YM-8", path: binding.path, recordId: 10 }, cli, target, env);
+    await callbackStarted;
+    owner.kill("SIGKILL");
+    await once(owner, "exit");
+    release();
+    const result = await completion;
+    assert.equal(result.state, "refused");
+    assert.match(result.reason ?? "", /owner or scout changed/);
+  } finally {
+    release?.();
     if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}
     if (owner.exitCode === null) owner.kill("SIGKILL");
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -456,10 +526,11 @@ test("an admitted plan record wins a concurrent worker exit", { timeout: 10000 }
     cancel: async () => {},
     planFinished: async () => { finishes += 1; },
     publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }),
-    recordPlan: async () => {
+    recordPlan: async (ticket, path, _origin, _context, _acceptance, verify) => {
       records += 1;
       markRecordStarted();
       await recordBarrier;
+      verify({ ticket, path, contentHash: "c".repeat(64), scopeHash: "d".repeat(64), repositories: ["org/repo"] });
       return { reason: "recorded" };
     },
   }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);

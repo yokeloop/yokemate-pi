@@ -20,7 +20,7 @@ export interface PlanRecordOutcome { runId?: string; reason: string; facts?: Rec
 export type PlanCompletionContext = { kind: "registered"; runId: string; listRunId?: string } | { kind: "save-only"; admissionId: string } | { kind: "main" } | { kind: "problem"; packageKey: string };
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: PlanHandoff; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number }
 export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan";
-export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, child: ChildIdentity, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, context: PlanCompletionContext): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; binding: PlanBinding; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, context: PlanCompletionContext, acceptanceId: number): Promise<PlanRecordOutcome>; planRecorded?(ticket: string, path: string, recordId: number, origin: ControlOrigin, context: PlanCompletionContext): Promise<PlanRecordOutcome>; planFinished?(ticket: string, context: PlanCompletionContext, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
+export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, child: ChildIdentity, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, context: PlanCompletionContext): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; binding: PlanBinding; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, context: PlanCompletionContext, acceptanceId: number, verifyCompletion: (binding: PlanBinding) => void): Promise<PlanRecordOutcome>; planRecorded?(ticket: string, path: string, recordId: number, origin: ControlOrigin, context: PlanCompletionContext, verifyCompletion: (binding: PlanBinding) => void, prior?: PlanRecordOutcome): Promise<PlanRecordOutcome>; planFinished?(ticket: string, context: PlanCompletionContext, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 interface PlanRunState {
@@ -135,7 +135,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const finalizedScoutAcceptances = new Map<string, Set<number>>();
   const scoutChildren = new Map<string, Map<number, ChildIdentity>>();
   const preparedPlans = new Map<string, PreparedPlanRecord>();
-  const numericRecords = new Map<string, { owner: ControlOrigin; path: string; recordId: number; promise?: Promise<PlanRecordOutcome>; reply?: PlanRecordOutcome }>();
+  const numericRecords = new Map<string, { owner: ControlOrigin; path: string; recordId: number; binding?: PlanBinding; promise?: Promise<PlanRecordOutcome>; reply?: PlanRecordOutcome }>();
+  const completedNumericRecords = new Map<string, { path: string; binding: PlanBinding; contextKind: PlanCompletionContext["kind"]; reply: PlanRecordOutcome }>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
   const saveOnlyKey = (origin: ControlOrigin, ticket: string) => `${origin.sessionId}\u0000${origin.pane ?? ""}\u0000${ticket}`;
@@ -206,7 +207,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     return id;
   };
   const verifyRecordedRetry = (ticket: string, binding: PlanBinding | undefined): void => {
-    if (!binding) return;
+    if (!binding) throw new Error("recorded plan retry binding is unavailable");
     try { assertPlanBinding(binding, readRecordedPlanBinding(canonicalRoot, ticket)); }
     catch { throw new Error("recorded plan retry binding changed"); }
   };
@@ -415,12 +416,19 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       planRun.terminal = "recording";
       planRun.recordPath = envelope.path;
       planRun.recordAcceptance = acceptanceId;
-      planRun.recordPromise = parent.recordPlan(ticket, envelope.path, origin, context, acceptanceId!);
+      const recordGeneration = planRun.scoutGeneration;
+      let completedBinding: PlanBinding | undefined;
+      const verifyCompletion = (binding: PlanBinding) => {
+        if (!planRun.worker || planRun.scoutAcceptance !== acceptanceId || planRun.scoutGeneration !== recordGeneration) throw new Error("plan completion scout changed");
+        completedBinding = { ...binding, repositories: [...binding.repositories] };
+      };
+      planRun.recordPromise = parent.recordPlan(ticket, envelope.path, origin, context, acceptanceId!, verifyCompletion);
       try {
         const outcome = await planRun.recordPromise;
+        if (!completedBinding) throw new Error("plan completion was not verified");
         planRun.terminal = "recorded";
         planRun.recordReply = outcome;
-        try { planRun.recordBinding = readRecordedPlanBinding(canonicalRoot, ticket); } catch {}
+        planRun.recordBinding = completedBinding;
         planRun.pendingExit = undefined;
         planRun.observer?.stop();
         planRun.observer = undefined;
@@ -452,17 +460,37 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...(await state.recordPromise) };
       }
       const numericKey = `${context.kind}\u0000${scoutKey}`;
+      const completedKey = `${ticket}\u0000${envelope.recordId}`;
+      const prior = context.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
       let numeric = numericRecords.get(numericKey);
-      if (!state && numeric && context.kind === "main") {
+      if (!state && numeric && context.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
         numericRecords.delete(numericKey);
         numeric = undefined;
       }
       if (!state && numeric) {
         if (!processMatches(numeric.owner.pid, numeric.owner.starttime) || numeric.path !== envelope.path || numeric.recordId !== envelope.recordId) throw new Error("recorded plan retry binding changed");
-        if (numeric.reply) return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...numeric.reply };
+        if (numeric.reply) {
+          verifyRecordedRetry(ticket, numeric.binding);
+          return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...numeric.reply };
+        }
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...(await numeric.promise!) };
       }
-      const promise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, context);
+      if (prior) {
+        if (context.kind !== "main" || prior.path !== envelope.path) throw new Error("recorded plan retry binding changed");
+        verifyRecordedRetry(ticket, prior.binding);
+      }
+      const completionGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
+      let completedBinding: PlanBinding | undefined;
+      const verifyCompletion = (binding: PlanBinding) => {
+        if (context.kind === "registered" && (!planRun!.worker || !ownerLive(planRun!.worker, ticket) || planRun!.prepared !== prepared || planRun!.scoutAcceptance !== acceptanceId || planRun!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (context.kind === "save-only" && (!ownerLive(saveOnly!.owner, ticket) || saveOnly!.prepared !== prepared || saveOnly!.scoutAcceptance !== acceptanceId || saveOnly!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (context.kind === "problem" && (!packageState || !problemOwnerMatches(packageState.owner) || preparedPlans.get(scoutKey) !== prepared || scoutAcceptances.get(scoutKey) !== acceptanceId || scoutGenerations.get(scoutKey) !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (context.kind === "main" && !processMatches(origin.pid, origin.starttime)) throw new Error("plan completion owner is no longer live");
+        if (prepared) assertPlanBinding(prepared.binding, binding);
+        if (prior) assertPlanBinding(prior.binding, binding);
+        completedBinding = { ...binding, repositories: [...binding.repositories] };
+      };
+      const promise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, context, verifyCompletion, prior?.reply);
       if (state) {
         state.recordPath = envelope.path;
         state.recordId = envelope.recordId;
@@ -474,15 +502,19 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       }
       try {
         const outcome = await promise;
+        if (!completedBinding) throw new Error("plan completion was not verified");
         if (state) {
           state.recordReply = outcome;
-          try { state.recordBinding = readRecordedPlanBinding(canonicalRoot, ticket); } catch {}
+          state.recordBinding = completedBinding;
           state.terminal = "recorded";
           state.recordPromise = undefined;
         } else {
+          numeric!.binding = completedBinding;
           numeric!.reply = outcome;
           numeric!.promise = undefined;
         }
+        completedNumericRecords.set(completedKey, { path: envelope.path, binding: completedBinding, contextKind: prior?.contextKind ?? context.kind, reply: outcome });
+        if (context.kind === "main" || context.kind === "problem") preparedPlans.delete(scoutKey);
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...outcome };
       } catch (error) {
         if (state) {

@@ -89,7 +89,7 @@ function value(args: string[], option: string): string | undefined {
 test("explicit plan lists do not bypass an unavailable live parent", () => {
   const f = fixture();
   try {
-    for (const entry of ["node", "package"]) for (const args of [["YM-1"], ["YM-1", "YM-2"]]) {
+    for (const entry of ["node", "package"]) for (const args of [["YM-1"], ["YM-1", "YM-2"], ["YM-1", "fix"]]) {
       const out = f.run("plan", args, { PI_SESSION_ID: "missing-parent-session" }, entry);
       assert.equal(out.status, 1);
       assert.match(out.stderr, /no live coordinator parent for this yokemate root/);

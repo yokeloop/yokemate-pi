@@ -523,7 +523,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.match(noIdRecord.stdout, /YM-1 → planned/);
     assert.match(noIdRecord.stdout, /plan-only; ready for \/do; automatic handoff unavailable/);
     assert.doesNotMatch(noIdRecord.stdout, /background run/);
+    const saveOnlyRecord = db.prepare("SELECT id FROM plan_record WHERE ticket='YM-1' AND successful_record=1 ORDER BY id DESC LIMIT 1").get() as { id: number };
     for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+    const reconciliation = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: saveOnlyRecord.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    assert.equal(reconciliation.state, "accepted", reconciliation.reason ?? "save-only reconciliation refused");
+    assert.equal(reconciliation.handoff, "unavailable");
+    assert.equal(reconciliation.runId, undefined);
     assert.match(output(await launch()), /waiting for the actual plan record/);
     extraction = "approve-ready-do";
     await input("Запускай YM-1");

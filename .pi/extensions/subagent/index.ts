@@ -1306,12 +1306,14 @@ export default function (pi: ExtensionAPI) {
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
 					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, binding: prepared.binding, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
-				planRecorded: async (ticket, recordedPath, recordId, _origin, context) => {
+				planRecorded: async (ticket, recordedPath, recordId, _origin, context, verifyCompletion, prior) => {
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
 					const publications = await publishRecordedArtifacts(recordId, binding);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
+					verifyCompletion(binding);
+					if (prior) return { ...prior, publications, ...(prior.facts ? { facts: { ...prior.facts, publications } } : {}) };
 					return completePlanRecord(ticket, recordedPath, binding, publications, context);
 				},
 				launchPlan: async (request, controlOrigin) => {
@@ -1342,7 +1344,7 @@ export default function (pi: ExtensionAPI) {
 					const found = listRuns.get(context.runId);
 					if (!found || !("run" in found) || !listRuns.settle(context.listRunId, context.runId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
-				recordPlan: async (ticket, planPath, origin, context, acceptanceId) => {
+				recordPlan: async (ticket, planPath, origin, context, acceptanceId, verifyCompletion) => {
 					if (context.kind !== "registered") throw new Error("owned plan record requires a registered run");
 					const planRunId = context.runId;
 					const controller = new AbortController();
@@ -1359,6 +1361,7 @@ export default function (pi: ExtensionAPI) {
 						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
+						verifyCompletion(prepared.binding);
 						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, context, result);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
