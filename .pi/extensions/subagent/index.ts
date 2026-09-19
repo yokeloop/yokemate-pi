@@ -63,6 +63,8 @@ import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptS
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
+import { installWorkflowIngress, WorkflowIngressWitnessStore, type WorkflowIngressWitness } from "../../../src/workflow-ingress.ts";
+import { BreakGlassPermitStore, parseBreakGlass, previewScoutAcceptance, resolveScoutAcceptance, type BreakGlassPreview, type PlanSnapshotIdentity } from "../../../src/workflow-break-glass.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -860,6 +862,10 @@ export default function (pi: ExtensionAPI) {
 	const recorderControllers = new Map<string, AbortController>();
 	const cancelledRecordingPlans = new Set<string>();
 	const shipPermits = new ShipPermitStore();
+	const workflowIngress = new WorkflowIngressWitnessStore();
+	const breakGlassPermits = new BreakGlassPermitStore();
+	let ingressWitness: WorkflowIngressWitness | undefined;
+	let uninstallIngress: (() => void) | undefined;
 	let authority: DoAuthorityStore | undefined;
 	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
@@ -912,6 +918,9 @@ export default function (pi: ExtensionAPI) {
 	};
 	const revokeAuthority = async () => {
 		shipPermits.invalidate();
+		breakGlassPermits.revoke();
+		workflowIngress.revoke();
+		ingressWitness = undefined;
 		await fenceListRuns("parent runtime changed");
 		for (const runId of authority?.revoke() ?? []) {
 			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run");
@@ -943,7 +952,9 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("workflow approval unavailable: no verified main parent runtime", "error");
 			return { action: "handled" as const };
 		}
-		const generation = authority.beginInput(event.text);
+		const witnessed = ingressWitness && !ingressWitness.consumed && ingressWitness.sessionId === sessionId && ingressWitness.runtimeId === controlIdentity.runtimeId && ingressWitness.raw === event.text ? ingressWitness : undefined;
+		const generation = witnessed ? authority.generation() : authority.beginInput(event.text);
+		if (!witnessed) { breakGlassPermits.revoke(); workflowIngress.revoke(); ingressWitness = undefined; }
 		shipPermits.invalidate();
 		let extractingWorkflow = false;
 		try {
@@ -1243,6 +1254,16 @@ export default function (pi: ExtensionAPI) {
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
+		uninstallIngress?.();
+		uninstallIngress = undefined;
+		if (ctx.mode === "tui" && typeof ctx.ui.getEditorComponent === "function" && typeof ctx.ui.setEditorComponent === "function") {
+			uninstallIngress = installWorkflowIngress(ctx.ui, (raw) => {
+				breakGlassPermits.revoke();
+				shipPermits.invalidate();
+				ingressWitness = workflowIngress.submit(raw, sessionId, runtimeId);
+				authority?.beginInput(raw);
+			});
+		}
 		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin) => {
 			const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 			assertPublishable(snapshot.bytes);
@@ -1452,6 +1473,64 @@ export default function (pi: ExtensionAPI) {
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
+	pi.registerCommand("break-glass", {
+		description: "Accept one exact failed plan-scout transport input through an audited incident.",
+		handler: async (args, ctx) => {
+			let state: DatabaseSync | undefined;
+			try {
+				const sessionId = ctx.sessionManager.getSessionId();
+				if (ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE || !controlIdentity || controlIdentity.sessionId !== sessionId || !ingressWitness) throw new Error("break-glass requires a fresh typed submit in verified MAIN TUI");
+				const raw = `/break-glass${args ? ` ${args}` : ""}`;
+				if (ingressWitness.raw !== raw || ingressWitness.runtimeId !== controlIdentity.runtimeId) throw new Error("break-glass requires the current exact typed submit");
+				const command = parseBreakGlass(raw);
+				state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				const candidate = state.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
+				if (!candidate || candidate.ticket !== command.ticket) throw new Error("unknown recovery candidate");
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const mainOrigin = currentControlOrigin(ENGINE_ROOT, sessionId);
+				const live = await requestPlanControl(ENGINE_ROOT, "read-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId }, mainOrigin, parent);
+				if (live.state !== "accepted" || live.failureHash !== candidate.failed_envelope_hash) throw new Error(live.reason ?? "recovery lineage is not live");
+				const snapshot = (): { scopeHash: string; targetHash: string; plan: PlanSnapshotIdentity } => {
+					const target = resolvePublicationTarget(state!, command.ticket);
+					try {
+						const binding = readRecordedPlanBinding(ENGINE_ROOT, command.ticket);
+						return { scopeHash: binding.scopeHash, targetHash: target.targetHash, plan: { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) } };
+					} catch {
+						const absent = sha256(JSON.stringify([command.ticket, target.targetHash, candidate.content_hash, "plan-absent"]));
+						return { scopeHash: absent, targetHash: target.targetHash, plan: { state: "absent", hash: sha256("absent"), scopeHash: absent, pathHash: sha256("absent") } };
+					}
+				};
+				const initial = snapshot();
+				const preview = previewScoutAcceptance({ db: state, root: ENGINE_ROOT, command, witness: ingressWitness, planningRunId: candidate.planning_identity, liveFailureHash: candidate.failed_envelope_hash, ...initial, store: breakGlassPermits });
+				const recheck = async (): Promise<Omit<BreakGlassPreview, "permitId" | "createdAt" | "expiresAt">> => {
+					const currentLive = await requestPlanControl(ENGINE_ROOT, "read-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId }, mainOrigin, parent);
+					if (currentLive.state !== "accepted" || currentLive.failureHash !== preview.failureHash) throw new Error(currentLive.reason ?? "recovery lineage changed");
+					const currentCandidate = state!.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
+					if (!currentCandidate || currentCandidate.content_hash !== preview.candidateHash || currentCandidate.bytes !== preview.candidateBytes || currentCandidate.failed_envelope_hash !== preview.failureHash) throw new Error("recovery candidate changed");
+					const current = snapshot();
+					const { permitId: _permitId, createdAt: _createdAt, expiresAt: _expiresAt, ...expected } = preview;
+					return { ...expected, ...current, plan: { ...current.plan }, bypassed: [...expected.bypassed] as ["plan.scout.transport-input"], preserved: [...expected.preserved], blockers: [] };
+				};
+				const accepted = await resolveScoutAcceptance({
+					db: state, root: ENGINE_ROOT, store: breakGlassPermits, preview, witness: ingressWitness, sourceUid: process.getuid!(),
+					confirm: async (value) => ctx.hasUI && await ctx.ui.confirm("Audited break-glass", `${value.ticket} accepts candidate ${value.candidateId}\nbytes: ${value.candidateBytes}\nhash: ${value.candidateHash}\nreason: ${value.reason}\nresult: plan-only; /do still needs fresh approval`, { timeout: Math.max(1, value.expiresAt - Date.now()) }),
+					recheck,
+					continueLineage: async () => {
+						const continued = await requestPlanControl(ENGINE_ROOT, "continue-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash }, mainOrigin, parent);
+						if (continued.state !== "accepted" || !continued.planningIdentity || !continued.generation) throw new Error(continued.reason ?? "recovery continuation refused");
+						return { planningIdentity: continued.planningIdentity, generation: continued.generation };
+					},
+				});
+				workflowIngress.consume(ingressWitness.id, sessionId, controlIdentity.runtimeId, raw);
+				ingressWitness = undefined;
+				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId} accepted; plan writer may continue; result remains plan-only`, "warning");
+			} catch (error) {
+				breakGlassPermits.revoke();
+				ctx.ui.notify(`break-glass refused: ${(error as Error).message}`, "error");
+			} finally { state?.close(); }
+		},
+	});
+
 	pi.registerCommand("yokemate-coordinator-ready", {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
@@ -1511,6 +1590,11 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		uninstallIngress?.();
+		uninstallIngress = undefined;
+		breakGlassPermits.revoke();
+		workflowIngress.revoke();
+		ingressWitness = undefined;
 		await fenceListRuns("parent session shutdown");
 		authority?.revoke();
 		authority = undefined;
