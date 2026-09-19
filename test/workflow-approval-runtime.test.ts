@@ -58,6 +58,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "agents", "plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
@@ -160,10 +161,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     };
     const workflowChild = process.argv[1];
     process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+    delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+    delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     assert.equal(process.env.PI_SESSION_ID, undefined);
     const scoutEnvelope = await runScout("scout-long");
-    assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope.artifact));
+    assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope));
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
     assert.match(readFileSync(scoutEnvelope.artifact.path, "utf8"), /EVIDENCE-TAIL/);
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
@@ -212,6 +215,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(unresolvedScout.publication.target, "unresolved/YM-1");
     assert.match(notifications.slice(warningsBeforeUnresolved).join("\n"), /warning: scout publication → unresolved\/YM-1: target_unavailable/);
     delete process.env.YOKEMATE_RUN_ID;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
     process.argv[1] = workflowChild;
     await input("/plan YM-1");
     const unresolvedRecord = await recordProcess();
@@ -370,6 +375,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
         await input("Plan and then do YM-1");
       }
       process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+      delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+      delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
       process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
       const before = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
       const scoutResult = await runScout(`legacy-${label}-scout`);
@@ -377,6 +384,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       assert.equal(scoutResult.publication.state, scoutExpected === "complete" ? "complete" : "pending", label);
       if (scoutExpected !== "complete") assert.equal(scoutResult.publication.error, scoutExpected, label);
       delete process.env.YOKEMATE_RUN_ID;
+      process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
       process.argv[1] = workflowChild;
       const result = await recordProcess();
       assertPublicationResult(`legacy-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
@@ -451,6 +460,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       let ownedExtension: Awaited<ReturnType<typeof ownedLoaderExtensions>>["extension"] | undefined;
       let ownedCtx: ExtensionContext | undefined;
       if (label === "scout-pending") {
+        delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+        delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
         process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
         const loadedOwned = await ownedLoaderExtensions();
         ownedExtension = loadedOwned.extension;
@@ -472,6 +483,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       }
       const commentsBeforeOwnedRecord = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
+      process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
       process.argv[1] = workflowChild;
       let result: Awaited<ReturnType<typeof recordProcess>>;
       try { result = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" }); }

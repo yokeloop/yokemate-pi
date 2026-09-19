@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
@@ -87,6 +87,9 @@ test("failed coordinator starts release duplicate reservations and capacity befo
   try {
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
     const agentDir = join(dir, "agent");
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir),
@@ -156,7 +159,6 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     const plan = record("YM-1");
     record("YM-2");
     await approve("/do YM-1 YM-2");
-    process.argv[1] = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
     const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"] } }, undefined, () => undefined, ctx);
     assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
     const { runId } = accepted.details as { runId: string };

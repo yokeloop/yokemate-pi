@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { JsonlAggregateValidator } from "./jsonl-aggregate.ts";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
@@ -28,6 +27,35 @@ export type ArtifactReference =
   | { state: "superseded"; path: string; hash: string; bytes: number; acceptanceId: number };
 export type ProcessOutcome = "exited" | "signaled" | "spawn_error" | "cancelled" | "not_started";
 export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
+export type ParserErrorKind = "invalid_json" | "invalid_event" | "record_limit" | "partial_record";
+export interface ParserErrorFact { kind: ParserErrorKind; offset: number }
+export interface StreamDiagnostics {
+  stdoutBytes: number;
+  stdoutHash: string;
+  events: Record<string, number>;
+  parserErrors: number;
+  parserErrorCounters: Record<ParserErrorKind, number>;
+  firstParserError?: ParserErrorFact;
+  lastParserError?: ParserErrorFact;
+  partialBytes: number;
+  partialHash: string;
+  assistantMessageSeen: boolean;
+  finalTextPresent: boolean;
+  activeTools: number;
+  retry: boolean;
+  compaction: boolean;
+  summaryRetry: boolean;
+  phase: "text" | "thinking" | "toolcall" | "unknown";
+  firstByteAt?: string;
+  lastEventAt?: string;
+  finalAt?: string;
+}
+export interface ResultDiagnostics {
+  stream: StreamDiagnostics;
+  stderr?: { bytes: number; hash: string };
+  final: { bytes: number; hash: string; previewBytes: number; previewHash: string; truncated: boolean };
+  snapshotStorage?: { state: "available" | "unavailable"; code?: string };
+}
 export interface ResultEnvelope {
   version: 1;
   kind: "result";
@@ -43,6 +71,7 @@ export interface ResultEnvelope {
   reviewVerdict: "approved" | "changes_required" | null;
   artifact?: ArtifactReference;
   publication?: PublicationReference;
+  diagnostics?: ResultDiagnostics;
 }
 export interface BatchEnvelope {
   version: 1;
@@ -62,8 +91,8 @@ export interface LaunchAck {
 export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batchId: string, task: ChildTask, defaultCwd: string, defaultTicket?: string): ChildIdentity {
   const cwd = realpathSync(task.cwd ?? defaultCwd);
   const ticket = task.ticket ?? defaultTicket;
-  if (task.agent === "plan-scout" && !ticket) throw new Error("plan-scout requires an explicit ticket binding");
-  if (task.agent === "plan-scout" && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error("plan-scout ticket differs from the stamped plan ticket");
+  if (["plan-scout", "plan-writer"].includes(task.agent) && !ticket) throw new Error(`${task.agent} requires an explicit ticket binding`);
+  if (["plan-scout", "plan-writer"].includes(task.agent) && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error(`${task.agent} ticket differs from the stamped plan ticket`);
   if (task.agent === "task-reviewer" && !task.review) throw new Error("task-reviewer requires review.baseSha and review.headSha");
   if (task.review) {
     for (const sha of [task.review.baseSha, task.review.headSha]) {
@@ -94,13 +123,34 @@ export function boundedText(text: string): string {
   while ((bytes[end]! & 0xc0) === 0x80) end--;
   return bytes.subarray(0, end).toString("utf8") + "\n[Output truncated]";
 }
-export function resultEnvelope(identity: ChildIdentity, task: string, terminal: { processOutcome: ProcessOutcome; exitCode: number | null; signal: string | null; stopReason?: string; protocolError?: boolean; incomplete?: boolean }, text: string): ResultEnvelope {
+function copyIdentity(identity: ChildIdentity): ChildIdentity {
+  return { ...identity, ...(identity.review ? { review: { ...identity.review } } : {}) };
+}
+function copyDiagnostics(value: ResultDiagnostics | undefined): ResultDiagnostics | undefined {
+  if (!value) return;
+  return {
+    stream: {
+      ...value.stream,
+      events: { ...value.stream.events },
+      parserErrorCounters: { ...value.stream.parserErrorCounters },
+      ...(value.stream.firstParserError ? { firstParserError: { ...value.stream.firstParserError } } : {}),
+      ...(value.stream.lastParserError ? { lastParserError: { ...value.stream.lastParserError } } : {}),
+    },
+    ...(value.stderr ? { stderr: { ...value.stderr } } : {}),
+    final: { ...value.final },
+    ...(value.snapshotStorage ? { snapshotStorage: { ...value.snapshotStorage } } : {}),
+  };
+}
+export function resultEnvelope(identity: ChildIdentity, task: string, terminal: { processOutcome: ProcessOutcome; exitCode: number | null; signal: string | null; stopReason?: string; protocolError?: boolean; incomplete?: boolean; diagnostics?: ResultDiagnostics }, text: string): ResultEnvelope {
   const clean = terminal.processOutcome === "exited" && terminal.exitCode === 0 && terminal.signal === null && terminal.stopReason === "stop" && !terminal.incomplete;
   const reviewer = identity.agent === "task-reviewer";
   const verdict = reviewer ? reviewerVerdict(text) : null;
   const overflow = reviewer && Buffer.byteLength(text) > PAYLOAD_LIMIT;
   const payloadOutcome: PayloadOutcome = terminal.protocolError ? "protocol_error" : !clean ? "incomplete" : overflow ? "output_limit" : !text.trim() ? "missing_final" : reviewer && !verdict ? "invalid_reviewer_json" : "valid";
-  return { version: 1, kind: "result", identity, actualTaskHash: sha256(task), processOutcome: terminal.processOutcome, exitCode: terminal.exitCode, signal: terminal.signal, stopReason: terminal.stopReason, payloadOutcome, payload: overflow ? "" : boundedText(text), reviewVerdict: payloadOutcome === "valid" ? verdict : null };
+  const payload = overflow ? "" : boundedText(text);
+  const supplied = copyDiagnostics(terminal.diagnostics);
+  const diagnostics = supplied ? { ...supplied, final: { bytes: Buffer.byteLength(text), hash: sha256(text), previewBytes: Buffer.byteLength(payload), previewHash: sha256(payload), truncated: payload !== text } } : undefined;
+  return { version: 1, kind: "result", identity: copyIdentity(identity), actualTaskHash: sha256(task), processOutcome: terminal.processOutcome, exitCode: terminal.exitCode, signal: terminal.signal, stopReason: terminal.stopReason, payloadOutcome, payload, reviewVerdict: payloadOutcome === "valid" ? verdict : null, ...(diagnostics ? { diagnostics } : {}) };
 }
 export function failedEnvelope(result: ResultEnvelope): boolean { return result.payloadOutcome !== "valid"; }
 export class ChildRuns {
@@ -109,13 +159,24 @@ export class ChildRuns {
   readonly children = new Map<string, { identity: ChildIdentity; state: "queued" | "running"; result?: ResultEnvelope }>();
   readonly batches = new Map<string, ChildIdentity[]>();
   private defaultTicket?: string;
+  private currentScouts = new Map<string, { runId: string; result?: ResultEnvelope }>();
   constructor(ownerRunId: string, ownerSessionId: string, defaultTicket?: string) { this.ownerRunId = ownerRunId; this.ownerSessionId = ownerSessionId; this.defaultTicket = defaultTicket; }
   admit(batchId: string, tasks: ChildTask[], cwd: string): LaunchAck {
     if (this.batches.has(batchId)) throw new Error("duplicate subagent batch admission");
     const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd, this.defaultTicket));
     batchPayloadQuota(identities);
+    const pendingScoutTickets = new Set(identities.filter((identity) => identity.agent === "plan-scout").map((identity) => identity.ticket).filter((ticket): ticket is string => !!ticket));
+    for (const identity of identities) {
+      if (identity.agent === "plan-writer") {
+        if (identity.ticket && pendingScoutTickets.has(identity.ticket)) throw new Error(`plan-writer cannot share admission with an unsettled scout for ${identity.ticket}`);
+        this.assertPlanWriterAdmission(identity);
+      }
+    }
     this.batches.set(batchId, identities);
-    for (const identity of identities) this.children.set(identity.runId, { identity, state: "queued" });
+    for (const identity of identities) {
+      if (identity.agent === "plan-scout" && identity.ticket) this.currentScouts.set(identity.ticket, { runId: identity.runId });
+      this.children.set(identity.runId, { identity, state: "queued" });
+    }
     return { version: 1, kind: "ack", terminal: false, batchId, children: identities.map((identity) => ({ identity, state: "queued" })) };
   }
   start(identity: ChildIdentity): void {
@@ -125,7 +186,11 @@ export class ChildRuns {
   settle(result: ResultEnvelope): boolean {
     const child = this.children.get(result.identity.runId);
     if (!child || child.result || sha256(JSON.stringify(child.identity)) !== sha256(JSON.stringify(result.identity))) return false;
-    child.result = result;
+    child.result = structuredClone(result);
+    if (result.identity.agent === "plan-scout" && result.identity.ticket) {
+      const current = this.currentScouts.get(result.identity.ticket);
+      if (current?.runId === result.identity.runId && result.payloadOutcome === "valid" && result.actualTaskHash === result.identity.taskHash && result.artifact?.state === "accepted") current.result = structuredClone(result);
+    }
     return true;
   }
   batch(batchId: string, kind: "batch" | "chain" = "batch"): BatchEnvelope | undefined {
@@ -133,28 +198,41 @@ export class ChildRuns {
     if (!identities) return;
     const results = identities.map((identity) => this.children.get(identity.runId)?.result);
     if (results.some((result) => !result)) return;
-    return { version: 1, kind, ownerRunId: this.ownerRunId, ownerSessionId: this.ownerSessionId, batchId, results: results as ResultEnvelope[] };
+    return { version: 1, kind, ownerRunId: this.ownerRunId, ownerSessionId: this.ownerSessionId, batchId, results: structuredClone(results as ResultEnvelope[]) };
   }
   active(): { identity: ChildIdentity; state: "queued" | "running" }[] { return [...this.children.values()].filter((child) => !child.result).map(({ identity, state }) => ({ identity, state })); }
+  isCurrentScout(identity: ChildIdentity): boolean { return identity.agent === "plan-scout" && !!identity.ticket && this.currentScouts.get(identity.ticket)?.runId === identity.runId; }
+  currentScout(ticket: string): ResultEnvelope | undefined { const result = this.currentScouts.get(ticket)?.result; return result ? structuredClone(result) : undefined; }
+  assertPlanWriterAdmission(identity: ChildIdentity): ResultEnvelope {
+    if (identity.agent !== "plan-writer" || !identity.ticket) throw new Error("plan-writer requires an explicit ticket binding");
+    const result = this.currentScout(identity.ticket);
+    if (!result || result.payloadOutcome !== "valid" || result.actualTaskHash !== result.identity.taskHash || result.artifact?.state !== "accepted") throw new Error(`plan-writer requires the current accepted scout for ${identity.ticket}`);
+    return result;
+  }
 }
 
 const RECORD_LIMIT = 1024 * 1024;
 const eventNames = new Set(["session", "entry_appended", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished", "queue_update", "extension_error", "response", "extension_ui_request"]);
+const parserCounter = (): Record<ParserErrorKind, number> => ({ invalid_json: 0, invalid_event: 0, record_limit: 0, partial_record: 0 });
+
 export class JsonlObservation {
-  private prefix?: Buffer;
-  private prefixLength = 0;
-  private aggregate?: JsonlAggregateValidator;
+  private record: Buffer[] = [];
   private recordBytes = 0;
   private recordHash = createHash("sha256");
-  private dropping = false;
+  private recordLimited = false;
   private offset = 0;
+  private ended = false;
   private errors = 0;
-  private lastError?: { kind: "invalid_json" | "invalid_event" | "record_limit" | "partial_record"; offset: number };
+  private firstError?: ParserErrorFact;
+  private lastError?: ParserErrorFact;
+  private errorCounters = parserCounter();
   private tools = new Set<string>();
   private retry = false;
   private compaction = false;
   private summaryRetry = false;
   private counts: Record<string, number> = {};
+  private stdoutHash = createHash("sha256");
+  private assistantSeen = false;
   stdoutBytes = 0;
   sessionId?: string;
   finalText = "";
@@ -169,75 +247,84 @@ export class JsonlObservation {
   constructor(onEvent?: (event: Record<string, any>) => void) { this.onEvent = onEvent; }
   get protocolError(): boolean { return this.errors > 0; }
   get incomplete(): boolean { return this.tools.size > 0 || this.retry || this.compaction || this.summaryRetry; }
-  private error(kind: NonNullable<JsonlObservation["lastError"]>["kind"]): void { this.errors++; this.lastError = { kind, offset: this.offset }; }
+  private error(kind: ParserErrorKind): void {
+    if (kind === "record_limit" && this.recordLimited) return;
+    const fact = { kind, offset: this.offset };
+    this.errors++;
+    this.errorCounters[kind]++;
+    this.firstError ??= fact;
+    this.lastError = fact;
+    if (kind === "record_limit") this.recordLimited = true;
+  }
   write(chunk: Buffer): void {
+    if (this.ended || !chunk.length) return;
     this.firstByteAt ??= new Date().toISOString();
     this.stdoutBytes += chunk.length;
+    this.stdoutHash.update(chunk);
     let start = 0;
     while (start < chunk.length) {
       const newline = chunk.indexOf(10, start);
       const end = newline < 0 ? chunk.length : newline;
-      const bytes = chunk.subarray(start, end);
-      this.recordBytes += bytes.length;
-      this.recordHash.update(bytes);
-      this.consumeRecordBytes(bytes);
+      this.consumeRecordBytes(chunk.subarray(start, end));
       if (newline < 0) break;
-      if (this.aggregate) {
-        if (this.aggregate.finish()) {
-          this.counts.agent_end = (this.counts.agent_end ?? 0) + 1;
-          this.lastEventAt = new Date().toISOString();
-        } else if (!this.dropping) this.error("record_limit");
-      } else if (!this.dropping) {
-        const line = (this.prefix ?? Buffer.alloc(0)).subarray(0, this.prefixLength).toString("utf8");
-        this.parse(line.endsWith("\r") ? line.slice(0, -1) : line);
-      }
+      this.finishRecord();
       this.offset += this.recordBytes + 1;
       this.resetRecord();
       start = newline + 1;
     }
   }
   end(): void {
-    if (this.recordBytes) this.error("partial_record");
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    this.aggregate = undefined;
-    this.dropping = false;
+    if (this.ended) return;
+    this.ended = true;
+    if (this.recordBytes) {
+      const trailingCr = this.record.length > 0 && this.record[this.record.length - 1]!.at(-1) === 13;
+      if (this.recordBytes - (trailingCr ? 1 : 0) > RECORD_LIMIT) this.error("record_limit");
+      this.error("partial_record");
+    }
   }
   private consumeRecordBytes(bytes: Buffer): void {
-    if (!bytes.length || this.dropping) return;
-    if (this.aggregate) {
-      this.aggregate.write(bytes);
-      if (this.aggregate.rejected) { this.error("record_limit"); this.dropping = true; this.aggregate = undefined; }
-      return;
+    if (!bytes.length) return;
+    this.recordBytes += bytes.length;
+    this.recordHash.update(bytes);
+    if (!this.recordLimited && this.recordBytes <= RECORD_LIMIT + 1) this.record.push(Buffer.from(bytes));
+    if (this.recordBytes > RECORD_LIMIT + 1) {
+      this.record = [];
+      this.error("record_limit");
     }
-    this.prefix ??= Buffer.allocUnsafe(RECORD_LIMIT);
-    const retained = Math.min(bytes.length, RECORD_LIMIT - this.prefixLength);
-    if (retained > 0) {
-      bytes.copy(this.prefix, this.prefixLength, 0, retained);
-      this.prefixLength += retained;
-    }
-    if (retained === bytes.length) return;
-    const validator = new JsonlAggregateValidator();
-    validator.write(this.prefix.subarray(0, this.prefixLength));
-    validator.write(bytes.subarray(retained));
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    if (validator.rejected) { this.error("record_limit"); this.dropping = true; }
-    else this.aggregate = validator;
+  }
+  private finishRecord(): void {
+    const joined = this.record.length ? Buffer.concat(this.record) : Buffer.alloc(0);
+    const line = joined.length && joined[joined.length - 1] === 13 ? joined.subarray(0, -1) : joined;
+    if (this.recordBytes - (joined.length !== line.length ? 1 : 0) > RECORD_LIMIT) this.error("record_limit");
+    if (this.recordLimited) return;
+    let text: string;
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(line); }
+    catch { this.error("invalid_json"); return; }
+    this.parse(text);
   }
   private resetRecord(): void {
+    this.record = [];
     this.recordBytes = 0;
     this.recordHash = createHash("sha256");
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    this.aggregate = undefined;
-    this.dropping = false;
+    this.recordLimited = false;
+  }
+  private validAgentEndSummary(event: Record<string, any>): boolean {
+    if (event.type !== "agent_end" || event.messagesSummary === undefined) return true;
+    if ("messages" in event || !["type", "messagesSummary", "willRetry"].every((key) => key in event || key === "willRetry") || Object.keys(event).some((key) => !["type", "messagesSummary", "willRetry"].includes(key))) return false;
+    if (event.willRetry !== undefined && typeof event.willRetry !== "boolean") return false;
+    const summary = event.messagesSummary;
+    return !!summary && typeof summary === "object" && !Array.isArray(summary)
+      && Object.keys(summary).sort().join(",") === "bytes,count,sha256,version"
+      && summary.version === 1
+      && Number.isSafeInteger(summary.count) && summary.count >= 0
+      && Number.isSafeInteger(summary.bytes) && summary.bytes >= 0
+      && typeof summary.sha256 === "string" && /^[a-f0-9]{64}$/.test(summary.sha256);
   }
   private parse(line: string): void {
     if (!line.trim()) return;
     let event: any;
     try { event = JSON.parse(line); } catch { this.error("invalid_json"); return; }
-    if (!event || typeof event !== "object" || typeof event.type !== "string") { this.error("invalid_event"); return; }
+    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !this.validAgentEndSummary(event)) { this.error("invalid_event"); return; }
     const name = eventNames.has(event.type) ? event.type : "other";
     this.counts[name] = (this.counts[name] ?? 0) + 1;
     this.lastEventAt = new Date().toISOString();
@@ -247,6 +334,7 @@ export class JsonlObservation {
       if (phase === "text" || phase === "thinking" || phase === "toolcall") this.phase = phase;
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
+      this.assistantSeen = true;
       const message = event.message;
       this.finalText = Array.isArray(message.content) ? message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("") : "";
       this.stopReason = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"].includes(message.stopReason) ? message.stopReason : undefined;
@@ -264,8 +352,28 @@ export class JsonlObservation {
     if (event.type === "summarization_retry_finished") this.summaryRetry = false;
     this.onEvent?.(event);
   }
-  metadata() {
-    return { stdoutBytes: this.stdoutBytes, events: { ...this.counts }, parserErrors: this.errors, lastParserError: this.lastError, partialBytes: this.recordBytes, partialHash: this.recordHash.copy().digest("hex"), activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, phase: this.phase, firstByteAt: this.firstByteAt, lastEventAt: this.lastEventAt, finalAt: this.finalAt };
+  metadata(): StreamDiagnostics {
+    return {
+      stdoutBytes: this.stdoutBytes,
+      stdoutHash: this.stdoutHash.copy().digest("hex"),
+      events: { ...this.counts },
+      parserErrors: this.errors,
+      parserErrorCounters: { ...this.errorCounters },
+      ...(this.firstError ? { firstParserError: { ...this.firstError } } : {}),
+      ...(this.lastError ? { lastParserError: { ...this.lastError } } : {}),
+      partialBytes: this.recordBytes,
+      partialHash: this.recordHash.copy().digest("hex"),
+      assistantMessageSeen: this.assistantSeen,
+      finalTextPresent: Buffer.byteLength(this.finalText) > 0,
+      activeTools: this.tools.size,
+      retry: this.retry,
+      compaction: this.compaction,
+      summaryRetry: this.summaryRetry,
+      phase: this.phase,
+      firstByteAt: this.firstByteAt,
+      lastEventAt: this.lastEventAt,
+      finalAt: this.finalAt,
+    };
   }
 }
 
@@ -277,61 +385,194 @@ export function errorMetadata(error: unknown) {
   const code = (error as NodeJS.ErrnoException)?.code;
   return { class: ["ENOENT", "EACCES", "EPERM", "ENOSPC", "EIO", "EPIPE"].includes(code ?? "") ? code : "unknown", bytes: Buffer.byteLength(message), hash: sha256(message) };
 }
+export type SnapshotStorageCode = "storage_busy" | "storage_limit" | "artifact_invalid" | "ENOENT" | "EACCES" | "EPERM" | "ENOSPC" | "EIO" | "unknown";
+export interface SnapshotStorageStatus { state: "available" | "unavailable"; code?: SnapshotStorageCode }
+export interface RunSnapshotV1 {
+  customType: "yokemate-run-snapshot";
+  version: 1;
+  ownerRunId: string;
+  ownerSessionId?: string;
+  batchId?: string;
+  runId: string;
+  agent?: string;
+  ticket?: string;
+  taskHash?: string;
+  actualTaskHash?: string;
+  lifecycle: { admittedAt?: string; spawnAt?: string; closeAt?: string; settledAt?: string; processClosed: boolean; deliveriesTerminal: boolean };
+  process?: { pid?: number; starttime?: string; outcome?: string; exitCode?: number | null; signal?: string | null; stopReason?: string; cancellationInitiator?: string };
+  resources?: Record<string, { path: string; hash: string }>;
+  stream?: StreamDiagnostics;
+  stderr?: { bytes: number; hash: string };
+  artifact?: { state?: string; hash?: string; bytes?: number; acceptanceId?: number };
+  publication?: { state?: string; revision?: string; publicationId?: number; error?: string };
+  deliveries: Array<{ id: string; state: string; envelopeHash?: string; at?: string }>;
+  snapshotStorage: SnapshotStorageStatus;
+  updatedAt: string;
+}
+interface SnapshotFile { path: string; name: string; size: number; updated: number; own: boolean; terminal: boolean }
+const snapshotCode = (error: unknown): SnapshotStorageCode => {
+  const explicit = (error as { code?: string })?.code;
+  return ["storage_busy", "storage_limit", "artifact_invalid", "ENOENT", "EACCES", "EPERM", "ENOSPC", "EIO"].includes(explicit ?? "") ? explicit as SnapshotStorageCode : "unknown";
+};
+const safeString = (value: unknown, pattern = /^[a-zA-Z0-9_.:/+-]{1,240}$/): string | undefined => typeof value === "string" && pattern.test(value) ? value : undefined;
+const safeNumber = (value: unknown): number | undefined => Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined;
+
 export class RunSnapshots {
-  private directory: string;
-  private stopped = false;
-  constructor(root: string, plan: string) {
-    let engine = root;
-    while (!fs.existsSync(path.join(engine, "home/knowledge")) && path.dirname(engine) !== engine) engine = path.dirname(engine);
-    const knowledge = fs.realpathSync(path.join(engine, "home/knowledge"));
-    const folder = fs.realpathSync(path.dirname(plan));
-    const relative = path.relative(knowledge, folder).split(path.sep);
-    if (relative.length !== 4 || relative[2] !== "ai" || relative.some((part) => part === "..")) throw new Error("invalid reviewer diagnostic task path");
-    this.directory = path.join(folder, "reviewer-runs");
-    fs.mkdirSync(this.directory, { recursive: true });
-    if (fs.realpathSync(this.directory) !== this.directory) throw new Error("reviewer diagnostic directory must not be a symlink");
+  readonly directory: string;
+  private pid: number;
+  private starttime: (pid: number) => string | undefined;
+  constructor(root: string, _legacyPlanOrOptions?: string | { pid?: number; processStarttime?: (pid: number) => string | undefined }) {
+    const options = typeof _legacyPlanOrOptions === "object" ? _legacyPlanOrOptions : {};
+    this.directory = path.join(path.resolve(root), "sessions", "subagent-runs");
+    this.pid = options.pid ?? process.pid;
+    this.starttime = options.processStarttime ?? ((pid) => {
+      try { return fs.readFileSync(`/proc/${pid}/stat`, "utf8").trim().split(/\s+/)[21]; } catch { return undefined; }
+    });
   }
-  write(ownerRunId: string, runId: string, metadata: Record<string, unknown>, completed: boolean): boolean {
-    if (this.stopped) return false;
+  write(ownerRunId: string, runId: string, metadata: Record<string, unknown>, completed: boolean): SnapshotStorageStatus {
+    let lockOwned = false;
     let temporary: string | undefined;
     try {
-      if (![ownerRunId, runId].every((id) => /^[a-zA-Z0-9-]{1,80}$/.test(id))) throw new Error("invalid diagnostic identity");
-      const target = path.join(this.directory, `${ownerRunId}-${runId}.json`);
-      const data = JSON.stringify({ customType: "yokemate-run-snapshot", version: 1, ownerRunId, runId, completed, updatedAt: new Date().toISOString(), ...metadata });
-      if (Buffer.byteLength(data) > PAYLOAD_LIMIT) throw new Error("snapshot limit");
-      const files = fs.readdirSync(this.directory).map((name) => {
-        const file = path.join(this.directory, name);
-        const stat = fs.lstatSync(file);
-        let own = false;
-        let terminal = false;
-        if (stat.isFile() && /^[a-zA-Z0-9-]+\.json$/.test(name) && stat.size <= PAYLOAD_LIMIT) {
-          try {
-            const value = JSON.parse(fs.readFileSync(file, "utf8"));
-            own = value.customType === "yokemate-run-snapshot" && value.version === 1 && name === `${value.ownerRunId}-${value.runId}.json`;
-            terminal = own && value.completed === true;
-          } catch {}
-        }
-        return { file, size: stat.size, updated: stat.mtimeMs, own, terminal };
-      });
-      const completedFiles = files.filter((file) => file.terminal && file.file !== target).sort((a, b) => a.updated - b.updated);
-      let total = files.reduce((sum, file) => sum + (file.file === target ? 0 : file.size), 0) + Buffer.byteLength(data);
-      while (completedFiles.length > (completed ? 19 : 20) || total > 2 * 1024 * 1024) {
-        const oldest = completedFiles.shift();
-        if (!oldest) throw new Error("diagnostic disk budget");
-        fs.unlinkSync(oldest.file);
-        total -= oldest.size;
+      if (![ownerRunId, runId].every((id) => /^[a-zA-Z0-9-]{1,80}$/.test(id))) throw Object.assign(new Error("invalid diagnostic identity"), { code: "artifact_invalid" });
+      this.initialize();
+      const lock = path.join(this.directory, ".lock");
+      try { this.createLock(lock); lockOwned = true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !this.clearStaleLock(lock)) throw Object.assign(error as Error, { code: (error as NodeJS.ErrnoException).code === "EEXIST" ? "storage_busy" : (error as NodeJS.ErrnoException).code });
+        this.createLock(lock);
+        lockOwned = true;
       }
-      temporary = `${target}.${randomUUID()}.tmp`;
-      fs.writeFileSync(temporary, data, { mode: 0o600, flag: "wx" });
+      this.cleanOwnTemps();
+      const targetName = `${ownerRunId}-${runId}.json`;
+      const target = path.join(this.directory, targetName);
+      const snapshot = this.allowlisted(ownerRunId, runId, metadata, completed);
+      const data = Buffer.from(JSON.stringify(snapshot));
+      if (data.length > PAYLOAD_LIMIT) throw Object.assign(new Error("snapshot limit"), { code: "storage_limit" });
+      let entries = this.inspect();
+      const targetEntry = entries.find((entry) => entry.path === target);
+      const incomingTerminal = snapshot.lifecycle.processClosed && snapshot.lifecycle.deliveriesTerminal;
+      const removable = () => entries.filter((entry) => entry.own && entry.terminal && entry.path !== target).sort((a, b) => a.updated - b.updated || a.name.localeCompare(b.name));
+      const ownCount = () => entries.filter((entry) => entry.own && entry.path !== target).length + 1;
+      const terminalCount = () => entries.filter((entry) => entry.own && entry.terminal && entry.path !== target).length + (incomingTerminal ? 1 : 0);
+      const temporaryBudget = () => entries.reduce((sum, entry) => sum + entry.size, 0) + data.length + 512;
+      while (ownCount() > 40 || terminalCount() > 20 || temporaryBudget() > 2 * 1024 * 1024) {
+        const oldest = removable()[0];
+        if (!oldest) throw Object.assign(new Error("snapshot disk budget"), { code: "storage_limit" });
+        const checked = fs.lstatSync(oldest.path);
+        if (!checked.isFile() || checked.isSymbolicLink()) throw Object.assign(new Error("snapshot changed"), { code: "artifact_invalid" });
+        fs.unlinkSync(oldest.path);
+        entries = entries.filter((entry) => entry.path !== oldest.path);
+      }
+      temporary = path.join(this.directory, `.tmp-${ownerRunId}-${runId}-${randomUUID()}`);
+      const descriptor = fs.openSync(temporary, "wx", 0o600);
+      try { fs.writeFileSync(descriptor, data); fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
       fs.renameSync(temporary, target);
-      return true;
-    } catch {
-      this.stopped = true;
-      console.error("[subagent] diagnostic writes stopped; primary outcome unchanged");
-      return false;
+      temporary = undefined;
+      try { const directoryFd = fs.openSync(this.directory, "r"); try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); } } catch {}
+      return { state: "available" };
+    } catch (error) {
+      const code = snapshotCode(error);
+      console.error(`[subagent] diagnostic snapshot unavailable: ${code}`);
+      return { state: "unavailable", code };
     } finally {
-      if (temporary) { try { fs.unlinkSync(temporary); } catch {} }
+      if (temporary) try { fs.unlinkSync(temporary); } catch {}
+      if (lockOwned) {
+        const lock = path.join(this.directory, ".lock");
+        try {
+          const owner = JSON.parse(fs.readFileSync(lock, "utf8"));
+          if (owner.pid === this.pid && owner.starttime === this.starttime(this.pid)) fs.unlinkSync(lock);
+        } catch {}
+      }
     }
+  }
+  private initialize(): void {
+    const parsed = path.parse(this.directory);
+    let current = parsed.root;
+    for (const component of this.directory.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component);
+      try {
+        const stat = fs.lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(current) !== current) throw Object.assign(new Error("invalid snapshot path"), { code: "artifact_invalid" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        fs.mkdirSync(current, { mode: 0o700 });
+        const stat = fs.lstatSync(current);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(current) !== current) throw Object.assign(new Error("invalid snapshot path"), { code: "artifact_invalid" });
+      }
+    }
+    fs.chmodSync(this.directory, 0o700);
+  }
+  private createLock(lock: string): void {
+    fs.writeFileSync(lock, JSON.stringify({ pid: this.pid, starttime: this.starttime(this.pid) }), { mode: 0o600, flag: "wx" });
+  }
+  private clearStaleLock(lock: string): boolean {
+    try {
+      const stat = fs.lstatSync(lock);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 512) return false;
+      const owner = JSON.parse(fs.readFileSync(lock, "utf8"));
+      if (!Number.isInteger(owner.pid) || typeof owner.starttime !== "string") return false;
+      const actual = this.starttime(owner.pid);
+      if (actual === owner.starttime || (actual === undefined && fs.existsSync(`/proc/${owner.pid}`))) return false;
+      fs.unlinkSync(lock);
+      return true;
+    } catch { return false; }
+  }
+  private cleanOwnTemps(): void {
+    for (const name of fs.readdirSync(this.directory)) {
+      if (!/^\.tmp-[a-zA-Z0-9-]{1,80}-[a-zA-Z0-9-]{1,80}-[a-f0-9-]{36}$/.test(name)) continue;
+      const file = path.join(this.directory, name);
+      try { const stat = fs.lstatSync(file); if (stat.isFile() && !stat.isSymbolicLink()) fs.unlinkSync(file); } catch {}
+    }
+  }
+  private inspect(): SnapshotFile[] {
+    return fs.readdirSync(this.directory).filter((name) => name !== ".lock").map((name) => {
+      const file = path.join(this.directory, name);
+      const stat = fs.lstatSync(file);
+      let own = false;
+      let terminal = false;
+      if (stat.isFile() && !stat.isSymbolicLink() && /^[a-zA-Z0-9-]{1,80}-[a-zA-Z0-9-]{1,80}\.json$/.test(name) && stat.size <= PAYLOAD_LIMIT) try {
+        const value = JSON.parse(fs.readFileSync(file, "utf8"));
+        own = value.customType === "yokemate-run-snapshot" && value.version === 1 && name === `${value.ownerRunId}-${value.runId}.json`;
+        terminal = own && value.lifecycle?.processClosed === true && value.lifecycle?.deliveriesTerminal === true;
+      } catch {}
+      return { path: file, name, size: stat.size, updated: stat.mtimeMs, own, terminal };
+    });
+  }
+  private allowlisted(ownerRunId: string, runId: string, metadata: Record<string, unknown>, completed: boolean): RunSnapshotV1 {
+    const identity = metadata.identity && typeof metadata.identity === "object" ? metadata.identity as Record<string, unknown> : {};
+    const terminal = metadata.terminal && typeof metadata.terminal === "object" ? metadata.terminal as Record<string, unknown> : {};
+    const deliveriesObject = metadata.deliveries && typeof metadata.deliveries === "object" ? metadata.deliveries as Record<string, unknown> : {};
+    const deliveries = Object.entries(deliveriesObject).slice(0, 3).map(([id, raw]) => {
+      const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+      const envelopeHash = safeString(value.envelopeHash, /^[a-f0-9]{64}$/);
+      const at = safeString(value.observedAt ?? value.failedAt ?? value.enqueuedAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+      return { id: safeString(id, /^[a-f0-9]{64}$/) ?? sha256(id), state: safeString(value.state, /^[a-z_]{1,40}$/) ?? "unknown", ...(envelopeHash ? { envelopeHash } : {}), ...(at ? { at } : {}) };
+    });
+    const processClosed = completed && typeof metadata.closeAt === "string";
+    const deliveriesTerminal = deliveries.length > 0 ? deliveries.every((delivery) => ["observed", "delivery_failed", "delivery_unknown"].includes(delivery.state)) : processClosed && metadata.noDeliveriesExpected === true;
+    const resources: Record<string, { path: string; hash: string }> = {};
+    for (const [role, source] of [["extension", metadata.extension], ["guard", metadata.guard], ["launch", metadata.launch], ["agentDefinition", metadata.agentDefinition]] as const) {
+      if (!source || typeof source !== "object") continue;
+      const record = source as Record<string, unknown>;
+      if (typeof record.path === "string" && typeof record.hash === "string" && /^[a-f0-9]{64}$/.test(record.hash)) resources[role] = { path: record.path, hash: record.hash };
+    }
+    return {
+      customType: "yokemate-run-snapshot", version: 1, ownerRunId,
+      ...(safeString(identity.ownerSessionId) ? { ownerSessionId: identity.ownerSessionId as string } : {}),
+      ...(safeString(identity.batchId) ? { batchId: identity.batchId as string } : {}), runId,
+      ...(safeString(identity.agent) ? { agent: identity.agent as string } : {}),
+      ...(safeString(identity.ticket, /^[A-Z][A-Z0-9]*-\d+$/) ? { ticket: identity.ticket as string } : {}),
+      ...(safeString(identity.taskHash, /^[a-f0-9]{64}$/) ? { taskHash: identity.taskHash as string } : {}),
+      ...(safeString(metadata.actualTaskHash, /^[a-f0-9]{64}$/) ? { actualTaskHash: metadata.actualTaskHash as string } : {}),
+      lifecycle: { admittedAt: safeString(metadata.admissionAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), spawnAt: safeString(metadata.spawnAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), closeAt: safeString(metadata.closeAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), settledAt: safeString(metadata.settledAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), processClosed, deliveriesTerminal },
+      process: { pid: safeNumber(metadata.pid), starttime: safeString(metadata.starttime, /^\d{1,30}$/), outcome: safeString(terminal.processOutcome, /^[a-z_]{1,40}$/), exitCode: terminal.exitCode === null || Number.isInteger(terminal.exitCode) ? terminal.exitCode as number | null : undefined, signal: safeString(terminal.signal, /^[A-Z0-9]+$/), stopReason: safeString(terminal.stopReason, /^[a-zA-Z0-9_ -]{1,80}$/), cancellationInitiator: safeString(metadata.cancellationInitiator, /^[a-z_]{1,80}$/) },
+      ...(Object.keys(resources).length ? { resources } : {}),
+      ...(metadata.stream && typeof metadata.stream === "object" ? { stream: structuredClone(metadata.stream) as StreamDiagnostics } : {}),
+      ...(metadata.stderr && typeof metadata.stderr === "object" ? { stderr: { bytes: safeNumber((metadata.stderr as any).bytes) ?? 0, hash: safeString((metadata.stderr as any).hash, /^[a-f0-9]{64}$/) ?? sha256("") } } : {}),
+      deliveries,
+      snapshotStorage: { state: "available" },
+      updatedAt: new Date().toISOString(),
+    };
   }
 }
 
@@ -342,6 +583,9 @@ export interface ReportDelivery {
   runIds: string[];
   envelopeHash: string;
   state: "pending" | "enqueued" | "observed" | "delivery_failed" | "delivery_unknown";
+  code?: string;
+  failedAt?: string;
+  observedAt?: string;
 }
 export interface ChildStateSnapshot {
   version: 1;
@@ -356,7 +600,8 @@ export interface ChildStateSnapshot {
 export function deliveryFor(envelope: ReportEnvelope): ReportDelivery {
   const identity = envelope.kind === "result" ? envelope.identity : envelope;
   const runIds = envelope.kind === "result" ? [envelope.identity.runId] : envelope.results.map((result) => result.identity.runId);
-  return { deliveryId: sha256(JSON.stringify([identity.ownerRunId, identity.ownerSessionId, identity.batchId, envelope.kind, runIds])), batchId: identity.batchId, runIds, envelopeHash: sha256(JSON.stringify(envelope)), state: "pending" };
+  const envelopeHash = sha256(JSON.stringify(envelope));
+  return { deliveryId: sha256(JSON.stringify([identity.ownerRunId, identity.ownerSessionId, identity.batchId, envelope.kind, runIds, envelopeHash])), batchId: identity.batchId, runIds, envelopeHash, state: "pending" };
 }
 export function reportContent(envelope: ReportEnvelope, delivery: ReportDelivery): string {
   const prefix = envelope.kind === "result" ? `[subagent ${envelope.identity.agent}${failedEnvelope(envelope) ? " failed" : ""}]` : envelope.kind === "batch" ? "[subagent batch complete]" : "[subagent chain]";
@@ -487,22 +732,30 @@ function batchPayloadQuota(identities: ChildIdentity[]): number {
   const delivery = deliveryFor(envelope);
   const message = { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), display: true, timestamp: Date.now(), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } };
   const overhead = Buffer.byteLength(JSON.stringify({ type: "message_end", message }));
-  const quota = Math.floor((RECORD_LIMIT - overhead - 4096 - identities.length * 256) / identities.length);
+  const quota = Math.floor((RECORD_LIMIT - overhead - 4096 - identities.length * 4096) / identities.length);
   if (quota < 0) throw new Error("subagent batch identity exceeds JSONL transport budget");
-  return quota;
+  return identities.length >= 16 ? Math.min(quota, 8192) : quota;
 }
 export function boundBatchResult(result: ResultEnvelope, identities: ChildIdentity[]): ResultEnvelope {
   const budget = resultWireCost(emptyBatchResult(result.identity)) + batchPayloadQuota(identities);
-  if (resultWireCost(result) <= budget) return result;
-  if (result.identity.agent === "task-reviewer") return { ...result, payloadOutcome: "output_limit", payload: "", reviewVerdict: null, outputLimit: "batch_transport" };
+  if (resultWireCost(result) <= budget) return structuredClone(result);
   const characters = Array.from(result.payload);
   let low = 0;
   let high = characters.length;
-  const limited = (end: number) => ({ ...result, payload: characters.slice(0, end).join("") + "\n[Output truncated: batch transport budget]" });
+  const limited = (end: number): ResultEnvelope => {
+    const payload = end > 0 ? characters.slice(0, end).join("") + "\n[Output truncated: batch transport budget]" : "";
+    return {
+      ...result,
+      identity: copyIdentity(result.identity),
+      payload,
+      ...(result.diagnostics ? { diagnostics: { ...copyDiagnostics(result.diagnostics)!, final: { ...result.diagnostics.final, previewBytes: Buffer.byteLength(payload), previewHash: sha256(payload), truncated: Buffer.byteLength(payload) !== result.diagnostics.final.bytes || sha256(payload) !== result.diagnostics.final.hash } } } : {}),
+    };
+  };
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
     if (resultWireCost(limited(middle)) <= budget) low = middle;
     else high = middle - 1;
   }
-  return limited(low);
+  const bounded = limited(low);
+  return resultWireCost(bounded) <= budget ? bounded : limited(0);
 }

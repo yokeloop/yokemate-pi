@@ -186,6 +186,10 @@ export function recordPublicationBlock(db: DatabaseSync, ticket: string, runId: 
   db.prepare("INSERT OR IGNORE INTO plan_publication_block (ticket,run_id,reason) VALUES (?,?,?)").run(ticket, runId, reason);
 }
 
+export function revokePendingPlanRecords(db: DatabaseSync, ticket: string): void {
+  db.prepare("UPDATE plan_record SET scout_acceptance=NULL,updated_at=datetime('now') WHERE ticket=? AND successful_record=0 AND scout_acceptance IS NOT NULL").run(ticket);
+}
+
 export function publicationById(db: DatabaseSync, id: number): PublicationRow | undefined {
   return db.prepare("SELECT * FROM plan_publication WHERE id=?").get(id) as unknown as PublicationRow | undefined;
 }

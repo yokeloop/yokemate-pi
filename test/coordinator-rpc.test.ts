@@ -281,18 +281,18 @@ test("blocked teardown after unexpected exit preserves the completed parent snap
     await rpc.request({ type: "prompt", message: "work" });
     await complete;
     await rpc.stop();
-    const file = join(folder, "reviewer-runs/run-1-run-1.json");
+    const file = join(root, "sessions/subagent-runs/run-1-run-1.json");
     const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
-    assert.equal(snapshot.completed, true);
-    assert.equal(snapshot.exitCode, 9);
-    assert.equal(snapshot.cancellationInitiator, "unknown");
+    assert.equal(snapshot.lifecycle.processClosed, true);
+    assert.equal(snapshot.process.exitCode, 9);
+    assert.equal(snapshot.process.cancellationInitiator, "unknown");
     assert.ok(diagnostics.some((entry) => entry.completed));
     const terminalDiagnostic = rpc.diagnosticSnapshot();
     assert.equal(terminalDiagnostic.exitCode, 9);
     assert.equal((terminalDiagnostic.stderr as any).bytes, Buffer.byteLength("private coordinator sentinel"));
     assert.doesNotMatch(JSON.stringify(terminalDiagnostic), /private coordinator sentinel/);
-    const snapshots = new RunSnapshots(root, plan);
-    for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, {}, true);
+    const snapshots = new RunSnapshots(root);
+    for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, { closeAt: new Date().toISOString(), terminal: { processOutcome: "exited", exitCode: 0, signal: null }, noDeliveriesExpected: true }, true);
     assert.equal(fs.existsSync(file), false);
   } finally { await rpc?.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });

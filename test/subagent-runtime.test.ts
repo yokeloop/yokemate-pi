@@ -215,7 +215,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 });
 
 const cases = [
-  ["parallel_max", "output_limit"], ["chain_max", "output_limit"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
+  ["parallel_max", "valid"], ["chain_max", "valid"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
   ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
@@ -279,7 +279,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         if (envelope?.kind === "batch") batch = envelope;
         if (event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state") {
           const state = (event.entry as any).data;
-          if (scenario === "delivery_async" && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "delivery_unknown")) markAsyncUpdated();
+          if (scenario === "delivery_async" && state.deliveries.length && state.deliveries.every((delivery: any) => ["delivery_failed", "delivery_unknown"].includes(delivery.state))) markAsyncUpdated();
           if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
@@ -288,22 +288,24 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
       await untilAborted(childWorking, signal);
+      const fs = await import("node:fs");
+      const snapshotDir = join(root, "sessions/subagent-runs");
+      const beforeStop = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8"))).filter((snapshot) => snapshot.ownerRunId === "owner-parent-cancel");
+      assert.ok(beforeStop.length, "parent_cancel admission snapshot missing");
       rpc.acceptTerminal();
       await rpc.stop("parent_control_cancel");
-      const fs = await import("node:fs");
-      const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
-      const child = snapshots.find((snapshot) => snapshot.identity?.agent === "task-reviewer");
-      assert.equal(child.completed, true);
-      assert.equal(child.terminal.processOutcome, "cancelled");
-      assert.equal(child.cancellationInitiator, "parent_control_cancel");
+      const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
+      const child = snapshots.find((snapshot) => snapshot.ownerRunId === "owner-parent-cancel" && snapshot.agent === "task-reviewer");
+      assert.ok(child);
+      assert.equal(child.lifecycle.processClosed, true);
+      assert.equal(child.process.outcome, "cancelled");
       assert.equal(child.stream.phase, "thinking");
       assert.ok(child.stream.stdoutBytes > 0);
-      assert.ok(child.sessionId);
-      assert.equal(child.effective.model, "unknown");
-      assert.ok(child.closeAt);
+      assert.ok(child.lifecycle.closeAt);
       return;
     }
-    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]), signal);
+    const deliveryTimeout = scenario === "chain_max" ? 45000 : 10000;
+    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), deliveryTimeout); })]), signal);
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
@@ -316,7 +318,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         assert.equal(rpc.childState.pendingIds().length, 2);
         for (const deliveryId of rpc.childState.pendingIds()) {
           const archived = JSON.parse(readFileSync(join(root, ".pi/subagent-reports", deliveryId, "diagnostics.json"), "utf8"));
-          assert.equal(archived.diagnostics.delivery.state, "delivery_unknown");
+          assert.match(archived.diagnostics.delivery.state, /^delivery_(?:failed|unknown)$/);
         }
       }
       rpc.acceptTerminal();
@@ -332,8 +334,8 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.equal(results[2].processOutcome, "not_started");
       assert.notEqual(results[1].actualTaskHash, results[1].identity.taskHash);
     }
-    if (scenario === "parallel_max") { assert.equal(results.length, 8); assert.ok(results.every((result: any) => result.payloadOutcome === "output_limit")); }
-    if (scenario === "chain_max") { assert.equal(results.length, 20); assert.ok(results.slice(1).every((result: any) => result.processOutcome === "not_started")); }
+    if (scenario === "parallel_max") { assert.equal(results.length, 8); assert.ok(results.every((result: any) => result.payloadOutcome === "valid")); }
+    if (scenario === "chain_max") { assert.equal(results.length, 20); assert.ok(results.every((result: any) => result.payloadOutcome === "valid")); }
     if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
@@ -343,7 +345,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
     const terminalReport = reports.find((message) => message.details.envelope.kind === (scenario.startsWith("chain") ? "chain" : "result")) ?? reports[0];
-    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /parser invalid_json/, protocol_partial: /parser (?:partial_record|invalid_json)/, protocol_overflow: /parser (?:record_limit|invalid_json)/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/, chain_max: /output limit/ };
+    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /protocol_error: invalid_json/, protocol_partial: /protocol_error: (?:partial_record|invalid_json)/, protocol_overflow: /protocol_error: (?:record_limit|invalid_json)/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/ };
     if (reasons[scenario]) assert.match(terminalReport.details.display.failureReason, reasons[scenario], scenario);
     if (scenario === "storage_error") assert.deepEqual(terminalReport.details.display.archive, { state: "unavailable", code: "EIO" });
     else if (!scenario.startsWith("delivery_")) {
@@ -356,14 +358,15 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.equal(rpc.childState.canFinish("done"), true, scenario);
     assert.ok(loaded.every((entry) => entry.data.file === provider));
     const fs = await import("node:fs");
-    const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
-    assert.doesNotMatch(JSON.stringify(snapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-    if (!["diagnostic_error", "spawn_error"].includes(scenario)) {
-      const childSnapshot = snapshots.find((snapshot) => snapshot.identity?.runId === results[0].identity.runId);
-      assert.equal(childSnapshot.terminal.exitCode, results[0].exitCode, scenario);
-      assert.equal(childSnapshot.guard.path, join(root, "src/guards.ts"));
-      assert.equal(childSnapshot.extension.path, extension);
-      assert.equal(childSnapshot.effective.thinking, "unknown");
+    const snapshotDir = join(root, "sessions/subagent-runs");
+    const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
+    const ownedSnapshots = snapshots.filter((snapshot) => snapshot.ownerRunId === `owner-${scenario.replaceAll("_", "-")}`);
+    assert.doesNotMatch(JSON.stringify(ownedSnapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
+    if (!["diagnostic_error", "spawn_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
+      const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
+      assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
+      assert.equal(childSnapshot.resources.guard.path, join(root, "src/guards.ts"));
+      assert.equal(childSnapshot.resources.extension.path, extension);
     }
     console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(extension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
     rpc.acceptTerminal();

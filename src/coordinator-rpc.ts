@@ -1,6 +1,6 @@
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { RuntimeIdentity } from "./coordinator-runtime.ts";
@@ -22,7 +22,21 @@ function processParent(pid: number): number | undefined {
     return Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[1]);
   } catch { return undefined; }
 }
-function piInvocation(args: string[]): { command: string; args: string[] } { const script = process.argv[1]; return script && !script.startsWith("/$bunfs/") ? { command: process.execPath, args: [script, ...args] } : { command: "pi", args }; }
+function piInvocation(args: string[], root: string): { command: string; args: string[] } {
+  const packageRoot = realpathSync(join(root, "node_modules", "@earendil-works", "pi-coding-agent"));
+  const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  if (manifest.version !== "0.85.1") throw new Error("pinned Pi 0.85.1 is unavailable");
+  const contract = readFileSync(join(packageRoot, "dist", "modes", "json-event.js"), "utf8");
+  if (!contract.includes("YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1")) throw new Error("pinned Pi JSON contract patch is unavailable");
+  const cli = realpathSync(join(packageRoot, "dist", "cli.js"));
+  const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  if (relay && process.env.NODE_TEST_CONTEXT) {
+    const canonicalRelay = realpathSync(relay);
+    if (canonicalRelay.split("/").at(-1) !== "subagent-json-relay.mjs") throw new Error("invalid test JSON relay");
+    return { command: process.execPath, args: [canonicalRelay, cli, ...args] };
+  }
+  return { command: process.execPath, args: [cli, ...args] };
+}
 export function coordinatorInvocationArgs(prepared: Pick<PreparedCoordinator, "mode" | "model" | "cwd" | "skillsPath" | "resourcesPath">): string[] {
   const definition = join(prepared.resourcesPath, ".pi", "agents", `${prepared.mode}-coordinator.md`);
   return ["--mode", "rpc", "--session-dir", join(prepared.cwd, "sessions"), "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition];
@@ -42,23 +56,24 @@ function invalidState(reason: string): string { return `coordinator invalid stat
 export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: RuntimeIdentity, expected: ExpectedCoordinatorModel, callbacks: RpcCallbacks = {}, options: CoordinatorRpcOptions = {}): CoordinatorRpc {
   const definition = join(prepared.resourcesPath, ".pi", "agents", `${prepared.mode}-coordinator.md`);
   if (!existsSync(definition)) throw new Error(`coordinator definition is missing: ${definition}`);
-  const invocation = options.invocation ?? piInvocation(coordinatorInvocationArgs(prepared));
+  const invocation = options.invocation ?? piInvocation(coordinatorInvocationArgs(prepared), prepared.resourcesPath);
   const log = openLog(prepared.cwd, `coordinator-${identity.runId}.log`);
   log?.(`[start ${new Date().toISOString()}] ${invocation.command} ${invocation.args.join(" ")}\n`);
-  const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project) };
+  const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project), YOKEMATE_SUBAGENT_JSON_CONTRACT: "1" };
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
+  const snapshots = new RunSnapshots(prepared.resourcesPath);
+  const metadata: Record<string, unknown> = { identity: { ownerSessionId: identity.parentSessionId, batchId: identity.runId, agent: `${identity.mode}-coordinator`, ticket: identity.ticket, taskHash: sha256(prepared.prompt) }, admissionAt: new Date().toISOString(), requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown", deliveries: {}, noDeliveriesExpected: true };
+  metadata.snapshotStorage = snapshots.write(identity.runId, identity.runId, metadata, false);
   const child = spawn(invocation.command, invocation.args, { cwd: prepared.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
   const childState = new OwnedChildState(identity.runId, child.pid ?? -1, child.pid ? processStarttime(child.pid) ?? "" : "");
-  let snapshots: RunSnapshots | undefined;
-  try { if (prepared.plan) snapshots = new RunSnapshots(prepared.resourcesPath, prepared.plan); } catch { console.error("[coordinator] diagnostic initialization failed"); }
-  const metadata: Record<string, unknown> = { pid: child.pid, starttime: child.pid ? processStarttime(child.pid) : undefined, cwd: prepared.cwd, spawnAt: new Date().toISOString(), requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown" };
+  Object.assign(metadata, { pid: child.pid, starttime: child.pid ? processStarttime(child.pid) : undefined, spawnAt: new Date().toISOString() });
   const stderrHash = createHash("sha256");
   let stderrBytes = 0;
   let stderrFinalHash: string | undefined;
   let observation: JsonlObservation | undefined;
   const diagnosticSnapshot = (): Record<string, unknown> => structuredClone({ ...metadata, stream: observation?.metadata() ?? metadata.stream, stderr: { bytes: stderrBytes, hash: stderrFinalHash ?? stderrHash.copy().digest("hex") } });
-  const save = (completed: boolean) => { snapshots?.write(identity.runId, identity.runId, metadata, completed); callbacks.onDiagnostic?.(diagnosticSnapshot(), completed); };
+  const save = (completed: boolean) => { metadata.snapshotStorage = snapshots.write(identity.runId, identity.runId, metadata, completed); callbacks.onDiagnostic?.(diagnosticSnapshot(), completed); };
   save(false);
   const owned = new Map<number, string>();
   const captureOwned = () => {
@@ -205,7 +220,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   observation = new JsonlObservation((event) => emit(event as RpcEvent));
   child.stdout.on("data", (chunk: Buffer) => { observation!.write(chunk); if (!stopping && observation!.protocolError) fail("coordinator RPC protocol_error"); });
   child.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; stderrHash.update(chunk); });
-  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; stderrFinalHash = stderrHash.copy().digest("hex"); metadata.stderr = { bytes: stderrBytes, hash: stderrFinalHash }; observation!.end(); metadata.stream = observation!.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (!stopping && observation!.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!stopping && !terminal && !blocked) fail("coordinator RPC exited without outcome"); });
+  child.on("close", (code, signal) => { closed = true; metadata.closeAt = new Date().toISOString(); metadata.exitCode = code; metadata.signal = signal; metadata.terminal = { processOutcome: signal ? "signaled" : "exited", exitCode: code, signal, stopReason: terminal ? "stop" : "unexpected_exit" }; stderrFinalHash = stderrHash.copy().digest("hex"); metadata.stderr = { bytes: stderrBytes, hash: stderrFinalHash }; observation!.end(); metadata.stream = observation!.metadata(); save(true); log?.(`[close ${new Date().toISOString()}] code=${code} signal=${signal}\n`); clearTimeout(readyTimer); if (!stopping && observation!.protocolError) fail("RPC EOF or malformed JSONL record"); else if (!stopping && !terminal && !blocked) fail("coordinator RPC exited without outcome"); });
   child.on("error", (error) => { metadata.spawnError = errorMetadata(error); save(false); fail("coordinator RPC spawn error"); });
   send({ id: `${identity.runId}:commands`, type: "get_commands" });
   const stop = (reason = "parent_rpc_stop") => stopPromise ??= new Promise<void>((resolve) => {

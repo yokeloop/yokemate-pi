@@ -31,7 +31,7 @@ test("briefs and concrete failure reasons are display-only and bounded", () => {
     [{ ...base, processOutcome: "signaled" as const, signal: "SIGTERM", payloadOutcome: "incomplete" as const }, {}, "signal SIGTERM"],
     [{ ...base, processOutcome: "spawn_error" as const, payloadOutcome: "incomplete" as const }, { spawnError: { class: "ENOENT" } }, "spawn ENOENT"],
     [{ ...base, processOutcome: "exited" as const, exitCode: 7, payloadOutcome: "incomplete" as const }, {}, "exit 7"],
-    [{ ...base, payloadOutcome: "protocol_error" as const }, { stream: { parserErrors: 2, lastParserError: { kind: "invalid_json", offset: 12 } } }, "parser invalid_json at 12 (2)"],
+    [{ ...base, payloadOutcome: "protocol_error" as const }, { stream: { parserErrors: 2, lastParserError: { kind: "invalid_json", offset: 12 } } }, "protocol_error: invalid_json at byte 12 (2 parser errors)"],
     [{ ...base, payloadOutcome: "output_limit" as const, outputLimit: "batch_transport" as const }, {}, "output limit: batch_transport"],
     [{ ...base, processOutcome: "not_started" as const, payloadOutcome: "incomplete" as const }, {}, "not started"],
   ] as const;
@@ -156,7 +156,7 @@ test("expanded batches summarize members without repeating result or chain paylo
   assert.equal(expanded.split("EXACT CHAIN PAYLOAD").length - 1, 1);
   assert.match(expand(singleBatch), /member #1 · worker · .* · done · 0:01 · single task$/m);
   assert.match(expand(chainBatch), /member #1 · worker · .* · done · 0:02 · chain first$/m);
-  assert.match(expand(chainBatch), /member #2 · worker · .* · not_started · 0:03 · chain skipped$/m);
+  assert.match(expand(chainBatch), /member #2 · worker · .* · not_started · 0:03 · chain skipped · not started$/m);
   assert.doesNotMatch(expand(singleBatch), /EXACT SINGLE PAYLOAD|"envelope"/);
   assert.doesNotMatch(expand(chainBatch), /EXACT CHAIN PAYLOAD|"envelope"/);
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -28,13 +28,18 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
   const previousMode = process.env.YOKEMATE_MODE;
   const previousRole = process.env.YOKEMATE_ROLE;
   const previousRunId = process.env.YOKEMATE_RUN_ID;
+  const previousRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const previousTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
   let shutdown: (() => Promise<void>) | undefined;
   try {
     delete process.env.YOKEMATE_MODE;
     delete process.env.YOKEMATE_ROLE;
     process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO = scenario;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = coordinatorChild;
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi/extensions/subagent"), join(dir, ".pi/extensions/subagent"), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi/agents/do"), { recursive: true });
     mkdirSync(join(dir, "home/knowledge/org/repo/ai/YM-1-work"), { recursive: true });
     writeFileSync(join(dir, ".pi/settings.json"), "{}");
@@ -59,7 +64,6 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     for (const handler of loadedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of loadedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     for (const handler of loadedExtension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "/do YM-1" } as never, { ...ctx, mode: "tui" });
-    process.argv[1] = coordinatorChild;
     const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent");
     assert.ok(tool);
     const accepted = await tool.definition.execute(`coordinator-${scenario}`, { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
@@ -80,7 +84,8 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     const terminalReports = () => sent.filter((entry) => entry.message.customType === "subagent-report");
     await waitFor(() => terminalReports().length === 1);
     const terminal = terminalReports()[0]!;
-    assert.deepEqual(terminal.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.equal(terminal.options.deliverAs, "followUp");
+    assert.equal(terminal.options.triggerTurn, true);
     assert.equal(terminal.message.customType, "subagent-report");
     assert.equal(terminal.message.display, true);
     assert.equal(terminal.message.details.mode, "do");
@@ -106,6 +111,8 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     if (previousMode === undefined) delete process.env.YOKEMATE_MODE; else process.env.YOKEMATE_MODE = previousMode;
     if (previousRole === undefined) delete process.env.YOKEMATE_ROLE; else process.env.YOKEMATE_ROLE = previousRole;
     if (previousRunId === undefined) delete process.env.YOKEMATE_RUN_ID; else process.env.YOKEMATE_RUN_ID = previousRunId;
+    if (previousRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = previousRelay;
+    if (previousTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = previousTarget;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -122,6 +129,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
   const agentDir = join(dir, "agent");
   const originalArgv = process.argv[1];
   const originalCwd = process.cwd();
+  const originalRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const originalTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
   const sent: { message: any; options: any }[] = [];
   let providerTurns = 0;
   try {
@@ -147,7 +156,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.ok(tool);
     const ctx = { cwd: dir, mode: "rpc", hasUI: false, model: undefined, thinkingLevel: "off", ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "loader-session" } } as unknown as ExtensionContext;
     process.chdir(dir);
-    process.argv[1] = child;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = child;
     const ack = await tool.definition.execute("loader-batch", { agent: "worker", task: "produce multiline canonical output" }, undefined, () => undefined, ctx);
     assert.match((ack.content[0] as any).text, /^Detached, not terminal: /);
     const parsedAck = JSON.parse((ack.content[0] as any).text.slice("Detached, not terminal: ".length));
@@ -155,10 +165,7 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.equal((ack.details as any).display.members[0].taskExcerpt, "produce multiline canoni");
     await waitFor(() => sent.length === 2);
     assert.equal(sent.length, 2);
-    assert.deepEqual(sent.map((entry) => entry.options), [
-      { deliverAs: "followUp", triggerTurn: true },
-      { deliverAs: "followUp", triggerTurn: true },
-    ]);
+    assert.ok(sent.every((entry) => entry.options.deliverAs === "followUp" && entry.options.triggerTurn === true && typeof entry.options.yokemateSendId === "string" && typeof entry.options.onYokemateSendError === "function"));
     const assertCanonicalReports = (entries: typeof sent) => {
       for (const { message, options } of entries) {
         const envelope = message.details.envelope as ReportEnvelope;
@@ -168,7 +175,10 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
         assert.equal(message.customType, "subagent-report");
         assert.equal(message.display, true);
         assert.equal(message.details.display.version, 1);
-        assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+        assert.equal(options.deliverAs, "followUp");
+        assert.equal(options.triggerTurn, true);
+        assert.equal(options.yokemateSendId, delivery.deliveryId);
+        assert.equal(typeof options.onYokemateSendError, "function");
         assert.equal(readFileSync(message.details.display.archive.reportPath, "utf8"), message.content);
         assert.equal(message.details.display.archive.reportBytes, Buffer.byteLength(message.content));
         assert.equal(message.details.display.archive.reportHash, sha256(message.content));
@@ -250,6 +260,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
   } finally {
     process.argv[1] = originalArgv;
     process.chdir(originalCwd);
+    if (originalRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = originalRelay;
+    if (originalTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = originalTarget;
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -28,6 +28,20 @@ test("identities distinguish same-name siblings and batches; duplicate and forei
   assert.deepEqual(runs.active().map((child) => child.identity.batchId), ["B"]);
 });
 
+test("settlement and batch snapshots are immutable from caller mutation", () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("immutable", [{ agent: "worker", task: "task" }], cwd).children[0]!.identity;
+  const result = resultEnvelope(identity, "task", clean, "original");
+  assert.equal(runs.settle(result), true);
+  result.payload = "mutated";
+  result.identity.agent = "changed";
+  const first = runs.batch("immutable")!;
+  assert.equal(first.results[0]!.payload, "original");
+  assert.equal(first.results[0]!.identity.agent, "worker");
+  first.results[0]!.payload = "batch mutation";
+  assert.equal(runs.batch("immutable")!.results[0]!.payload, "original");
+});
+
 test("plan scouts require an explicit or stamped ticket and keep it in correlation identity", () => {
   assert.throws(() => new ChildRuns("owner", "session").admit("missing", [{ agent: "plan-scout", task: "scout" }], cwd), /ticket binding/);
   const stamped = new ChildRuns("owner", "session", "YM-1");
@@ -36,6 +50,21 @@ test("plan scouts require an explicit or stamped ticket and keep it in correlati
   assert.throws(() => stamped.admit("foreign", [{ agent: "plan-scout", task: "scout", ticket: "YM-2" }], cwd), /differs/);
   const problem = new ChildRuns("owner", "session").admit("problem", [{ agent: "plan-scout", task: "scout", ticket: "YM-3" }], cwd);
   assert.equal(problem.children[0]!.identity.ticket, "YM-3");
+});
+
+test("current accepted scout gates plan writers and a newer scout revokes prior permission", () => {
+  const runs = new ChildRuns("owner", "session", "YM-1");
+  assert.throws(() => new ChildRuns("owner", "session").admit("writer-unbound", [{ agent: "plan-writer", task: "write" }], cwd), /ticket binding/);
+  assert.throws(() => runs.admit("writer-early", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
+  const first = runs.admit("scout-one", [{ agent: "plan-scout", task: "scout one" }], cwd).children[0]!.identity;
+  const accepted = resultEnvelope(first, "scout one", clean, "# Scout");
+  accepted.artifact = { state: "accepted", path: "/artifact", hash: "a".repeat(64), bytes: 7, acceptanceId: 1 };
+  assert.equal(runs.settle(accepted), true);
+  assert.equal(runs.admit("writer-one", [{ agent: "plan-writer", task: "write" }], cwd).children[0]!.identity.ticket, "YM-1");
+  const newer = runs.admit("scout-two", [{ agent: "plan-scout", task: "scout two" }], cwd).children[0]!.identity;
+  assert.throws(() => runs.admit("writer-revoked", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
+  assert.equal(runs.settle(resultEnvelope(newer, "scout two", { ...clean, protocolError: true }, "beautiful final")), true);
+  assert.throws(() => runs.admit("writer-after-fault", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
 });
 
 test("review revisions are validated before admission and template hashes survive chain substitution", () => {
@@ -98,6 +127,93 @@ test("JSONL framing reports malformed, unfinished and overflow records without r
   }
 });
 
+test("parser facts are byte-exact, cumulative and preserve authoritative final hashes", async () => {
+  const { JsonlObservation, sha256 } = await import("../src/subagent-runs.ts");
+  const record = (bytes: number) => {
+    const prefix = '{"type":"future_event","pad":"';
+    const suffix = '"}';
+    return Buffer.from(prefix + "x".repeat(bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)) + suffix);
+  };
+  const exact = new JsonlObservation();
+  const exactWire = Buffer.concat([record(1024 * 1024), Buffer.from("\r\n")]);
+  for (let offset = 0; offset < exactWire.length; offset += 8191) exact.write(exactWire.subarray(offset, offset + 8191));
+  exact.end();
+  assert.equal(exact.protocolError, false);
+  assert.equal(exact.metadata().events.other, 1);
+  assert.equal(exact.metadata().stdoutBytes, exactWire.length);
+  assert.equal(exact.metadata().stdoutHash, sha256(exactWire));
+
+  const tooLarge = new JsonlObservation();
+  tooLarge.write(Buffer.concat([record(1024 * 1024 + 1), Buffer.from("\n")]))
+  tooLarge.end();
+  assert.deepEqual(tooLarge.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+  assert.equal(tooLarge.metadata().parserErrorCounters.record_limit, 1);
+
+  const overflowEof = new JsonlObservation();
+  overflowEof.write(record(1024 * 1024 + 2));
+  overflowEof.end();
+  overflowEof.end();
+  assert.deepEqual(overflowEof.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+  assert.deepEqual(overflowEof.metadata().lastParserError, { kind: "partial_record", offset: 0 });
+  assert.deepEqual(overflowEof.metadata().parserErrorCounters, { invalid_json: 0, invalid_event: 0, record_limit: 1, partial_record: 1 });
+
+  const mixed = new JsonlObservation();
+  const finalText = "é日🙂tail";
+  const final = Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText }], stopReason: "stop" } }) + "\n");
+  const wire = Buffer.concat([Buffer.from("junk\n{}\n{\"type\":\"future\"}\n"), final]);
+  for (const byte of wire) mixed.write(Buffer.from([byte]));
+  mixed.end();
+  assert.equal(mixed.finalText, finalText);
+  assert.equal(mixed.metadata().assistantMessageSeen, true);
+  assert.equal(mixed.metadata().finalTextPresent, true);
+  assert.equal(mixed.metadata().events.other, 1);
+  assert.deepEqual(mixed.metadata().parserErrorCounters, { invalid_json: 1, invalid_event: 1, record_limit: 0, partial_record: 0 });
+  assert.deepEqual(mixed.metadata().firstParserError, { kind: "invalid_json", offset: 0 });
+  assert.deepEqual(mixed.metadata().lastParserError, { kind: "invalid_event", offset: 5 });
+  assert.equal(mixed.metadata().stdoutHash, sha256(wire));
+
+  const completeWithoutLf = new JsonlObservation();
+  completeWithoutLf.write(final.subarray(0, -1));
+  completeWithoutLf.end();
+  assert.equal(completeWithoutLf.metadata().assistantMessageSeen, false);
+  assert.deepEqual(completeWithoutLf.metadata().lastParserError, { kind: "partial_record", offset: 0 });
+});
+
+test("patched producer summarizes only oversized agent_end messages and parser validates the summary", async () => {
+  const { JsonlObservation, sha256 } = await import("../src/subagent-runs.ts");
+  const { toJsonEvent, YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/json-event.js");
+  assert.equal(YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION, 1);
+  const small = { type: "agent_end", messages: [{ role: "user", content: "small" }], willRetry: false } as any;
+  const smallCopy = structuredClone(small);
+  assert.equal(toJsonEvent(small, { yokemateSubagentJsonContract: 1 }), small);
+  assert.equal(JSON.stringify(toJsonEvent(small, { yokemateSubagentJsonContract: 1 })), JSON.stringify(small));
+  assert.deepEqual(small, smallCopy);
+
+  const messages = [{ role: "user", content: "é".repeat(600_000) }, { role: "assistant", content: "tail" }];
+  const large = { type: "agent_end", messages, willRetry: true } as any;
+  const summarized = toJsonEvent(large, { yokemateSubagentJsonContract: 1 }) as any;
+  const serializedMessages = JSON.stringify(messages);
+  assert.equal(summarized.messages, undefined);
+  assert.deepEqual(summarized.messagesSummary, { version: 1, count: 2, bytes: Buffer.byteLength(serializedMessages), sha256: sha256(serializedMessages) });
+  assert.equal(summarized.willRetry, true);
+  assert.equal(large.messages, messages);
+
+  const valid = new JsonlObservation();
+  valid.write(Buffer.from(JSON.stringify(summarized) + "\n"));
+  valid.end();
+  assert.equal(valid.protocolError, false);
+  for (const bad of [
+    { ...summarized, messages: [{ role: "user", content: "small" }] },
+    { ...summarized, messagesSummary: { ...summarized.messagesSummary, version: 2 } },
+    { ...summarized, messagesSummary: { ...summarized.messagesSummary, sha256: "A".repeat(64) } },
+  ]) {
+    const observed = new JsonlObservation();
+    observed.write(Buffer.from(JSON.stringify(bad) + "\n"));
+    observed.end();
+    assert.deepEqual(observed.metadata().lastParserError, { kind: "invalid_event", offset: 0 });
+  }
+});
+
 test("tool and retry remain incomplete until their actual end events", async () => {
   const { JsonlObservation } = await import("../src/subagent-runs.ts");
   const observed = new JsonlObservation();
@@ -112,37 +228,42 @@ test("tool and retry remain incomplete until their actual end events", async () 
   assert.doesNotMatch(JSON.stringify(observed.metadata()), /private/);
 });
 
-test("metadata snapshots are private, bounded, retain active runs and survive write/rename/prune faults", async () => {
+test("ordinary snapshots are private, bounded, locked and protect active delivery lifecycles", async () => {
   const fs = (await import("node:fs")).default;
   const path = await import("node:path");
   const { tmpdir } = await import("node:os");
-  const { RunSnapshots, errorMetadata } = await import("../src/subagent-runs.ts");
-  const root = fs.mkdtempSync(path.join(tmpdir(), "ym204-snapshots-"));
-  const folder = path.join(root, "home/knowledge/org/repo/ai/task");
-  fs.mkdirSync(folder, { recursive: true });
-  const plan = path.join(folder, "plan.md");
-  fs.writeFileSync(plan, "plan");
-  const dir = path.join(folder, "reviewer-runs");
+  const { RunSnapshots } = await import("../src/subagent-runs.ts");
+  const root = fs.mkdtempSync(path.join(tmpdir(), "ym226-snapshots-"));
+  const activeRoot = path.join(root, "active");
   try {
-    const snapshots = new RunSnapshots(root, plan);
-    assert.equal(snapshots.write("owner", "active", { error: errorMetadata(new Error("private credentials")) }, false), true);
-    for (let i = 0; i < 24; i++) assert.equal(snapshots.write("owner", `run-${i}`, {}, true), true);
-    assert.equal(fs.readdirSync(dir).length, 21);
+    const snapshots = new RunSnapshots(activeRoot);
+    const identity = { ownerSessionId: "session", batchId: "batch", agent: "worker", taskHash: "a".repeat(64) };
+    assert.deepEqual(snapshots.write("owner", "active", { identity, rawPrompt: "private sentinel", deliveries: {} }, false), { state: "available" });
+    const dir = path.join(activeRoot, "sessions/subagent-runs");
     const active = fs.readFileSync(path.join(dir, "owner-active.json"), "utf8");
-    assert.doesNotMatch(active, /private credentials/);
+    assert.doesNotMatch(active, /private sentinel|rawPrompt/);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(path.join(dir, "owner-active.json")).mode & 0o777, 0o600);
-    for (const method of ["writeFileSync", "renameSync", "unlinkSync"] as const) {
-      const writer = new RunSnapshots(root, plan);
-      assert.equal(writer.write("owner", `fill-${method}`, {}, true), true);
-      const original = fs[method];
-      (fs as any)[method] = () => { throw new Error("injected private failure"); };
-      try { assert.equal(writer.write("owner", `fault-${method}`, {}, true), false); }
-      finally { (fs as any)[method] = original; }
+    for (let i = 0; i < 39; i++) assert.equal(snapshots.write("owner", `active-${i}`, { identity, deliveries: {} }, false).state, "available");
+    assert.deepEqual(snapshots.write("owner", "protected-overflow", { identity, deliveries: {} }, false), { state: "unavailable", code: "storage_limit" });
+    assert.equal(fs.readdirSync(dir).filter((name: string) => name.endsWith(".json")).length, 40);
+
+    const completedRoot = path.join(root, "completed");
+    const completed = new RunSnapshots(completedRoot);
+    for (let i = 0; i < 24; i++) {
+      const delivery = "b".repeat(62) + i.toString(16).padStart(2, "0");
+      const status = completed.write("owner", `run-${i}`, { identity, closeAt: new Date().toISOString(), terminal: { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, deliveries: { [delivery]: { state: "observed", envelopeHash: "c".repeat(64), observedAt: new Date().toISOString() } }, arbitrary: "private sentinel" }, true);
+      assert.equal(status.state, "available");
     }
-    assert.equal(fs.existsSync(path.join(dir, "owner-active.json")), true);
-    assert.throws(() => new RunSnapshots(root, path.join(root, "plan.md")), /invalid reviewer/);
-    const limit = new RunSnapshots(root, plan);
-    assert.equal(limit.write("owner", "oversize", { tooLarge: "x".repeat(PAYLOAD_LIMIT) }, true), false);
+    const completedDir = path.join(completedRoot, "sessions/subagent-runs");
+    assert.equal(fs.readdirSync(completedDir).filter((name: string) => name.endsWith(".json")).length, 20);
+    assert.doesNotMatch(fs.readFileSync(path.join(completedDir, fs.readdirSync(completedDir).find((name: string) => name.endsWith(".json"))!), "utf8"), /private sentinel/);
+
+    const liveLockRoot = path.join(root, "live-lock");
+    const liveLock = new RunSnapshots(liveLockRoot, { pid: 42, processStarttime: () => "live" });
+    fs.mkdirSync(liveLock.directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(liveLock.directory, ".lock"), JSON.stringify({ pid: 41, starttime: "live" }), { mode: 0o600 });
+    assert.deepEqual(liveLock.write("owner", "blocked", { identity }, false), { state: "unavailable", code: "storage_busy" });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -179,7 +300,8 @@ test("aggregate framing budgets account for escaped content and details without 
     const payload = JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: character.repeat(character === "x" ? 48000 : 24000), fix: "fixture" }] });
     assert.ok(Buffer.byteLength(payload) < PAYLOAD_LIMIT);
     const results = ack.children.map(({ identity }) => boundBatchResult(resultEnvelope(identity, task.task, clean, payload), ack.children.map((child) => child.identity)));
-    assert.ok(results.every((result) => result.payloadOutcome === (character === "x" ? "valid" : "output_limit")));
+    assert.ok(results.every((result) => result.payloadOutcome === "valid"));
+    if (character === '"') assert.ok(results.every((result) => Buffer.byteLength(result.payload) < Buffer.byteLength(payload)));
     for (const result of results) assert.equal(runs.settle(result), true);
     const envelope = runs.batch("maximum")!;
     assert.deepEqual(envelope.results, results);
