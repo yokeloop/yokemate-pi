@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { policyWorkflowBoundary, type WorkflowBoundary } from "./workflow-boundaries.ts";
 
 export const ENGINE_ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -75,7 +76,7 @@ export function resolveGuardPolicy(value: unknown, source = "<settings>"): Guard
 export function formatGuardPolicy({ source, policy, limits }: RuntimeSettings): string {
   const enabled = GUARD_IDS.filter((id) => policy.guards[id]).join(", ") || "none";
   const disabled = GUARD_IDS.filter((id) => !policy.guards[id]).join(", ") || "none";
-  return `Runtime settings: ${source}; maxParallelTasks=${limits.maxParallelTasks}; maxConcurrency=${limits.maxConcurrency}; maxDetached=${limits.maxDetached}; yolo=${policy.yolo}; workflowApproval=${policy.workflowApproval}; enabled=${enabled}; disabled=${disabled}. False settings never widen the current engineer request. Only verified parent interactive input can create initial do or ship authority. Immutable boundaries: assigned scope, quality gates, ready-PR reporting, explicit /ship for merge, external authentication, and required data remain mandatory.`;
+  return `Runtime settings: ${source}; maxParallelTasks=${limits.maxParallelTasks}; maxConcurrency=${limits.maxConcurrency}; maxDetached=${limits.maxDetached}; yolo=${policy.yolo}; workflowApproval=${policy.workflowApproval}; enabled=${enabled}; disabled=${disabled}. Policy settings only make their named optional policy boundary inapplicable; they never bypass it. Approval is live single-use engineer authority. An audited incident may accept only the exact failed plan-scout transport input and remains plan-only. Immutable boundaries: assigned scope, target identity, required data, per-effect external authentication, quality gates, ready-PR reporting, explicit /ship, do authority, truthful outcome, live ownership, plan binding, terminal lineage, single-use authority, audit, complete scout bytes, and plan-writer admission remain mandatory. There is no disable-all mode.`;
 }
 
 export interface SubagentLimits {
@@ -184,6 +185,11 @@ const CONSUMERS = {
   "subagent.maxConcurrency": ["prompts.subagent", "subagentConcurrency", NA, "subagentConcurrency", "subagentConcurrency", "subagentConcurrency.nested"],
   "subagent.maxDetached": ["prompts.subagent", "subagentAdmission/startCoordinator", "spawn/mode-tab.ship", "subagentAdmission/startCoordinator", "subagentAdmission", "coordinatorChecks.checkAdmission"],
 } as const satisfies Record<RuntimeSettingKey, readonly [string, string, string, string, string, string]>;
+
+export const GUARD_POLICY_BOUNDARIES = Object.freeze(Object.fromEntries(GUARD_IDS.map((id) => [
+  id,
+  policyWorkflowBoundary(id, [...new Set(CONSUMERS[`guards.${id}`].filter((entry) => entry !== NA))]),
+])) as Record<GuardId, WorkflowBoundary>);
 
 export const RUNTIME_SETTINGS_MATRIX: Readonly<Record<RuntimeSettingKey, RuntimeSettingRow>> = Object.freeze(Object.fromEntries(
   RUNTIME_SETTING_KEYS.map((key) => [key, Object.freeze(Object.fromEntries(RUNTIME_SETTING_SURFACES.map((surface, index) => {
