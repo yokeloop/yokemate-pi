@@ -1545,7 +1545,13 @@ export default function (pi: ExtensionAPI) {
 		await Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity)));
 		await Promise.all(coordinatorStops);
 		detached.clear();
+		ordinaryProcesses.clear();
 		batches.clear();
+		batchModes.clear();
+		sentBatches.clear();
+		deliveries.clear();
+		diagnostics.clear();
+		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
 		renderRunningWidget();
