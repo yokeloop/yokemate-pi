@@ -1525,6 +1525,12 @@ export default function (pi: ExtensionAPI) {
 					workflowExtraction?.cancel("parent_cancel");
 					shipPermits.invalidate();
 					let cancelled = false;
+					const pendingStops = new Map<string, { reason: "parent_control_cancel" | "parent_cancel_run"; suppress: boolean }>();
+					const queueStop = (coordinatorRunId: string, reason: "parent_control_cancel" | "parent_cancel_run", suppress = false) => {
+						if (!coordinators.get(coordinatorRunId)) return;
+						pendingStops.set(coordinatorRunId, { reason, suppress });
+						cancelled = true;
+					};
 					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
 					for (const entry of entries) {
 						planRunGenerations.delete(entry.keyRunId);
@@ -1536,16 +1542,16 @@ export default function (pi: ExtensionAPI) {
 							cancelled = true;
 						} else {
 							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
-							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
+							queueStop(entry.keyRunId, "parent_control_cancel", true);
 						}
-						for (const coordinatorRunId of stopped) if (coordinatorRunId !== entry.keyRunId && coordinators.get(coordinatorRunId)) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
+						for (const coordinatorRunId of stopped) if (coordinatorRunId !== entry.keyRunId) queueStop(coordinatorRunId, "parent_cancel_run");
 					}
 					if (!target && direct) {
-						for (const coordinatorRunId of authority?.revoke(direct.identity.ticket) ?? []) if (coordinatorRunId !== runId && coordinators.get(coordinatorRunId)) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
-						await cancelCoordinator(runId, "parent_control_cancel", cancelled);
-						cancelled = true;
+						for (const coordinatorRunId of authority?.revoke(direct.identity.ticket) ?? []) if (coordinatorRunId !== runId) queueStop(coordinatorRunId, "parent_cancel_run");
+						queueStop(runId, "parent_control_cancel");
 					}
 					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+					await Promise.all([...pendingStops].map(([coordinatorRunId, stop]) => cancelCoordinator(coordinatorRunId, stop.reason, stop.suppress)));
 				},
 				merge: async (runId, request, mergeOrigin) => {
 					const run = coordinators.get(runId);

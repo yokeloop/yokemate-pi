@@ -86,7 +86,7 @@ async function createTarget(parent: string, kind: "baseline" | "head"): Promise<
 
 type Scenario = "none" | "approval" | "ready-tool" | "none-tool" | "malformed-tool" | "error-tool" | "timeout-tool" | "near-timeout-tool" | "late-success-tool" | "hold-main";
 interface CaseOptions { warning?: { needle: string; timeout: number }; trigger?: "new_input" | "active_interrupt" | "idle_interrupt" | "session_new" | "session_fork" | "session_reload" | "session_shutdown"; awaitLate?: boolean; awaitTool?: boolean; expectRun?: boolean }
-async function runCase(root: string, scenario: Scenario, input: string, options: CaseOptions = {}): Promise<{ extractionCount: number; renderBeforeRelease: boolean; mainBeforeRelease: boolean; phases: string[]; elapsedMs?: number; runCount: number; reservedBeforeRelease: boolean; toolEndedBeforeRelease: boolean }> {
+async function runCase(root: string, scenario: Scenario, input: string, options: CaseOptions = {}): Promise<{ extractionCount: number; renderBeforeRelease: boolean; mainBeforeRelease: boolean; phases: string[]; elapsedMs?: number; runCount: number; reservedBeforeRelease: boolean; toolEndedBeforeRelease: boolean; sentinelVisible: boolean }> {
   const runtime = mkdtempSync(join(tmpdir(), "ym-workflow-input-runtime-"));
   const home = join(runtime, "home");
   const agent = join(runtime, "agent");
@@ -165,25 +165,21 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
     } else if (options.trigger === "active_interrupt" || options.trigger === "idle_interrupt") {
       await driver.request("key", { data: Buffer.from("\u001b").toString("base64") });
     } else if (options.trigger === "session_shutdown") {
-      const clear = Buffer.from("\u0003").toString("base64");
-      await driver.request("key", { data: clear });
+      await driver.request("signal");
     } else if (options.trigger) {
       const commandName = { session_new: "/wf-new", session_fork: "/wf-fork", session_reload: "/wf-reload" }[options.trigger];
       await driver.request("write", { text: commandName });
       await driver.request("enter");
     }
     if (options.trigger === "session_shutdown") {
-      const abortDeadline = Date.now() + 5000;
-      while (!events.some((event) => event.phase === "extraction_abort") && Date.now() < abortDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-      assert.ok(events.some((event) => event.phase === "extraction_abort"), `session shutdown did not fence extraction: ${JSON.stringify(events.map((event) => event.phase))}`);
+      const shutdownDeadline = Date.now() + 5000;
+      while ((!events.some((event) => event.phase === "session_shutdown") || !events.some((event) => event.phase === "extraction_abort")) && Date.now() < shutdownDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.ok(events.some((event) => event.phase === "session_shutdown"), `session shutdown hook did not run: ${JSON.stringify(events.map((event) => event.phase))}`);
+      assert.ok(events.some((event) => event.phase === "extraction_abort"), `session shutdown did not fence held extraction: ${JSON.stringify(events.map((event) => event.phase))}`);
+      assert.ok(extractionSockets.size > 0, "session shutdown released the provider before the lifecycle fence was observed");
       for (const socket of extractionSockets) socket.end("release\n");
       const releaseDeadline = Date.now() + 5000;
       while (!events.some((event) => event.phase === "extraction_released") && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      await driver.request("signal");
-      const shutdownDeadline = Date.now() + 5000;
-      while (!events.some((event) => event.phase === "session_shutdown") && Date.now() < shutdownDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-      assert.ok(events.some((event) => event.phase === "session_shutdown"), `session shutdown hook did not run: ${JSON.stringify(events.map((event) => event.phase))}`);
     } else if (options.trigger) {
       const abortDeadline = Date.now() + 10000;
       while (!events.some((event) => event.phase === "extraction_abort") && Date.now() < abortDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -219,7 +215,9 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
     while ((!events.some((event) => event.phase === "turn_start") || !events.some((event) => event.phase === "message_start_user")) && Date.now() < phaseDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
     const runFile = join(root, "work", "YM-1", "fixture-runs");
     const runCount = existsSync(runFile) ? readFileSync(runFile, "utf8").trim().split("\n").filter(Boolean).length : 0;
-    return { extractionCount: events.filter((event) => event.phase === "extraction_enter").length, renderBeforeRelease, mainBeforeRelease, phases: events.map((event) => event.phase), elapsedMs, runCount, reservedBeforeRelease, toolEndedBeforeRelease };
+    const terminalSnapshot = await driver.request("snapshot", { needles: ["SENTINEL_PRIVATE_PROVIDER_ERROR"] });
+    const sentinelVisible = terminalSnapshot.contains[0] as boolean;
+    return { extractionCount: events.filter((event) => event.phase === "extraction_enter").length, renderBeforeRelease, mainBeforeRelease, phases: events.map((event) => event.phase), elapsedMs, runCount, reservedBeforeRelease, toolEndedBeforeRelease, sentinelVisible };
   } finally {
     for (const socket of extractionSockets) socket.destroy();
     await driver.stop();
@@ -267,6 +265,7 @@ test("real Pi TUI input pipeline is nonblocking and ordinary input skips extract
       assert.equal(result.reservedBeforeRelease, false, `${label} reserved before extraction settled`);
       assert.equal(result.toolEndedBeforeRelease, false, `${label} consumer refused before extraction settled`);
       assert.equal(result.runCount, 0, `${label} started a run`);
+      if (label === "error") assert.equal(result.sentinelVisible, false, "provider exception leaked into the real PTY output");
       assert.doesNotMatch(JSON.stringify(result), /SENTINEL_PRIVATE_PROVIDER_ERROR/);
     }
     const timed = await runCase(await freshHead("timeout"), "timeout-tool", candidate, { warning: { needle: "workflow extraction unavailable: outcome=timeout", timeout: 18 }, awaitLate: true, awaitTool: true });
