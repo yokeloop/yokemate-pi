@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -21,6 +21,19 @@ const clearCoordinatorOrigin = () => {
 };
 const runtimeCases = (keys: readonly string[], surfaces: readonly string[]) => {
   for (const key of keys) for (const surface of surfaces) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:${key}:${variant}`);
+};
+const waitForRunMarker = (file: string, runId: string): Promise<void> => {
+  const present = () => existsSync(file) && readFileSync(file, "utf8").split("\n").includes(runId);
+  if (present()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const watcher = watch(join(file, ".."), () => {
+      if (!present()) return;
+      clearTimeout(timer);
+      watcher.close();
+      resolve();
+    });
+    const timer = setTimeout(() => { watcher.close(); reject(new Error(`timed out waiting for run marker ${runId}`)); }, 10000);
+  });
 };
 
 test("public guard hook rereads one strict snapshot before any tool and preserves system context", async () => {
@@ -549,6 +562,11 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     await approve();
     const cliAllowed = await cli();
     const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    for (const runId of [firstId, secondId, cliId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await approve();
+    const packageAllowed = await packageCli();
+    const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForRunMarker(join(dir, "work", "YM-1", "fixture-runs"), packageId);
     writeFileSync(join(socketDir(process.env, process.getuid!()), "plan-pane.json"), JSON.stringify({ mode: "plan", ticket: "YM-1", cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: "main-pane" }));
     const modeStamp = { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: "plan-pane", YOKEMATE_PARENT_PANE: "main-pane" };
     Object.assign(process.env, modeStamp);
@@ -578,7 +596,7 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const uncapped = await launch();
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
-    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    for (const runId of [packageId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
     runtimeCases(["guards.duplicateDo"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["cli", "coordinator"]);
   } finally {
@@ -672,6 +690,11 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     await permit();
     const cliAllowed = await cli();
     const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    for (const runId of [firstId, secondId, cliId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await permit();
+    const packageAllowed = await packageCli();
+    const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForRunMarker(join(dir, "fixture-runs"), packageId);
     await permit();
     const foreign = { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext;
     assert.match(JSON.stringify(await launch(foreign)), /current interactive \/ship/);
@@ -683,7 +706,7 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const uncapped = await launch();
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
-    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    for (const runId of [packageId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
     runtimeCases(["guards.duplicateMode"], ["tool", "cli", "coordinator"]);
     runtimeCases(["guards.shipConfirmation"], ["cli"]);
   } finally {

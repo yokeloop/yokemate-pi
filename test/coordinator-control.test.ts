@@ -447,6 +447,86 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
 });
 
 
+test("every plan operation requires the registered role, run, ticket, session and live process", { timeout: 20000 }, async () => {
+  const owner = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const foreign = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  await Promise.all([once(owner, "spawn"), once(foreign, "spawn")]);
+  const ownerStarttime = processStarttime(owner.pid!)!;
+  const foreignStarttime = processStarttime(foreign.pid!)!;
+  const operations = ["publish-plan-scout", "reject-plan-scout", "prepare-plan-publication", "plan-recorded", "record-plan", "plan-finished"] as const;
+  try {
+    for (const operation of operations) {
+      const root = mkdtempSync(join(tmpdir(), `plan-operation-${operation}-`));
+      const runtime = mkdtempSync(join(tmpdir(), "plan-operation-runtime-"));
+      const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+      const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+      const calls = { publish: 0, prepare: 0, recorded: 0, record: 0, finish: 0 };
+      mkdirSync(socketDir(env, process.getuid!()), { recursive: true });
+      writePane(env, "main", root, "main", null, target.sessionId);
+      writePane(env, "plan", root, "plan", "YM-1", "plan-session", owner.pid!, "main");
+      const server = bindCoordinatorControl(root, {
+        launch: async () => { throw new Error("unexpected launch"); },
+        status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+        publishPlanScout: async () => { calls.publish++; return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }; },
+        preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { calls.prepare++; return { reason: "prepared", recordId: 7, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: "b".repeat(64) }; },
+        planRecorded: async () => { calls.recorded++; return { reason: "recorded" }; },
+        recordPlan: async () => { calls.record++; return { reason: "recorded" }; },
+        planFinished: async () => { calls.finish++; },
+      }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
+      try {
+        if (!server.listening) await once(server, "listening");
+        const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+        const registered = await requestPlanControl(root, "register-plan", { ticket: "YM-1" }, main, target, env);
+        assert.ok(registered.runId);
+        const runId = registered.runId!;
+        assert.equal((await requestPlanControl(root, "bind-plan", { ticket: "YM-1", runId, pane: "plan" }, main, target, env)).state, "accepted");
+        const worker = { sessionId: "plan-session", pid: owner.pid!, starttime: ownerStarttime, cwd: root, pane: "plan", parentPane: "main", mode: "plan", ticket: "YM-1", role: "coordinator" };
+        assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId }, worker, target, env)).state, "accepted");
+        if (["reject-plan-scout", "prepare-plan-publication", "record-plan"].includes(operation))
+          assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId, acceptanceId: 1 }, worker, target, env)).state, "accepted");
+        const payload = operation === "publish-plan-scout" ? { ticket: "YM-1", runId, acceptanceId: 2 }
+          : operation === "reject-plan-scout" ? { ticket: "YM-1", runId, acceptanceId: 1 }
+          : operation === "prepare-plan-publication" ? { ticket: "YM-1", runId, path: "/plan.md", contentHash: "c".repeat(64) }
+          : operation === "plan-recorded" ? { ticket: "YM-1", runId, path: "/plan.md", recordId: 7 }
+          : operation === "record-plan" ? { ticket: "YM-1", runId, path: "/plan.md" }
+          : { ticket: "YM-1", runId, outcome: "blocked" as const, reason: "fixture" };
+        const { role: _role, ...missingRole } = worker;
+        const invalid = [
+          { origin: missingRole, payload },
+          { origin: { ...worker, role: "executor" }, payload },
+          { origin: { ...worker, role: "unknown" }, payload },
+          { origin: { ...worker, sessionId: "foreign-session" }, payload },
+          { origin: { ...worker, pid: foreign.pid!, starttime: foreignStarttime }, payload },
+          { origin: { ...worker, starttime: "0" }, payload },
+          { origin: worker, payload: { ...payload, runId: "foreign-run" } },
+          { origin: worker, payload: { ...payload, ticket: "YM-2" } },
+        ];
+        for (const variant of invalid) {
+          const before = structuredClone(calls);
+          const refused = await requestPlanControl(root, operation, variant.payload, variant.origin, target, env);
+          assert.equal(refused.state, "refused", `${operation}: ${refused.reason}`);
+          assert.deepEqual(calls, before, operation);
+        }
+        if (operation === "reject-plan-scout") {
+          assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", runId, path: "/plan.md", contentHash: "d".repeat(64) }, worker, target, env)).state, "accepted");
+        }
+        assert.equal((await requestPlanControl(root, operation, payload, worker, target, env)).state, "accepted", operation);
+        if (operation === "reject-plan-scout") {
+          assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-1", runId, path: "/plan.md", contentHash: "d".repeat(64) }, worker, target, env)).state, "refused");
+        }
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        rmSync(root, { recursive: true, force: true });
+        rmSync(runtime, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    owner.kill("SIGKILL");
+    foreign.kill("SIGKILL");
+    await Promise.all([once(owner, "exit"), once(foreign, "exit")]);
+  }
+});
+
 test("plan worker process exit settles once without using herdr agent status", { timeout: 10000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "plan-process-exit-"));
   const runtime = mkdtempSync(join(tmpdir(), "plan-process-runtime-"));
