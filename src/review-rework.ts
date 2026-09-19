@@ -24,7 +24,7 @@ export class ReviewReworkStore {
   private raw = "";
   private receipt?: Receipt;
   private operation?: Operation;
-  private readonly cycles = new Map<string, { operationId: string; binding: PlanBinding; started: boolean }>();
+  private readonly cycles = new Map<string, { operationId: string; generation: ReviewInputGeneration; binding: PlanBinding; started: boolean }>();
   private started = false;
 
   constructor(owner: ReviewReworkOwner) {
@@ -108,27 +108,36 @@ export class ReviewReworkStore {
     assertPlanBinding(receipt.binding, binding);
     receipt.state = "consumed";
     receipt.cycleId = cycleId;
-    this.cycles.set(cycleId, { operationId, binding: copyBinding(binding), started: false });
+    this.cycles.set(cycleId, { operationId, generation: { ...operation.generation }, binding: copyBinding(binding), started: false });
   }
 
   startCycle(cycleId: string): void {
     const cycle = this.cycles.get(cycleId);
     if (!cycle) throw new Error("review rework cycle is not active");
+    this.checkCycle(cycleId, cycle.binding);
     cycle.started = true;
   }
 
   checkCycle(cycleId: string, binding: PlanBinding): void {
     const cycle = this.cycles.get(cycleId);
     if (!cycle) throw new Error("review rework cycle is not active");
+    if (!cycle.started) {
+      if (!sameGeneration(cycle.generation, this.generation())) throw new Error("review rework cycle was superseded by fresh input");
+      if (!processIdentityMatches(this.owner.worker.pid, this.owner.worker.starttime)) throw new Error("review worker process ended before do startup");
+    }
     assertPlanBinding(cycle.binding, binding);
+  }
+
+  cancelPreStartCycles(): string[] {
+    const cycles = [...this.cycles].filter(([, cycle]) => !cycle.started).map(([id]) => id);
+    for (const id of cycles) this.cycles.delete(id);
+    return cycles;
   }
 
   revoke(): string[] {
     this.revision++;
     if (this.receipt && this.receipt.state !== "consumed") this.receipt.state = "revoked";
-    const cycles = [...this.cycles].filter(([, cycle]) => !cycle.started).map(([id]) => id);
-    for (const id of cycles) this.cycles.delete(id);
-    return cycles;
+    return this.cancelPreStartCycles();
   }
 
   finish(cycleId?: string): void {

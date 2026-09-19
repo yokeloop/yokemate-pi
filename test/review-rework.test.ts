@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PlanBinding } from "../src/plan-binding.ts";
+import { processStarttime } from "../src/coordinator-control.ts";
 import { ReviewReworkStore, validateReviewReworkExtraction } from "../src/review-rework.ts";
 
 const binding: PlanBinding = { ticket: "YM-1", path: "/knowledge/rework.md", contentHash: "content", scopeHash: "scope", repositories: ["org/repo"] };
@@ -8,7 +9,7 @@ const owner = {
   parent: { sessionId: "parent-session", runtimeId: "parent-runtime" },
   reviewRunId: "review-run",
   ticket: "YM-1",
-  worker: { sessionId: "review-session", runtimeId: "review-runtime", pid: 101, starttime: "11" },
+  worker: { sessionId: "review-session", runtimeId: "review-runtime", pid: process.pid, starttime: processStarttime(process.pid)! },
   surface: { surface: "tab" as const, paneId: "pane-review", tabId: "tab-review" },
 };
 
@@ -80,6 +81,29 @@ test("fresh input after failed handoff creates a new operation and stale complet
   });
   assert.equal(second.state, "started");
   assert.equal(second.runId, "fresh");
+});
+
+test("fresh input and dead worker synchronously fence a consumed pre-start cycle", async () => {
+  const store = new ReviewReworkStore(owner);
+  const generation = approved(store);
+  await store.claimHandoff(generation, binding.path, async (operationId) => {
+    store.bindRecorded(operationId, binding);
+    store.consume(operationId, "do-run", binding);
+    store.beginInput("стоп");
+    assert.throws(() => store.checkCycle("do-run", binding), /superseded/);
+    assert.throws(() => store.startCycle("do-run"), /superseded/);
+    assert.deepEqual(store.cancelPreStartCycles(), ["do-run"]);
+    assert.throws(() => store.checkCycle("do-run", binding), /not active/);
+    return { state: "cancelled", recorded: true };
+  });
+  const dead = new ReviewReworkStore({ ...owner, worker: { ...owner.worker, pid: 999999999, starttime: "missing" } });
+  const deadGeneration = approved(dead);
+  await dead.claimHandoff(deadGeneration, binding.path, async (operationId) => {
+    dead.bindRecorded(operationId, binding);
+    dead.consume(operationId, "dead-run", binding);
+    assert.throws(() => dead.checkCycle("dead-run", binding), /worker process ended/);
+    return { state: "cancelled", recorded: true };
+  });
 });
 
 test("mismatch, stale generation and revoked verdict refuse before action", async () => {

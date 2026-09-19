@@ -1221,10 +1221,12 @@ export default function (pi: ExtensionAPI) {
 				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
 				else authority!.checkCycle(ownedRun.identity.runId, current);
 			}
-			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
+			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt }, (response) => {
+				if (response.success !== true || !lane) return;
+				if (lane.review) lane.review.store.startCycle(ownedRun.identity.runId);
+				if (!lane.context.startup({ state: "started", runId: ownedRun.identity.runId, facts: { model: prepared.model, cwd: prepared.cwd } })) throw new Error("coordinator startup acknowledgement lost its retained claim");
+			});
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
-			if (lane?.review) lane.review.store.startCycle(ownedRun.identity.runId);
-			lane?.context.startup({ state: "started", runId: ownedRun.identity.runId, facts: { model: prepared.model, cwd: prepared.cwd } });
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
@@ -1384,10 +1386,15 @@ export default function (pi: ExtensionAPI) {
 					const stopObserver = observeProcessIdentity(reviewOrigin.pid, reviewOrigin.starttime, () => { void revokeReviewRun(reviewRunId, "review worker process ended before do startup"); });
 					reviewReworks.set(reviewRunId, { store, stopObserver });
 				},
-				reviewInput: (ticket, reviewRunId, raw) => {
+				reviewInput: async (ticket, reviewRunId, raw) => {
 					const review = reviewReworks.get(reviewRunId);
 					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
-					return review.store.beginInput(raw);
+					const generation = review.store.beginInput(raw);
+					for (const runId of review.store.cancelPreStartCycles()) {
+						listRuns.cancel(runId, "review verdict was superseded by fresh input");
+						if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run", true).catch(() => {});
+					}
+					return generation;
 				},
 				reviewExtraction: async (ticket, reviewRunId, extraction, generation) => {
 					const review = reviewReworks.get(reviewRunId);

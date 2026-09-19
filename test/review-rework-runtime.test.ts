@@ -65,6 +65,8 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     const agentDir = join(dir, "agent");
     mkdirSync(agentDir, { recursive: true });
     Object.assign(process.env, { XDG_RUNTIME_DIR: runtime, PATH: `${shim}:${savedEnv.PATH ?? ""}`, REVIEW_CLOSE_LOG: closeLog, HERDR_PANE_ID: "main-pane", PI_SESSION_ID: "parent-session", PI_CODING_AGENT_DIR: agentDir });
+    if (workflowApproval) delete process.env.WORKFLOW_FAST_TERMINAL;
+    else process.env.WORKFLOW_FAST_TERMINAL = "1";
     for (const key of ["YOKEMATE_MODE", "YOKEMATE_ROLE", "YOKEMATE_TICKET", "YOKEMATE_REVIEW_RUN_ID", "YOKEMATE_REVIEW_RUNTIME_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     const runtimeDir = socketDir(process.env, process.getuid!());
@@ -147,6 +149,7 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     assert.equal(current.prepare("SELECT COUNT(*) AS count FROM part WHERE work_id=?").get(work.id)!.count, 1);
     current.close();
     assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), outcome.runId);
+    if (!workflowApproval) assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-fast-terminals"), "utf8").trim(), outcome.runId);
     assert.deepEqual(readFileSync(closeLog, "utf8").trim().split("\n").map((line) => JSON.parse(line)), [["tab", "close", "review-tab"]]);
     assert.equal(confirms, 0);
     assert.match(notifications.join("\n"), new RegExp(`YM-1: rework .* \\(${outcome.contentHash}\\) recorded; do ${outcome.runId} started with test/model`));
