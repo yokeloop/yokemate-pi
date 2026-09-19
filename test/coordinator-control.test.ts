@@ -351,6 +351,67 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
 });
 
 
+test("logical plan finish fences publication record and handoff before parent callbacks complete", async () => {
+  const root = mkdtempSync(join(tmpdir(), "plan-finish-fence-"));
+  const runtime = mkdtempSync(join(tmpdir(), "plan-finish-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  writeFileSync(join(runtimeDir, "plan.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-1" }));
+  let releasePublication!: () => void;
+  let publicationStarted!: () => void;
+  const started = new Promise<void>((resolve) => { publicationStarted = resolve; });
+  let finishCalls = 0;
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); },
+    status: (requestId) => ({ requestId, state: "status" }),
+    cancel: async () => {},
+    publishPlanScout: async () => {
+      publicationStarted();
+      await new Promise<void>((resolve) => { releasePublication = resolve; });
+      return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) };
+    },
+    planFinished: async () => { finishCalls++; },
+    preparePlanPublication: async () => ({ reason: "prepared", recordId: 1, snapshotPath: "/snapshot", scoutAcceptance: 1, revision: "b".repeat(64) }),
+    recordPlan: async () => ({ reason: "recorded" }),
+    planRecorded: async () => ({ reason: "recorded" }),
+  }, { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const register = await requestPlanControl(root, "register-plan", { ticket: "YM-1" }, main, target, env);
+    assert.ok(register.runId);
+    assert.equal((await requestPlanControl(root, "bind-plan", { ticket: "YM-1", runId: register.runId, pane: "plan" }, main, target, env)).state, "accepted");
+    const worker = { ...main, sessionId: "plan-session", mode: "plan", ticket: "YM-1", role: "coordinator", pane: "plan", parentPane: "main" };
+    assert.equal((await requestPlanControl(root, "plan-started", { ticket: "YM-1", runId: register.runId }, worker, target, env)).state, "accepted");
+    const publication = requestPlanControl(root, "publish-plan-scout", { ticket: "YM-1", runId: register.runId, acceptanceId: 1 }, worker, target, env);
+    await started;
+    const finished = await requestPlanControl(root, "plan-finished", { ticket: "YM-1", runId: register.runId, outcome: "cancelled", reason: "engineer stopped" }, worker, target, env);
+    assert.equal(finished.state, "accepted");
+    assert.equal(finishCalls, 1);
+    releasePublication();
+    const late = await publication;
+    assert.equal(late.artifactAcceptance, "superseded");
+    for (const [operation, payload] of [
+      ["publish-plan-scout", { acceptanceId: 2 }],
+      ["prepare-plan-publication", { path: "/plan.md", contentHash: "c".repeat(64) }],
+      ["record-plan", { path: "/plan.md" }],
+      ["plan-recorded", { path: "/plan.md", recordId: 1 }],
+    ] as const) {
+      const reply = await requestPlanControl(root, operation, { ticket: "YM-1", runId: register.runId, ...payload }, worker, target, env);
+      assert.equal(reply.state, "refused", operation);
+      assert.match(reply.reason ?? "", /no longer active/, operation);
+    }
+  } finally {
+    releasePublication?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("plan worker process exit settles once without using herdr agent status", { timeout: 10000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "plan-process-exit-"));
   const runtime = mkdtempSync(join(tmpdir(), "plan-process-runtime-"));

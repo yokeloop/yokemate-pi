@@ -118,7 +118,7 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
   const previousArgv = process.argv[1];
   const previousSocket = process.env.RUNTIME_SETTINGS_TEST_SOCKET;
   const previousMode = process.env.SUBAGENT_CANCEL_MODE;
-  const previousOwner = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE, YOKEMATE_RUN_ID: process.env.YOKEMATE_RUN_ID };
+  const previousOwner = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE, YOKEMATE_RUN_ID: process.env.YOKEMATE_RUN_ID, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_PLAN_RUN_ID: process.env.YOKEMATE_PLAN_RUN_ID, PI_SESSION_ID: process.env.PI_SESSION_ID };
   const sockets = new Set<Socket>();
   const events: any[] = [];
   const waiters: Array<() => void> = [];
@@ -202,6 +202,16 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
     assert.throws(() => process.kill(killChild.pid, 0));
     assert.ok(states.some((state) => state.children?.some((entry: any) => entry.identity.runId === killRunId)));
     assert.ok(states.some((state) => state.children?.length === 0));
+
+    Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_PLAN_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_TICKET: "YM-1" });
+    delete process.env.PI_SESSION_ID;
+    const planFinish = loaded.extensions[0]!.tools.get("plan_finish")!.definition;
+    const stopped = await planFinish.execute("finish", { outcome: "cancelled", reason: "fixture stop" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in stopped && stopped.isError, true);
+    assert.doesNotMatch((stopped.content[0] as any).text, /PI_SESSION_ID/);
+    const fenced = await tool.execute("after-stop", { agent: "worker", task: "must stay conversational" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in fenced && fenced.isError, true);
+    assert.match((fenced.content[0] as any).text, /plan run is stopped/);
   } finally {
     process.argv[1] = previousArgv;
     if (previousSocket === undefined) delete process.env.RUNTIME_SETTINGS_TEST_SOCKET; else process.env.RUNTIME_SETTINGS_TEST_SOCKET = previousSocket;
