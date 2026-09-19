@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { openDb } from "../src/db.ts";
+import { acceptScoutArtifact } from "../src/plan-publication-state.ts";
 import { readRecordedPlanBinding } from "../src/plan-binding.ts";
 import { currentControlOrigin, processStarttime, requestPlanControl, requestPlanLaunch, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
@@ -24,7 +25,7 @@ async function waitForFile(path: string, timeout = 15000): Promise<void> {
   }
 }
 
-test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 60000 }, async () => {
+test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 120000 }, async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "workflow-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
   const env = { ...process.env };
@@ -82,10 +83,12 @@ test("raw interactive authority flows through real plan CLI and parent control w
     writeFileSync(commentsFile, "[]");
     const shim = join(dir, "shim");
     mkdirSync(shim);
-    writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){if(process.env.WORKFLOW_GH_FAIL==="1"){console.error("comment unavailable"); process.exit(1);} let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
+    writeFileSync(join(shim, "gh"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2); const file=process.env.WORKFLOW_COMMENTS; const rows=JSON.parse(fs.readFileSync(file,"utf8"));\nif(args[0]==="api"){const page=Number(/&page=(\\d+)/.exec(args[1])[1]); console.log(JSON.stringify(rows.slice((page-1)*100,page*100)));}\nelse if(args[0]==="issue"&&args[1]==="comment"){let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data",c=>body+=c); process.stdin.on("end",()=>{const kind=/\"kind\":\"(scout|plan)\"/.exec(body)?.[1]; if(process.env.WORKFLOW_GH_CONFLICT_KIND===kind){const metadata=JSON.parse(body.slice("<!-- yokemate-plan-publication:".length,body.indexOf(" -->"))); const conflict=body.slice(0,"<!-- yokemate-plan-publication:".length)+JSON.stringify({...metadata,run:metadata.run+"-conflict"})+body.slice(body.indexOf(" -->")); for(const text of [body,conflict]) rows.push({id:rows.length+1,body:text,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.error("comment conflict"); process.exit(1);} if(process.env.WORKFLOW_GH_FAIL==="1"||process.env.WORKFLOW_GH_FAIL_KIND===kind){console.error("comment unavailable"); process.exit(1);} rows.push({id:rows.length+1,body,html_url:"https://github.com/org/repo/issues/1#issuecomment-"+(rows.length+1)}); fs.writeFileSync(file,JSON.stringify(rows)); console.log("ok");});}\nelse process.exit(2);\n`, { mode: 0o755 });
     const ownedPlanReady = join(runtime, "owned-plan-ready");
-    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs";\nconst args=process.argv.slice(2);\nif(args[0]==="tab"&&args[1]==="create") console.log(JSON.stringify({result:{tab:{tab_id:"owned-tab"},root_pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="agent"&&args[1]==="prompt"){fs.writeFileSync(process.env.WORKFLOW_OWNED_PLAN_READY,"ready"); console.log(JSON.stringify({result:{}}));}\nelse if(args[0]==="agent"&&args[1]==="wait") setTimeout(()=>console.log(JSON.stringify({result:{state:"done"}})),10000);\nelse console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
+    const ownedPlanFinished = join(runtime, "owned-plan-finished");
+    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs";\nimport path from "node:path";\nconst args=process.argv.slice(2);\nif(args[0]==="tab"&&args[1]==="create") console.log(JSON.stringify({result:{tab:{tab_id:"owned-tab"},root_pane:{pane_id:"owned-pane"}}}));\nelse if(args[0]==="agent"&&args[1]==="prompt"){fs.writeFileSync(process.env.WORKFLOW_OWNED_PLAN_READY,"ready"); console.log(JSON.stringify({result:{}}));}\nelse if(args[0]==="agent"&&args[1]==="wait"){const file=process.env.WORKFLOW_OWNED_PLAN_FINISHED; const done=()=>{console.log(JSON.stringify({result:{state:"done"}})); process.exit(0);}; if(fs.existsSync(file)) done(); else {const watcher=fs.watch(path.dirname(file),(_event,name)=>{if(name===path.basename(file)&&fs.existsSync(file)){watcher.close(); done();}});}}\nelse console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
     process.env.WORKFLOW_OWNED_PLAN_READY = ownedPlanReady;
+    process.env.WORKFLOW_OWNED_PLAN_FINISHED = ownedPlanFinished;
     process.env.PATH = `${shim}:${process.env.PATH ?? ""}`;
     process.env.WORKFLOW_COMMENTS = commentsFile;
     const db = openDb(join(dir, "yokemate.db"));
@@ -146,7 +149,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       const ack = await scoutTool.execute(callId, { agent: "plan-scout", task: "Return the complete fixture investigation.", ticket: "YM-1" }, undefined, () => undefined, scoutContext);
       assert.match(JSON.stringify(ack), /YM-1/);
       let timer: NodeJS.Timeout | undefined;
-      try { await Promise.race([delivered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`scout report timeout: ${JSON.stringify({ ack, reports })}`)), 15000); })]); }
+      try { await Promise.race([delivered, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`scout report timeout: ${JSON.stringify({ ack, reports: reports.slice(-4) })}`)), 30000); })]); }
       finally { clearTimeout(timer); }
       return reports.slice(before).map((item: any) => item?.details?.envelope).find((envelope: any) => envelope?.kind === "result" && envelope.identity?.agent === "plan-scout" && envelope.identity.batchId === callId);
     };
@@ -316,63 +319,139 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(confirms, 0);
     assert.deepEqual(notifications, []);
     assert.equal(readRecordedPlanBinding(dir, "YM-1").path, plan);
-    writeFileSync(plan, text.replace("## Goal", "## Goal\n\nfailed-send revision"));
-    reset();
-    process.env.WORKFLOW_GH_FAIL = "1";
-    process.env.YM204_FIXTURE_SCENARIO = "plan_scout_failed_send";
-    process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
-    process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
-    const failedSendScout = await runScout("failed-send-scout");
-    assert.equal(failedSendScout.artifact.state, "accepted");
-    assert.equal(failedSendScout.publication.state, "pending");
-    delete process.env.YOKEMATE_RUN_ID;
-    process.argv[1] = workflowChild;
-    const commentsBeforeFailedSend = JSON.parse(readFileSync(commentsFile, "utf8")).length;
-    const failedSendRecord = await recordProcess();
-    assert.match(failedSendRecord.stdout, /YM-1 → planned/);
-    assert.match(failedSendRecord.stderr, /warning: scout publication .* unavailable/);
-    assert.match(failedSendRecord.stderr, /warning: plan publication .* unavailable/);
-    assert.equal(JSON.parse(readFileSync(commentsFile, "utf8")).length, commentsBeforeFailedSend);
-    delete process.env.WORKFLOW_GH_FAIL;
-    process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
+    type ExpectedPublication = "complete" | "unavailable" | "remote_conflict";
+    const configurePublication = (label: string, scout: ExpectedPublication, planOutcome: ExpectedPublication) => {
+      for (const key of ["WORKFLOW_GH_FAIL", "WORKFLOW_GH_FAIL_KIND", "WORKFLOW_GH_CONFLICT_KIND"]) delete process.env[key];
+      process.env.WORKFLOW_SCOUT_REVISION = `-${label}`;
+      if (scout === "unavailable" && planOutcome === "unavailable") process.env.WORKFLOW_GH_FAIL = "1";
+      else if (scout === "unavailable") process.env.WORKFLOW_GH_FAIL_KIND = "scout";
+      else if (planOutcome === "unavailable") process.env.WORKFLOW_GH_FAIL_KIND = "plan";
+      else if (scout === "remote_conflict") process.env.WORKFLOW_GH_CONFLICT_KIND = "scout";
+      else if (planOutcome === "remote_conflict") process.env.WORKFLOW_GH_CONFLICT_KIND = "plan";
+      writeFileSync(plan, text.replace("Exercise authority.", `Exercise authority for ${label}.`));
+      reset();
+    };
+    const clearPublication = () => {
+      for (const key of ["WORKFLOW_GH_FAIL", "WORKFLOW_GH_FAIL_KIND", "WORKFLOW_GH_CONFLICT_KIND", "WORKFLOW_SCOUT_REVISION"]) delete process.env[key];
+    };
+    const assertPublicationResult = (label: string, result: { stdout: string; stderr: string }, scout: ExpectedPublication, planOutcome: ExpectedPublication, handoff: "plan-only" | "started" = "plan-only") => {
+      assert.match(result.stdout, /YM-1 → planned/, label);
+      if (handoff === "started") assert.match(result.stdout, /background run [a-f0-9-]+/, label);
+      else assert.match(result.stdout, /plan-only; ready for \/do/, label);
+      for (const [kind, expected] of [["scout", scout], ["plan", planOutcome]] as const) {
+        if (expected === "complete") {
+          assert.match(result.stdout, new RegExp(`YM-1: ${kind} published to`), label);
+          assert.doesNotMatch(result.stderr, new RegExp(`warning: ${kind} publication`), label);
+        } else {
+          assert.match(result.stderr, new RegExp(`warning: ${kind} publication .* ${expected}`), label);
+          assert.doesNotMatch(result.stdout, new RegExp(`YM-1: ${kind} published to`), label);
+        }
+      }
+      assert.doesNotMatch(result.stderr, /comment unavailable|comment conflict/, label);
+    };
+    const runLegacyPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none") => {
+      configurePublication(`legacy-${label}`, scoutExpected, planExpected);
+      if (authority === "plain") {
+        set(false);
+        extraction = "none";
+        await input("/plan YM-1");
+      } else if (authority === "advance" || authority === "guarded") {
+        set(authority === "guarded");
+        extraction = "advance-plan-do";
+        await input("Plan and then do YM-1");
+      }
+      process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+      process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+      const before = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
+      const scoutResult = await runScout(`legacy-${label}-scout`);
+      assert.equal(scoutResult.artifact.state, "accepted", label);
+      assert.equal(scoutResult.publication.state, scoutExpected === "complete" ? "complete" : "pending", label);
+      if (scoutExpected !== "complete") assert.equal(scoutResult.publication.error, scoutExpected, label);
+      delete process.env.YOKEMATE_RUN_ID;
+      process.argv[1] = workflowChild;
+      const result = await recordProcess();
+      assertPublicationResult(`legacy-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
+      if (authority === "advance") {
+        const runId = result.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+        await waitForFile(join(dir, "work", "YM-1", "fixture-runs"));
+        await cancel(runId);
+        for (const socket of eventConnections.splice(0)) socket.destroy();
+      } else if (authority === "plain" || authority === "guarded") {
+        const refused = await launch();
+        assert.match(output(refused), /approval|consumed|workflowApproval/, label);
+        assert.equal((refused.details as { runId?: string }).runId, undefined, label);
+      }
+      set(false);
+      extraction = "none";
+      const after = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
+      if (scoutExpected === "unavailable" && planExpected === "unavailable") assert.equal(after, before, label);
+      else assert.ok(after > before, label);
+      clearPublication();
+    };
+    await runLegacyPublicationCase("scout-pending", "unavailable", "complete", "plain");
+    await runLegacyPublicationCase("plan-pending", "complete", "unavailable", "advance");
+    await runLegacyPublicationCase("both-pending", "unavailable", "unavailable", "guarded");
+    await runLegacyPublicationCase("conflict", "complete", "remote_conflict");
+    const launchTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const ownedLoaderExtensions = async () => {
+      const ownedLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
+      await ownedLoader.reload();
+      const ownedLoaded = ownedLoader.getExtensions();
+      assert.deepEqual(ownedLoaded.errors, []);
+      ownedLoaded.runtime.appendEntry = () => undefined;
+      ownedLoaded.runtime.sendMessage = receiveReport;
+      const extension = ownedLoaded.extensions[0]!;
+      return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext };
+    };
+    const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication) => {
+      configurePublication(`owned-${label}`, scoutExpected, planExpected);
+      rmSync(ownedPlanReady, { force: true });
+      rmSync(ownedPlanFinished, { force: true });
+      const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+      assert.equal(ownedLaunch.state, "accepted", label);
+      const ownedRunId = ownedLaunch.results?.[0]?.keyRunId;
+      assert.ok(ownedRunId, label);
+      await waitForFile(ownedPlanReady);
+      writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
+      Object.assign(process.env, { PI_SESSION_FILE: join(dir, `owned-${label}.jsonl`), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" });
+      const ownedWorker = { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane" };
+      const ownedStarted = await requestPlanControl(dir, "plan-started", { ticket: "YM-1", runId: ownedRunId }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+      assert.equal(ownedStarted.state, "accepted", ownedStarted.reason ?? label);
+      let ownedExtension: Awaited<ReturnType<typeof ownedLoaderExtensions>>["extension"] | undefined;
+      let ownedCtx: ExtensionContext | undefined;
+      if (label === "scout-pending") {
+        process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+        const loadedOwned = await ownedLoaderExtensions();
+        ownedExtension = loadedOwned.extension;
+        ownedCtx = loadedOwned.context;
+        for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
+        const ownedScout = await runScout(`owned-${label}-scout`, loadedOwned.tool, ownedCtx);
+        assert.equal(ownedScout.artifact.state, "accepted", label);
+        assert.equal(ownedScout.publication.state, scoutExpected === "complete" ? "complete" : "pending", label);
+      } else {
+        const identity = { ownerRunId: ownedRunId, ownerSessionId: "parent", batchId: `owned-${label}-batch`, runId: `owned-${label}-run`, agent: "plan-scout", taskHash: "a".repeat(64), cwd: dir, ticket: "YM-1" } as const;
+        const acceptance = acceptScoutArtifact(db, dir, identity, Buffer.from(`# Scout\n\n## Facts and sources\n${"owned evidence\n".repeat(5000)}${label}\n\n## Assumptions\n- Fixture.\n\n## Forks and recommendations\n- Fixture.\n`));
+        const accepted = await requestPlanControl(dir, "publish-plan-scout", { ticket: "YM-1", runId: ownedRunId, acceptanceId: acceptance.id }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+        assert.equal(accepted.state, "accepted", accepted.reason ?? label);
+        assert.equal(accepted.artifactAcceptance, "accepted", label);
+        assert.equal(accepted.publication, scoutExpected === "complete" ? "complete" : "pending", label);
+        if (scoutExpected !== "complete") assert.equal(accepted.reason, scoutExpected, label);
+      }
+      process.argv[1] = workflowChild;
+      let result: Awaited<ReturnType<typeof recordProcess>>;
+      try { result = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" }); }
+      finally { writeFileSync(ownedPlanFinished, "done"); }
+      assertPublicationResult(`owned-${label}`, result, scoutExpected, planExpected);
+      if (ownedExtension && ownedCtx) for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
+      for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+      clearPublication();
+    };
+    await runOwnedPublicationCase("scout-pending", "unavailable", "complete");
+    await runOwnedPublicationCase("plan-pending", "complete", "unavailable");
+    await runOwnedPublicationCase("both-pending", "unavailable", "unavailable");
+    await runOwnedPublicationCase("conflict", "complete", "remote_conflict");
     writeFileSync(plan, text);
     reset();
-    const launchTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    const ownedLaunch = await requestPlanLaunch(dir, { targets: [{ ticket: "YM-1", workerWords: ["YM-1"] }], surface: "tab", literal: [], parentPane: "", parentWorkspace: "workspace" }, { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir }, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    assert.equal(ownedLaunch.state, "accepted");
-    const ownedRunId = ownedLaunch.results?.[0]?.keyRunId;
-    assert.ok(ownedRunId);
-    await waitForFile(ownedPlanReady);
-    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
-    process.env.YOKEMATE_MODE = "plan";
-    process.env.YOKEMATE_TICKET = "YM-1";
-    process.env.YOKEMATE_ROLE = "coordinator";
-    process.env.YOKEMATE_PLAN_RUN_ID = ownedRunId;
-    process.env.YOKEMATE_RUN_ID = ownedRunId;
-    process.env.HERDR_PANE_ID = "owned-pane";
-    process.env.YOKEMATE_PARENT_PANE = "";
-    process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
-    const ownedLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
-    await ownedLoader.reload();
-    const ownedLoaded = ownedLoader.getExtensions();
-    assert.deepEqual(ownedLoaded.errors, []);
-    ownedLoaded.runtime.appendEntry = () => undefined;
-    ownedLoaded.runtime.sendMessage = receiveReport;
-    const ownedExtension = ownedLoaded.extensions[0]!;
-    const ownedTool = ownedExtension.tools.get("subagent")!.definition;
-    const ownedCtx = { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext;
-    for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
-    const ownedWorker = { sessionId: "parent", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, mode: "plan", ticket: "YM-1", role: "coordinator", pane: "owned-pane" };
-    const ownedStarted = await requestPlanControl(dir, "plan-started", { ticket: "YM-1", runId: ownedRunId }, ownedWorker, launchTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    assert.equal(ownedStarted.state, "accepted", ownedStarted.reason ?? "plan-started refused");
-    const ownedScout = await runScout("owned-scout", ownedTool, ownedCtx);
-    assert.equal(ownedScout.artifact.state, "accepted", JSON.stringify(ownedScout));
-    process.argv[1] = workflowChild;
-    const ownedRecord = await record({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "" });
-    assert.match(ownedRecord, /YM-1 → planned/);
-    assert.match(ownedRecord, /plan-only; ready for \/do/);
-    for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
-    for (const key of ["YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
     for (const surface of ["typed", "tool", "cli", "pane", "ordinary", "coordinator"]) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:guardPolicy.workflowApproval:${variant}`);
     db.close();
   } finally {

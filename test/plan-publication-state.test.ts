@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db.ts";
 import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding } from "../src/plan-binding.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationFor, readPublicationArtifact, reserveCanonicalUrl, writePublicationArtifact } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationById, publicationFor, readPublicationArtifact, reserveCanonicalUrl, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
 const plan = (ticket = "YM-1", repo = "org/repo") => `# ${ticket} — fixture
@@ -230,6 +230,11 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     const planRow = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "plan", bytes: planBytes, runId: "plan" });
     assert.equal(planRow.plan_path, null);
     const firstRecord = acceptPlanRecord(db, { ticket: "YM-1", publicationId: planRow.id, planPath: "/plan", contentHash: planRow.content_hash, scopeHash: "scope", artifactPath: planRow.artifact_path, bytes: planRow.bytes, scoutPublication: first.id, scoutAcceptance: firstDelivery.id });
+    assert.throws(() => acceptPlanRecord(db, { ticket: "YM-1", publicationId: first.id, planPath: "/invalid-kind", contentHash: first.content_hash, scopeHash: "scope", artifactPath: first.artifact_path, bytes: first.bytes, scoutAcceptance: firstDelivery.id }), /artifact_invalid/);
+    const foreignPlan = acceptPublication(db, root, { target, targetHash, ticket: "YM-2", kind: "plan", bytes: planBytes, runId: "foreign-plan" });
+    assert.throws(() => acceptPlanRecord(db, { ticket: "YM-1", publicationId: foreignPlan.id, planPath: "/foreign", contentHash: foreignPlan.content_hash, scopeHash: "scope", artifactPath: foreignPlan.artifact_path, bytes: foreignPlan.bytes, scoutAcceptance: firstDelivery.id }), /artifact_invalid/);
+    assert.throws(() => acceptPlanRecord(db, { ticket: "YM-1", publicationId: planRow.id, planPath: "/wrong-hash", contentHash: "f".repeat(64), scopeHash: "scope", artifactPath: planRow.artifact_path, bytes: planRow.bytes, scoutAcceptance: firstDelivery.id }), /artifact_invalid/);
+    assert.throws(() => acceptPlanRecord(db, { ticket: "YM-1", planPath: "/wrong-scout", contentHash: planRow.content_hash, scopeHash: "scope", artifactPath: planRow.artifact_path, bytes: planRow.bytes, scoutPublication: second.id, scoutAcceptance: firstDelivery.id }), /artifact_invalid/);
     db.exec("BEGIN IMMEDIATE");
     markSuccessfulRecord(db, firstRecord.id);
     db.exec("ROLLBACK");
@@ -250,6 +255,15 @@ test("publication ledger keeps immutable identities, revisions and restart-verif
     assert.equal(repeatedLocalRecord.publication_id, planRow.id);
     assert.equal(repeatedLocalRecord.scout_publication, null, "the legacy remote tuple stays unique while local acceptance identity remains distinct");
     assert.equal(repeatedLocalRecord.scout_acceptance, restartDelivery.id);
+    const lateBytes = Buffer.from(plan().replace("Publish a plan.", "Publish a late plan."));
+    const latePublication = acceptPublication(db, root, { target, targetHash, ticket: "YM-1", kind: "plan", bytes: lateBytes, runId: "late-plan" });
+    const lateRecord = acceptPlanRecord(db, { ticket: "YM-1", planPath: "/late-plan", contentHash: latePublication.content_hash, scopeHash: "late-scope", artifactPath: latePublication.artifact_path, bytes: latePublication.bytes, scoutPublication: first.id, scoutAcceptance: firstDelivery.id });
+    markSuccessfulRecord(db, lateRecord.id);
+    assert.equal(publicationById(db, latePublication.id)?.plan_path, null);
+    const linkedLateRecord = acceptPlanRecord(db, { ticket: "YM-1", publicationId: latePublication.id, planPath: "/late-plan", contentHash: latePublication.content_hash, scopeHash: "late-scope", artifactPath: latePublication.artifact_path, bytes: latePublication.bytes, scoutPublication: first.id, scoutAcceptance: firstDelivery.id });
+    assert.equal(linkedLateRecord.publication_id, latePublication.id);
+    assert.equal(publicationById(db, latePublication.id)?.plan_path, "/late-plan");
+    assert.equal(publicationById(db, latePublication.id)?.scope_hash, "late-scope");
     writeFileSync(first.artifact_path, "tampered");
     assert.throws(() => readPublicationArtifact(root, first), /artifact_invalid/);
     chmodSync(join(root, ".pi", "plan-publications"), 0o700);

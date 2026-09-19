@@ -228,6 +228,10 @@ export function markPublicationResult(db: DatabaseSync, rowId: number, result: {
 export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): PlanRecordRow {
   const acceptance = publicationAcceptanceById(db, input.scoutAcceptance);
   if (!acceptance || acceptance.ticket !== input.ticket) throw new Error("artifact_invalid");
+  const planPublication = input.publicationId === undefined ? undefined : publicationById(db, input.publicationId);
+  if (input.publicationId !== undefined && (!planPublication || planPublication.ticket !== input.ticket || planPublication.kind !== "plan" || planPublication.content_hash !== input.contentHash)) throw new Error("artifact_invalid");
+  const scoutPublication = input.scoutPublication === undefined ? undefined : publicationById(db, input.scoutPublication);
+  if (input.scoutPublication !== undefined && (!scoutPublication || scoutPublication.ticket !== input.ticket || scoutPublication.kind !== "scout" || scoutPublication.content_hash !== acceptance.content_hash || acceptance.publication_id !== input.scoutPublication)) throw new Error("artifact_invalid");
   db.prepare(`INSERT INTO plan_record
     (ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance)
     VALUES (?,NULL,?,?,?,?,?,NULL,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
@@ -240,18 +244,26 @@ export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): Plan
   if (!row || row.artifact_path !== input.artifactPath || row.bytes !== input.bytes) throw new Error("artifact_invalid");
   if (input.publicationId !== undefined) {
     if (row.publication_id !== null && row.publication_id !== input.publicationId) throw new Error("artifact_invalid");
-    db.prepare("UPDATE plan_record SET publication_id=? WHERE id=? AND publication_id IS NULL").run(input.publicationId, row.id);
+    const desiredScout = input.scoutPublication ?? row.scout_publication;
+    const collision = desiredScout === null ? undefined : db.prepare(`SELECT id FROM plan_record
+      WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=? AND id<>? LIMIT 1`).get(
+      row.ticket, input.publicationId, row.plan_path, row.content_hash, row.scope_hash, desiredScout, row.id,
+    );
+    db.prepare("UPDATE plan_record SET publication_id=?,scout_publication=CASE WHEN ? THEN NULL ELSE scout_publication END WHERE id=? AND publication_id IS NULL").run(input.publicationId, collision ? 1 : 0, row.id);
     row = planRecordById(db, row.id)!;
   }
   if (input.scoutPublication !== undefined) {
     if (row.scout_publication !== null && row.scout_publication !== input.scoutPublication) throw new Error("artifact_invalid");
-    const collision = row.publication_id === null ? true : db.prepare(`SELECT id FROM plan_record
+    const collision = row.publication_id === null ? undefined : db.prepare(`SELECT id FROM plan_record
       WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=? AND id<>? LIMIT 1`).get(
       row.ticket, row.publication_id, row.plan_path, row.content_hash, row.scope_hash, input.scoutPublication, row.id,
     );
     if (!collision) db.prepare("UPDATE plan_record SET scout_publication=? WHERE id=? AND scout_publication IS NULL").run(input.scoutPublication, row.id);
   }
   row = planRecordById(db, row.id)!;
+  if (row.successful_record && row.publication_id !== null) {
+    db.prepare("UPDATE plan_publication SET plan_path=?,scope_hash=?,updated_at=datetime('now') WHERE id=? AND kind='plan' AND plan_path IS NULL AND scope_hash IS NULL").run(row.plan_path, row.scope_hash, row.publication_id);
+  }
   return row;
 }
 
