@@ -153,6 +153,15 @@ function migratePublicationProvenance(db: DatabaseSync): void {
 }
 
 function migrateIncidentColumns(db: DatabaseSync): void {
+  addColumn(db, "plan_publication", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
+  addColumn(db, "plan_publication", "incident_id TEXT");
+  addColumn(db, "plan_publication", "candidate_id TEXT");
+  addColumn(db, "plan_publication", "source_run_id TEXT");
+  addColumn(db, "plan_publication", "failure_hash TEXT");
+  addColumn(db, "plan_publication", "payload_hash TEXT");
+  addColumn(db, "plan_publication", "skipped_json TEXT");
+  addColumn(db, "plan_publication", "preserved_json TEXT");
+  addColumn(db, "plan_publication", "incident_reason TEXT");
   addColumn(db, "plan_publication_acceptance", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
   addColumn(db, "plan_publication_acceptance", "incident_id TEXT");
   addColumn(db, "plan_publication_acceptance", "candidate_id TEXT");
@@ -386,6 +395,20 @@ export function openDb(path: string): DatabaseSync {
       actual_task_hash TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (accepted_input_id,planning_identity,dispatch_kind,revision_of)
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_writer_draft (
+      content_hash TEXT PRIMARY KEY,
+      accepted_input_id INTEGER NOT NULL REFERENCES plan_publication_acceptance(id),
+      planning_identity TEXT NOT NULL,
+      writer_run_id TEXT NOT NULL,
+      writer_task_hash TEXT NOT NULL,
+      writer_actual_task_hash TEXT NOT NULL,
+      plan_path TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      result_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (accepted_input_id,planning_identity,writer_run_id)
     );
 
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_update BEFORE UPDATE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;

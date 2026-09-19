@@ -36,6 +36,26 @@ export interface PublicationRow extends ArtifactMetadata {
   complete: 0 | 1;
   error_code: PublicationError | null;
   side_effects_started: 0 | 1;
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  source_run_id: string | null;
+  failure_hash: string | null;
+  payload_hash: string | null;
+  skipped_json: string | null;
+  preserved_json: string | null;
+  incident_reason: string | null;
+}
+export interface PublicationProvenance {
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  source_run_id: string | null;
+  failure_hash: string | null;
+  payload_hash: string | null;
+  skipped_json: string | null;
+  preserved_json: string | null;
+  incident_reason: string | null;
 }
 export interface PublicationIdentityInput {
   target: string;
@@ -47,6 +67,7 @@ export interface PublicationIdentityInput {
   child?: ChildIdentity;
   planPath?: string;
   scopeHash?: string;
+  provenance?: PublicationProvenance;
 }
 export type ScoutInputSource = "normal-transport" | "engineer-accepted-input";
 export interface PublicationAcceptanceRow extends ArtifactMetadata {
@@ -72,6 +93,12 @@ export interface PublicationAcceptanceRow extends ArtifactMetadata {
 }
 export interface PlanRecordRow extends ArtifactMetadata {
   id: number;
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  writer_run_id: string | null;
+  writer_task_hash: string | null;
+  writer_actual_task_hash: string | null;
   ticket: string;
   publication_id: number | null;
   plan_path: string;
@@ -91,6 +118,7 @@ export interface PlanRecordInput {
   scoutAcceptance: number;
   publicationId?: number;
   scoutPublication?: number;
+  writer?: { runId: string; taskHash: string; actualTaskHash: string };
 }
 
 const contained = (root: string, candidate: string): boolean => {
@@ -141,17 +169,20 @@ export function writePublicationArtifact(root: string, ticket: string, kind: Pub
 export function acceptPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput): PublicationRow {
   const contentHash = sha256(input.bytes);
   const artifact = writePublicationArtifact(root, input.ticket, input.kind, contentHash, input.bytes);
-  const provenanceKey = "normal";
+  const provenance = input.provenance ?? { source_kind: "normal-transport", incident_id: null, candidate_id: null, source_run_id: null, failure_hash: null, payload_hash: null, skipped_json: null, preserved_json: null, incident_reason: null };
+  if (provenance.source_kind === "engineer-accepted-input" && (!provenance.incident_id || !provenance.candidate_id || !provenance.source_run_id || !provenance.failure_hash || !provenance.payload_hash || !provenance.skipped_json || !provenance.preserved_json || !provenance.incident_reason)) throw new Error("artifact_invalid");
+  const provenanceKey = provenance.source_kind === "normal-transport" ? "normal" : `incident:${provenance.incident_id}:candidate:${provenance.candidate_id}:failure:${provenance.failure_hash}`;
   db.prepare(`INSERT INTO plan_publication
-    (target,target_hash,ticket,kind,content_hash,provenance_key,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    (target,target_hash,ticket,kind,content_hash,provenance_key,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(target,ticket,kind,content_hash,provenance_key) DO NOTHING`).run(
     input.target, input.targetHash, input.ticket, input.kind, contentHash, provenanceKey, artifact, input.bytes.length, input.runId,
     input.child?.ownerRunId ?? null, input.child?.ownerSessionId ?? null, input.child?.batchId ?? null, input.child?.taskHash ?? null,
-    input.planPath ?? null, input.scopeHash ?? null,
+    input.planPath ?? null, input.scopeHash ?? null, provenance.source_kind, provenance.incident_id, provenance.candidate_id,
+    provenance.source_run_id, provenance.failure_hash, provenance.payload_hash, provenance.skipped_json, provenance.preserved_json, provenance.incident_reason,
   );
   const row = db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=? AND provenance_key=?").get(input.target, input.ticket, input.kind, contentHash, provenanceKey) as unknown as PublicationRow;
-  if (row.target_hash !== input.targetHash || row.artifact_path !== artifact || row.bytes !== input.bytes.length) throw new Error("artifact_invalid");
+  if (row.target_hash !== input.targetHash || row.artifact_path !== artifact || row.bytes !== input.bytes.length || row.source_kind !== provenance.source_kind || row.incident_id !== provenance.incident_id || row.candidate_id !== provenance.candidate_id || row.failure_hash !== provenance.failure_hash) throw new Error("artifact_invalid");
   return row;
 }
 
@@ -206,6 +237,13 @@ export function acceptScoutArtifact(db: DatabaseSync, root: string, child: Child
 export function acceptPublicationDelivery(db: DatabaseSync, publicationId: number, child: ChildIdentity): PublicationAcceptanceRow {
   const publication = publicationById(db, publicationId);
   if (!publication || publication.kind !== "scout" || publication.ticket !== child.ticket) throw new Error("artifact_invalid");
+  const existing = deliveryRow(db, child);
+  if (existing?.source_kind === "engineer-accepted-input") {
+    if (publication.source_kind !== existing.source_kind || publication.incident_id !== existing.incident_id || publication.candidate_id !== existing.candidate_id || publication.source_run_id !== existing.source_run_id || publication.failure_hash !== existing.failure_hash || publication.payload_hash !== existing.payload_hash || publication.content_hash !== existing.content_hash || publication.artifact_path !== existing.artifact_path || publication.bytes !== existing.bytes) throw new Error("artifact_invalid");
+    if (existing.publication_id !== null && existing.publication_id !== publicationId) throw new Error("artifact_invalid");
+    db.prepare("UPDATE plan_publication_acceptance SET publication_id=COALESCE(publication_id,?) WHERE id=?").run(publicationId, existing.id);
+    return publicationAcceptanceById(db, existing.id)!;
+  }
   return acceptDelivery(db, child, publication, publicationId, { source: "normal-transport" });
 }
 
@@ -266,20 +304,24 @@ export function markPublicationResult(db: DatabaseSync, rowId: number, result: {
 export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): PlanRecordRow {
   const acceptance = publicationAcceptanceById(db, input.scoutAcceptance);
   if (!acceptance || acceptance.ticket !== input.ticket) throw new Error("artifact_invalid");
+  if (acceptance.source_kind === "engineer-accepted-input" && (!acceptance.incident_id || !acceptance.candidate_id || !input.writer)) throw new Error("artifact_invalid");
+  if (acceptance.source_kind === "normal-transport" && (acceptance.incident_id || acceptance.candidate_id)) throw new Error("artifact_invalid");
   const planPublication = input.publicationId === undefined ? undefined : publicationById(db, input.publicationId);
   if (input.publicationId !== undefined && (!planPublication || planPublication.ticket !== input.ticket || planPublication.kind !== "plan" || planPublication.content_hash !== input.contentHash)) throw new Error("artifact_invalid");
   const scoutPublication = input.scoutPublication === undefined ? undefined : publicationById(db, input.scoutPublication);
   if (input.scoutPublication !== undefined && (!scoutPublication || scoutPublication.ticket !== input.ticket || scoutPublication.kind !== "scout" || scoutPublication.content_hash !== acceptance.content_hash || acceptance.publication_id !== input.scoutPublication)) throw new Error("artifact_invalid");
   db.prepare(`INSERT INTO plan_record
-    (ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance)
-    VALUES (?,NULL,?,?,?,?,?,NULL,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
+    (ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance,source_kind,incident_id,candidate_id,writer_run_id,writer_task_hash,writer_actual_task_hash)
+    VALUES (?,NULL,?,?,?,?,?,NULL,?,?,?,?,?,?,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
     input.ticket, input.planPath, input.contentHash, input.scopeHash, input.artifactPath, input.bytes, input.scoutAcceptance,
+    acceptance.source_kind, acceptance.incident_id, acceptance.candidate_id, input.writer?.runId ?? null, input.writer?.taskHash ?? null, input.writer?.actualTaskHash ?? null,
   );
   let row = db.prepare(`SELECT * FROM plan_record
     WHERE ticket=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_acceptance=?`).get(
     input.ticket, input.planPath, input.contentHash, input.scopeHash, input.scoutAcceptance,
   ) as unknown as PlanRecordRow | undefined;
-  if (!row || row.artifact_path !== input.artifactPath || row.bytes !== input.bytes) throw new Error("artifact_invalid");
+  if (!row || row.artifact_path !== input.artifactPath || row.bytes !== input.bytes || row.source_kind !== acceptance.source_kind || row.incident_id !== acceptance.incident_id || row.candidate_id !== acceptance.candidate_id) throw new Error("artifact_invalid");
+  if (input.writer && (row.writer_run_id !== input.writer.runId || row.writer_task_hash !== input.writer.taskHash || row.writer_actual_task_hash !== input.writer.actualTaskHash)) throw new Error("artifact_invalid");
   if (input.publicationId !== undefined) {
     if (row.publication_id !== null && row.publication_id !== input.publicationId) throw new Error("artifact_invalid");
     const desiredScout = input.scoutPublication ?? row.scout_publication;

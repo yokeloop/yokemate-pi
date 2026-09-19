@@ -48,8 +48,13 @@ test("only a live blocked plan lineage can continue one registered candidate gen
     assert.equal(continued.generation, 2);
     assert.equal(continued.planningIdentity, `${runId}:2`);
     assert.equal((await requestPlanControl(root, "continue-scout-candidate", { ticket: "YM-1", runId, candidateId, failureHash }, main, target, env)).state, "refused");
-    assert.equal((await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "writer-run" }, main, target, env)).state, "refused");
-    const writer = await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "writer-run" }, worker, target, env);
+    assert.equal((await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "writer-run", acceptanceId: 7 }, main, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "bind-recovered-scout", { ticket: "YM-1", runId, candidateId, failureHash, acceptanceId: 7 }, worker, target, env)).state, "refused");
+    const bound = await requestPlanControl(root, "bind-recovered-scout", { ticket: "YM-1", runId, candidateId, failureHash, acceptanceId: 7 }, main, target, env);
+    assert.equal(bound.state, "accepted");
+    const writerInput = await requestPlanControl(root, "read-plan-writer-input", { ticket: "YM-1", runId }, worker, target, env);
+    assert.equal(writerInput.acceptanceId, 7);
+    const writer = await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "writer-run", acceptanceId: 7 }, worker, target, env);
     assert.equal(writer.state, "accepted");
     assert.equal(writer.planningIdentity, `${runId}:2`);
   } finally {

@@ -241,6 +241,39 @@ export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncident
   return id;
 }
 
+export interface WriterDraftRow {
+  content_hash: string;
+  accepted_input_id: number;
+  planning_identity: string;
+  writer_run_id: string;
+  writer_task_hash: string;
+  writer_actual_task_hash: string;
+  plan_path: string;
+  bytes: number;
+  result_hash: string;
+}
+
+export function recordWriterDraft(db: DatabaseSync, input: WriterDraftRow): WriterDraftRow {
+  for (const [value, label] of [[input.content_hash, "draft hash"], [input.writer_task_hash, "writer task hash"], [input.writer_actual_task_hash, "writer actual task hash"], [input.result_hash, "writer result hash"]] as const) safeHash(value, label);
+  if (!Number.isSafeInteger(input.accepted_input_id) || input.accepted_input_id < 1 || !Number.isSafeInteger(input.bytes) || input.bytes < 1) throw new Error("invalid writer draft size or input");
+  safeId(input.planning_identity, "planning identity");
+  safeId(input.writer_run_id, "writer run");
+  db.prepare(`INSERT INTO workflow_writer_draft
+    (content_hash,accepted_input_id,planning_identity,writer_run_id,writer_task_hash,writer_actual_task_hash,plan_path,bytes,result_hash)
+    VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(content_hash) DO NOTHING`).run(
+    input.content_hash, input.accepted_input_id, input.planning_identity, input.writer_run_id, input.writer_task_hash,
+    input.writer_actual_task_hash, input.plan_path, input.bytes, input.result_hash,
+  );
+  const row = writerDraftFor(db, input.content_hash);
+  if (!row || JSON.stringify(row) !== JSON.stringify(input)) throw new Error("writer draft identity changed");
+  return row;
+}
+
+export function writerDraftFor(db: DatabaseSync, contentHash: string): WriterDraftRow | undefined {
+  return db.prepare(`SELECT content_hash,accepted_input_id,planning_identity,writer_run_id,writer_task_hash,writer_actual_task_hash,plan_path,bytes,result_hash
+    FROM workflow_writer_draft WHERE content_hash=?`).get(contentHash) as unknown as WriterDraftRow | undefined;
+}
+
 export function incidentById(db: DatabaseSync, id: string): WorkflowIncidentRow | undefined {
   return db.prepare("SELECT * FROM workflow_incident WHERE id=?").get(id) as unknown as WorkflowIncidentRow | undefined;
 }

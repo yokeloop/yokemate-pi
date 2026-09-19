@@ -11,7 +11,7 @@ function input(text: string, run = "run-one") {
 
 function row(text: string): { row: PublicationRow; bytes: Buffer } {
   const value = input(text);
-  return { bytes: value.bytes, row: { id: 1, target: value.target, target_hash: value.targetHash, canonical_url: value.canonicalUrl, ticket: value.ticket, kind: "scout", content_hash: value.hash, artifact_path: "/fixture", bytes: value.bytes.length, run_id: value.run, owner_run_id: null, owner_session_id: null, batch_id: null, task_hash: null, plan_path: null, scope_hash: null, scout_publication: null, successful_record: 0, complete: 0, error_code: null, side_effects_started: 0 } };
+  return { bytes: value.bytes, row: { id: 1, target: value.target, target_hash: value.targetHash, canonical_url: value.canonicalUrl, ticket: value.ticket, kind: "scout", content_hash: value.hash, artifact_path: "/fixture", bytes: value.bytes.length, run_id: value.run, owner_run_id: null, owner_session_id: null, batch_id: null, task_hash: null, plan_path: null, scope_hash: null, scout_publication: null, successful_record: 0, complete: 0, error_code: null, side_effects_started: 0, source_kind: "normal-transport", incident_id: null, candidate_id: null, source_run_id: null, failure_hash: null, payload_hash: null, skipped_json: null, preserved_json: null, incident_reason: null } };
 }
 
 test("publication framing is lossless, stable and inside the byte budget", () => {
@@ -22,6 +22,16 @@ test("publication framing is lossless, stable and inside the byte budget", () =>
   assert.ok(framed.every((part) => Buffer.byteLength(part.body) <= COMMENT_BUDGET));
   assert.deepEqual(Buffer.concat(framed.map((part) => part.fragment)), bytes);
   assert.equal(reconcilePublication({ ...input(bytes.toString()), bytes, hash: sha256(bytes) }, framed.map((part) => ({ id: String(part.part), text: part.body }))).complete, true);
+});
+
+test("recovered publications use incident-v2 markers and cannot reconcile against downgraded v1 comments", () => {
+  const value = { ...input("# Recovered\n"), provenance: { source: "engineer-accepted-input" as const, incident: "incident-1", candidate: "candidate-1", sourceRun: "scout-run", failureHash: sha256("failure"), payloadHash: sha256("payload"), skipped: '["failed-transport-envelope"]', preserved: '["plan-only"]', reason: "Complete output survived a transport failure." } };
+  const framed = splitPublication(value);
+  assert.match(framed[0]!.body, /^<!-- yokemate-plan-publication:\{"v":2,/);
+  assert.match(framed[0]!.body, /source: engineer-accepted-input/);
+  assert.equal(reconcilePublication(value, framed.map((part) => ({ id: String(part.part), text: part.body }))).complete, true);
+  const normal = splitPublication(input("# Recovered\n"));
+  assert.throws(() => reconcilePublication(value, normal.map((part) => ({ id: String(part.part), text: part.body }))), (error: unknown) => error instanceof PublicationFailure && error.code === "remote_conflict");
 });
 
 test("remote trimming of one trailing newline is restored only when metadata proves the byte", () => {

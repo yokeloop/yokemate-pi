@@ -63,7 +63,7 @@ test("production subagent admission injects an owned exact scout and claims one 
     const ctx = { cwd: root, mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => "plan-session" }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { hasConfiguredAuth: () => true }, ui: { setWidget() {}, notify() {} } } as unknown as ExtensionContext;
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
-    await assert.rejects(() => tool.execute("missing", { agent: "plan-writer", task: "write", ticket: "YM-1" }, undefined, () => undefined, ctx), /acceptedInputId/);
+    await assert.rejects(() => tool.execute("missing", { agent: "plan-writer", task: "write", ticket: "YM-1" }, undefined, () => undefined, ctx), /acceptedInputId|no live coordinator parent/);
     const launched = await tool.execute("writer", { agent: "plan-writer", task: "Write from the accepted source.", ticket: "YM-1", acceptedInputId: scout.id }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(launched), /Detached, not terminal/);
     await report;

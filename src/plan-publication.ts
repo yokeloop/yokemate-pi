@@ -21,6 +21,17 @@ export interface PublicationFrameInput {
   hash: string;
   bytes: Buffer;
   knowledgePath?: string;
+  provenance?: {
+    source: "engineer-accepted-input";
+    incident: string;
+    candidate: string;
+    sourceRun: string;
+    failureHash: string;
+    payloadHash: string;
+    skipped: string;
+    preserved: string;
+    reason: string;
+  };
 }
 export interface PublicationPart { part: number; total: number; bytes: number; chunkHash: string; fragment: Buffer; body: string; run: string }
 export interface RemoteComment { id: string; text: string; url?: string }
@@ -70,7 +81,8 @@ export function assertPublishable(bytes: Buffer): void {
 }
 
 function marker(input: PublicationFrameInput, part: number, total: number, fragment: Buffer): string {
-  return `${markerPrefix}${JSON.stringify({ v: 1, target: input.targetHash, ticket: input.ticket, run: input.run, kind: input.kind, hash: input.hash, part, total, bytes: fragment.length, chunkHash: sha256(fragment) })} -->`;
+  const common = { target: input.targetHash, ticket: input.ticket, run: input.run, kind: input.kind, hash: input.hash, part, total, bytes: fragment.length, chunkHash: sha256(fragment) };
+  return `${markerPrefix}${JSON.stringify(input.provenance ? { v: 2, ...common, provenance: input.provenance } : { v: 1, ...common })} -->`;
 }
 
 function frame(input: PublicationFrameInput, part: number, total: number, fragment: Buffer): string {
@@ -80,6 +92,7 @@ function frame(input: PublicationFrameInput, part: number, total: number, fragme
     `target: ${input.canonicalUrl}`,
     `run: ${input.run}`,
   ];
+  if (input.provenance) lines.push(`source: ${input.provenance.source}`, `incident: ${input.provenance.incident}`, `candidate: ${input.provenance.candidate}`, `source-run: ${input.provenance.sourceRun}`, "failure-category: failed-transport-envelope", `failure-hash: ${input.provenance.failureHash}`, "status: audit-preserved; plan-only");
   if (input.kind === "plan") {
     if (!input.knowledgePath) throw new PublicationFailure("artifact_invalid");
     lines.push(`knowledge: ${input.knowledgePath}`, "record: planned (successful local record)");
@@ -153,6 +166,7 @@ interface ParsedPart {
   chunkHash: string;
   fragment: Buffer;
   body: string;
+  provenance?: PublicationFrameInput["provenance"];
 }
 
 function parseOwnComment(text: string): ParsedPart | null | "malformed" {
@@ -163,8 +177,15 @@ function parseOwnComment(text: string): ParsedPart | null | "malformed" {
   if (!match) return "malformed";
   let value: Record<string, unknown>;
   try { value = JSON.parse(match[1]!); } catch { return "malformed"; }
-  const keys = ["v", "target", "ticket", "run", "kind", "hash", "part", "total", "bytes", "chunkHash"];
-  if (JSON.stringify(Object.keys(value)) !== JSON.stringify(keys) || value.v !== 1 || typeof value.target !== "string" || !/^[a-f0-9]{64}$/.test(value.target) || typeof value.ticket !== "string" || typeof value.run !== "string" || !["scout", "plan"].includes(String(value.kind)) || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash) || !Number.isInteger(value.part) || !Number.isInteger(value.total) || !Number.isInteger(value.bytes) || typeof value.chunkHash !== "string") return "malformed";
+  const keys = value.v === 2 ? ["v", "target", "ticket", "run", "kind", "hash", "part", "total", "bytes", "chunkHash", "provenance"] : ["v", "target", "ticket", "run", "kind", "hash", "part", "total", "bytes", "chunkHash"];
+  if (JSON.stringify(Object.keys(value)) !== JSON.stringify(keys) || ![1, 2].includes(value.v as number) || typeof value.target !== "string" || !/^[a-f0-9]{64}$/.test(value.target) || typeof value.ticket !== "string" || typeof value.run !== "string" || !["scout", "plan"].includes(String(value.kind)) || typeof value.hash !== "string" || !/^[a-f0-9]{64}$/.test(value.hash) || !Number.isInteger(value.part) || !Number.isInteger(value.total) || !Number.isInteger(value.bytes) || typeof value.chunkHash !== "string") return "malformed";
+  let provenance: PublicationFrameInput["provenance"];
+  if (value.v === 2) {
+    const item = value.provenance as Record<string, unknown> | null;
+    const pkeys = ["source", "incident", "candidate", "sourceRun", "failureHash", "payloadHash", "skipped", "preserved", "reason"];
+    if (!item || JSON.stringify(Object.keys(item)) !== JSON.stringify(pkeys) || item.source !== "engineer-accepted-input" || pkeys.slice(1).some((key) => typeof item[key] !== "string") || !/^[a-f0-9]{64}$/.test(String(item.failureHash)) || !/^[a-f0-9]{64}$/.test(String(item.payloadHash))) return "malformed";
+    provenance = item as unknown as NonNullable<PublicationFrameInput["provenance"]>;
+  }
   const split = text.indexOf(separator, firstEnd);
   if (split < 0) return "malformed";
   let fragment = Buffer.from(text.slice(split + separator.length), "utf8");
@@ -177,7 +198,7 @@ function parseOwnComment(text: string): ParsedPart | null | "malformed" {
     }
   }
   if (fragment.length !== value.bytes || sha256(fragment) !== value.chunkHash) return "malformed";
-  return { target: value.target, ticket: value.ticket, run: value.run, kind: value.kind as PublicationKind, hash: value.hash, part: value.part as number, total: value.total as number, bytes: value.bytes as number, chunkHash: value.chunkHash, fragment, body };
+  return { target: value.target, ticket: value.ticket, run: value.run, kind: value.kind as PublicationKind, hash: value.hash, part: value.part as number, total: value.total as number, bytes: value.bytes as number, chunkHash: value.chunkHash, fragment, body, ...(provenance ? { provenance } : {}) };
 }
 
 export function reconcilePublication(input: PublicationFrameInput, comments: RemoteComment[]): { complete: boolean; parts: PublicationPart[]; missing: PublicationPart[] } {
@@ -216,7 +237,11 @@ export function reconcilePublication(input: PublicationFrameInput, comments: Rem
 const localPublicationFailures = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
 
 export async function publishDocument(row: PublicationRow, bytes: Buffer, adapter: PublicationAdapter, options: { canonicalUrl: string; knowledgePath?: string; verifyBinding?: () => void | Promise<void> }): Promise<PublishResult> {
-  const input: PublicationFrameInput = { target: row.target, targetHash: row.target_hash, canonicalUrl: options.canonicalUrl, ticket: row.ticket, run: row.run_id, kind: row.kind, hash: row.content_hash, bytes, knowledgePath: options.knowledgePath };
+  const provenance = row.source_kind === "engineer-accepted-input"
+    ? { source: "engineer-accepted-input" as const, incident: row.incident_id!, candidate: row.candidate_id!, sourceRun: row.source_run_id!, failureHash: row.failure_hash!, payloadHash: row.payload_hash!, skipped: row.skipped_json!, preserved: row.preserved_json!, reason: row.incident_reason! }
+    : undefined;
+  if (row.source_kind === "engineer-accepted-input" && Object.values(provenance!).some((value) => !value)) throw new PublicationFailure("artifact_invalid");
+  const input: PublicationFrameInput = { target: row.target, targetHash: row.target_hash, canonicalUrl: options.canonicalUrl, ticket: row.ticket, run: row.run_id, kind: row.kind, hash: row.content_hash, bytes, knowledgePath: options.knowledgePath, provenance };
   try {
     assertPublishable(bytes);
     await options.verifyBinding?.();

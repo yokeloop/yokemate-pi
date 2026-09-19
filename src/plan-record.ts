@@ -11,6 +11,7 @@ import { applyMove, type MoveEnv } from "./transitions.ts";
 import { assertPlanBinding, readCandidatePlanSnapshot, toPlanBinding, type PlanBinding } from "./plan-binding.ts";
 import { assertPublishable } from "./plan-publication.ts";
 import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicationAcceptanceById, readPublicationArtifact } from "./plan-publication-state.ts";
+import { appendIncidentEvent, incidentById, writerDraftFor } from "./workflow-incident-state.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
 export interface RecordPlanOptions { expectedBinding: PlanBinding; recordId: number; signal?: AbortSignal; onLocked?(): void }
@@ -29,9 +30,18 @@ function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBi
     if (!snapshot.equals(candidate.bytes)) throw new Error("binding_changed");
     assertPublishable(snapshot);
     const scout = publicationAcceptanceById(db, record.scout_acceptance);
-    if (!scout || scout.ticket !== ticket) throw new Error("artifact_invalid");
+    if (!scout || scout.ticket !== ticket || record.source_kind !== scout.source_kind || record.incident_id !== scout.incident_id || record.candidate_id !== scout.candidate_id) throw new Error("artifact_invalid");
     assertPublishable(readPublicationArtifact(root, scout));
-    return { db, candidate, record };
+    let incident;
+    if (scout.source_kind === "engineer-accepted-input") {
+      if (!scout.incident_id || !scout.candidate_id || !record.writer_run_id || !record.writer_task_hash || !record.writer_actual_task_hash) throw new Error("artifact_invalid");
+      incident = incidentById(db, scout.incident_id);
+      const draft = writerDraftFor(db, candidate.contentHash);
+      if (!incident || !draft || draft.accepted_input_id !== scout.id || draft.planning_identity !== scout.continuation_id || draft.writer_run_id !== record.writer_run_id || draft.writer_task_hash !== record.writer_task_hash || draft.writer_actual_task_hash !== record.writer_actual_task_hash || draft.plan_path !== candidate.path || draft.bytes !== candidate.bytes.length) throw new Error("binding_changed");
+      const markers = ["BREAK-GLASS: engineer-accepted-input", `incident: ${scout.incident_id}`, `source-run: ${scout.source_run_id}`, `source-hash: ${scout.content_hash}`, `reason: ${scout.incident_reason}`, "skipped: failed-transport-envelope"];
+      if (markers.some((marker) => !candidate.text.includes(marker))) throw new Error("binding_changed");
+    }
+    return { db, candidate, record, scout, incident };
   } catch (error) {
     db.close();
     throw error;
@@ -40,7 +50,7 @@ function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBi
 
 export function recordPlanCore(root: string, ticket: string, expectedBinding: PlanBinding, recordId: number, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
   const data = dataRoot(root);
-  const { db, candidate, record } = verifyLocalRecord(root, ticket, expectedBinding, recordId);
+  const { db, candidate, record, scout, incident } = verifyLocalRecord(root, ticket, expectedBinding, recordId);
   const plan = candidate.path;
   const dataRelative = relative(data, plan);
   if (dataRelative.startsWith("..") || isAbsolute(dataRelative)) { db.close(); throw new Error(`plan is outside the data root: ${plan}`); }
@@ -49,8 +59,10 @@ export function recordPlanCore(root: string, ticket: string, expectedBinding: Pl
   let sideEffects = false;
   try {
     out = applyMove(db, "plan", env, ticket, () => {
+      if (incident) appendIncidentEvent(db, incident, { kind: "effect-start", code: "record-plan", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "started" });
       db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
       markSuccessfulRecord(db, record.id);
+      if (incident) appendIncidentEvent(db, incident, { kind: "outcome", code: "local-record", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "planned" });
     }, { settings });
     if (out.ok) sideEffects = markSideEffectsStarted(db, record.id);
   } finally { db.close(); }

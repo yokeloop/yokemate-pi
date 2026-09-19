@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { openDb } from "../src/db.ts";
 import { captureScoutCandidate } from "../src/plan-scout-recovery.ts";
-import { acceptRecoveredScoutArtifact, acceptScoutArtifact, publicationAcceptanceById } from "../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptRecoveredScoutArtifact, acceptScoutArtifact, publicationAcceptanceById, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { ChildRuns, JsonlObservation, resultEnvelope, sha256 } from "../src/subagent-runs.ts";
-import { claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, safeIncidentReason } from "../src/workflow-incident-state.ts";
+import { claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, recordWriterDraft, safeIncidentReason } from "../src/workflow-incident-state.ts";
 
 function candidateFixture(root: string) {
   mkdirSync(join(root, ".pi"), { recursive: true });
@@ -58,6 +58,10 @@ test("candidate consumption, acceptance and audit commit atomically and survive 
     assert.equal(consumed.value.incident_id, consumed.incident.id);
     assert.equal(consumed.value.candidate_id, row.id);
     assert.equal(consumed.value.failure_hash, row.failed_envelope_hash);
+    const publication = acceptPublication(db, root, { target: "github:org/repo#1", targetHash: sha256("github:org/repo#1"), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# Exact scout\n\nEvidence.\n"), runId: row.run_id, provenance: consumed.value });
+    const linked = acceptPublicationDelivery(db, publication.id, candidate.child);
+    assert.equal(linked.publication_id, publication.id);
+    assert.equal(publication.source_kind, "engineer-accepted-input");
     assert.deepEqual(readIncidentEvents(db, consumed.incident.id).map((event) => event.kind), ["grant", "consume"]);
     assert.throws(() => consumeScoutIncident(db, incidentInput(row.id, row.content_hash), () => undefined), /UNIQUE/);
     const writer = claimWriterDispatch(db, consumed.incident, { acceptedInputId: String(consumed.value.id), planningIdentity: consumed.incident.planning_identity, kind: "initial", writerRunId: "writer-run", taskHash: sha256("writer task"), actualTaskHash: sha256("writer task") });
@@ -72,6 +76,28 @@ test("candidate consumption, acceptance and audit commit atomically and survive 
     assert.equal(acceptance.incident_id, consumed.incident.id);
     assert.equal(db.prepare("SELECT count(*) AS n FROM workflow_incident_event WHERE incident_id=?").get(consumed.incident.id)?.n, 3);
     assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+    db.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("recovered plan records require immutable incident and correlated writer provenance", () => {
+  const root = mkdtempSync(join(tmpdir(), "incident-plan-record-"));
+  try {
+    const candidate = candidateFixture(root);
+    const db = openDb(join(root, "yokemate.db"));
+    const row = persistScoutCandidate(db, root, candidate);
+    const consumed = consumeScoutIncident(db, incidentInput(row.id, row.content_hash), (incident, exact) => acceptRecoveredScoutArtifact(db, root, incident, exact, exact.content_hash, ["failed-transport-envelope"], ["plan-only"], "continuation", 2));
+    const plan = Buffer.from("# Plan\n\n## Goal\nShip.\n\n## Acceptance\nPass.\n\n## Assumptions\n- recovery.\n");
+    const planHash = sha256(plan);
+    const planPath = "home/knowledge/org/repo/ai/YM-1-test/YM-1-test-plan.md";
+    const artifactPath = writePublicationArtifact(root, "YM-1", "plan", planHash, plan);
+    const base = { ticket: "YM-1", planPath, contentHash: planHash, scopeHash: sha256("scope"), artifactPath, bytes: plan.length, scoutAcceptance: consumed.value.id };
+    assert.throws(() => acceptPlanRecord(db, base), /artifact_invalid/);
+    const draft = recordWriterDraft(db, { content_hash: planHash, accepted_input_id: consumed.value.id, planning_identity: "continuation", writer_run_id: "writer-run", writer_task_hash: sha256("writer task"), writer_actual_task_hash: sha256("writer actual task"), plan_path: planPath, bytes: plan.length, result_hash: sha256(planPath) });
+    const record = acceptPlanRecord(db, { ...base, writer: { runId: draft.writer_run_id, taskHash: draft.writer_task_hash, actualTaskHash: draft.writer_actual_task_hash } });
+    assert.equal(record.source_kind, "engineer-accepted-input");
+    assert.equal(record.incident_id, consumed.incident.id);
+    assert.equal(record.writer_run_id, "writer-run");
     db.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

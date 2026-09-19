@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
-import { claimWriterDispatch, incidentById, persistScoutCandidate } from "../../../src/workflow-incident-state.ts";
+import { appendIncidentEvent, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -59,7 +59,7 @@ import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../sr
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 import { finalizeShip } from "../../../src/ship-finalize.ts";
 import { PublicationTargetFailure, publicationTargetLabel, resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationProvenance, type PublicationRow } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
@@ -707,17 +707,43 @@ export default function (pi: ExtensionAPI) {
 					publication = publicationById(binding, publication.id)!;
 				} finally { binding.close(); }
 				canonicalUrl = resolved.canonicalUrl;
+				if (publication.source_kind === "engineer-accepted-input") {
+					const audit = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					try {
+						const incident = publication.incident_id ? incidentById(audit, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(audit, incident, { kind: "effect-start", code: `publish-${publication.kind}`, payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: "started" });
+					} finally { audit.close(); }
+				}
 				const knowledgePath = publication.plan_path ? path.relative(ENGINE_ROOT, publication.plan_path) : undefined;
 				const result = await publishDocument(publication, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding: verifyPublicationBinding });
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-				try { markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl }); }
+				try {
+					update.exec("BEGIN IMMEDIATE");
+					markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl });
+					if (publication.source_kind === "engineer-accepted-input") {
+						const incident = publication.incident_id ? incidentById(update, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(update, incident, { kind: "outcome", code: result.error ?? (result.complete ? "complete" : "partial"), payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: result.complete ? "complete" : "partial" });
+					}
+					update.exec("COMMIT");
+				} catch (error) { try { update.exec("ROLLBACK"); } catch {} throw error; }
 				finally { update.close(); }
 				return { ...result, target: resolved.canonicalUrl };
 			} catch (error) {
 				const code = error instanceof PublicationFailure ? error.code : "unavailable";
 				if (localPublicationErrors.has(code)) throw error;
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-				try { markPublicationResult(update, publication.id, { complete: false, error: code, canonicalUrl }); }
+				try {
+					update.exec("BEGIN IMMEDIATE");
+					markPublicationResult(update, publication.id, { complete: false, error: code, canonicalUrl });
+					if (publication.source_kind === "engineer-accepted-input") {
+						const incident = publication.incident_id ? incidentById(update, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(update, incident, { kind: "outcome", code, payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: "failed" });
+					}
+					update.exec("COMMIT");
+				} catch (auditError) { try { update.exec("ROLLBACK"); } catch {} throw auditError; }
 				finally { update.close(); }
 				return { complete: false, error: code, parts: 0, revision: publication.content_hash, target: canonicalUrl ?? safeTarget(publication.ticket) };
 			}
@@ -729,7 +755,7 @@ export default function (pi: ExtensionAPI) {
 	const attemptArtifactPublication = async (input: {
 		kind: "scout" | "plan"; ticket: string; artifact: ArtifactMetadata; runId: string; publicationId?: number;
 		child?: ChildIdentity; planPath?: string; scopeHash?: string; attach(db: DatabaseSync, row: PublicationRow): void;
-		verifyBinding?: () => void | Promise<void>;
+		verifyBinding?: () => void | Promise<void>; provenance?: PublicationProvenance;
 	}): Promise<PublicationOutcome> => {
 		const local = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		let row: PublicationRow | undefined;
@@ -751,7 +777,7 @@ export default function (pi: ExtensionAPI) {
 				markPublicationResult(local, row.id, { complete: false, error: "target_changed" });
 				return { kind: input.kind, state: "pending", target: row.canonical_url ?? publicationTargetLabel(local, input.ticket), revision: row.content_hash, publicationId: row.id, error: "target_changed" };
 			}
-			if (!row) row = acceptPublication(local, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash });
+			if (!row) row = acceptPublication(local, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash, provenance: input.provenance });
 			input.attach(local, row);
 		} finally { local.close(); }
 		const result = await publishAccepted(row!.id, input.verifyBinding);
@@ -1279,8 +1305,16 @@ export default function (pi: ExtensionAPI) {
 				const scout = publicationAcceptanceById(db, acceptanceId);
 				if (!scout || scout.ticket !== ticket || scout.owner_session_id !== origin.sessionId) throw new Error("plan preparation requires its current accepted scout");
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
+				let writer: { runId: string; taskHash: string; actualTaskHash: string } | undefined;
+				if (scout.source_kind === "engineer-accepted-input") {
+					const draft = writerDraftFor(db, snapshot.contentHash);
+					if (!draft || draft.accepted_input_id !== scout.id || draft.planning_identity !== scout.continuation_id || draft.plan_path !== snapshot.path || draft.bytes !== snapshot.bytes.length) throw new Error("recovery plan is not the correlated writer draft");
+					const markers = ["BREAK-GLASS: engineer-accepted-input", `incident: ${scout.incident_id}`, `source-run: ${scout.source_run_id}`, `source-hash: ${scout.content_hash}`, `reason: ${scout.incident_reason}`, "skipped: failed-transport-envelope"];
+					if (markers.some((marker) => !snapshot.text.includes(marker))) throw new Error("recovery plan assumptions do not match incident provenance");
+					writer = { runId: draft.writer_run_id, taskHash: draft.writer_task_hash, actualTaskHash: draft.writer_actual_task_hash };
+				}
 				const snapshotPath = writePublicationArtifact(ENGINE_ROOT, ticket, "plan", snapshot.contentHash, snapshot.bytes);
-				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}) });
+				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}), ...(writer ? { writer } : {}) });
 				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
@@ -1298,10 +1332,10 @@ export default function (pi: ExtensionAPI) {
 			} finally { db.close(); }
 			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
-			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, provenance: scout, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
 			const planOutcome: PublicationOutcome = scoutOutcome.error === "target_changed"
 				? { kind: "plan", state: "pending", target: scoutOutcome.target, revision: record.content_hash, ...(record.publication_id ? { publicationId: record.publication_id } : {}), error: "target_changed" }
-				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
+				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, provenance: scout, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}), ...(record.writer_run_id && record.writer_task_hash && record.writer_actual_task_hash ? { writer: { runId: record.writer_run_id, taskHash: record.writer_task_hash, actualTaskHash: record.writer_actual_task_hash } } : {}) }); }, verifyBinding: verify });
 			return [scoutOutcome, planOutcome];
 		};
 		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
@@ -1348,7 +1382,7 @@ export default function (pi: ExtensionAPI) {
 						assertPublishable(readPublicationArtifact(ENGINE_ROOT, acceptance));
 					} finally { db.close(); }
 					const child: ChildIdentity = { ownerRunId: acceptance.owner_run_id, ownerSessionId: acceptance.owner_session_id, batchId: acceptance.batch_id, runId: acceptance.run_id, agent: "plan-scout", taskHash: acceptance.task_hash, cwd: ENGINE_ROOT, ticket };
-					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
+					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
 				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
@@ -1520,7 +1554,7 @@ export default function (pi: ExtensionAPI) {
 				};
 				const accepted = await resolveScoutAcceptance({
 					db: state, root: ENGINE_ROOT, store: breakGlassPermits, preview, witness: ingressWitness, sourceUid: process.getuid!(),
-					confirm: async (value) => ctx.hasUI && await ctx.ui.confirm("Audited break-glass", `${value.ticket} accepts candidate ${value.candidateId}\nbytes: ${value.candidateBytes}\nhash: ${value.candidateHash}\nreason: ${value.reason}\nresult: plan-only; /do still needs fresh approval`, { timeout: Math.max(1, value.expiresAt - Date.now()) }),
+					confirm: async (value) => ctx.hasUI && await ctx.ui.confirm("Audited break-glass", `${value.ticket} accepts candidate ${value.candidateId}\nsource-run: ${value.sourceRunId}\nbytes: ${value.candidateBytes}\npayload-hash: ${value.candidateHash}\nfailure-category: failed-transport-envelope\nfailure-hash: ${value.failureHash}\nreason: ${value.reason}\nstatus: pending engineer confirmation\nresult: plan-only; /do still needs fresh approval`, { timeout: Math.max(1, value.expiresAt - Date.now()) }),
 					recheck,
 					continueLineage: async () => {
 						const continued = await requestPlanControl(ENGINE_ROOT, "continue-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash }, mainOrigin, parent);
@@ -1528,9 +1562,11 @@ export default function (pi: ExtensionAPI) {
 						return { planningIdentity: continued.planningIdentity, generation: continued.generation };
 					},
 				});
+				const bound = await requestPlanControl(ENGINE_ROOT, "bind-recovered-scout", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash, acceptanceId: accepted.acceptance.id }, mainOrigin, parent);
+				if (bound.state !== "accepted") throw new Error(bound.reason ?? "recovered scout binding refused");
 				workflowIngress.consume(ingressWitness.id, sessionId, controlIdentity.runtimeId, raw);
 				ingressWitness = undefined;
-				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId} accepted; plan writer may continue; result remains plan-only`, "warning");
+				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId}; accepted-input ${accepted.acceptance.id}; source-run ${candidate.run_id}; failure failed-transport-envelope ${candidate.failed_envelope_hash}; status accepted as ${accepted.planningIdentity}; result remains plan-only`, "warning");
 			} catch (error) {
 				breakGlassPermits.revoke();
 				ctx.ui.notify(`break-glass refused: ${(error as Error).message}`, "error");
@@ -1725,6 +1761,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const dispatch = state.prepare("SELECT planning_identity FROM workflow_writer_dispatch WHERE writer_run_id=? AND accepted_input_id=? AND actual_task_hash=?").get(result.identity.runId, String(result.identity.acceptedInputId), result.actualTaskHash) as { planning_identity?: string } | undefined;
 					if (!dispatch?.planning_identity) throw new Error("writer dispatch correlation is missing");
+					recordWriterDraft(state, { content_hash: draft.contentHash, accepted_input_id: result.identity.acceptedInputId, planning_identity: dispatch.planning_identity, writer_run_id: result.identity.runId, writer_task_hash: result.identity.taskHash, writer_actual_task_hash: result.actualTaskHash, plan_path: draft.path, bytes: draft.bytes.length, result_hash: sha256(result.payload) });
 					verifiedWriterDrafts.set(draft.contentHash, { acceptedInputId: result.identity.acceptedInputId, planningIdentity: dispatch.planning_identity, runId: result.identity.runId });
 				} finally { state.close(); }
 			} catch (error) {
@@ -1942,23 +1979,25 @@ export default function (pi: ExtensionAPI) {
 					let planningIdentity = process.env.YOKEMATE_PLAN_RUN_ID;
 					let incident;
 					let provenance = "normal-transport";
+					let markerInstructions = "";
 					if (accepted.source_kind === "engineer-accepted-input") {
 						if (!accepted.incident_id || !accepted.candidate_id || !accepted.failure_hash || !accepted.continuation_id || !accepted.continuation_generation) throw new Error("plan-writer recovery provenance is incomplete");
 						const candidate = state.prepare("SELECT planning_identity FROM plan_scout_candidate WHERE id=?").get(accepted.candidate_id) as { planning_identity?: string } | undefined;
 						if (!candidate?.planning_identity || candidate.planning_identity !== process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("plan-writer recovery lineage is foreign");
-						const reply = await requestPlanControl(ENGINE_ROOT, "admit-plan-writer", { ticket: identity.ticket, runId: candidate.planning_identity, candidateId: accepted.candidate_id, failureHash: accepted.failure_hash, generation: accepted.continuation_generation, writerRunId: identity.runId }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						const reply = await requestPlanControl(ENGINE_ROOT, "admit-plan-writer", { ticket: identity.ticket, runId: candidate.planning_identity, candidateId: accepted.candidate_id, failureHash: accepted.failure_hash, generation: accepted.continuation_generation, writerRunId: identity.runId, acceptanceId: accepted.id }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
 						if (reply.state !== "accepted" || reply.planningIdentity !== accepted.continuation_id) throw new Error(reply.reason ?? "plan-writer recovery admission refused");
 						planningIdentity = accepted.continuation_id;
 						incident = incidentById(state, accepted.incident_id);
 						if (!incident) throw new Error("plan-writer incident is missing");
 						provenance = `engineer-accepted-input incident=${accepted.incident_id} candidate=${accepted.candidate_id} source-run=${accepted.source_run_id} failure=${accepted.failure_hash} skipped=${accepted.skipped_json} preserved=${accepted.preserved_json} plan-only=true`;
+						markerInstructions = `\n\nThe plan's Assumptions section must preserve these exact audit lines:\nBREAK-GLASS: engineer-accepted-input\nincident: ${accepted.incident_id}\nsource-run: ${accepted.source_run_id}\nsource-hash: ${accepted.content_hash}\nreason: ${accepted.incident_reason}\nskipped: failed-transport-envelope`;
 					} else if (accepted.source_kind !== "normal-transport" || accepted.owner_session_id !== sessionId) throw new Error("plan-writer normal source is not owned by this plan worker");
 					if (identity.writerRevisionOf) {
 						const draft = verifiedWriterDrafts.get(identity.writerRevisionOf);
 						if (!draft || draft.acceptedInputId !== accepted.id || draft.planningIdentity !== planningIdentity) throw new Error("plan-writer revision draft is unknown or foreign");
 					}
 					const source = new TextDecoder("utf-8", { fatal: true }).decode(exact);
-					const injected = `${expandedTask}\n\nAccepted scout input (${provenance}; hash=${accepted.content_hash}; bytes=${accepted.bytes}):\n\n${source}`;
+					const injected = `${expandedTask}${markerInstructions}\n\nAccepted scout input (${provenance}; hash=${accepted.content_hash}; bytes=${accepted.bytes}):\n\n${source}`;
 					if (claim) claimWriterDispatch(state, incident, { acceptedInputId: String(accepted.id), planningIdentity, kind: identity.writerRevisionOf ? "revision" : "initial", revisionOf: identity.writerRevisionOf, writerRunId: identity.runId, taskHash: identity.taskHash, actualTaskHash: sha256(injected) });
 					return injected;
 				} finally { state.close(); }
@@ -2001,6 +2040,15 @@ export default function (pi: ExtensionAPI) {
 				return { envelope, output };
 			};
 			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
+				tasks = await Promise.all(tasks.map(async (task) => {
+					if (task.agent !== "plan-writer" || task.acceptedInputId) return task;
+					const ticket = task.ticket ?? process.env.YOKEMATE_TICKET;
+					const runId = process.env.YOKEMATE_PLAN_RUN_ID;
+					if (!ticket || !runId || process.env.YOKEMATE_MODE !== "plan") return task;
+					const input = await requestPlanControl(ENGINE_ROOT, "read-plan-writer-input", { ticket, runId }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
+					if (input.state !== "accepted" || !input.acceptanceId) throw new Error(input.reason ?? "plan writer accepted input is unavailable");
+					return { ...task, ticket, acceptedInputId: input.acceptanceId };
+				}));
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
