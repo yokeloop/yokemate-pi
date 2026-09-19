@@ -7,6 +7,9 @@ import { dataRoot } from "./data-root.ts";
 
 export interface PlanBinding { ticket: string; path: string; contentHash: string; scopeHash: string; repositories: string[] }
 export interface CandidatePlanSnapshot extends PlanBinding { bytes: Buffer; text: string }
+export function toPlanBinding(value: PlanBinding): PlanBinding {
+  return { ticket: value.ticket, path: value.path, contentHash: value.contentHash, scopeHash: value.scopeHash, repositories: [...value.repositories] };
+}
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const contained = (root: string, path: string) => { const r = relative(root, path); return r !== "" && r !== ".." && !r.startsWith("../") && !isAbsolute(r); };
 const headings = ["Goal", "Affected repositories", "Steps", "Assumptions", "Out of scope", "Acceptance"];
@@ -60,8 +63,7 @@ export function readRecordedPlanBinding(root: string, ticket: string): PlanBindi
   try { recorded = (db.prepare("SELECT plan FROM work WHERE ticket = ?").get(ticket) as { plan?: string } | undefined)?.plan; }
   finally { db.close(); }
   if (!recorded) throw new Error(`${ticket}: no current recorded plan for approval`);
-  const { bytes: _bytes, text: _text, ...binding } = readCandidatePlanSnapshot(root, ticket, recorded);
-  return binding;
+  return toPlanBinding(readCandidatePlanSnapshot(root, ticket, recorded));
 }
 
 export function assertPlanBinding(expected: PlanBinding, actual: PlanBinding): void {

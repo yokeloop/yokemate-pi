@@ -8,7 +8,7 @@ import { readRuntimeSettings } from "./guard-policy.ts";
 import { logMoveDetailed } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
-import { assertPlanBinding, readCandidatePlanSnapshot, type PlanBinding } from "./plan-binding.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, toPlanBinding, type PlanBinding } from "./plan-binding.ts";
 import { assertPublishable } from "./plan-publication.ts";
 import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicationAcceptanceById, readPublicationArtifact } from "./plan-publication-state.ts";
 
@@ -88,7 +88,7 @@ function runRecorder(root: string, lock: string, payload: string, env: NodeJS.Pr
 
 export async function recordPlan(root: string, ticket: string, planPath: string, env: NodeJS.ProcessEnv = process.env, options: RecordPlanOptions): Promise<PlanRecordResult> {
   if (resolve(planPath) !== resolve(options.expectedBinding.path) || options.expectedBinding.ticket !== ticket) throw new Error("binding_changed");
-  const payload = Buffer.from(JSON.stringify({ root, ticket, expectedBinding: options.expectedBinding, recordId: options.recordId })).toString("base64");
+  const payload = Buffer.from(JSON.stringify({ root, ticket, expectedBinding: toPlanBinding(options.expectedBinding), recordId: options.recordId })).toString("base64");
   const lock = recordLockPath(dataRoot(root));
   mkdirSync(dirname(lock), { recursive: true });
   const output = await runRecorder(root, lock, payload, env, options);

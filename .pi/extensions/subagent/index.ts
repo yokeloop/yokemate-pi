@@ -13,7 +13,7 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
+import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, toPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
 import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -1230,7 +1230,7 @@ export default function (pi: ExtensionAPI) {
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
 				const snapshotPath = writePublicationArtifact(ENGINE_ROOT, ticket, "plan", snapshot.contentHash, snapshot.bytes);
 				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}) });
-				return { binding: snapshot as PlanBinding, record, snapshotPath, scout };
+				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
 		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding): Promise<PublicationOutcome[]> => {
