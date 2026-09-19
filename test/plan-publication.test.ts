@@ -70,11 +70,27 @@ test("binding is rechecked after the final remote listing", async () => {
   const framed = splitPublication(input(document.bytes.toString()));
   let listings = 0;
   let changed = false;
-  const result = await publishDocument(document.row, document.bytes, {
+  await assert.rejects(publishDocument(document.row, document.bytes, {
     list: async () => { listings++; if (listings === 2) changed = true; return framed.map((part) => ({ id: String(part.part), text: part.body })); },
     add: async () => assert.fail("complete remote must not post"),
-  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } });
-  assert.equal(result.error, "binding_changed");
+  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } }), (error: unknown) => error instanceof PublicationFailure && error.code === "binding_changed");
+});
+
+test("remote target changes are pending while local binding failures remain blocking", async () => {
+  const document = row("# body\n");
+  let posts = 0;
+  const remote = await publishDocument(document.row, document.bytes, {
+    list: async () => [],
+    add: async () => { posts++; },
+  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { throw new PublicationFailure("target_changed"); } });
+  assert.equal(remote.complete, false);
+  assert.equal(remote.error, "target_changed");
+  assert.equal(posts, 0);
+  await assert.rejects(publishDocument(document.row, document.bytes, {
+    list: async () => [],
+    add: async () => { posts++; },
+  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { throw new PublicationFailure("binding_changed"); } }), (error: unknown) => error instanceof PublicationFailure && error.code === "binding_changed");
+  assert.equal(posts, 0);
 });
 
 test("binding changes stop multipart publication before the next remote write", async () => {
@@ -83,11 +99,10 @@ test("binding changes stop multipart publication before the next remote write", 
   const remote: RemoteComment[] = [];
   let posts = 0;
   let changed = false;
-  const result = await publishDocument(document.row, document.bytes, {
+  await assert.rejects(publishDocument(document.row, document.bytes, {
     list: async () => remote,
     add: async (body) => { posts++; remote.push({ id: String(posts), text: body }); changed = true; },
-  }, { canonicalUrl: input(text).canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } });
-  assert.equal(result.error, "binding_changed");
+  }, { canonicalUrl: input(text).canonicalUrl, verifyBinding: () => { if (changed) throw new PublicationFailure("binding_changed"); } }), (error: unknown) => error instanceof PublicationFailure && error.code === "binding_changed");
   assert.equal(posts, 1);
 });
 
@@ -112,8 +127,7 @@ test("credential sentinels block the whole document before the first post and pl
     const text = `# Safe beginning\n${"x".repeat(30_000)}\n${sentinel}`;
     const document = row(text);
     let posts = 0;
-    const result = await publishDocument(document.row, document.bytes, { list: async () => [], add: async () => { posts++; } }, { canonicalUrl: input(text).canonicalUrl });
-    assert.equal(result.error, "unsafe_document", sentinel);
+    await assert.rejects(publishDocument(document.row, document.bytes, { list: async () => [], add: async () => { posts++; } }, { canonicalUrl: input(text).canonicalUrl }), (error: unknown) => error instanceof PublicationFailure && error.code === "unsafe_document", sentinel);
     assert.equal(posts, 0, sentinel);
   }
   assert.doesNotThrow(() => assertPublishable(Buffer.from("token = ${TOKEN}\npassword: <example>\nsecret=[REDACTED]\nAuthorization: Bearer <TOKEN>\nhttps://example.test/?token=${TOKEN}\nhttps://${USERINFO}@example.test/path\nCookie: session=${SESSION}")));

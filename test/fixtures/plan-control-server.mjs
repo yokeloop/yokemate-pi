@@ -20,10 +20,14 @@ const server = createServer((connection) => {
     else if (request.operation === "prepare-plan-publication") reply = {
       requestId: request.requestId, state: "accepted", reason: "prepared",
       publicationId: Number(process.env.PLAN_PUBLICATION_ID), recordId: Number(process.env.PLAN_RECORD_ID),
-      snapshotPath: process.env.PLAN_SNAPSHOT, scoutPublication: Number(process.env.PLAN_SCOUT_ID),
+      snapshotPath: process.env.PLAN_SNAPSHOT, scoutAcceptance: Number(process.env.PLAN_SCOUT_ACCEPTANCE),
+      publicationId: Number(process.env.PLAN_PUBLICATION_ID), scoutPublication: Number(process.env.PLAN_SCOUT_ID),
       target: "fixture-target", revision: process.env.PLAN_REVISION,
     };
-    else if (request.operation === "plan-recorded") reply = { requestId: request.requestId, state: "accepted", publication: "complete", target: "fixture-target", revision: process.env.PLAN_REVISION, reason: "plan-only; ready for /do" };
+    else if (request.operation === "plan-recorded") reply = { requestId: request.requestId, state: "accepted", publications: [
+      { kind: "scout", state: "complete", target: "fixture-target", revision: process.env.PLAN_REVISION, publicationId: Number(process.env.PLAN_SCOUT_ID) },
+      { kind: "plan", state: "complete", target: "fixture-target", revision: process.env.PLAN_REVISION, publicationId: Number(process.env.PLAN_PUBLICATION_ID) },
+    ], handoff: "plan-only", reason: "plan-only; ready for /do" };
     else reply = { requestId: request.requestId, state: "refused", reason: "unsupported fixture operation" };
     connection.end(JSON.stringify(reply) + "\n");
   });

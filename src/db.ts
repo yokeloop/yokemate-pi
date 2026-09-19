@@ -32,6 +32,91 @@ export function queueLine(r: {
   return `${r.ticket.padEnd(10)} ${r.stage.padEnd(8)} ${owner.padEnd(6)} ${(r.title ?? "").slice(0, 48).padEnd(48)} ${r.next ?? ""}`;
 }
 
+function columns(db: DatabaseSync, table: string): Map<string, { notnull: number }> {
+  return new Map((db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string; notnull: number }[]).map((column) => [column.name, column]));
+}
+
+function migratePlanArtifacts(db: DatabaseSync): void {
+  const acceptance = columns(db, "plan_publication_acceptance");
+  const records = columns(db, "plan_record");
+  const oldAcceptance = !acceptance.has("artifact_path") || acceptance.get("publication_id")?.notnull === 1;
+  const oldRecords = !records.has("artifact_path") || !records.has("scout_acceptance") || records.get("publication_id")?.notnull === 1;
+  if (!oldAcceptance && !oldRecords) {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS plan_record_local_identity
+      ON plan_record(ticket,plan_path,content_hash,scope_hash,scout_acceptance)
+      WHERE scout_acceptance IS NOT NULL`);
+    return;
+  }
+  db.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+  try {
+    if (oldAcceptance) {
+      db.exec(`
+        CREATE TABLE plan_publication_acceptance_next (
+          id INTEGER PRIMARY KEY,
+          publication_id INTEGER REFERENCES plan_publication(id),
+          ticket TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          owner_run_id TEXT NOT NULL,
+          owner_session_id TEXT NOT NULL,
+          batch_id TEXT NOT NULL,
+          task_hash TEXT NOT NULL,
+          artifact_path TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          bytes INTEGER NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (owner_run_id, owner_session_id, batch_id, run_id, task_hash)
+        );
+        INSERT INTO plan_publication_acceptance_next
+          (id,publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash,artifact_path,content_hash,bytes,created_at)
+        SELECT a.id,a.publication_id,a.ticket,a.run_id,a.owner_run_id,a.owner_session_id,a.batch_id,a.task_hash,
+               p.artifact_path,p.content_hash,p.bytes,a.created_at
+        FROM plan_publication_acceptance a JOIN plan_publication p ON p.id=a.publication_id;
+        DROP TABLE plan_publication_acceptance;
+        ALTER TABLE plan_publication_acceptance_next RENAME TO plan_publication_acceptance;
+      `);
+    }
+    if (oldRecords) {
+      db.exec(`
+        CREATE TABLE plan_record_next (
+          id INTEGER PRIMARY KEY,
+          ticket TEXT NOT NULL,
+          publication_id INTEGER REFERENCES plan_publication(id),
+          plan_path TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          scope_hash TEXT NOT NULL,
+          artifact_path TEXT NOT NULL,
+          bytes INTEGER NOT NULL,
+          scout_publication INTEGER REFERENCES plan_publication(id),
+          scout_acceptance INTEGER REFERENCES plan_publication_acceptance(id),
+          successful_record INTEGER NOT NULL DEFAULT 0 CHECK (successful_record IN (0,1)),
+          side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (ticket, publication_id, plan_path, content_hash, scope_hash, scout_publication)
+        );
+        INSERT INTO plan_record_next
+          (id,ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance,successful_record,side_effects_started,created_at,updated_at)
+        SELECT r.id,r.ticket,r.publication_id,r.plan_path,r.content_hash,r.scope_hash,
+               p.artifact_path,p.bytes,r.scout_publication,NULL,r.successful_record,r.side_effects_started,r.created_at,r.updated_at
+        FROM plan_record r JOIN plan_publication p ON p.id=r.publication_id;
+        DROP TABLE plan_record;
+        ALTER TABLE plan_record_next RENAME TO plan_record;
+      `);
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS plan_record_local_identity
+      ON plan_record(ticket,plan_path,content_hash,scope_hash,scout_acceptance)
+      WHERE scout_acceptance IS NOT NULL`);
+    const violations = db.prepare("PRAGMA foreign_key_check").all();
+    if (violations.length) throw new Error("plan artifact migration failed foreign key check");
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
@@ -112,13 +197,16 @@ export function openDb(path: string): DatabaseSync {
 
     CREATE TABLE IF NOT EXISTS plan_publication_acceptance (
       id               INTEGER PRIMARY KEY,
-      publication_id   INTEGER NOT NULL REFERENCES plan_publication(id),
+      publication_id   INTEGER REFERENCES plan_publication(id),
       ticket           TEXT NOT NULL,
       run_id           TEXT NOT NULL,
       owner_run_id     TEXT NOT NULL,
       owner_session_id TEXT NOT NULL,
       batch_id         TEXT NOT NULL,
       task_hash        TEXT NOT NULL,
+      artifact_path    TEXT NOT NULL,
+      content_hash     TEXT NOT NULL,
+      bytes            INTEGER NOT NULL,
       created_at       TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (owner_run_id, owner_session_id, batch_id, run_id, task_hash)
     );
@@ -126,11 +214,14 @@ export function openDb(path: string): DatabaseSync {
     CREATE TABLE IF NOT EXISTS plan_record (
       id                   INTEGER PRIMARY KEY,
       ticket               TEXT NOT NULL,
-      publication_id       INTEGER NOT NULL REFERENCES plan_publication(id),
+      publication_id       INTEGER REFERENCES plan_publication(id),
       plan_path            TEXT NOT NULL,
       content_hash         TEXT NOT NULL,
       scope_hash           TEXT NOT NULL,
-      scout_publication    INTEGER NOT NULL REFERENCES plan_publication(id),
+      artifact_path        TEXT NOT NULL,
+      bytes                INTEGER NOT NULL,
+      scout_publication    INTEGER REFERENCES plan_publication(id),
+      scout_acceptance     INTEGER REFERENCES plan_publication_acceptance(id),
       successful_record    INTEGER NOT NULL DEFAULT 0 CHECK (successful_record IN (0,1)),
       side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
       created_at           TEXT NOT NULL DEFAULT (datetime('now')),
@@ -147,6 +238,7 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (ticket, run_id, reason)
     );
   `);
+  migratePlanArtifacts(db);
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.
   const have = new Set(

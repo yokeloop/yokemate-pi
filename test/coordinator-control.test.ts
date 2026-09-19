@@ -91,7 +91,7 @@ test("ticketless problem workers can continue only tickets admitted by their acc
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
     publishPlanScout: async (ticket, acceptanceId) => ({ reason: `${ticket}/${acceptanceId}`, publication: "complete", target: "fixture", revision: "a".repeat(64) }),
-    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepares++; assert.equal(acceptanceId, 1); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, target: "fixture", revision: "b".repeat(64) }; },
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepares++; assert.equal(acceptanceId, 1); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: "b".repeat(64) }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
     if (!server.listening) await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -233,6 +233,7 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
   const target = { sessionId: "main-session", runtimeId: "main-runtime" };
   const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
   let records = 0;
+  let ownedRecords = 0;
   const prepareAcceptances: number[] = [];
   let releaseDelayed: (() => void) | undefined;
   let markDelayedStarted: (() => void) | undefined;
@@ -247,7 +248,8 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
       }
       return { reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) };
     },
-    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, target: "fixture", revision: "b".repeat(64) }; },
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => { prepareAcceptances.push(acceptanceId); return { reason: "prepared", publicationId: 2, recordId: 3, snapshotPath: "/snapshot", scoutPublication: 1, scoutAcceptance: acceptanceId, target: "fixture", revision: "b".repeat(64) }; },
+    recordPlan: async () => { ownedRecords++; return { reason: "recorded" }; },
     planRecorded: async (ticket, path, recordId) => { records++; assert.equal(ticket, "YM-1"); assert.equal(path, "/recorded.md"); assert.equal(recordId, 7); return { reason: "recorded" }; },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
@@ -262,6 +264,10 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal((await requestPlanControl(root, "plan-recorded", handoff, worker, target, env)).state, "refused");
     assert.equal((await requestPlanControl(root, "bind-plan", { ...payload, pane: "plan" }, main, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "plan-started", payload, worker, target, env)).state, "accepted");
+    const recordWithoutScout = await requestPlanControl(root, "record-plan", { ...payload, path: "/plan.md" }, worker, target, env);
+    assert.equal(recordWithoutScout.state, "refused");
+    assert.match(recordWithoutScout.reason ?? "", /current accepted scout/);
+    assert.equal(ownedRecords, 0);
     const prepare = () => requestPlanControl(root, "prepare-plan-publication", { ...payload, path: "/plan.md", contentHash: "c".repeat(64) }, worker, target, env);
     assert.equal((await prepare()).state, "refused");
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ...payload, acceptanceId: 11 }, worker, target, env)).state, "accepted");
@@ -277,7 +283,8 @@ test("plan handoff is bound to the registered pane run and its live worker sessi
     assert.equal((await prepare()).state, "accepted");
     releaseDelayed!();
     const superseded = await delayed;
-    assert.equal(superseded.publication, "pending");
+    assert.equal(superseded.publication, "complete");
+    assert.equal(superseded.artifactAcceptance, "superseded");
     assert.equal(superseded.reason, "scout superseded");
     const oldRejection = await requestPlanControl(root, "reject-plan-scout", { ...payload, acceptanceId: 12 }, worker, target, env);
     assert.equal(oldRejection.state, "accepted");

@@ -213,6 +213,8 @@ export function reconcilePublication(input: PublicationFrameInput, comments: Rem
   return { complete: missing.length === 0, parts, missing };
 }
 
+const localPublicationFailures = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
+
 export async function publishDocument(row: PublicationRow, bytes: Buffer, adapter: PublicationAdapter, options: { canonicalUrl: string; knowledgePath?: string; verifyBinding?: () => void | Promise<void> }): Promise<PublishResult> {
   const input: PublicationFrameInput = { target: row.target, targetHash: row.target_hash, canonicalUrl: options.canonicalUrl, ticket: row.ticket, run: row.run_id, kind: row.kind, hash: row.content_hash, bytes, knowledgePath: options.knowledgePath };
   try {
@@ -225,6 +227,7 @@ export async function publishDocument(row: PublicationRow, bytes: Buffer, adapte
       try { await adapter.add(part.body); }
       catch (error) {
         const code = error instanceof PublicationFailure ? error.code : "unavailable";
+        if (localPublicationFailures.has(code)) throw error;
         comments = await adapter.list();
         state = reconcilePublication(input, comments);
         if (!state.missing.some((item) => item.part === part.part)) continue;
@@ -239,6 +242,7 @@ export async function publishDocument(row: PublicationRow, bytes: Buffer, adapte
       ? { complete: true, parts: state.parts.length, revision: row.content_hash }
       : { complete: false, error: "incomplete_listing", parts: state.parts.length, revision: row.content_hash };
   } catch (error) {
+    if (error instanceof PublicationFailure && localPublicationFailures.has(error.code)) throw error;
     return { complete: false, error: error instanceof PublicationFailure ? error.code : "unavailable", parts: 0, revision: row.content_hash };
   }
 }

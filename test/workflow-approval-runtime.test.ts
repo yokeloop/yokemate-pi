@@ -149,7 +149,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     assert.equal(process.env.PI_SESSION_ID, undefined);
     const scoutEnvelope = await runScout("scout-long");
+    assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope.artifact));
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
+    assert.match(readFileSync(scoutEnvelope.artifact.path, "utf8"), /EVIDENCE-TAIL/);
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
     assert.doesNotMatch(scoutEnvelope.payload, /EVIDENCE-TAIL/);
     const scoutRemote = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
@@ -161,8 +163,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const scoutPartCount = scoutRemote.length;
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout_secret";
     const blockedScout = await runScout("scout-secret");
-    assert.equal(blockedScout.publication.state, "blocked");
-    assert.equal(blockedScout.publication.error, "unsafe_document");
+    assert.equal(blockedScout.artifact.state, "blocked");
+    assert.equal(blockedScout.artifact.reason, "unsafe_document");
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     await assert.rejects(record, (error: any) => /current accepted scout/.test(String(error.stderr)));
     assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get(), undefined);
@@ -170,6 +172,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.env.YM204_FIXTURE_SCENARIO = "protocol_overflow";
     const invalidScout = await runScout("scout-protocol-overflow");
     assert.equal(invalidScout.payloadOutcome, "protocol_error");
+    assert.equal(invalidScout.artifact.state, "blocked");
     assert.equal(invalidScout.publication, undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
@@ -177,8 +180,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.env.YOKEMATE_TICKET = "YM-1";
     process.env.YOKEMATE_PLAN_RUN_ID = "foreign-plan-run";
     const refusedScout = await runScout("scout-parent-refusal");
-    assert.equal(refusedScout.publication.state, "blocked");
-    assert.equal(refusedScout.publication.error, "unavailable");
+    assert.equal(refusedScout.artifact.state, "blocked");
+    assert.equal(refusedScout.artifact.reason, "unavailable");
     assert.equal(db.prepare("SELECT reason FROM plan_publication_block WHERE ticket='YM-1' AND run_id=?").get(refusedScout.identity.runId)?.reason, "unavailable");
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     delete process.env.YOKEMATE_MODE;
@@ -203,14 +206,13 @@ test("raw interactive authority flows through real plan CLI and parent control w
     writeFileSync(planPublication.artifact_path, "tampered");
     const parentTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
     const artifactReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    assert.equal(artifactReply.publication, "pending");
+    assert.equal(artifactReply.state, "refused");
     assert.equal(artifactReply.reason, "artifact_invalid");
-    assert.equal(db.prepare("SELECT error_code FROM plan_publication WHERE id=?").get(recorded.publication_id)?.error_code, "artifact_invalid");
     writeFileSync(planPublication.artifact_path, planArtifact);
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
     const targetReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    assert.equal(targetReply.publication, "pending");
-    assert.equal(targetReply.reason, "binding_changed");
+    assert.equal(targetReply.state, "accepted");
+    assert.deepEqual(targetReply.publications?.map((outcome) => [outcome.kind, outcome.state, outcome.error]), [["scout", "pending", "target_changed"], ["plan", "pending", "target_changed"]]);
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
     assert.equal(existsSync(join(dir, "work", "YM-1", "fixture-runs")), false);
     assert.equal(calls, 0);
@@ -221,7 +223,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     extraction = "advance-plan-do";
     db.prepare("UPDATE project SET model='missing/model' WHERE tracker_key='YM'").run();
     await input("Спланируй YM-1 и затем выполни");
-    await assert.rejects(record, (error: any) => /publication complete.*handoff refused.*missing\/model/s.test(String(error.stderr)));
+    await assert.rejects(record, (error: any) => /handoff refused.*missing\/model/s.test(String(error.stderr)));
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount + 1);
     db.prepare("UPDATE project SET model='test/model' WHERE tracker_key='YM'").run();
     await input("Спланируй YM-1 и затем выполни");
