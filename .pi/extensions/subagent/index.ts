@@ -42,13 +42,18 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 import { ListRunRegistry, type KeyRunContext } from "../../../src/list-run.ts";
 import { launchPlanKey } from "../../../src/plan-launch.ts";
 import { herdrAsync } from "../../../src/herdr.ts";
+import { closeModeSurface } from "../../../src/mode-surface.ts";
+import { observeProcessIdentity, ReviewReworkStore, REVIEW_REWORK_EXTRACTION_INSTRUCTION, validateReviewReworkExtraction, type ReviewHandoffOutcome } from "../../../src/review-rework.ts";
+import { recordReviewRework } from "../../../src/accept.ts";
+import { logMove } from "../../../src/move-log.ts";
+import { syncPush } from "../../../src/git-sync.ts";
 import { openDb } from "../../../src/db.ts";
 import { dataRoot } from "../../../src/data-root.ts";
 import { modelForTicket } from "../../../src/project-model.ts";
@@ -838,6 +843,7 @@ export default function (pi: ExtensionAPI) {
 	const cancelledRecordingPlans = new Set<string>();
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
+	const reviewReworks = new Map<string, { store: ReviewReworkStore; stopObserver: () => void }>();
 	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
@@ -874,6 +880,15 @@ export default function (pi: ExtensionAPI) {
 		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
 		return operation;
 	};
+	const revokeReviewRun = async (reviewRunId: string, reason: string) => {
+		const review = reviewReworks.get(reviewRunId);
+		if (!review) return;
+		for (const runId of review.store.revoke()) {
+			listRuns.cancel(runId, reason);
+			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run", true).catch(() => {});
+		}
+		review.stopObserver();
+	};
 	const fenceListRuns = async (reason: string) => {
 		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
 			if (recordingPlans.has(entry.keyRunId)) {
@@ -889,15 +904,22 @@ export default function (pi: ExtensionAPI) {
 	};
 	const revokeAuthority = async () => {
 		shipPermits.invalidate();
+		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent runtime changed")));
 		await fenceListRuns("parent runtime changed");
 		for (const runId of authority?.revoke() ?? []) {
 			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run");
 			else listRuns.cancel(runId, "parent runtime changed");
 		}
 	};
-	pi.on("session_before_switch", revokeAuthority);
-	pi.on("session_before_fork", revokeAuthority);
-	pi.on("session_before_tree", revokeAuthority);
+	const endOwnedReview = async (reason: string) => {
+		if (process.env.YOKEMATE_MODE !== "review" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_REVIEW_RUN_ID || !process.env.PI_SESSION_ID) return;
+		try { await requestReviewControl(ENGINE_ROOT, "review-ended", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID, reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT)); }
+		catch {}
+	};
+	const fenceOwnedAuthority = async () => { await endOwnedReview("review runtime changed"); await revokeAuthority(); };
+	pi.on("session_before_switch", fenceOwnedAuthority);
+	pi.on("session_before_fork", fenceOwnedAuthority);
+	pi.on("session_before_tree", fenceOwnedAuthority);
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
 	const sendCoordinatorTerminal = (run: CoordinatorRun, outcome: "done" | "blocked", summary: string, reason: string | undefined, verification: unknown, rpcDiagnostic?: Record<string, unknown>, awaitLateDiagnostics = false): void => {
@@ -913,6 +935,31 @@ export default function (pi: ExtensionAPI) {
 		pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome, verification, display } }, { deliverAs: "followUp", triggerTurn: true });
 	};
 	pi.on("input", async (event, ctx) => {
+		if (event.source === "interactive" && ctx.mode === "tui" && process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_ROLE === "coordinator" && process.env.YOKEMATE_TICKET && process.env.YOKEMATE_REVIEW_RUN_ID) {
+			const ticket = process.env.YOKEMATE_TICKET;
+			const runId = process.env.YOKEMATE_REVIEW_RUN_ID;
+			const origin = currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId());
+			let controller: AbortController | undefined;
+			let timer: NodeJS.Timeout | undefined;
+			try {
+				readRuntimeSettings(ENGINE_ROOT);
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const begun = await requestReviewControl(ENGINE_ROOT, "review-input", { ticket, runId, raw: event.text }, origin, parent);
+				if (begun.state !== "accepted" || !begun.generation) throw new Error(begun.reason ?? "review input registration refused");
+				if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("review verdict extraction requires the configured review model and external authentication");
+				controller = new AbortController();
+				const message = await Promise.race([
+					ctx.modelRegistry.complete(ctx.model, { systemPrompt: REVIEW_REWORK_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 512 }),
+					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller!.abort(); reject(new Error("review verdict extraction timed out")); }, 15_000); }),
+				]);
+				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("review verdict extraction did not return a clean no-tools result");
+				const extraction = validateReviewReworkExtraction(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, ticket);
+				const extracted = await requestReviewControl(ENGINE_ROOT, "review-extraction", { ticket, runId, generation: begun.generation, extraction }, origin, parent);
+				if (extracted.state !== "accepted") throw new Error(extracted.reason ?? "review verdict registration refused");
+			} catch (error) { ctx.ui.notify((error as Error).message, "warning"); }
+			finally { clearTimeout(timer); controller?.abort(); }
+			return;
+		}
 		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const text = event.text.trim();
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -994,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), lane?: { context: KeyRunContext; doBinding?: PlanBinding }) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), lane?: { context: KeyRunContext; doBinding?: PlanBinding; review?: { store: ReviewReworkStore; operationId: string } }) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
@@ -1044,7 +1091,12 @@ export default function (pi: ExtensionAPI) {
 			})();
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin, settings) : await prepareShip(root, request);
 			if (ownedRun.state === "blocked") throw new Error("coordinator was cancelled during preparation");
-			if (doBinding) { authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!)); prepared.doBinding = doBinding; }
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+				prepared.doBinding = doBinding;
+			}
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
@@ -1072,7 +1124,11 @@ export default function (pi: ExtensionAPI) {
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (rpc && !terminalReported) {
 					try {
-						if (doBinding && (event.type === "agent_settled" || event.type === "tool_execution_start")) authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!));
+						if (doBinding && (event.type === "agent_settled" || event.type === "tool_execution_start")) {
+							const current = readRecordedPlanBinding(root, request.tickets[0]!);
+							if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+							else authority!.checkCycle(ownedRun.identity.runId, current);
+						}
 						continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
 					}
 					catch (error) { reportBlocked?.((error as Error).message); }
@@ -1140,6 +1196,11 @@ export default function (pi: ExtensionAPI) {
 			}, onBlocked: reportBlocked });
 			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+			}
 			coordinators.attachProcess(ownedRun.identity.runId, rpc.process);
 			const { mode, tickets } = prepared;
 			const plan = mode === "do" ? prepared.plans[tickets[0]!] : undefined;
@@ -1148,8 +1209,14 @@ export default function (pi: ExtensionAPI) {
 			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
 			const admissionDisplay = coordinatorAdmissions.get(ownedRun.identity.runId);
 			if (admissionDisplay) admissionDisplay.taskExcerpt = reportTaskExcerpt(excerpt || tickets.join("+"));
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+			}
 			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
+			lane?.context.startup({ state: "started", runId: ownedRun.identity.runId, facts: { model: prepared.model, cwd: prepared.cwd } });
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
@@ -1158,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
 			throw error;
 		}
 	};
-	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
+	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), review?: { store: ReviewReworkStore; operationId: string; binding: PlanBinding }) => {
 		if (!request || !["do", "ship"].includes(request.mode) || !Array.isArray(request.tickets) || !request.tickets.length) throw new Error("coordinator request needs ordered tickets");
 		if (new Set(request.tickets).size !== request.tickets.length) throw new Error("ticket list contains duplicates");
 		const checks = coordinatorChecks(settings);
@@ -1173,16 +1240,24 @@ export default function (pi: ExtensionAPI) {
 		for (const ticket of request.tickets) {
 			if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) { rejection.set(ticket, `invalid ticket key ${JSON.stringify(ticket)}`); continue; }
 			if (request.mode === "do") try {
-				if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
 				const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 				if (request.plan && fs.realpathSync(path.resolve(origin.cwd ?? ENGINE_ROOT, request.plan)) !== binding.path) throw new Error("do approval --plan differs from the recorded binding");
-				authority.check(ticket, binding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+				if (review) {
+					if (request.tickets.length !== 1 || review.store.owner.ticket !== ticket) throw new Error("review rework handoff ticket mismatch");
+					assertPlanBinding(review.binding, binding);
+				} else {
+					if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
+					authority.check(ticket, binding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+				}
 				bindings.set(ticket, binding);
 			} catch (error) { rejection.set(ticket, (error as Error).message); }
 		}
-		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
+		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: review ? true : checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
 		const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
-		if (request.mode === "do") for (const entry of accepted) authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+		if (request.mode === "do") for (const entry of accepted) {
+			if (review) review.store.consume(review.operationId, entry.keyRunId, bindings.get(entry.key)!);
+			else authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+		}
 		listUnits += accepted.length;
 		activeUnits += accepted.length;
 		deferredListDeliveries.add(run.identity.listRunId);
@@ -1191,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
 			listRuns.start(run.identity.listRunId, async (lane) => {
 				lane.signal.addEventListener("abort", () => { void cancelCoordinator(lane.keyRunId, "parent_cancel_run", true).catch(() => {}); }, { once: true });
 				const part = { ...request, tickets: [lane.key] };
-				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key) });
+				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key), ...(review ? { review: { store: review.store, operationId: review.operationId } } : {}) });
 				lane.active({ identity: result.details.identity, model: result.details.identity?.model, cwd: result.details.identity?.cwd });
 			});
 		});
@@ -1201,6 +1276,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
+		if (process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_REVIEW_RUN_ID && process.env.YOKEMATE_TICKET) {
+			try {
+				const reply = await requestReviewControl(ENGINE_ROOT, "review-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+				if (reply.state !== "accepted") throw new Error(reply.reason ?? "review worker registration refused");
+			} catch (error) { ctx.ui.notify(`automatic rework handoff unavailable: ${(error as Error).message}`, "warning"); }
+		}
 		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
 			try {
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
@@ -1210,6 +1291,7 @@ export default function (pi: ExtensionAPI) {
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 		await revokeAuthority();
+		reviewReworks.clear();
 		if (controlServer) await new Promise<void>((resolve) => controlServer!.close(() => resolve()));
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
@@ -1282,6 +1364,85 @@ export default function (pi: ExtensionAPI) {
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
+				reviewStarted: async (ticket, reviewRunId, reviewOrigin, surface) => {
+					if (!controlIdentity || !reviewOrigin.runtimeId) throw new Error("review parent identity is unavailable");
+					const existing = reviewReworks.get(reviewRunId);
+					if (existing) {
+						const worker = existing.store.owner.worker;
+						if (worker.sessionId !== reviewOrigin.sessionId || worker.runtimeId !== reviewOrigin.runtimeId || worker.pid !== reviewOrigin.pid || worker.starttime !== reviewOrigin.starttime) throw new Error("review run cannot be revived by a new worker identity");
+						return;
+					}
+					const store = new ReviewReworkStore({ parent: controlIdentity, reviewRunId, ticket, worker: { sessionId: reviewOrigin.sessionId, runtimeId: reviewOrigin.runtimeId, pid: reviewOrigin.pid, starttime: reviewOrigin.starttime }, surface });
+					const stopObserver = observeProcessIdentity(reviewOrigin.pid, reviewOrigin.starttime, () => { void revokeReviewRun(reviewRunId, "review worker process ended before do startup"); });
+					reviewReworks.set(reviewRunId, { store, stopObserver });
+				},
+				reviewInput: (ticket, reviewRunId, raw) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					return review.store.beginInput(raw);
+				},
+				reviewExtraction: async (ticket, reviewRunId, extraction, generation) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					const checked = validateReviewReworkExtraction(extraction, review.store.rawInput(generation), ticket);
+					if (checked.kind === "rework") review.store.approveRework(generation);
+					else if (checked.kind === "revoke") await revokeReviewRun(reviewRunId, "review verdict revoked before do startup");
+				},
+				reviewRecord: async (ticket, reviewRunId, candidatePath) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
+					const generation = review.store.generation();
+					return review.store.claimHandoff(generation, snapshot, async (operationId) => {
+						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						let recorded;
+						try {
+							const stage = (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage;
+							if (stage !== "review" && stage !== "planned") throw new Error(`${ticket} is at ${stage ?? "absent"}; review rework records only review or its owned planned retry`);
+							recorded = recordReviewRework(db, ENGINE_ROOT, ticket, snapshot.path, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: ticket, YOKEMATE_ROLE: "coordinator" }, stage);
+						} finally { db.close(); }
+						review.store.bindRecorded(operationId, recorded.binding);
+						if (!recorded.repeat) {
+							logMove(dataRoot(ENGINE_ROOT), ticket, "на доработку", path.basename(recorded.binding.path, ".md"));
+							syncPush(dataRoot(ENGINE_ROOT), `${ticket} на доработку`);
+						}
+						const settings = readRuntimeSettings(ENGINE_ROOT);
+						const startedAt = Date.now();
+						const launched = await startCoordinator({ mode: "do", tickets: [ticket], plan: recorded.binding.path }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { store: review.store, operationId, binding: recorded.binding });
+						const details = launched.details as { runId?: string; listRunId?: string };
+						if (("isError" in launched && launched.isError) || !details.runId) throw new Error(launched.content.map((part) => part.text).join("\n") || "review do admission refused");
+						if (details.listRunId) setImmediate(() => flushListDelivery(details.listRunId!));
+						const remaining = Math.max(1, 120_000 - (Date.now() - startedAt));
+						let timer: NodeJS.Timeout | undefined;
+						let startup;
+						try {
+							startup = await Promise.race([
+								listRuns.waitForStartup(details.runId),
+								new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("review do startup timed out after 120000ms")), remaining); }),
+							]);
+						} catch (error) {
+							listRuns.cancel(details.runId, (error as Error).message);
+							if (coordinators.get(details.runId)) await cancelCoordinator(details.runId, "parent_cancel_run", true).catch(() => {});
+							throw error;
+						} finally { clearTimeout(timer); }
+						if (startup.state !== "started") {
+							review.store.finish(details.runId);
+							return { state: startup.state === "cancelled" ? "cancelled" : "refused", recorded: true, runId: details.runId, reason: startup.reason, stage: "planned", plan: recorded.binding.path, contentHash: recorded.binding.contentHash } as ReviewHandoffOutcome;
+						}
+						review.store.finish(details.runId);
+						review.stopObserver();
+						const close = await closeModeSurface({ ...review.store.owner.surface, cleanup() {} });
+						const stageDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						let actualStage = "unknown";
+						try { actualStage = String((stageDb.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage ?? "absent"); }
+						finally { stageDb.close(); }
+						const outcome: ReviewHandoffOutcome = { state: "started", recorded: true, runId: details.runId, stage: actualStage, plan: recorded.binding.path, contentHash: recorded.binding.contentHash, close };
+						ctx.ui.notify(close.state === "closed" ? `${ticket}: rework recorded; do ${details.runId} started` : `${ticket}: do ${details.runId} started; review close failed: ${close.reason}`, close.state === "closed" ? "info" : "warning");
+						return outcome;
+					});
+				},
+				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),
+				reviewEnded: async (_ticket, reviewRunId, reason) => { await revokeReviewRun(reviewRunId, reason); },
 				publishPlanScout: async (ticket, acceptanceId, origin) => {
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let acceptance;
@@ -1488,6 +1649,8 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		await endOwnedReview("review session shutdown");
+		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent session shutdown")));
 		await fenceListRuns("parent session shutdown");
 		authority?.revoke();
 		authority = undefined;
@@ -1495,6 +1658,7 @@ export default function (pi: ExtensionAPI) {
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
+		reviewReworks.clear();
 		await publicationMcp.shutdown();
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();

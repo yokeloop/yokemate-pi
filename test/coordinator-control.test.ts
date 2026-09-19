@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestShipFinalize } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
@@ -220,6 +220,52 @@ test("merge control passes trusted live origin and structured result to the pare
     assert.equal(finalized.finalization?.cleanup, "removed");
     assert.equal(calls, 2);
   } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("review control separates launcher, worker input and descendant record authority", async () => {
+  const root = mkdtempSync(join(tmpdir(), "review-control-"));
+  const runtime = mkdtempSync(join(tmpdir(), "review-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const main = { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" };
+  const calls: string[] = [];
+  let descendant: ChildProcess | undefined;
+  const server = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    reviewStarted: async () => { calls.push("started"); },
+    reviewInput: async (_ticket, _runId, raw) => { calls.push(`input:${raw}`); return { serial: 1, revision: 0, inputHash: "hash" }; },
+    reviewExtraction: async (_ticket, _runId, extraction) => { calls.push(`extract:${extraction.kind}`); },
+    reviewRecord: async (_ticket, _runId, plan) => { calls.push(`record:${plan}`); return { state: "started", recorded: true, runId: "do-run" }; },
+    reviewEnded: async () => { calls.push("ended"); },
+  }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const runtimeDir = socketDir(env, process.getuid!());
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "main.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "main", ticket: null }));
+    writeFileSync(join(runtimeDir, "review.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "review", ticket: "YM-1" }));
+    const registered = await requestReviewControl(root, "register-review", { ticket: "YM-1" }, main, target, env);
+    assert.equal(registered.state, "accepted");
+    const runId = registered.runId!;
+    assert.equal((await requestReviewControl(root, "bind-review", { ticket: "YM-1", runId, pane: "review", surface: "tab", tabId: "tab-review" }, main, target, env)).state, "accepted");
+    const worker = { ...main, sessionId: "review-session", runtimeId: "review-runtime", mode: "review", ticket: "YM-1", role: "coordinator", pane: "review", parentPane: "main" };
+    assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, worker, target, env)).state, "accepted");
+    const input = await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "на доработку" }, worker, target, env);
+    assert.equal(input.generation?.serial, 1);
+    assert.equal((await requestReviewControl(root, "review-extraction", { ticket: "YM-1", runId, generation: input.generation, extraction: { kind: "rework", evidence: [{ start: 0, end: 12, text: "на доработку" }] } }, worker, target, env)).state, "accepted");
+    descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    await once(descendant, "spawn");
+    const cli = { ...worker, pid: descendant.pid!, starttime: processStarttime(descendant.pid!)! };
+    assert.equal((await requestReviewControl(root, "review-record", { ticket: "YM-1", runId, path: "/plan.md" }, cli, target, env)).rework?.runId, "do-run");
+    assert.equal((await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "foreign" }, cli, target, env)).state, "refused");
+    assert.equal((await requestReviewControl(root, "review-ended", { ticket: "YM-1", runId, reason: "shutdown" }, worker, target, env)).state, "accepted");
+    assert.deepEqual(calls, ["started", "input:на доработку", "extract:rework", "record:/plan.md", "ended"]);
+  } finally {
+    if (descendant && descendant.exitCode === null) { descendant.kill("SIGKILL"); descendant.unref(); }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

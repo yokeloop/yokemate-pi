@@ -13,10 +13,30 @@ import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
-import { applyMove, type MoveEnv } from "./transitions.ts";
+import { applyMove, type From, type MoveEnv } from "./transitions.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding, type PlanBinding } from "./plan-binding.ts";
+import { currentControlOrigin, requestReviewControl, resolveCoordinatorParent } from "./coordinator-control.ts";
 
 export interface AcceptOptions {
-  reworkPlan?: string; // path to the rework plan → remarks path
+  reworkPlan?: string;
+}
+
+export interface ReviewReworkRecord { outcome: "rework"; folder: string | null; binding: PlanBinding; previous: From; repeat: boolean }
+
+export function recordReviewRework(db: DatabaseSync, root: string, ticket: string, candidatePath: string, env: MoveEnv, expected: "review" | "planned" = "review"): ReviewReworkRecord {
+  const snapshot = readCandidatePlanSnapshot(root, ticket, candidatePath);
+  const row = db.prepare("SELECT folder, plan FROM work WHERE ticket = ?").get(ticket) as { folder: string | null; plan: string | null } | undefined;
+  if (expected === "planned") {
+    if (!row?.plan) throw new Error(`${ticket}: planned rework repeat has no previous recorded binding`);
+    assertPlanBinding(readRecordedPlanBinding(root, ticket), snapshot);
+  }
+  const settings = readRuntimeSettings(root);
+  const out = applyMove(db, "accept-rework", env, ticket, () => {
+    db.prepare("UPDATE work SET stage = 'planned', plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(snapshot.path, ticket);
+  }, { expected, settings });
+  if (!out.ok) throw new Error(out.refuse);
+  assertPlanBinding(snapshot, readRecordedPlanBinding(root, ticket));
+  return { outcome: "rework", folder: row?.folder ?? null, binding: snapshot, previous: out.prev, repeat: out.repeat };
 }
 
 export function accept(
@@ -82,6 +102,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       i++;
     } else {
       console.error(`unknown argument ${argv[i]} — known: --rework <plan-path>`);
+      process.exit(1);
+    }
+  }
+  if (reworkPlan && process.env.YOKEMATE_MODE === "review") {
+    try {
+      const runId = process.env.YOKEMATE_REVIEW_RUN_ID;
+      if (!runId) throw new Error("stamped review rework has no parent-owned review run");
+      const parent = resolveCoordinatorParent(ROOT);
+      const reply = await requestReviewControl(ROOT, "review-record", { ticket, runId, path: resolve(reworkPlan) }, currentControlOrigin(ROOT), parent);
+      if (reply.state !== "accepted" || !reply.rework) throw new Error(reply.reason ?? "review rework handoff was refused");
+      const outcome = reply.rework;
+      console.log(JSON.stringify(outcome));
+      if (outcome.state !== "started") process.exitCode = 1;
+      process.exit();
+    } catch (error) {
+      console.error((error as Error).message);
       process.exit(1);
     }
   }

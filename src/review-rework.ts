@@ -43,6 +43,7 @@ export class ReviewReworkStore {
 
   generation(): ReviewInputGeneration { return { serial: this.serial, revision: this.revision, inputHash: this.inputHash }; }
   rawInput(generation: ReviewInputGeneration): string { this.assertGeneration(generation); return this.raw; }
+  outcome(): ReviewHandoffOutcome | undefined { return this.operation?.settled ? { ...this.operation.settled, close: this.operation.settled.close && { ...this.operation.settled.close } } : undefined; }
 
   assertGeneration(generation: ReviewInputGeneration): void {
     if (!sameGeneration(generation, this.generation())) throw new Error("stale review verdict generation");
@@ -73,7 +74,7 @@ export class ReviewReworkStore {
       this.operation = undefined;
     }
     const id = randomUUID();
-    const operation = { id, generation: { ...generation }, binding: copyBinding(binding), promise: undefined as unknown as Promise<ReviewHandoffOutcome> };
+    const operation: Operation = { id, generation: { ...generation }, binding: copyBinding(binding), promise: undefined as unknown as Promise<ReviewHandoffOutcome> };
     operation.promise = Promise.resolve().then(async () => {
       if (!sameGeneration(operation.generation, this.generation()) || this.receipt?.state === "revoked") {
         operation.settled = { state: "cancelled", recorded: false, reason: "review verdict was superseded" };
