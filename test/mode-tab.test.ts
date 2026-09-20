@@ -86,6 +86,32 @@ function value(args: string[], option: string): string | undefined {
   return index < 0 ? undefined : args[index + 1];
 }
 
+test("D01 parent-owned async plan launches preserve Pi isolation on both surfaces", async () => {
+  const f = fixture();
+  const injected = { PATH: f.env.PATH, JOURNAL: f.env.JOURNAL, PI_CODING_AGENT_DIR: join(f.root, "isolated agent"), PI_CODING_AGENT_SESSION_DIR: join(f.root, "isolated sessions"), PI_SESSION_ID: "stale-session-sentinel", YOKEMATE_RUN_ID: "stale-run-sentinel", UNRELATED_SECRET: "safe-secret-sentinel" };
+  const previous = Object.fromEntries(Object.keys(injected).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, injected);
+  try {
+    for (const surface of ["tab", "split"] as const) {
+      writeFileSync(f.env.JOURNAL, "");
+      const target = { ticket: "YM-1", workerWords: ["YM-1"] };
+      const freshRun = "11111111-1111-4111-8111-111111111111";
+      await launchPlanKey(f.root, { targets: [target], surface, literal: [], parentPane: ids.parent, parentWorkspace: "w-fixture" }, target, freshRun, "test/model", async () => {});
+      const calls = readFileSync(f.env.JOURNAL, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+      const created = calls.find((call) => call[1] === "create" || call[1] === "split")!;
+      const env = Object.fromEntries(created.flatMap((word, i) => word === "--env" ? [created[i + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
+      assert.equal(env.PI_CODING_AGENT_DIR, injected.PI_CODING_AGENT_DIR);
+      assert.equal(env.PI_CODING_AGENT_SESSION_DIR, injected.PI_CODING_AGENT_SESSION_DIR);
+      assert.equal(env.YOKEMATE_RUN_ID, freshRun);
+      assert.equal(env.PI_SESSION_ID, undefined);
+      assert.equal(env.UNRELATED_SECRET, undefined);
+    }
+  } finally {
+    for (const [key, val] of Object.entries(previous)) if (val === undefined) delete process.env[key]; else process.env[key] = val;
+    f.cleanup();
+  }
+});
+
 test("explicit plan lists do not bypass an unavailable live parent", () => {
   const f = fixture();
   try {
@@ -227,6 +253,24 @@ test("package and Node plan lists show ready, queued and mixed parent admission 
 });
 
 for (const mode of modes) {
+  for (const surface of ["tab", "split"] as const) test(`D01 ${mode} ${surface} forwards only explicit Pi isolation`, () => {
+    const f = fixture();
+    try {
+      const isolation = { PI_CODING_AGENT_DIR: join(f.root, "isolated agent"), PI_CODING_AGENT_SESSION_DIR: join(f.root, "isolated sessions") };
+      for (const configured of [false, true]) {
+        const out = f.run(mode, [...inputs[mode], ...(surface === "split" ? ["--split"] : [])], {
+          ...(configured ? isolation : {}), PI_SESSION_FILE: "stale-session-sentinel", UNRELATED_SECRET: "safe-secret-sentinel",
+        });
+        assert.equal(out.status, 0, out.stderr);
+        const created = out.calls.find((call) => call[1] === "create" || call[1] === "split")!;
+        const env = Object.fromEntries(created.flatMap((word, i) => word === "--env" ? [created[i + 1]!.split(/=(.*)/s).slice(0, 2)] : []));
+        for (const [key, val] of Object.entries(isolation)) assert.equal(env[key], configured ? val : undefined);
+        assert.equal(env.PI_SESSION_FILE, undefined);
+        assert.equal(env.UNRELATED_SECRET, undefined);
+        assert.equal(env.YOKEMATE_MODE, mode);
+      }
+    } finally { f.cleanup(); }
+  });
   for (const entry of ["node", "package"]) {
     test(`${entry} ${mode}: default, explicit split and literal separator preserve identity`, () => {
       const f = fixture();

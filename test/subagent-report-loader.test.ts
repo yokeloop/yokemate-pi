@@ -247,6 +247,47 @@ test("real loader sends one compact parent terminal for every coordinator termin
   assert.equal(new Set([verified.details.runId, blocked.details.runId, local.details.runId]).size, 3);
 });
 
+test("D01 ordinary descendants inherit isolation and retain default session behavior", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isolation-loader-"));
+  const originalCwd = process.cwd();
+  const keys = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "YOKEMATE_ROLE", "YM217_REPORT_SCENARIO", "YOKEMATE_SUBAGENT_TEST_RELAY", "YOKEMATE_SUBAGENT_TEST_TARGET"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const sent: any[] = [];
+  try {
+    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: isolation fixture\n---\nReturn output.\n");
+    const agentDir = join(dir, "isolated agent");
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = () => undefined;
+    loaded.runtime.sendMessage = ((message: any) => { sent.push(message); }) as any;
+    const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent")!;
+    const ctx = { cwd: dir, mode: "rpc", hasUI: false, ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "isolation-session" } } as unknown as ExtensionContext;
+    process.chdir(dir);
+    Object.assign(process.env, { PI_CODING_AGENT_DIR: agentDir, YM217_REPORT_SCENARIO: "isolation", YOKEMATE_SUBAGENT_TEST_RELAY: join(root, "test/fixtures/subagent-json-relay.mjs"), YOKEMATE_SUBAGENT_TEST_TARGET: child });
+    for (const coordinator of [false, true]) for (const isolated of [false, true]) {
+      if (coordinator) process.env.YOKEMATE_ROLE = "coordinator"; else delete process.env.YOKEMATE_ROLE;
+      if (isolated) process.env.PI_CODING_AGENT_SESSION_DIR = join(dir, "isolated sessions"); else delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      const before = sent.length;
+      await tool.definition.execute(`isolation-${coordinator}-${isolated}`, { agent: "worker", task: "inspect safe fixture configuration" }, undefined, () => undefined, ctx);
+      await waitFor(() => sent.length === before + 2);
+      const observed = JSON.parse(sent[before].details.envelope.payload);
+      assert.equal(observed.agentDir, agentDir);
+      assert.equal(observed.sessionDir, isolated ? join(dir, "isolated sessions") : undefined);
+      assert.equal(observed.role, "executor");
+      assert.equal(observed.args.includes("--no-session"), !coordinator);
+      assert.equal(observed.args.includes("--session-dir"), coordinator && !isolated);
+      if (coordinator && !isolated) assert.equal(observed.args[observed.args.indexOf("--session-dir") + 1], join(dir, "sessions"));
+    }
+  } finally {
+    process.chdir(originalCwd);
+    for (const [key, val] of Object.entries(previous)) if (val === undefined) delete process.env[key]; else process.env[key] = val;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("real loader keeps canonical reports byte-equivalent while renderer collapses and expands", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ym217-loader-"));
   const agentDir = join(dir, "agent");
@@ -305,6 +346,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
         assert.equal(readFileSync(message.details.display.archive.reportPath, "utf8"), message.content);
         assert.equal(message.details.display.archive.reportBytes, Buffer.byteLength(message.content));
         assert.equal(message.details.display.archive.reportHash, sha256(message.content));
+        const diagnostics = readFileSync(message.details.display.archive.diagnosticsPath, "utf8");
+        assert.doesNotMatch(diagnostics, /requestedTask|produce multiline canonical output|parallel one|parallel two|chain one|after \{previous\}/);
         const llm = convertToLlm([{ role: "custom", timestamp: 0, ...message }]);
         assert.equal((llm[0]!.content[0] as any).text, message.content);
       }

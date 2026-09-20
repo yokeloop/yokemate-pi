@@ -463,7 +463,7 @@ async function runSingleAgent(
 	}
 
 	const coordinatorChild = process.env.YOKEMATE_ROLE === "coordinator";
-	const args: string[] = ["--mode", "json", "-p", ...(coordinatorChild ? ["--session-dir", path.join(process.cwd(), "sessions")] : ["--no-session"]), "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
+	const args: string[] = ["--mode", "json", "-p", ...(coordinatorChild ? process.env.PI_CODING_AGENT_SESSION_DIR ? [] : ["--session-dir", path.join(process.cwd(), "sessions")] : ["--no-session"]), "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);

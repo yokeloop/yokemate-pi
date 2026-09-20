@@ -39,7 +39,7 @@ function piInvocation(args: string[], root: string): { command: string; args: st
 }
 export function coordinatorInvocationArgs(prepared: Pick<PreparedCoordinator, "mode" | "model" | "cwd" | "skillsPath" | "resourcesPath">): string[] {
   const definition = join(prepared.resourcesPath, ".pi", "agents", `${prepared.mode}-coordinator.md`);
-  return ["--mode", "rpc", "--session-dir", join(prepared.cwd, "sessions"), "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition];
+  return ["--mode", "rpc", ...(process.env.PI_CODING_AGENT_SESSION_DIR ? [] : ["--session-dir", join(prepared.cwd, "sessions")]), "-a", "--model", prepared.model, "--skill", prepared.skillsPath, "--append-system-prompt", definition];
 }
 function openLog(cwd: string, name: string): ((chunk: string) => void) | undefined {
   try {

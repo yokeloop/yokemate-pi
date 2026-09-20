@@ -203,6 +203,18 @@ test("RPC ignores delayed UI replies after stop begins", async (t) => {
   }
 });
 
+test("D01 coordinator honors explicitly isolated session storage", () => {
+  const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+  try {
+    process.env.PI_CODING_AGENT_SESSION_DIR = "/isolated sessions";
+    const args = coordinatorInvocationArgs(prepared);
+    assert.equal(args.includes("--session-dir"), false);
+    assert.equal(args.includes("--no-session"), false);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR; else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+  }
+});
+
 test("coordinator invocation keeps a session under the task folder", () => {
   const args = coordinatorInvocationArgs({ mode: "do", model: "test/model", cwd: "/tasks/YM-1", skillsPath: "/skills", resourcesPath: "/resources" });
   assert.ok(!args.includes("--no-session"));

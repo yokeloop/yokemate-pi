@@ -58,7 +58,12 @@ export async function closeModeSurface(opened: OpenedSurface, run: (args: string
   } finally { clearTimeout(timer); }
 }
 
+function piIsolationEnv(): string[] {
+  return ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"].flatMap((key) => process.env[key] === undefined ? [] : [`${key}=${process.env[key]}`]);
+}
+
 export async function openModeSurfaceAsync(surface: Surface, parentPane: string, parentWorkspace: string, cwd: string, label: string, env: string[]): Promise<OpenedSurface> {
+  env = [...env, ...piIsolationEnv()];
   if (surface === "split") {
     const { pane } = (await herdrAsync(["pane", "split", parentPane, "--direction", "down", "--cwd", cwd, ...env.flatMap((entry) => ["--env", entry])]) as { result: { pane: { pane_id: string } } }).result;
     return { surface, paneId: pane.pane_id, cleanup: () => void herdrAsync(["pane", "close", pane.pane_id]) };
@@ -76,6 +81,7 @@ export function openModeSurface(
   env: string[],
   run: (args: string[]) => unknown = herdr,
 ): OpenedSurface {
+  env = [...env, ...piIsolationEnv()];
   if (surface === "split") {
     const { pane } = (run([
       "pane", "split", parentPane, "--direction", "down", "--cwd", cwd,
