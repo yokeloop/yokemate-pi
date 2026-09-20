@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, type Socket } from "node:net";
-import { cpSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -16,6 +16,10 @@ const extension = join(root, ".pi/extensions/subagent/index.ts");
 const provider = join(root, "test/fixtures/subagent-runtime-provider.ts");
 const piVersion = JSON.parse(readFileSync(join(root, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
 const cli = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+const baselineSha = "b5c36542da67f79f1c88e5bdffe49620b53a8115";
+const unpatchedPi = readdirSync(join(root, "node_modules/.pnpm")).find((name) => name.startsWith("@earendil-works+pi-coding-agent@0.85.1_") && !name.includes("patch_hash"));
+if (!unpatchedPi) throw new Error("unpatched Pi 0.85.1 fixture is unavailable");
+const unpatchedCli = realpathSync(join(root, "node_modules/.pnpm", unpatchedPi, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
 
 test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when parent control is unavailable", { timeout: 30000 }, async () => {
   const sandbox = mkdtempSync(join(tmpdir(), "plan-scout-terminal-"));
@@ -222,6 +226,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 });
 
 const cases = [
+  ["baseline_read_heavy_24", "valid"], ["baseline_read_heavy_32", "valid"], ["baseline_read_heavy_parallel", "valid"],
   ["read_heavy_24", "valid"], ["read_heavy_32", "valid"], ["read_heavy_parallel", "valid"],
   ["parallel_max", "valid"], ["chain_max", "valid"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
@@ -233,14 +238,21 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const cwd = join(sandbox, "cwd");
   const agentDir = join(sandbox, "agent");
   const folder = join(sandbox, "home/knowledge/org/repo/ai/task");
+  const relayFacts = join(sandbox, "relay-facts");
   const runtimeExtension = join(sandbox, ".pi/extensions/subagent/index.ts");
   mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
   mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
   mkdirSync(join(sandbox, "tmp"), { recursive: true });
+  mkdirSync(relayFacts, { recursive: true });
   mkdirSync(folder, { recursive: true });
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
-  cpSync(join(root, "src"), join(sandbox, "src"), { recursive: true });
-  cpSync(join(root, ".pi/extensions/subagent"), join(sandbox, ".pi/extensions/subagent"), { recursive: true });
+  if (scenario.startsWith("baseline_")) {
+    const archive = execFileSync("git", ["archive", baselineSha, "src", ".pi/extensions/subagent"], { cwd: root });
+    execFileSync("tar", ["-x", "-C", sandbox], { input: archive });
+  } else {
+    cpSync(join(root, "src"), join(sandbox, "src"), { recursive: true });
+    cpSync(join(root, ".pi/extensions/subagent"), join(sandbox, ".pi/extensions/subagent"), { recursive: true });
+  }
   mkdirSync(join(sandbox, "test/fixtures"), { recursive: true });
   cpSync(join(root, "test/fixtures/subagent-json-relay.mjs"), join(sandbox, "test/fixtures/subagent-json-relay.mjs"));
   symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
@@ -251,12 +263,14 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
   writeFileSync(join(folder, "plan.md"), "fixture\n".repeat(6144));
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  const runtimeCli = scenario.startsWith("baseline_") ? unpatchedCli : cli;
   const priorEnv = { ...process.env };
   for (const key of Object.keys(process.env)) if (!["PATH", "NODE_TEST_CONTEXT"].includes(key)) delete process.env[key];
   Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
   if (scenario === "protocol_partial" || scenario === "protocol_overflow") {
     process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(sandbox, "test/fixtures/subagent-json-relay.mjs");
     process.env.YOKEMATE_SUBAGENT_TEST_FAULT = scenario === "protocol_partial" ? "eof_without_lf" : "record_overflow";
+    process.env.YOKEMATE_SUBAGENT_TEST_MANIFEST_DIR = relayFacts;
   }
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
@@ -302,7 +316,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
           if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
-      { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
+      { invocation: { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
     await untilAborted(rpc.ready, signal);
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
@@ -327,7 +341,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.ok(child.lifecycle.closeAt);
       return;
     }
-    const deliveryTimeout = scenario === "chain_max" || scenario.startsWith("read_heavy") ? 45000 : 10000;
+    const deliveryTimeout = scenario === "chain_max" || scenario.includes("read_heavy") ? 45000 : 10000;
     await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), deliveryTimeout); })]), signal);
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
@@ -350,6 +364,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.equal(failureReason, undefined, scenario);
     assert.ok(batch, scenario);
     const results = batch.results;
+    const profileScenario = scenario.replace(/^baseline_/, "");
     assert.equal(results[scenario === "chain" ? 1 : 0].payloadOutcome, outcome, scenario);
     if (scenario === "chain") {
       assert.equal(results.length, 3);
@@ -357,18 +372,23 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.equal(results[2].processOutcome, "not_started");
       assert.notEqual(results[1].actualTaskHash, results[1].identity.taskHash);
     }
-    if (scenario === "read_heavy_24" || scenario === "read_heavy_32") {
-      const expectedBytes = scenario === "read_heavy_24" ? 16070 : 25684;
-      const tail = scenario === "read_heavy_24" ? "READ-HEAVY-216-TAIL" : "READ-HEAVY-217-TAIL";
+    if (profileScenario === "read_heavy_24" || profileScenario === "read_heavy_32") {
+      const expectedBytes = profileScenario === "read_heavy_24" ? 16070 : 25684;
+      const expectedHash = profileScenario === "read_heavy_24" ? "563075c35e48a653df726ebaca4d9064c7a8e818ffa88eed43737a73fcb5eccb" : "564498bf81e6aa2146ed0f5afbe4d9b43c115b74f6f082cd88cad3a1b1127a4a";
+      const tail = profileScenario === "read_heavy_24" ? "READ-HEAVY-216-TAIL" : "READ-HEAVY-217-TAIL";
       assert.equal(results.length, 1);
-      assert.equal(results[0].diagnostics.final.bytes, expectedBytes);
       assert.equal(Buffer.byteLength(results[0].payload), expectedBytes);
       assert.match(results[0].payload, new RegExp(`${tail}\\n`));
-      assert.equal(results[0].diagnostics.final.hash, createHash("sha256").update(results[0].payload).digest("hex"));
+      assert.equal(createHash("sha256").update(results[0].payload).digest("hex"), expectedHash);
+      if (results[0].diagnostics) {
+        assert.equal(results[0].diagnostics.final.bytes, expectedBytes);
+        assert.equal(results[0].diagnostics.final.hash, expectedHash);
+      }
     }
-    if (scenario === "read_heavy_parallel") {
+    if (profileScenario === "read_heavy_parallel") {
       assert.equal(results.length, 2);
-      assert.deepEqual(results.map((result: any) => result.diagnostics.final.bytes), [16070, 25684]);
+      assert.deepEqual(results.map((result: any) => Buffer.byteLength(result.payload)), [16070, 25684]);
+      assert.deepEqual(results.map((result: any) => createHash("sha256").update(result.payload).digest("hex")), ["563075c35e48a653df726ebaca4d9064c7a8e818ffa88eed43737a73fcb5eccb", "564498bf81e6aa2146ed0f5afbe4d9b43c115b74f6f082cd88cad3a1b1127a4a"]);
       assert.match(results[0].payload, /READ-HEAVY-216-TAIL/);
       assert.match(results[1].payload, /READ-HEAVY-217-TAIL/);
     }
@@ -385,17 +405,29 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     const terminalReport = reports.find((message) => message.details.envelope.kind === (scenario.startsWith("chain") ? "chain" : "result")) ?? reports[0];
     const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /protocol_error: invalid_json/, protocol_partial: /protocol_error: partial_record/, protocol_overflow: /protocol_error: record_limit/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/ };
     if (reasons[scenario]) assert.match(terminalReport.details.display.failureReason, reasons[scenario], scenario);
-    if (scenario === "protocol_partial") {
-      assert.deepEqual(results[0].diagnostics.stream.firstParserError, results[0].diagnostics.stream.lastParserError);
-      assert.equal(results[0].diagnostics.stream.firstParserError.kind, "partial_record");
-      assert.equal(results[0].diagnostics.stream.parserErrorCounters.partial_record, 1);
-      assert.equal(results[0].diagnostics.stream.finalTextPresent, true);
-    }
-    if (scenario === "protocol_overflow") {
-      assert.equal(results[0].diagnostics.stream.firstParserError.kind, "record_limit");
-      assert.equal(results[0].diagnostics.stream.lastParserError.kind, "record_limit");
-      assert.equal(results[0].diagnostics.stream.parserErrorCounters.record_limit, 1);
-      assert.equal(results[0].diagnostics.stream.finalTextPresent, true);
+    if (scenario === "protocol_partial" || scenario === "protocol_overflow") {
+      const factFiles = readdirSync(relayFacts).filter((file) => file.endsWith(".json"));
+      assert.equal(factFiles.length, 1);
+      const wire = JSON.parse(readFileSync(join(relayFacts, factFiles[0]!), "utf8"));
+      const stream = results[0].diagnostics.stream;
+      assert.equal(stream.stdoutBytes, wire.stdoutBytes);
+      assert.equal(stream.stdoutHash, wire.stdoutHash);
+      assert.equal(stream.partialBytes, wire.partialBytes);
+      assert.equal(stream.partialHash, wire.partialHash);
+      assert.equal(stream.finalTextPresent, true);
+      if (scenario === "protocol_partial") {
+        const expected = { kind: "partial_record", offset: wire.stdoutBytes - wire.partialBytes };
+        assert.deepEqual(stream.firstParserError, expected);
+        assert.deepEqual(stream.lastParserError, expected);
+        assert.deepEqual(stream.parserErrorCounters, { invalid_json: 0, invalid_event: 0, record_limit: 0, partial_record: 1 });
+        assert.ok(wire.partialBytes > 0);
+      } else {
+        assert.deepEqual(stream.firstParserError, { kind: "record_limit", offset: 0 });
+        assert.deepEqual(stream.lastParserError, { kind: "record_limit", offset: 0 });
+        assert.deepEqual(stream.parserErrorCounters, { invalid_json: 0, invalid_event: 0, record_limit: 1, partial_record: 0 });
+        assert.equal(wire.partialBytes, 0);
+        assert.equal(wire.partialHash, createHash("sha256").update("").digest("hex"));
+      }
     }
     if (scenario === "storage_error") assert.deepEqual(terminalReport.details.display.archive, { state: "unavailable", code: "EIO" });
     else if (!scenario.startsWith("delivery_")) {
@@ -407,18 +439,20 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.equal(rpc.childState.busyCount(), 0, scenario);
     assert.equal(rpc.childState.canFinish("done"), true, scenario);
     assert.ok(loaded.every((entry) => entry.data.file === provider));
-    const fs = await import("node:fs");
-    const snapshotDir = join(sandbox, "sessions/subagent-runs");
-    const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
-    const ownedSnapshots = snapshots.filter((snapshot) => snapshot.ownerRunId === `owner-${scenario.replaceAll("_", "-")}`);
-    assert.doesNotMatch(JSON.stringify(ownedSnapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-    if (!["diagnostic_error", "spawn_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
-      const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
-      assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
-      assert.equal(childSnapshot.resources.guard.path, join(sandbox, "src/guards.ts"));
-      assert.equal(childSnapshot.resources.extension.path, runtimeExtension);
+    if (!scenario.startsWith("baseline_")) {
+      const fs = await import("node:fs");
+      const snapshotDir = join(sandbox, "sessions/subagent-runs");
+      const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
+      const ownedSnapshots = snapshots.filter((snapshot) => snapshot.ownerRunId === `owner-${scenario.replaceAll("_", "-")}`);
+      assert.doesNotMatch(JSON.stringify(ownedSnapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
+      if (!["diagnostic_error", "spawn_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
+        const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
+        assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
+        assert.equal(childSnapshot.resources.guard.path, join(sandbox, "src/guards.ts"));
+        assert.equal(childSnapshot.resources.extension.path, runtimeExtension);
+      }
     }
-    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(runtimeExtension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
+    console.log(JSON.stringify({ piVersion, scenario, cli: fileProvenance(runtimeCli), extension: fileProvenance(runtimeExtension), baseSha: scenario.startsWith("baseline_") ? baselineSha : head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, finalBytes: Buffer.byteLength(result.payload), finalHash: createHash("sha256").update(result.payload).digest("hex"), exitCode: result.exitCode, signal: result.signal })) }));
     rpc.acceptTerminal();
   } finally {
     clearTimeout(timeout);
@@ -432,6 +466,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
 }
 
 for (const [scenario, outcome] of cases) {
-  test(`real Pi ${scenario} retains primary outcomes`, { timeout: scenario === "chain_max" || scenario.startsWith("read_heavy") ? 60000 : 30000 }, (t) =>
+  test(`real Pi ${scenario} retains primary outcomes`, { timeout: scenario === "chain_max" || scenario.includes("read_heavy") ? 60000 : 30000 }, (t) =>
     runBoundedRuntimeCase(t, (signal) => runFaultScenario(scenario, outcome, signal)));
 }

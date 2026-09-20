@@ -125,9 +125,9 @@ export default function (pi: ExtensionAPI) {
           };
           if (!calledA) {
             calledA = true;
-            if (scenario?.startsWith("read_heavy")) {
+            if (scenario?.includes("read_heavy")) {
               message.stopReason = "toolUse";
-              const items = scenario === "read_heavy_parallel" ? ["read-heavy-24", "read-heavy-32"] : [scenario === "read_heavy_32" ? "read-heavy-32" : "read-heavy-24"];
+              const items = scenario.includes("parallel") ? ["read-heavy-24", "read-heavy-32"] : [scenario.includes("32") ? "read-heavy-32" : "read-heavy-24"];
               const tasks = items.map((task) => ({ agent: "plan-scout", task, ticket: "YM-204" }));
               message.content = [{ type: "toolCall", id: "read-heavy", name: "subagent", arguments: tasks.length === 1 ? tasks[0] : { tasks } }];
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
