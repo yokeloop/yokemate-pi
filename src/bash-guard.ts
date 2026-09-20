@@ -11,7 +11,7 @@
 // a broken guard must not paralyze the work it protects.
 
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { assertMandatoryBoundary, WorkflowBoundaryError } from "./workflow-boundaries.ts";
@@ -241,8 +241,8 @@ function packageTargetVerdict(command: string, own?: PackageScope): Verdict | nu
     const detected = (s: PackageSegment) => PACKAGE_MANAGER.test(s.words[0] ?? "") ||
       (s.substitution && PACKAGE_TEXT.test(s.words.join(" "))) ||
       (!PACKAGE_DATA.has(s.words[0] ?? "") && s.words.some((w) => PACKAGE_MANAGER.test(w.replace(/^[({]+|[)}]+$/g, "")))) ||
-      (!PACKAGE_DATA.has(s.words[0] ?? "") && s.words.some((w) => RUNNER.test(w)) && s.words.some((w) => PACKAGE_TEXT.test(w))) ||
-      (unsupported && segments.some((p) => /^(?:sh|bash|zsh|eval)$/.test(p.words[0] ?? "")) && s.words.some((w) => PACKAGE_TEXT.test(w)));
+      (!PACKAGE_DATA.has(s.words[0] ?? "") && s.words.some((w) => RUNNER.test(isAbsolute(w) ? basename(w) : w)) && s.words.some((w) => PACKAGE_TEXT.test(w))) ||
+      (unsupported && segments.some((p) => /^(?:sh|bash|zsh|eval)$/.test(isAbsolute(p.words[0] ?? "") ? basename(p.words[0]!) : p.words[0] ?? "")) && s.words.some((w) => PACKAGE_TEXT.test(w)));
     if (!segments.some(detected)) return null;
     if (!own || typeof own.cwd !== "string" || !isAbsolute(own.cwd) || !/^[A-Z][A-Z0-9]*-\d+$/.test(own.ticket ?? "")) return deny("missing or malformed host cwd/ticket");
     const projects: unknown = JSON.parse(own.project ?? "null");

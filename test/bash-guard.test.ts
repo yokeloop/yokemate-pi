@@ -118,6 +118,26 @@ test("package targets reject unassigned ambiguous and unsupported execution", ()
   }
 });
 
+for (const command of [
+  '/bin/bash -c "npm test"',
+  '/bin/sh -c "npm test"',
+  "echo 'npm test' | /bin/sh",
+  "echo 'npm test' | /bin/bash",
+]) {
+  test(`package targets detect absolute shell wrappers: ${command}`, () => {
+    assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper })?.decision, "deny");
+  });
+}
+
+test("package targets keep absolute shell wrapper text as ordinary data", () => {
+  for (const command of [
+    `grep -n '/bin/bash -c "npm test"' src/x`,
+    `echo '/bin/sh -c "npm test"'`,
+    `printf '%s' "echo 'npm test' | /bin/sh"`,
+    `rg "echo 'npm test' | /bin/bash" src/x`,
+  ]) assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper }), null, command);
+});
+
 test("package targets preserve engine orchestration and data rather than granting script-wide bypass", () => {
   for (const command of ["pnpm where do YM-1", "pnpm ready YM-1", "pnpm gate YM-1", "pnpm record-report YM-1", "pnpm pr-link YM-1 url", "npm run where -- do YM-1"]) {
     assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper }), null, command);
