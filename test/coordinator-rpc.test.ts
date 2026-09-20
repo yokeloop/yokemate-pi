@@ -213,7 +213,7 @@ test("owned state requires matching transport identity, launch admission and del
   tracker.toolEnd("A", ack, false);
   assert.equal(tracker.canFinish("blocked", "child still active"), false);
   const delivery = deliveryFor(result);
-  assert.equal(tracker.accept({ ...initial, sequence: 3, deliveries: [delivery] }), true);
+  assert.equal(tracker.accept({ ...initial, sequence: 3, deliveries: [{ ...delivery, state: "delivery_failed" }] }), true);
   assert.equal(tracker.settled(), "wait");
   tracker.recordDeliveryError();
   assert.equal(tracker.canFinish("done"), false);
@@ -250,7 +250,7 @@ test("an observed delivery retires its asynchronous error before a later healthy
   const terminal = { processOutcome: "exited" as const, exitCode: 0, signal: null, stopReason: "stop" };
   const deliveryA = deliveryFor(resultEnvelope(a.children[0]!.identity, "A", terminal, "A"));
   const deliveryB = deliveryFor(resultEnvelope(b.children[0]!.identity, "B", terminal, "B"));
-  tracker.accept({ ...initial, sequence: 2, children: b.children, deliveries: [deliveryA] });
+  tracker.accept({ ...initial, sequence: 2, children: b.children, deliveries: [{ ...deliveryA, state: "delivery_failed" }] });
   tracker.recordDeliveryError();
   tracker.accept({ ...initial, sequence: 3, children: b.children, deliveries: [{ ...deliveryA, state: "observed" }] });
   tracker.accept({ ...initial, sequence: 4, deliveries: [{ ...deliveryA, state: "observed" }, deliveryB] });

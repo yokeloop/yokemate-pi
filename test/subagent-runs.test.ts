@@ -232,16 +232,23 @@ test("ordinary snapshots are private, bounded, locked and protect active deliver
   const fs = (await import("node:fs")).default;
   const path = await import("node:path");
   const { tmpdir } = await import("node:os");
-  const { RunSnapshots } = await import("../src/subagent-runs.ts");
+  const { JsonlObservation, RunSnapshots } = await import("../src/subagent-runs.ts");
   const root = fs.mkdtempSync(path.join(tmpdir(), "ym226-snapshots-"));
   const activeRoot = path.join(root, "active");
   try {
     const snapshots = new RunSnapshots(activeRoot);
     const identity = { ownerSessionId: "session", batchId: "batch", agent: "worker", taskHash: "a".repeat(64) };
-    assert.deepEqual(snapshots.write("owner", "active", { identity, rawPrompt: "private sentinel", deliveries: {} }, false), { state: "available" });
+    const observed = new JsonlObservation();
+    observed.write(Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } }) + "\n"));
+    const stream = { ...observed.metadata(), privateNested: "private sentinel" };
+    assert.deepEqual(snapshots.write("owner", "active", { identity, ownerPid: process.pid, runtime: { node: process.version, pi: "0.85.1", contract: 1, privateNested: "private sentinel" }, artifact: { state: "accepted", hash: "b".repeat(64), bytes: 4, acceptanceId: 7, path: "private sentinel" }, publication: { state: "pending", revision: "c".repeat(64), publicationId: 9, error: "target_unavailable", target: "private sentinel" }, stream, rawPrompt: "private sentinel", deliveries: {} }, false), { state: "available" });
     const dir = path.join(activeRoot, "sessions/subagent-runs");
     const active = fs.readFileSync(path.join(dir, "owner-active.json"), "utf8");
-    assert.doesNotMatch(active, /private sentinel|rawPrompt/);
+    const activeSnapshot = JSON.parse(active);
+    assert.deepEqual(activeSnapshot.artifact, { state: "accepted", hash: "b".repeat(64), bytes: 4, acceptanceId: 7 });
+    assert.deepEqual(activeSnapshot.publication, { state: "pending", revision: "c".repeat(64), publicationId: 9, error: "target_unavailable" });
+    assert.deepEqual(activeSnapshot.runtime, { node: process.version, pi: "0.85.1", contract: 1 });
+    assert.doesNotMatch(active, /private sentinel|rawPrompt|privateNested/);
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(path.join(dir, "owner-active.json")).mode & 0o777, 0o600);
     for (let i = 0; i < 39; i++) assert.equal(snapshots.write("owner", `active-${i}`, { identity, deliveries: {} }, false).state, "available");
@@ -317,6 +324,9 @@ test("aggregate framing budgets account for escaped content and details without 
   }
   const runs = new ChildRuns("owner", "session");
   assert.throws(() => runs.admit("oversized-identities", Array.from({ length: 2000 }, () => ({ agent: "worker", task: "task" })), cwd), /batch identity exceeds JSONL transport budget/);
+  const one = new ChildRuns("owner", "session").admit("immutable-overflow", [{ agent: "worker", task: "task" }], cwd);
+  const immutableOverflow = { ...resultEnvelope(one.children[0]!.identity, "task", clean, "done"), artifact: { state: "verified" as const, path: `/private/${"x".repeat(600000)}`, hash: "a".repeat(64), bytes: 4 } };
+  assert.throws(() => boundBatchResult(immutableOverflow, one.children.map((child) => child.identity)), /immutable subagent result exceeds JSONL transport budget/);
   assert.equal(runs.children.size, 0);
   assert.equal(runs.batches.size, 0);
 });

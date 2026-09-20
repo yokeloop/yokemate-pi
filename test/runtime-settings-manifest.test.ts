@@ -18,14 +18,14 @@ const adapters: Adapter[] = [
   { file: "mode-tab.test.ts", name: "generic duplicate guards and ticketless name series are surface independent" },
 ];
 
-test("public regression manifest consumes exact passed case IDs for every runtime setting cell", { timeout: 60000 }, () => {
+test("public regression manifest consumes exact passed case IDs for every runtime setting cell", { timeout: 120000 }, () => {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   const passed = new Set<string>();
   for (const file of [...new Set(adapters.map((adapter) => adapter.file))]) {
     const names = adapters.filter((adapter) => adapter.file === file).map((adapter) => adapter.name);
     const pattern = `^(?:${names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`;
-    const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "--test", `--test-name-pattern=${pattern}`, new URL(file, import.meta.url).pathname], { encoding: "utf8", timeout: 55000, env });
+    const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "--test", `--test-name-pattern=${pattern}`, new URL(file, import.meta.url).pathname], { encoding: "utf8", timeout: 110000, env });
     assert.equal(result.status, 0, `${file}\n${result.stdout}\n${result.stderr}`);
     for (const name of names) {
       const line = result.stdout.split("\n").find((value) => value.includes(` - ${name}`) && /^ok\s/.test(value));

@@ -58,10 +58,13 @@ test("raw interactive authority flows through real plan CLI and parent control w
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    mkdirSync(join(dir, "test", "fixtures"), { recursive: true });
+    cpSync(join(source, "test/fixtures/subagent-json-relay.mjs"), join(dir, "test/fixtures/subagent-json-relay.mjs"));
     symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "agents", "plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
+    writeFileSync(join(dir, ".pi", "agents", "plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read\n---\nRead the accepted scout.\n");
     const agentDir = join(dir, "agent");
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     symlinkSync(join(source, "test/fixtures/subagent-runtime-provider.ts"), join(agentDir, "extensions/provider.ts"));
@@ -171,6 +174,10 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.match(readFileSync(scoutEnvelope.artifact.path, "utf8"), /EVIDENCE-TAIL/);
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
     assert.doesNotMatch(scoutEnvelope.payload, /EVIDENCE-TAIL/);
+    const acceptedScoutBytes = readFileSync(scoutEnvelope.artifact.path);
+    writeFileSync(scoutEnvelope.artifact.path, "tampered");
+    await assert.rejects(() => tool.execute("writer-tampered", { agent: "plan-writer", task: "Read the accepted scout.", ticket: "YM-1" }, undefined, () => undefined, ctx), /artifact_invalid|artifact changed|binding is invalid/);
+    writeFileSync(scoutEnvelope.artifact.path, acceptedScoutBytes);
     const scoutRemote = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
     assert.ok(scoutRemote.length >= 3);
     const reconstructedScout = scoutRemote.map((comment) => comment.body.slice(comment.body.indexOf("\n\n---\n\n") + 7)).join("");
@@ -187,7 +194,11 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get(), undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "protocol_overflow";
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(dir, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_FAULT = "record_overflow";
     const invalidScout = await runScout("scout-protocol-overflow");
+    delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+    delete process.env.YOKEMATE_SUBAGENT_TEST_FAULT;
     assert.equal(invalidScout.payloadOutcome, "protocol_error");
     assert.equal(invalidScout.artifact.state, "blocked");
     assert.equal(invalidScout.publication, undefined);

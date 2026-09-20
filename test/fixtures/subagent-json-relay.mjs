@@ -6,9 +6,10 @@ const target = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
 if (target) {
   await import(pathToFileURL(target).href);
 } else {
+  const fault = process.env.YOKEMATE_SUBAGENT_TEST_FAULT;
+  if (fault === "record_overflow") process.stdout.write("x".repeat(1024 * 1024 + 1) + "\n");
   const child = spawn(process.execPath, [upstream, ...args], { env: process.env, stdio: ["inherit", "pipe", "inherit"] });
   let pending = Buffer.alloc(0);
-  const fault = process.env.YOKEMATE_SUBAGENT_TEST_FAULT;
   child.stdout.on("data", (chunk) => {
     if (fault === "eof_without_lf") {
       pending = Buffer.concat([pending, chunk]);

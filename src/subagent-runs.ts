@@ -161,7 +161,7 @@ export class ChildRuns {
   private defaultTicket?: string;
   private currentScouts = new Map<string, { runId: string; result?: ResultEnvelope }>();
   constructor(ownerRunId: string, ownerSessionId: string, defaultTicket?: string) { this.ownerRunId = ownerRunId; this.ownerSessionId = ownerSessionId; this.defaultTicket = defaultTicket; }
-  admit(batchId: string, tasks: ChildTask[], cwd: string): LaunchAck {
+  admit(batchId: string, tasks: ChildTask[], cwd: string, validate?: (identity: ChildIdentity) => void): LaunchAck {
     if (this.batches.has(batchId)) throw new Error("duplicate subagent batch admission");
     const identities = tasks.map((task) => reserveIdentity(this.ownerRunId, this.ownerSessionId, batchId, task, cwd, this.defaultTicket));
     batchPayloadQuota(identities);
@@ -170,6 +170,7 @@ export class ChildRuns {
       if (identity.agent === "plan-writer") {
         if (identity.ticket && pendingScoutTickets.has(identity.ticket)) throw new Error(`plan-writer cannot share admission with an unsettled scout for ${identity.ticket}`);
         this.assertPlanWriterAdmission(identity);
+        validate?.(identity);
       }
     }
     this.batches.set(batchId, identities);
@@ -399,7 +400,10 @@ export interface RunSnapshotV1 {
   taskHash?: string;
   actualTaskHash?: string;
   lifecycle: { admittedAt?: string; spawnAt?: string; closeAt?: string; settledAt?: string; processClosed: boolean; deliveriesTerminal: boolean };
+  owner?: { pid?: number; starttime?: string };
   process?: { pid?: number; starttime?: string; outcome?: string; exitCode?: number | null; signal?: string | null; stopReason?: string; cancellationInitiator?: string };
+  runtime?: { node?: string; pi?: string; contract?: number };
+  hashes?: { task?: string; actualTask?: string; appendedPrompt?: string };
   resources?: Record<string, { path: string; hash: string }>;
   stream?: StreamDiagnostics;
   stderr?: { bytes: number; hash: string };
@@ -416,6 +420,53 @@ const snapshotCode = (error: unknown): SnapshotStorageCode => {
 };
 const safeString = (value: unknown, pattern = /^[a-zA-Z0-9_.:/+-]{1,240}$/): string | undefined => typeof value === "string" && pattern.test(value) ? value : undefined;
 const safeNumber = (value: unknown): number | undefined => Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined;
+const allowlistedStream = (source: unknown): StreamDiagnostics | undefined => {
+  if (!source || typeof source !== "object") return;
+  const value = source as Record<string, unknown>;
+  const counters = value.parserErrorCounters && typeof value.parserErrorCounters === "object" ? value.parserErrorCounters as Record<string, unknown> : {};
+  const error = (raw: unknown): ParserErrorFact | undefined => {
+    if (!raw || typeof raw !== "object") return;
+    const item = raw as Record<string, unknown>;
+    if (!["invalid_json", "invalid_event", "record_limit", "partial_record"].includes(String(item.kind))) return;
+    const offset = safeNumber(item.offset);
+    return offset === undefined ? undefined : { kind: item.kind as ParserErrorKind, offset };
+  };
+  const eventsSource = value.events && typeof value.events === "object" ? value.events as Record<string, unknown> : {};
+  const events: Record<string, number> = {};
+  for (const kind of ["session", "agent_start", "turn_start", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "turn_end", "agent_end", "agent_settled", "other"]) {
+    const count = safeNumber(eventsSource[kind]);
+    if (count !== undefined) events[kind] = count;
+  }
+  const stdoutBytes = safeNumber(value.stdoutBytes);
+  const stdoutHash = safeString(value.stdoutHash, /^[a-f0-9]{64}$/);
+  const parserErrors = safeNumber(value.parserErrors);
+  const partialBytes = safeNumber(value.partialBytes);
+  const partialHash = safeString(value.partialHash, /^[a-f0-9]{64}$/);
+  if (stdoutBytes === undefined || !stdoutHash || parserErrors === undefined || partialBytes === undefined || !partialHash) return;
+  const phase = ["text", "thinking", "toolcall", "unknown"].includes(String(value.phase)) ? value.phase as StreamDiagnostics["phase"] : "unknown";
+  return {
+    stdoutBytes, stdoutHash, events, parserErrors,
+    parserErrorCounters: {
+      invalid_json: safeNumber(counters.invalid_json) ?? 0,
+      invalid_event: safeNumber(counters.invalid_event) ?? 0,
+      record_limit: safeNumber(counters.record_limit) ?? 0,
+      partial_record: safeNumber(counters.partial_record) ?? 0,
+    },
+    ...(error(value.firstParserError) ? { firstParserError: error(value.firstParserError) } : {}),
+    ...(error(value.lastParserError) ? { lastParserError: error(value.lastParserError) } : {}),
+    partialBytes, partialHash,
+    assistantMessageSeen: value.assistantMessageSeen === true,
+    finalTextPresent: value.finalTextPresent === true,
+    activeTools: safeNumber(value.activeTools) ?? 0,
+    retry: value.retry === true,
+    compaction: value.compaction === true,
+    summaryRetry: value.summaryRetry === true,
+    phase,
+    ...(safeString(value.firstByteAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/) ? { firstByteAt: value.firstByteAt as string } : {}),
+    ...(safeString(value.lastEventAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/) ? { lastEventAt: value.lastEventAt as string } : {}),
+    ...(safeString(value.finalAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/) ? { finalAt: value.finalAt as string } : {}),
+  };
+};
 
 export class RunSnapshots {
   readonly directory: string;
@@ -556,6 +607,15 @@ export class RunSnapshots {
       const record = source as Record<string, unknown>;
       if (typeof record.path === "string" && typeof record.hash === "string" && /^[a-f0-9]{64}$/.test(record.hash)) resources[role] = { path: record.path, hash: record.hash };
     }
+    const runtime = metadata.runtime && typeof metadata.runtime === "object" ? metadata.runtime as Record<string, unknown> : {};
+    const artifact = metadata.artifact && typeof metadata.artifact === "object" ? metadata.artifact as Record<string, unknown> : {};
+    const publication = metadata.publication && typeof metadata.publication === "object" ? metadata.publication as Record<string, unknown> : {};
+    const stream = allowlistedStream(metadata.stream);
+    const artifactState = safeString(artifact.state, /^[a-z_]{1,40}$/);
+    const artifactHash = safeString(artifact.hash, /^[a-f0-9]{64}$/);
+    const publicationState = safeString(publication.state, /^[a-z_]{1,40}$/);
+    const publicationRevision = safeString(publication.revision, /^[a-f0-9]{64}$/);
+    const publicationError = safeString(publication.error, /^[a-z_]{1,80}$/);
     return {
       customType: "yokemate-run-snapshot", version: 1, ownerRunId,
       ...(safeString(identity.ownerSessionId) ? { ownerSessionId: identity.ownerSessionId as string } : {}),
@@ -565,10 +625,15 @@ export class RunSnapshots {
       ...(safeString(identity.taskHash, /^[a-f0-9]{64}$/) ? { taskHash: identity.taskHash as string } : {}),
       ...(safeString(metadata.actualTaskHash, /^[a-f0-9]{64}$/) ? { actualTaskHash: metadata.actualTaskHash as string } : {}),
       lifecycle: { admittedAt: safeString(metadata.admissionAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), spawnAt: safeString(metadata.spawnAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), closeAt: safeString(metadata.closeAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), settledAt: safeString(metadata.settledAt, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/), processClosed, deliveriesTerminal },
+      owner: { pid: safeNumber(metadata.ownerPid), starttime: safeString(metadata.ownerStarttime, /^\d{1,30}$/) },
       process: { pid: safeNumber(metadata.pid), starttime: safeString(metadata.starttime, /^\d{1,30}$/), outcome: safeString(terminal.processOutcome, /^[a-z_]{1,40}$/), exitCode: terminal.exitCode === null || Number.isInteger(terminal.exitCode) ? terminal.exitCode as number | null : undefined, signal: safeString(terminal.signal, /^[A-Z0-9]+$/), stopReason: safeString(terminal.stopReason, /^[a-zA-Z0-9_ -]{1,80}$/), cancellationInitiator: safeString(metadata.cancellationInitiator, /^[a-z_]{1,80}$/) },
+      runtime: { node: safeString(runtime.node, /^v?\d+(?:\.\d+){2}$/), pi: safeString(runtime.pi, /^\d+(?:\.\d+){2}$/), contract: safeNumber(runtime.contract) },
+      hashes: { task: safeString(metadata.taskHash, /^[a-f0-9]{64}$/), actualTask: safeString(metadata.actualTaskHash, /^[a-f0-9]{64}$/), appendedPrompt: safeString(metadata.appendedPromptHash, /^[a-f0-9]{64}$/) },
       ...(Object.keys(resources).length ? { resources } : {}),
-      ...(metadata.stream && typeof metadata.stream === "object" ? { stream: structuredClone(metadata.stream) as StreamDiagnostics } : {}),
+      ...(stream ? { stream } : {}),
       ...(metadata.stderr && typeof metadata.stderr === "object" ? { stderr: { bytes: safeNumber((metadata.stderr as any).bytes) ?? 0, hash: safeString((metadata.stderr as any).hash, /^[a-f0-9]{64}$/) ?? sha256("") } } : {}),
+      ...(artifactState || artifactHash ? { artifact: { state: artifactState, hash: artifactHash, bytes: safeNumber(artifact.bytes), acceptanceId: safeNumber(artifact.acceptanceId) } } : {}),
+      ...(publicationState || publicationRevision || publicationError ? { publication: { state: publicationState, revision: publicationRevision, publicationId: safeNumber(publication.publicationId), error: publicationError } } : {}),
       deliveries,
       snapshotStorage: { state: "available" },
       updatedAt: new Date().toISOString(),
@@ -621,7 +686,9 @@ export class OwnedChildState {
   private progress = 0;
   private lastNudgeProgress = -1;
   private deliveryErrors = new Set<string>();
-  recordDeliveryError(): void { for (const id of this.pendingIds()) this.deliveryErrors.add(id); }
+  recordDeliveryError(): void {
+    for (const delivery of this.snapshot?.deliveries ?? []) if (delivery.state === "delivery_failed") this.deliveryErrors.add(delivery.deliveryId);
+  }
   uncertainDeliveryIds(): string[] { return [...this.deliveryErrors]; }
   get deliveryError(): boolean { return this.deliveryErrors.size > 0; }
   retry = false;
@@ -702,8 +769,9 @@ export class OwnedChildState {
   busyCount(): number { return !this.snapshot || this.invalid || !this.sessionId ? 1 : this.snapshot.children.length + this.inFlight.size + this.pendingIds().length; }
   canFinish(outcome: "done" | "blocked", reason?: string): boolean {
     if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size) return false;
-    if (!this.pendingIds().length) return true;
-    return outcome === "blocked" && (this.deliveryError || this.snapshot.deliveries.some((delivery) => delivery.state === "delivery_failed")) && this.pendingIds().every((id) => reason?.includes(id));
+    const pending = this.snapshot.deliveries.filter((delivery) => delivery.state !== "observed");
+    if (!pending.length) return true;
+    return outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && reason?.includes(delivery.deliveryId));
   }
   verificationCount(outcome: "done" | "blocked", reason?: string): number { return this.canFinish(outcome, reason) ? 0 : Math.max(1, this.busyCount()); }
   deliveryFailureReason(): string | undefined {
@@ -757,5 +825,8 @@ export function boundBatchResult(result: ResultEnvelope, identities: ChildIdenti
     else high = middle - 1;
   }
   const bounded = limited(low);
-  return resultWireCost(bounded) <= budget ? bounded : limited(0);
+  if (resultWireCost(bounded) <= budget) return bounded;
+  const empty = limited(0);
+  if (resultWireCost(empty) <= budget) return empty;
+  throw new Error("immutable subagent result exceeds JSONL transport budget");
 }

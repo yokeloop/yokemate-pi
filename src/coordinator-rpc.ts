@@ -63,7 +63,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
   const snapshots = new RunSnapshots(prepared.resourcesPath);
-  const metadata: Record<string, unknown> = { identity: { ownerSessionId: identity.parentSessionId, batchId: identity.runId, agent: `${identity.mode}-coordinator`, ticket: identity.ticket, taskHash: sha256(prepared.prompt) }, admissionAt: new Date().toISOString(), requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown", deliveries: {}, noDeliveriesExpected: true };
+  const metadata: Record<string, unknown> = { identity: { ownerSessionId: identity.parentSessionId, batchId: identity.runId, agent: `${identity.mode}-coordinator`, ticket: identity.ticket, taskHash: sha256(prepared.prompt) }, admissionAt: new Date().toISOString(), ownerPid: process.pid, ownerStarttime: processStarttime(process.pid), runtime: { node: process.version, pi: "0.85.1", contract: 1 }, requested: { model: prepared.model }, taskHash: sha256(prepared.prompt), appendedPromptHash: sha256(readFileSync(definition)), effective: "unknown", launch: fileProvenance(invocation.args[0] ?? invocation.command), agentDefinition: fileProvenance(definition), cancellationInitiator: "unknown", deliveries: {}, noDeliveriesExpected: true };
   metadata.snapshotStorage = snapshots.write(identity.runId, identity.runId, metadata, false);
   const child = spawn(invocation.command, invocation.args, { cwd: prepared.cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
   const childState = new OwnedChildState(identity.runId, child.pid ?? -1, child.pid ? processStarttime(child.pid) ?? "" : "");
@@ -260,7 +260,8 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
 
 export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, reportBlocked: (reason: string) => void): void {
   if (event.type === "extension_error" && event.event === "send_message") {
-    void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${Buffer.from(JSON.stringify({ runId: rpc.childState.ownerRunId(), deliveryIds: rpc.childState.uncertainDeliveryIds() })).toString("base64")}` }).catch(() => {});
+    const deliveryIds = rpc.childState.uncertainDeliveryIds();
+    if (deliveryIds.length) void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${Buffer.from(JSON.stringify({ runId: rpc.childState.ownerRunId(), deliveryIds })).toString("base64")}` }).catch(() => {});
   }
   const deliveryFailure = rpc.childState.deliveryFailureReason();
   if (deliveryFailure) { reportBlocked(deliveryFailure); return; }

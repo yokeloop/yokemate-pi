@@ -494,11 +494,26 @@ async function runSingleAgent(
 				emitUpdate();
 			}
 		});
-		const refreshObservation = () => {
-			diagnostic.metadata.stream = observation.metadata();
+		const refreshObservation = (stream = observation.metadata()) => {
+			diagnostic.metadata.stream = stream;
 			diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
 			diagnostic.metadata.sessionId = observation.sessionId;
 			diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
+		};
+		let lastProgressSnapshot = 0;
+		let priorParserErrors = 0;
+		let priorPhase: string = "unknown";
+		const checkpointProgress = () => {
+			const stream = observation.metadata();
+			const now = Date.now();
+			const firstFault = priorParserErrors === 0 && stream.parserErrors > 0;
+			const phaseChanged = stream.phase !== priorPhase;
+			priorParserErrors = stream.parserErrors;
+			priorPhase = stream.phase;
+			if (!firstFault && !phaseChanged && now - lastProgressSnapshot < 1000) return;
+			lastProgressSnapshot = now;
+			refreshObservation(stream);
+			diagnostic.save(false);
 		};
 		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -526,7 +541,7 @@ async function runSingleAgent(
 				proc.kill("SIGTERM");
 				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
 			};
-			proc.stdout.on("data", (data: Buffer) => observation.write(data));
+			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
 			proc.once("close", (exitCode, signalName) => {
@@ -544,8 +559,7 @@ async function runSingleAgent(
 		refreshObservation();
 		const stream = observation.metadata();
 		const stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
-		const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
-		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false }, ...(snapshotStorage ? { snapshotStorage } : {}) } }, observation.finalText);
+		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
 		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
 			const bytes = normalizeScoutMarkdown(observation.finalText);
 			try {
@@ -562,7 +576,10 @@ async function runSingleAgent(
 		diagnostic.metadata.actualTaskHash = currentResult.envelope.actualTaskHash;
 		diagnostic.metadata.usage = { ...currentResult.usage };
 		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), retainedBytes: Buffer.byteLength(currentResult.envelope.payload), retainedHash: sha256(currentResult.envelope.payload), truncated: currentResult.envelope.payload !== observation.finalText, verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.metadata.artifact = currentResult.envelope.artifact;
 		diagnostic.save(true);
+		const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+		if (snapshotStorage && currentResult.envelope.diagnostics) currentResult.envelope.diagnostics.snapshotStorage = { ...snapshotStorage };
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -1689,10 +1706,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
-		if (!runs.settle(result)) return;
 		const settledAt = Date.now();
-		reportSettledAt.set(result.identity.runId, settledAt);
 		const diagnostic = diagnostics.get(result.identity.runId);
 		if (diagnostic) {
 			diagnostic.metadata.settledAt = new Date(settledAt).toISOString();
@@ -1703,7 +1717,12 @@ export default function (pi: ExtensionAPI) {
 			const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
 			diagnostic.metadata.payload = { ...originalPayload, outcome: result.payloadOutcome, retainedBytes: Buffer.byteLength(result.payload), retainedHash: sha256(result.payload), truncated: result.diagnostics?.final.truncated ?? false, verdict: result.reviewVerdict, outputLimit: result.outputLimit };
 			diagnostic.save(true);
+			const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+			if (snapshotStorage && result.diagnostics) result.diagnostics.snapshotStorage = { ...snapshotStorage };
 		}
+		result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
+		if (!runs.settle(result)) return;
+		reportSettledAt.set(result.identity.runId, settledAt);
 		if (report) registerDelivery(result);
 		const batch = runs.batch(result.identity.batchId);
 		if (batch) {
@@ -1912,11 +1931,11 @@ export default function (pi: ExtensionAPI) {
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
-				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), ownerPid: process.pid, ownerStarttime: processStarttime(process.pid), runtime: { node: process.version, pi: "0.85.1", contract: 1 }, extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => {
 						const status = snapshots.write(identity.ownerRunId, identity.runId, metadata, completed);
 						metadata.snapshotStorage = status;
