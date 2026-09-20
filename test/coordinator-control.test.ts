@@ -427,12 +427,13 @@ test("logical plan finish supersedes an admitted recorder before its parent comm
   let recordStarted!: () => void;
   let releaseRecord!: () => void;
   const started = new Promise<void>((resolve) => { recordStarted = resolve; });
+  let finishCalls = 0;
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }),
     cancel: async () => {},
     publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: "a".repeat(64) }),
-    planFinished: async () => {},
+    planFinished: async () => { finishCalls++; },
     recordPlan: async () => {
       recordStarted();
       await new Promise<void>((resolve) => { releaseRecord = resolve; });
@@ -450,6 +451,7 @@ test("logical plan finish supersedes an admitted recorder before its parent comm
     const record = requestPlanControl(root, "record-plan", { ticket: "YM-1", runId: register.runId, path: "/plan.md" }, worker, target, env);
     await started;
     assert.equal((await requestPlanControl(root, "plan-finished", { ticket: "YM-1", runId: register.runId, outcome: "cancelled", reason: "engineer stopped" }, worker, target, env)).state, "accepted");
+    assert.equal(finishCalls, 1);
     releaseRecord();
     const superseded = await record;
     assert.equal(superseded.state, "refused");

@@ -220,6 +220,7 @@ test("unconfirmed process identity releases cancellation wait and compact repeat
   assert.deepEqual(await requested.completion, unconfirmed);
   assert.equal(runs.requestCancel(identity.runId, "repeat").result.status, "cancellation_requested");
   const terminal = runs.claimTerminal(identity, "sensitive prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  assert.equal(runs.completeCleanup(identity), true);
   assert.equal(runs.settle(terminal), true);
   assert.ok(runs.batch("mismatch"));
   assert.equal(runs.compactBatch("mismatch"), true);
@@ -228,7 +229,9 @@ test("unconfirmed process identity releases cancellation wait and compact repeat
   assert.equal(retained.templateTask, undefined);
   assert.equal(retained.resolvedTask, undefined);
   assert.equal(retained.cleanupPromise, undefined);
-  assert.equal(runs.requestCancel(identity.runId, "after-terminal").result.status, "cancellation_requested");
+  const terminalRepeat = runs.requestCancel(identity.runId, "after-terminal").result;
+  assert.equal(terminalRepeat.status, "already_terminal");
+  assert.equal(terminalRepeat.cancellationInitiator, "tool_cancel");
 
   const cleanupRuns = new ChildRuns("owner", "session");
   const cleanupIdentity = cleanupRuns.admit("cleanup", [{ agent: "worker", task: "prompt" }], cwd).children[0]!.identity;
@@ -239,8 +242,23 @@ test("unconfirmed process identity releases cancellation wait and compact repeat
   cleanupRuns.compactBatch("cleanup");
   const cleanupRepeat = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel").result;
   assert.equal(cleanupRepeat.status, "cancellation_requested");
-  assert.equal(cleanupRepeat.cancellationInitiator, "late-cancel");
+  assert.equal(cleanupRepeat.cancellationInitiator, undefined);
   assert.match(cleanupRepeat.reason ?? "", /cleanup could not be verified/);
+});
+
+test("bulk shutdown excludes deferred chain remainder from explicit cancellation", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("shutdown-chain", [{ agent: "worker", task: "first" }, { agent: "worker", task: "after {previous}" }], cwd);
+  const first = ack.children[0]!.identity;
+  const remainder = ack.children[1]!.identity;
+  runs.defer(remainder);
+  runs.start(first);
+  assert.deepEqual(runs.shutdownActive().map((child) => child.identity.runId), [first.runId]);
+  runs.requestCancel(first.runId, "session_shutdown");
+  runs.resolveTask(remainder, "after cancelled predecessor");
+  const result = runs.claimNoSpawn(remainder)!;
+  assert.equal(result.processOutcome, "not_started");
+  assert.equal(result.cancellationInitiator, undefined);
 });
 
 test("deferred chain cancellation waits for the actual resolved task and protocol errors win payload classification", async () => {

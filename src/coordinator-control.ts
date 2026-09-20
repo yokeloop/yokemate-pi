@@ -16,7 +16,7 @@ export interface ControlEnvelope { version: 1; operation: "attach-origin" | "lau
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; cancellation?: CancellationResult; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number }
 export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan";
-export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string, acceptanceId: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }>; planRecorded?(ticket: string, path: string, recordIdOrOrigin: number | ControlOrigin, originOrRunId?: ControlOrigin | string, legacyOrigin?: ControlOrigin): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<CancellationResult | void> }
+export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, runId?: string, generation?: number): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, runId: string, acceptanceId: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused" }>; planRecorded?(ticket: string, path: string, recordIdOrOrigin: number | ControlOrigin, originOrRunId?: ControlOrigin | string, legacyOrigin?: ControlOrigin, runId?: string, generation?: number): Promise<{ runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: "plan-only" | "started" | "refused"; target?: string; revision?: string }>; planFinished?(ticket: string, runId: string, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<CancellationResult | void> }
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
 interface PlanRunState {
@@ -218,13 +218,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                   if (planRun?.terminal && !finishingRecording || !main && !planRun) throw new Error("plan run is no longer active");
                   if (envelope.operation === "plan-finished") {
                     if (!planRun || !envelope.runId || !envelope.outcome || !envelope.reason || !parent.planFinished) throw new Error("plan finish handoff is unavailable");
-                    if (finishingRecording) {
-                      await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
-                      fencePlanRun(planRun, envelope.outcome);
-                    } else {
-                      fencePlanRun(planRun, envelope.outcome);
-                      await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
-                    }
+                    fencePlanRun(planRun, envelope.outcome);
+                    await parent.planFinished(ticket, envelope.runId, envelope.outcome, envelope.reason, origin);
                     reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
                   } else {
                   if (!envelope.path || !envelope.runId || !parent.recordPlan) throw new Error("plan record handoff is unavailable");
@@ -317,13 +312,15 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
                 } else if (envelope.operation === "prepare-plan-publication") {
                   const acceptanceId = planRun?.scoutAcceptance ?? scoutAcceptances.get(scoutKey);
                   if (!envelope.path || !envelope.contentHash || !Number.isSafeInteger(acceptanceId) || !parent.preparePlanPublication) throw new Error("plan publication preparation requires a current accepted scout");
-                  const outcome = await parent.preparePlanPublication(ticket, envelope.path, envelope.contentHash, acceptanceId!, origin);
-                  if (planRun?.terminal) throw new Error("plan run is no longer active");
+                  const generation = planRun?.scoutGeneration ?? scoutGenerations.get(scoutKey) ?? 0;
+                  const outcome = await parent.preparePlanPublication(ticket, envelope.path, envelope.contentHash, acceptanceId!, origin, envelope.runId, generation);
+                  if (planRun?.terminal || (planRun && planRun.scoutGeneration !== generation)) throw new Error("plan run is no longer active");
                   reply({ requestId: envelope.requestId, state: "accepted", ...outcome });
                 } else {
                   if (!envelope.path || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
-                  const outcome = await parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin);
-                  if (planRun?.terminal) throw new Error("plan run is no longer active");
+                  const generation = planRun?.scoutGeneration ?? scoutGenerations.get(scoutKey) ?? 0;
+                  const outcome = await parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, undefined, envelope.runId, generation);
+                  if (planRun?.terminal || (planRun && planRun.scoutGeneration !== generation)) throw new Error("plan run is no longer active");
                   reply({ requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...outcome });
                 }
               }

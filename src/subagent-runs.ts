@@ -212,14 +212,18 @@ export class ChildRuns {
       const result = cancellationResult(runId, "unknown", "unknown", false);
       return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
     }
+    if ((child.claim || child.result) && child.cleanupDone) {
+      const result = this.cancellationResult(child, "already_terminal", true);
+      return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
+    }
     if (child.intent?.reason || child.cleanupError) {
-      child.intent ??= Object.freeze({ initiator });
-      const result = this.cancellationResult(child, "cancellation_requested", false, child.intent.reason ?? child.cleanupError);
+      const result = this.cancellationResult(child, "cancellation_requested", false, child.intent?.reason ?? child.cleanupError);
       return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
     }
     if (child.claim || child.result) {
-      const result = this.cancellationResult(child, "already_terminal", true);
-      return { result, first: false, shouldSignal: false, waitForCleanup: false, completion: Promise.resolve(result) };
+      const result = this.cancellationResult(child, "cancellation_requested", false, "terminal cleanup is still pending");
+      const completion = child.cleanupPromise?.then(() => this.cancellationResult(child, "already_terminal", true)) ?? Promise.resolve(result);
+      return { result, first: false, shouldSignal: false, waitForCleanup: true, completion };
     }
     const first = !child.intent;
     child.intent ??= Object.freeze({ initiator });
@@ -301,6 +305,9 @@ export class ChildRuns {
   }
   active(): { identity: ChildIdentity; state: "queued" | "running" }[] {
     return [...this.children.values()].filter((child) => child.state !== "finalized").map(({ identity, state }) => ({ identity, state: state === "queued" ? "queued" : "running" }));
+  }
+  shutdownActive(): { identity: ChildIdentity; state: "queued" | "running" }[] {
+    return [...this.children.values()].filter((child) => child.state !== "finalized" && child.resolvedTask !== undefined).map(({ identity, state }) => ({ identity, state: state === "queued" ? "queued" : "running" }));
   }
   owns(runId: string, ownerRunId: string, ownerSessionId: string): boolean {
     const child = this.children.get(runId);

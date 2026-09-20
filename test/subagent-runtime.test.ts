@@ -217,7 +217,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 const cases = [
   ["parallel_max", "output_limit"], ["chain_max", "output_limit"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
-  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
+  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["public_cancel", "incomplete"], ["public_cancel_parallel", "valid"], ["public_cancel_chain", "valid"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
 
 async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1], signal: AbortSignal): Promise<void> {
@@ -247,6 +247,8 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
+  const observedPhases: string[] = [];
+  let cancellationReleased = false;
   let working!: () => void;
   const childWorking = new Promise<void>((resolve) => { working = resolve; });
   const server = createServer((socket) => {
@@ -258,8 +260,11 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       buffer += chunk.toString();
       if (!buffer.includes("\n")) return;
       const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      observedPhases.push(event.phase);
       if (event.phase === "loaded") loaded.push(event);
       if (scenario === "parent_cancel" && event.phase === "child-working") working();
+      else if (scenario.startsWith("public_cancel") && event.phase === "child-working" && !cancellationReleased) return;
+      else if (scenario.startsWith("public_cancel") && event.phase === "public-cancel-result") { cancellationReleased = true; for (const candidate of sockets) candidate.end("release\n"); }
       else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
       else socket.end("release\n");
     });
@@ -310,7 +315,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.ok(child.closeAt);
       return;
     }
-    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]), signal);
+    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed; phases=${observedPhases.join(",")}`)), 10000); })]), signal);
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
@@ -344,6 +349,22 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
+    if (scenario.startsWith("public_cancel")) {
+      const cancelled = results.filter((result: any) => result.processOutcome === "cancelled");
+      assert.equal(cancelled.length, 1);
+      assert.equal(cancelled[0].cancellationInitiator, "tool_cancel");
+      if (scenario === "public_cancel_parallel") {
+        assert.equal(results.length, 8);
+        assert.ok(results.slice(0, -1).every((result: any) => result.processOutcome === "exited"));
+      }
+      if (scenario === "public_cancel_chain") {
+        assert.equal(results.length, 3);
+        assert.equal(results[1].processOutcome, "cancelled");
+        assert.equal(results[2].processOutcome, "not_started");
+      }
+      assert.ok(observedPhases.includes("public-cancel-result"));
+      assert.ok(rpc.events.some((event) => event.type === "tool_execution_start" && event.toolName === "subagent" && (event.args as any)?.cancelRun));
+    }
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
     if (["spawn_error", "write_cleanup_error"].includes(scenario)) assert.equal(results[0].processOutcome, "spawn_error");
     if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
@@ -365,7 +386,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     const fs = await import("node:fs");
     const snapshots = fs.readdirSync(join(folder, "reviewer-runs")).map((file) => JSON.parse(fs.readFileSync(join(folder, "reviewer-runs", file), "utf8")));
     assert.doesNotMatch(JSON.stringify(snapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-    if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario)) {
+    if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario) && !scenario.startsWith("public_cancel")) {
       const childSnapshot = snapshots.find((snapshot) => snapshot.identity?.runId === results[0].identity.runId);
       assert.equal(childSnapshot.terminal.exitCode, results[0].exitCode, scenario);
       assert.equal(childSnapshot.guard.path, join(root, "src/guards.ts"));

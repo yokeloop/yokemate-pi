@@ -13,6 +13,9 @@ export default function (pi: ExtensionAPI) {
   });
   const scenario = process.env.YM204_FIXTURE_SCENARIO;
   let childTurns = 0;
+let cancelIssued = false;
+let repeatedCancelIssued = false;
+let cancelledRunId: string | undefined;
   if ((scenario === "delivery_sync" || scenario === "delivery_async") && process.env.YOKEMATE_ROLE === "coordinator") {
     const original = AgentSession.prototype.sendCustomMessage;
     AgentSession.prototype.sendCustomMessage = function (message, options) {
@@ -115,11 +118,39 @@ export default function (pi: ExtensionAPI) {
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
               stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
             } else call("batch-A", "review-A");
-            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max") {
+            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max" || scenario === "public_cancel_parallel" || scenario === "public_cancel_chain") {
               const block = message.content[0] as any;
               const single = block.arguments;
-              block.arguments = { [scenario === "parallel" || scenario === "parallel_max" ? "tasks" : "chain"]: Array.from({ length: scenario === "parallel_max" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" ? 3 : 2 }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
+              const parallel = scenario === "parallel" || scenario === "parallel_max" || scenario === "public_cancel_parallel";
+              const length = scenario === "parallel_max" || scenario === "public_cancel_parallel" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" || scenario === "public_cancel_chain" ? 3 : 2;
+              block.arguments = { [parallel ? "tasks" : "chain"]: Array.from({ length }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
             }
+          }
+          else if (scenario?.startsWith("public_cancel") && !cancelIssued && text.includes('"kind":"ack"')) {
+            const runIds = [...text.matchAll(/"runId":"([0-9a-f-]{36})"/g)].map((match) => match[1]!);
+            const runId = scenario === "public_cancel_parallel" ? runIds.at(-1) : scenario === "public_cancel_chain" ? runIds[1] : runIds[0];
+            if (!runId) throw new Error("public cancellation fixture did not observe child ACK runId");
+            cancelIssued = true;
+            cancelledRunId = runId;
+            message.stopReason = "toolUse";
+            message.content = [{ type: "toolCall", id: "cancel-child", name: "subagent", arguments: { cancelRun: runId } }];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+          }
+          else if (scenario !== "public_cancel" && scenario?.startsWith("public_cancel") && cancelIssued && text.includes('"status":"cancellation_requested"')) {
+            await barrier("public-cancel-result", context.messages);
+            message.content = [{ type: "text", text: "continued after deferred public cancellation" }];
+          }
+          else if (scenario?.startsWith("public_cancel") && cancelIssued && !repeatedCancelIssued && text.includes('"status":"cancelled"')) {
+            repeatedCancelIssued = true;
+            message.stopReason = "toolUse";
+            message.content = [{ type: "toolCall", id: "repeat-cancel-child", name: "subagent", arguments: { cancelRun: cancelledRunId } }];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+          }
+          else if (scenario?.startsWith("public_cancel") && repeatedCancelIssued && text.includes('"status":"already_terminal"')) {
+            await barrier("public-cancel-result", context.messages);
+            message.content = [{ type: "text", text: "continued after public cancellation" }];
           }
           else if (!scenario && !calledB && text.includes("[subagent task-reviewer]")) { calledB = true; call("batch-B", "review-B"); }
           else {

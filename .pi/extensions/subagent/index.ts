@@ -297,6 +297,7 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	cleanupError?: string;
+	cleanupPath?: string;
 	step?: number;
 }
 
@@ -361,6 +362,18 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
+class PromptCleanupFailure extends Error {
+	readonly dir: string;
+	readonly writeFailure: ReturnType<typeof errorMetadata>;
+	readonly cleanupFailure: ReturnType<typeof errorMetadata>;
+	constructor(dir: string, writeError: unknown, cleanupError: unknown) {
+		super("temporary prompt write and cleanup failed");
+		this.dir = dir;
+		this.writeFailure = errorMetadata(writeError);
+		this.cleanupFailure = errorMetadata(cleanupError);
+	}
+}
+
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
@@ -372,7 +385,7 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 		return { dir: tmpDir, filePath };
 	} catch (error) {
 		try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); }
-		catch { throw new Error("temporary prompt write and cleanup failed", { cause: error }); }
+		catch (cleanupError) { throw new PromptCleanupFailure(tmpDir, error, cleanupError); }
 		throw error;
 	}
 }
@@ -583,9 +596,10 @@ async function runSingleAgent(
 	} finally {
 		if (tmpPromptDir) {
 			try { fs.rmSync(tmpPromptDir, { recursive: true, force: true }); }
-			catch {
+			catch (error) {
 				currentResult.cleanupError = "temporary prompt cleanup could not be verified";
-				diagnostic.metadata.cleanupError = currentResult.cleanupError;
+				currentResult.cleanupPath = tmpPromptDir;
+				diagnostic.metadata.cleanupError = { reason: currentResult.cleanupError, path: tmpPromptDir, cleanupFailure: errorMetadata(error) };
 				diagnostic.save(true);
 			}
 		}
@@ -858,7 +872,14 @@ export default function (pi: ExtensionAPI) {
 	const stoppedPlanRuns = new Set<string>();
 	const lockedRecordingPlans = new Set<string>();
 	const recorderControllers = new Map<string, AbortController>();
+	const recorderCompletions = new Map<string, Promise<void>>();
 	const cancelledRecordingPlans = new Set<string>();
+	const planContinuationGenerations = new Map<string, number>();
+	const assertPlanContinuation = (runId: string | undefined, generation: number | undefined): void => {
+		if (!runId) return;
+		const found = listRuns.get(runId);
+		if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) || planContinuationGenerations.get(runId) !== generation) throw new Error("plan run is no longer active");
+	};
 	const shipPermits = new ShipPermitStore();
 	let authority: DoAuthorityStore | undefined;
 	let ownedBinding: PlanBinding | undefined;
@@ -1258,7 +1279,7 @@ export default function (pi: ExtensionAPI) {
 				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
-		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding): Promise<PublicationOutcome[]> => {
+		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding, continuation?: () => void): Promise<PublicationOutcome[]> => {
 			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 			let record;
 			let scout;
@@ -1272,10 +1293,13 @@ export default function (pi: ExtensionAPI) {
 			} finally { db.close(); }
 			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
+			continuation?.();
 			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			continuation?.();
 			const planOutcome: PublicationOutcome = scoutOutcome.error === "target_changed"
 				? { kind: "plan", state: "pending", target: scoutOutcome.target, revision: record.content_hash, ...(record.publication_id ? { publicationId: record.publication_id } : {}), error: "target_changed" }
 				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
+			continuation?.();
 			return [scoutOutcome, planOutcome];
 		};
 		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
@@ -1309,6 +1333,7 @@ export default function (pi: ExtensionAPI) {
 			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
 			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
 			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
+			if (planRunId) planContinuationGenerations.delete(planRunId);
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
@@ -1325,19 +1350,29 @@ export default function (pi: ExtensionAPI) {
 					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
-				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin, planRunId, generation) => {
+					if (planRunId && generation !== undefined) {
+						const found = listRuns.get(planRunId);
+						if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state)) throw new Error("plan run is no longer active");
+						planContinuationGenerations.set(planRunId, generation);
+					}
+					assertPlanContinuation(planRunId, generation);
 					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
+					assertPlanContinuation(planRunId, generation);
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
 					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
-				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, originOrRunId) => {
+				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, _originOrRunId, _legacyOrigin, planRunId, generation) => {
 					if (typeof recordIdOrOrigin !== "number") throw new Error("legacy plan record needs a local record id");
+					const continuation = () => assertPlanContinuation(planRunId, generation);
+					continuation();
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
-					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
+					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding, continuation);
+					continuation();
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					return completePlanRecord(ticket, recordedPath, binding, publications, planRunId);
 				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
@@ -1363,10 +1398,10 @@ export default function (pi: ExtensionAPI) {
 					return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
 				},
 				planFinished: async (_ticket, planRunId, outcome, reason) => {
+					planContinuationGenerations.delete(planRunId);
 					const found = listRuns.get(planRunId);
 					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
 					if (recordingPlans.has(planRunId)) {
-						if (lockedRecordingPlans.has(planRunId)) throw new Error("plan recorder already acquired its write lock");
 						cancelledRecordingPlans.add(planRunId);
 						recorderControllers.get(planRunId)?.abort();
 					}
@@ -1374,6 +1409,10 @@ export default function (pi: ExtensionAPI) {
 				},
 				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
 					const controller = new AbortController();
+					const generation = sessionGeneration;
+					let resolveCompletion!: () => void;
+					const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+					recorderCompletions.set(planRunId, completion);
 					recordingPlans.add(planRunId);
 					recorderControllers.set(planRunId, controller);
 					let locallyRecorded = false;
@@ -1381,6 +1420,7 @@ export default function (pi: ExtensionAPI) {
 						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin);
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
+						if (cancelledRecordingPlans.has(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
 						const pushed = result.push;
 						if (pushed?.state === "deferred" || pushed?.state === "error") ctx.ui.notify(`git-sync: ${pushed.reason}`, "warning");
@@ -1405,8 +1445,11 @@ export default function (pi: ExtensionAPI) {
 						if (cancelledRecordingPlans.delete(planRunId)) {
 							const found = listRuns.get(planRunId);
 							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
+							listRuns.cancel(planRunId, "plan recorder cancelled before publication and handoff");
 							if (agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
+						resolveCompletion();
+						recorderCompletions.delete(planRunId);
 					}
 				},
 				launch: async (request, controlOrigin) => {
@@ -1532,8 +1575,9 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown = true;
 		sessionGeneration += 1;
 		const sessionId = latestCtx?.sessionManager?.getSessionId?.();
-		const ordinaryStops = sessionId && runs ? runs.active().map((child) => requestOrdinaryCancellation(child.identity.runId, "session_shutdown", runs!.ownerRunId, sessionId)) : [];
+		const ordinaryStops = sessionId && runs ? runs.shutdownActive().map((child) => requestOrdinaryCancellation(child.identity.runId, "session_shutdown", runs!.ownerRunId, sessionId)) : [];
 		await fenceListRuns("parent session shutdown");
+		await Promise.all([...recorderCompletions.values()]);
 		authority?.revoke();
 		authority = undefined;
 		shipPermits.invalidate();
@@ -1560,6 +1604,7 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.clear();
 		deliveries.clear();
 		diagnostics.clear();
+		planContinuationGenerations.clear();
 		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
@@ -1935,9 +1980,14 @@ export default function (pi: ExtensionAPI) {
 				let envelope: ResultEnvelope | undefined;
 				let output = "";
 				let cleanupError: string | undefined;
+				let cleanupPath: string | undefined;
 				try {
 					runs!.resolveTask(identity, task);
-					if (shuttingDown) runs!.requestCancel(identity.runId, "parent_session_shutdown");
+					if (shuttingDown) {
+						envelope = runs!.claimNoSpawn(identity);
+						if (!envelope) throw new Error("subagent run cannot be fenced during shutdown");
+						return { envelope, output };
+					}
 					if (!runs!.start(identity)) {
 						envelope = runs!.claimed(identity) ?? runs!.claimNoSpawn(identity);
 						if (!envelope) throw new Error("subagent run cannot start");
@@ -1951,6 +2001,7 @@ export default function (pi: ExtensionAPI) {
 					}, identity, runs!, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
 					cleanupError = result.cleanupError;
+					cleanupPath = result.cleanupPath;
 					envelope = boundBatchResult(result.envelope ?? runs!.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
@@ -1960,16 +2011,23 @@ export default function (pi: ExtensionAPI) {
 					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes, retainedHash, truncated: originalPayload === undefined ? false : originalPayload.bytes !== retainedBytes || originalPayload.hash !== retainedHash, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
-					if ((error as Error).message === "temporary prompt write and cleanup failed") cleanupError = "temporary prompt cleanup could not be verified";
+					if (error instanceof PromptCleanupFailure) {
+						cleanupError = "temporary prompt cleanup could not be verified";
+						cleanupPath = error.dir;
+					}
 					const diagnostic = diagnostics.get(identity.runId);
-					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
+					if (diagnostic) {
+						diagnostic.metadata.spawnError = errorMetadata(error);
+						if (error instanceof PromptCleanupFailure) diagnostic.metadata.cleanupError = { reason: cleanupError, path: error.dir, writeFailure: error.writeFailure, cleanupFailure: error.cleanupFailure };
+						diagnostic.save(true);
+					}
 					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
 					if (!envelope) throw error;
 				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
 					ordinaryProcesses.delete(identity.runId);
-					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupError);
+					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupPath ? `${cleanupError}: ${cleanupPath}` : cleanupError);
 					else runs!.completeCleanup(identity);
 				}
 				return { envelope: envelope!, output };

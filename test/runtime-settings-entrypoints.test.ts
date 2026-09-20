@@ -408,6 +408,7 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     let confirmations = 0;
     const ctx = { cwd: dir, mode: "rpc", hasUI: true, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "caps-owner" }, ui: { setWidget() {}, confirm: async () => { confirmations++; return false; } } } as unknown as ExtensionContext;
     shutdown = async () => { for (const handler of loaded.extensions[0]!.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
+    const start = async () => { for (const handler of loaded.extensions[0]!.handlers.get("session_start") ?? []) await handler({ type: "session_start" } as never, ctx); };
     let serial = 0;
     const task = { agent: "worker", task: "fixture" };
     const dispatch = async (params: Record<string, unknown>) => {
@@ -501,10 +502,13 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     await dispatch({ tasks: [{ ...task, task: "shutdown running" }, { ...task, task: "shutdown queued" }] });
     await count(shutdownStart + 1);
     await shutdown();
-    shutdown = undefined;
     assert.equal(connections.length, shutdownStart + 1);
     const afterShutdown = await tool.execute("after-shutdown", task, undefined, () => undefined, ctx);
     assert.match(text(afterShutdown), /shutting down/);
+    await start();
+    const reentered = await dispatch(task);
+    await count(shutdownStart + 2);
+    await finish(reentered, [shutdownStart + 1]);
     runtimeCases(["guards.projectAgentConfirmation", "guards.parallelTaskLimit", "guards.parallelConcurrencyLimit", "subagent.maxParallelTasks", "subagent.maxConcurrency"], ["tool", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["tool", "pane", "ordinary"]);
   } finally {
