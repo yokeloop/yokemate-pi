@@ -1232,23 +1232,69 @@ export default function (pi: ExtensionAPI) {
 			const origin = currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId());
 			let controller: AbortController | undefined;
 			let timer: NodeJS.Timeout | undefined;
+			const model = ctx.model;
+			const startedAt = performance.now();
+			const inputHash = sha256(event.text);
+			let serial: number | null = null;
+			let revision: number | null = null;
+			let stopReason = "unknown";
+			let responseHash: string | null = null;
+			let responseBytes = 0;
+			let validation: "not_run" | "rejected" | "accepted" = "not_run";
+			let inputControl: "not_run" | "error" | "refused" | "accepted" = "not_run";
+			let extractionControl: "not_run" | "error" | "refused" | "accepted" = "not_run";
+			let outcome: "refused" | "accepted" = "refused";
+			let reasonCode: "settings_error" | "input_control_error" | "input_control_refused" | "auth_unavailable" | "model_error" | "timeout" | "unclean_response" | "invalid_json" | "invalid_evidence" | "extraction_control_error" | "extraction_control_refused" | "none" | "rework" | "revoke" = "settings_error";
+			const persist = (phase: "start" | "terminal") => {
+				try {
+					pi.appendEntry("yokemate-review-extraction", { version: 1, phase, reviewRunId: safeWorkflowId(runId), serial, revision, inputHash, provider: safeWorkflowId(model?.provider) ?? "unknown", model: safeWorkflowId(model?.id) ?? "unknown", outcome: phase === "start" ? "pending" : outcome, reasonCode: phase === "start" ? "pending" : reasonCode, stopReason, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), responseHash, responseBytes, validation, inputControl, extractionControl });
+				} catch {}
+			};
+			persist("start");
 			try {
 				readRuntimeSettings(ENGINE_ROOT);
+				reasonCode = "input_control_error";
+				inputControl = "error";
 				const parent = resolveCoordinatorParent(ENGINE_ROOT);
 				const begun = await requestReviewControl(ENGINE_ROOT, "review-input", { ticket, runId, raw: event.text }, origin, parent);
-				if (begun.state !== "accepted" || typeof begun.generation !== "object" || !begun.generation) throw new Error(begun.reason ?? "review input registration refused");
-				if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("review verdict extraction requires the configured review model and external authentication");
+				reasonCode = "input_control_refused";
+				inputControl = "refused";
+				if (begun.state !== "accepted" || typeof begun.generation !== "object" || !begun.generation) throw new Error(reasonCode);
+				inputControl = "accepted";
+				serial = Number.isSafeInteger(begun.generation.serial) && begun.generation.serial >= 0 ? begun.generation.serial : null;
+				revision = Number.isSafeInteger(begun.generation.revision) && begun.generation.revision >= 0 ? begun.generation.revision : null;
+				reasonCode = "auth_unavailable";
+				if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error(reasonCode);
 				controller = new AbortController();
+				reasonCode = "model_error";
 				const message = await Promise.race([
-					ctx.modelRegistry.complete(ctx.model, { systemPrompt: REVIEW_REWORK_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 512 }),
-					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller!.abort(); reject(new Error("review verdict extraction timed out")); }, 15_000); }),
+					ctx.modelRegistry.complete(model, { systemPrompt: REVIEW_REWORK_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 512 }),
+					new Promise<never>((_, reject) => { timer = setTimeout(() => { reasonCode = "timeout"; controller!.abort(); reject(new Error(reasonCode)); }, 15_000); }),
 				]);
-				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("review verdict extraction did not return a clean no-tools result");
-				const extraction = adaptReviewReworkQuotes(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, ticket);
+				clearTimeout(timer);
+				reasonCode = "unclean_response";
+				stopReason = ["stop", "length", "toolUse", "error", "aborted"].includes(message.stopReason) ? message.stopReason : "unknown";
+				const response = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+				responseHash = sha256(response);
+				responseBytes = Buffer.byteLength(response);
+				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error(reasonCode);
+				validation = "rejected";
+				reasonCode = "invalid_json";
+				const value: unknown = JSON.parse(response);
+				reasonCode = "invalid_evidence";
+				const extraction = adaptReviewReworkQuotes(value, event.text, ticket);
+				validation = "accepted";
+				reasonCode = "extraction_control_error";
+				extractionControl = "error";
 				const extracted = await requestReviewControl(ENGINE_ROOT, "review-extraction", { ticket, runId, generation: begun.generation, extraction }, origin, parent);
-				if (extracted.state !== "accepted") throw new Error(extracted.reason ?? "review verdict registration refused");
-			} catch (error) { ctx.ui.notify((error as Error).message, "warning"); }
-			finally { clearTimeout(timer); controller?.abort(); }
+				reasonCode = "extraction_control_refused";
+				extractionControl = "refused";
+				if (extracted.state !== "accepted") throw new Error(reasonCode);
+				extractionControl = "accepted";
+				outcome = "accepted";
+				reasonCode = extraction.kind;
+			} catch { ctx.ui.notify(`review verdict extraction unavailable: reason=${reasonCode}; no inferred rework approval`, "warning"); }
+			finally { clearTimeout(timer); controller?.abort(); persist("terminal"); }
 			return;
 		}
 		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;

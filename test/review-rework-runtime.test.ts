@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { currentControlOrigin, processStarttime, requestReviewControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { openDb } from "../src/db.ts";
 import { socketDir } from "../src/inbox.ts";
@@ -14,12 +14,12 @@ import { socketDir } from "../src/inbox.ts";
 const source = join(import.meta.dirname, "..");
 const planText = (ticket: string, goal: string) => `# ${ticket} — rework\n\n## Goal\n${goal}\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Fix the agreed remark.\n\n## Assumptions\n- Existing stand.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nThe agreed remark is fixed.\n`;
 
-async function loadExtension(root: string, agentDir: string) {
+async function loadExtension(root: string, agentDir: string, appendEntry: (type: string, data: unknown) => void = () => undefined) {
   const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager: SettingsManager.create(root, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(root, ".pi", "extensions", "subagent", "index.ts")] });
   await loader.reload();
   const loaded = loader.getExtensions();
   assert.deepEqual(loaded.errors, []);
-  loaded.runtime.appendEntry = () => undefined;
+  loaded.runtime.appendEntry = appendEntry;
   loaded.runtime.sendMessage = () => undefined;
   return loaded.extensions[0]!;
 }
@@ -78,15 +78,21 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     writeFileSync(join(runtimeDir, "review-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "review-session", parentPane: "main-pane", cwd: dir, mode: "review", ticket: "YM-1" }));
     const notifications: string[] = [];
     let confirms = 0;
-    let observedWrongOffsets = false;
+    const verdict = "План доработки согласован. На доработку.";
+    const quoteReply = (text: string, stopReason = "stop") => ({ stopReason, content: [{ type: "text", text }] });
+    const approvedReply = async (raw: string) => quoteReply(JSON.stringify({ kind: "rework", evidence: [{ text: raw === verdict || raw === "🚀 е\u0301: На доработку." ? "На доработку." : raw }] }));
+    let completeReview = approvedReply;
+    let modelCalls = 0;
+    let configuredAuth = true;
     const modelRegistry = {
       getAll: () => [{ provider: "test", id: "review", name: "review" }, { provider: "test", id: "model", name: "model" }],
-      hasConfiguredAuth: () => true,
-      complete: async (_model: unknown, context: { messages: { content: string }[] }) => {
+      hasConfiguredAuth: () => configuredAuth,
+      complete: async (_model: unknown, context: { systemPrompt: string; messages: { content: string }[] }) => {
+        modelCalls++;
+        assert.match(context.systemPrompt, /Do not calculate or return offsets/);
+        assert.match(context.systemPrompt, /Questions, quotations, negations, conditions/);
         const raw = JSON.parse(context.messages[0]!.content).raw as string;
-        return { stopReason: "stop", content: [{ type: "text", text: observedWrongOffsets
-          ? '{"kind":"rework","evidence":[{"start":26,"end":39,"text":"На доработку."}]}'
-          : JSON.stringify({ kind: "rework", evidence: [{ text: raw === "План доработки согласован. На доработку." ? "На доработку." : raw }] }) }] };
+        return completeReview(raw);
       },
     };
     const ui = { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } };
@@ -102,7 +108,18 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     assert.equal(bound.state, "accepted", bound.reason ?? "review binding refused");
     Object.assign(process.env, { YOKEMATE_MODE: "review", YOKEMATE_ROLE: "coordinator", YOKEMATE_TICKET: "YM-1", YOKEMATE_REVIEW_RUN_ID: reviewRunId, YOKEMATE_REVIEW_RUNTIME_ID: "review-runtime", YOKEMATE_PARENT_PANE: "main-pane", HERDR_PANE_ID: "review-pane", PI_SESSION_ID: "review-session" });
     const workerCtx = { ...mainCtx, mode: "tui", sessionManager: { getSessionId: () => "review-session" } } as unknown as ExtensionContext;
-    const worker = await loadExtension(dir, agentDir);
+    const diagnosticSession = SessionManager.create(dir, join(dir, "diagnostic-sessions"));
+    diagnosticSession.appendMessage({ role: "assistant", content: [], api: "openai-responses", provider: "test", model: "review", stopReason: "stop", timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    let diagnosticFailure = false;
+    const worker = await loadExtension(dir, agentDir, (type, data) => {
+      if (diagnosticFailure) throw new Error("PRIVATE_DIAGNOSTIC_ERROR");
+      diagnosticSession.appendCustomEntry(type, data);
+    });
+    const diagnosticEntries = () => (readFileSync(diagnosticSession.getSessionFile()!, "utf8").trim().split("\n").map((line) => JSON.parse(line)) as { customType?: string; data?: any }[]).filter((entry) => entry.customType === "yokemate-review-extraction").map((entry) => entry.data);
+    const terminal = () => diagnosticEntries().filter((entry) => entry.phase === "terminal").at(-1);
+    const input = async (text: string) => {
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, workerCtx);
+    };
     for (const handler of worker.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, workerCtx);
     workerShutdown = async () => { for (const handler of worker.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, workerCtx); };
     const command = entry === "package" ? "pnpm" : process.execPath;
@@ -118,10 +135,129 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
     for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "Итог: отправляй на доработку" } as never, { ...workerCtx, mode: "rpc" } as ExtensionContext);
     await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
-    observedWrongOffsets = true;
-    for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "План доработки согласован. На доработку." } as never, workerCtx);
-    await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
-    observedWrongOffsets = false;
+    assert.equal(modelCalls, 0);
+    const noHandoff = async () => {
+      await assert.rejects(accept, (error: any) => /approval is missing|stale|revoked/.test(String(error.stderr)));
+      const state = openDb(join(dir, "yokemate.db"));
+      try { assert.deepEqual({ ...state.prepare("SELECT stage, plan FROM work WHERE ticket='YM-1'").get() }, { stage: "review", plan: oldPlan }); }
+      finally { state.close(); }
+      assert.equal(readFileSync(closeLog, "utf8"), "");
+    };
+    completeReview = async () => quoteReply('{"kind":"rework","evidence":[{"start":26,"end":39,"text":"На доработку."}]}');
+    await input(verdict);
+    await noHandoff();
+    assert.equal(terminal()?.reasonCode, "invalid_evidence");
+    if (!workflowApproval) {
+      const sentinel = "PRIVATE_REVIEW_SENTINEL";
+      for (const [raw, response, reasonCode] of [
+        [verdict, '{"kind":"rework","evidence":[{"text":"На доработку!"}]}', "invalid_evidence"],
+        [verdict, '{"kind":"rework"}', "invalid_evidence"],
+        [verdict, '{"kind":"rework","evidence":[{"text":""}]}', "invalid_evidence"],
+        [verdict, '{"kind":"rework","evidence":[]}', "invalid_evidence"],
+        [`${verdict} На доработку.`, '{"kind":"rework","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [verdict, JSON.stringify({ kind: "rework", evidence: Array(9).fill({ text: "На доработку." }) }), "invalid_evidence"],
+        [verdict, '{"kind":"approve","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [verdict, JSON.stringify({ kind: "none", extra: { nested: sentinel } }), "invalid_evidence"],
+        [`${verdict} YM-2`, '{"kind":"rework","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [sentinel, `not JSON ${sentinel}`, "invalid_json"],
+        ["Отправить на доработку?", '{"kind":"none"}', "none"],
+        ["Не отправляй на доработку.", '{"kind":"none"}', "none"],
+        ["Если тесты пройдут, отправь на доработку.", '{"kind":"none"}', "none"],
+        ["Согласен только с заменой Guest на Visitor.", '{"kind":"none"}', "none"],
+        ["Он сказал: «На доработку.»", '{"kind":"none"}', "none"],
+      ]) {
+        completeReview = async () => quoteReply(response!);
+        await input(raw!);
+        await noHandoff();
+        assert.equal(terminal().reasonCode, reasonCode);
+        assert.equal(terminal().responseHash, createHash("sha256").update(response!).digest("hex"));
+        assert.equal(terminal().responseBytes, Buffer.byteLength(response!));
+      }
+      completeReview = async () => { throw new Error(`provider ${sentinel}`); };
+      await input(sentinel);
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "model_error");
+      for (const stop of ["length", "error", "aborted", "toolUse", sentinel]) {
+        completeReview = async () => ({ ...quoteReply(sentinel, stop), errorMessage: sentinel, extra: { nested: sentinel } });
+        await input(sentinel);
+        await noHandoff();
+        assert.equal(terminal().reasonCode, "unclean_response");
+        assert.equal(terminal().stopReason, stop === sentinel ? "unknown" : stop);
+      }
+      completeReview = async () => ({ stopReason: "stop", content: [{ type: "toolCall", text: sentinel }] });
+      await input(sentinel);
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "unclean_response");
+      configuredAuth = false;
+      const callsBeforeAuth = modelCalls;
+      await input(verdict);
+      await noHandoff();
+      assert.equal(modelCalls, callsBeforeAuth);
+      assert.equal(terminal().reasonCode, "auth_unavailable");
+      configuredAuth = true;
+      completeReview = approvedReply;
+      await input("🚀 е\u0301: На доработку.");
+      assert.equal(terminal().reasonCode, "rework");
+      completeReview = async () => quoteReply('{"kind":"revoke","evidence":[{"text":"стоп"}]}');
+      await input("стоп");
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "revoke");
+      let release!: (value: Awaited<ReturnType<typeof approvedReply>>) => void;
+      for (const kind of ["none", "revoke"]) {
+        let entered!: () => void;
+        const waiting = new Promise<void>((resolve) => { entered = resolve; });
+        completeReview = () => { entered(); return new Promise((resolve) => { release = resolve; }); };
+        const stale = input(verdict);
+        await waiting;
+        completeReview = async () => quoteReply(JSON.stringify(kind === "none" ? { kind } : { kind, evidence: [{ text: "стоп" }] }));
+        await input(kind === "none" ? "Ещё вопрос?" : "стоп");
+        release(await approvedReply(verdict));
+        await stale;
+        await noHandoff();
+        assert.equal(terminal().reasonCode, "extraction_control_refused");
+        assert.equal(terminal().validation, "accepted");
+        assert.equal(terminal().extractionControl, "refused");
+        assert.equal(terminal().outcome, "refused");
+      }
+      const runtimeId = process.env.YOKEMATE_REVIEW_RUNTIME_ID;
+      process.env.YOKEMATE_REVIEW_RUNTIME_ID = "foreign-runtime";
+      const callsBeforeForeign = modelCalls;
+      await input(verdict);
+      assert.equal(modelCalls, callsBeforeForeign);
+      assert.equal(terminal().reasonCode, "input_control_refused");
+      process.env.YOKEMATE_REVIEW_RUNTIME_ID = runtimeId;
+      await noHandoff();
+      const timeoutStarted = Date.now();
+      completeReview = () => new Promise((resolve) => { release = resolve; });
+      await input(sentinel);
+      assert.ok(Date.now() - timeoutStarted >= 15000);
+      assert.equal(terminal().reasonCode, "timeout");
+      release(await approvedReply(sentinel));
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "timeout");
+      const entriesBeforeFailure = diagnosticEntries().length;
+      diagnosticFailure = true;
+      completeReview = async () => quoteReply(`malformed ${sentinel}`);
+      await input(sentinel);
+      await noHandoff();
+      diagnosticFailure = false;
+      assert.equal(diagnosticEntries().length, entriesBeforeFailure);
+      const entries = diagnosticEntries();
+      const allowed = ["version", "phase", "reviewRunId", "serial", "revision", "inputHash", "provider", "model", "outcome", "reasonCode", "stopReason", "elapsedMs", "responseHash", "responseBytes", "validation", "inputControl", "extractionControl"].sort();
+      for (const diagnostic of entries) {
+        assert.deepEqual(Object.keys(diagnostic).sort(), allowed);
+        assert.equal(diagnostic.provider, "test");
+        assert.equal(diagnostic.model, "review");
+        assert.match(diagnostic.inputHash, /^[a-f0-9]{64}$/);
+        assert.ok(Number.isFinite(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
+        assert.ok(JSON.stringify(diagnostic).length < 2048);
+      }
+      assert.equal(entries.filter((entry) => entry.phase === "start").length, entries.filter((entry) => entry.phase === "terminal").length);
+      const persisted = readFileSync(diagnosticSession.getSessionFile()!, "utf8");
+      for (const privateText of [sentinel, verdict, "На доработку.", planText("YM-1", "Apply the accepted review rework.")]) assert.equal(persisted.includes(privateText), false);
+      assert.equal(notifications.join("\n").includes(sentinel), false);
+    }
+    completeReview = approvedReply;
     if (workflowApproval) {
       const failedDb = openDb(join(dir, "yokemate.db"));
       failedDb.prepare("UPDATE project SET mode_models=? WHERE tracker_key='YM'").run(JSON.stringify({ review: "test/review", do: "missing/model" }));
@@ -146,6 +282,15 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     } else {
       for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "План доработки согласован. На доработку." } as never, workerCtx);
     }
+    const approved = terminal();
+    assert.equal(approved.reasonCode, "rework");
+    assert.equal(approved.outcome, "accepted");
+    assert.equal(approved.validation, "accepted");
+    assert.equal(approved.inputControl, "accepted");
+    assert.equal(approved.extractionControl, "accepted");
+    assert.ok(Number.isSafeInteger(approved.serial) && approved.serial > 0);
+    assert.ok(Number.isSafeInteger(approved.revision) && approved.revision >= 0);
+    if (!workflowApproval) assert.equal(approved.inputHash, createHash("sha256").update(verdict).digest("hex"));
     const result = await accept();
     const outcome = parseOutput(result.stdout, result.stderr) as { state: string; recorded: boolean; runId: string; model: string; plan: string; contentHash: string; close: { state: string } };
     assert.equal(outcome.state, "started");
