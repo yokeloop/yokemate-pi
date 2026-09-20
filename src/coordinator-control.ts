@@ -533,6 +533,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...result.outcome };
       }
       const prior = context.kind === "main" && recordContext.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
+      if (context.kind === "main" && recordContext.kind === "main" && !prepared && !prior) throw new Error("main plan reconciliation requires an exact prepared or completed record");
       let numeric = numericRecords.get(numericKey);
       if (!state && numeric && recordContext.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
         numericRecords.delete(numericKey);

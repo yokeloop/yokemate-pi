@@ -381,6 +381,48 @@ test("plan worker process exit settles once without using herdr agent status", {
   }
 });
 
+test("a restarted control server refuses an unbound main replay of an old save-only record", async () => {
+  const root = mkdtempSync(join(tmpdir(), "save-only-restart-control-"));
+  const binding = recordedPlan(root, "YM-6");
+  const runtime = mkdtempSync(join(tmpdir(), "save-only-restart-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "main-session", runtimeId: "main-runtime" };
+  const starttime = processStarttime(process.pid)!;
+  const runtimeDir = socketDir(env, process.getuid!());
+  mkdirSync(runtimeDir, { recursive: true });
+  writeFileSync(join(runtimeDir, "save-restart-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-6" }));
+  const worker = { sessionId: "save-restart-session", pid: process.pid, starttime, cwd: root, pane: "save-restart-pane", parentPane: "main", mode: "plan", ticket: "YM-6", role: "coordinator" };
+  const identity = { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" };
+  const first = bindCoordinatorControl(root, {
+    launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+    publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: binding.contentHash }),
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => ({ reason: "prepared", recordId: 77, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }),
+  }, identity, env);
+  let completions = 0;
+  try {
+    if (!first.listening) await once(first, "listening");
+    const child = { ...scoutChild(worker, "YM-6", "restart"), cwd: root };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-6", acceptanceId: 6, child }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-6", path: binding.path, contentHash: binding.contentHash }, worker, target, env)).recordId, 77);
+    await new Promise<void>((resolve) => first.close(() => resolve()));
+    const restarted = bindCoordinatorControl(root, {
+      launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+      planRecorded: async () => { completions++; return { reason: "unexpected", handoff: "started" }; },
+    }, identity, env);
+    try {
+      if (!restarted.listening) await once(restarted, "listening");
+      const replay = await requestPlanControl(root, "plan-recorded", { ticket: "YM-6", path: binding.path, recordId: 77 }, { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root }, target, env);
+      assert.equal(replay.state, "refused");
+      assert.match(replay.reason ?? "", /exact prepared or completed record/);
+      assert.equal(completions, 0);
+    } finally { await new Promise<void>((resolve) => restarted.close(() => resolve())); }
+  } finally {
+    if (first.listening) await new Promise<void>((resolve) => first.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("a correlated scout admits one live save-only worker and its CLI descendant", { timeout: 10000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "save-only-plan-control-"));
   const binding = recordedPlan(root, "YM-7");
