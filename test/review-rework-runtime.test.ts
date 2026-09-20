@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { currentControlOrigin, requestReviewControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { currentControlOrigin, processStarttime, requestReviewControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { openDb } from "../src/db.ts";
 import { socketDir } from "../src/inbox.ts";
 
@@ -71,8 +71,8 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     const runtimeDir = socketDir(process.env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });
-    writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "main", ticket: null }));
-    writeFileSync(join(runtimeDir, "review-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "review", ticket: "YM-1" }));
+    writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "parent-session", parentPane: null, cwd: dir, mode: "main", ticket: null }));
+    writeFileSync(join(runtimeDir, "review-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "review-session", parentPane: "main-pane", cwd: dir, mode: "review", ticket: "YM-1" }));
     const notifications: string[] = [];
     let confirms = 0;
     const modelRegistry = {

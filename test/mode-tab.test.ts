@@ -92,7 +92,7 @@ test("explicit plan lists do not bypass an unavailable live parent", () => {
     for (const entry of ["node", "package"]) {
       const out = f.run("plan", ["YM-1", "YM-2"], { PI_SESSION_ID: "missing-parent-session" }, entry);
       assert.equal(out.status, 1);
-      assert.match(out.stderr, /no live coordinator parent for this yokemate root/);
+      assert.match(out.stderr, /coordinator parent sidecar is missing/);
       assert.equal(out.calls.some((call) => call[1] === "create" || call[1] === "split"), false);
     }
   } finally { f.cleanup(); }
@@ -111,7 +111,7 @@ test("package and Node plan-list launchers print a parent refusal before admissi
   try {
     if (!parent.listening) await once(parent, "listening");
     const runtimeDir = socketDir(f.env, process.getuid!());
-    writeFileSync(join(runtimeDir, `${ids.parent}.json`), JSON.stringify({ mode: "review", ticket: null, cwd: f.root, pid: process.pid }));
+    writeFileSync(join(runtimeDir, `${ids.parent}.json`), JSON.stringify({ mode: "review", ticket: null, cwd: f.root, pid: process.pid, starttime: processStarttime(process.pid), sessionId: target.sessionId, parentPane: null }));
     for (const entry of ["node", "package"]) {
       writeFileSync(join(f.root, "journal.jsonl"), "");
       const command = entry === "package" ? "pnpm" : process.execPath;
@@ -127,7 +127,7 @@ test("package and Node plan-list launchers print a parent refusal before admissi
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       const [status] = await once(child, "close") as [number, NodeJS.Signals | null];
       assert.equal(status, 1, stdout + stderr);
-      assert.match(stderr, /panel origin is not registered with this parent/);
+      assert.match(stderr, /pane mode mismatch/);
       const calls = readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
       assert.equal(calls.some((call) => call[1] === "create" || call[1] === "split"), false);
     }
@@ -178,7 +178,7 @@ test("package and Node plan lists show ready, queued and mixed parent admission 
   };
   try {
     if (!parent.listening) await once(parent, "listening");
-    writeFileSync(join(socketDir(f.env, process.getuid!()), `${ids.parent}.json`), JSON.stringify({ mode: "main", ticket: null, cwd: f.root, pid: process.pid }));
+    writeFileSync(join(socketDir(f.env, process.getuid!()), `${ids.parent}.json`), JSON.stringify({ mode: "main", ticket: null, cwd: f.root, pid: process.pid, starttime: processStarttime(process.pid), sessionId: target.sessionId, parentPane: null }));
     for (const entry of ["node", "package"]) {
       writeFileSync(join(f.root, "journal.jsonl"), "");
       const command = entry === "package" ? "pnpm" : process.execPath;

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { processStarttime } from "../src/coordinator-control.ts";
+import { socketDir } from "../src/inbox.ts";
 
 const root = join(import.meta.dirname, "..");
 const coordinatorOriginKeys = ["YOKEMATE_MODE", "YOKEMATE_ROLE", "YOKEMATE_TICKET", "YOKEMATE_PARENT_PANE", "HERDR_PANE_ID"] as const;
@@ -19,6 +23,39 @@ const clearCoordinatorOrigin = () => {
 };
 const runtimeCases = (keys: readonly string[], surfaces: readonly string[]) => {
   for (const key of keys) for (const surface of surfaces) for (const variant of ["on", "off", "neighbor"]) console.log(`RUNTIME_CASE ${surface}:${key}:${variant}`);
+};
+const waitForRunMarker = (file: string, runId: string): Promise<void> => {
+  const present = () => existsSync(file) && readFileSync(file, "utf8").split("\n").includes(runId);
+  if (present()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const watcher = watch(join(file, ".."), () => {
+      if (!present()) return;
+      clearTimeout(timer);
+      watcher.close();
+      resolve();
+    });
+    const timer = setTimeout(() => { watcher.close(); reject(new Error(`timed out waiting for run marker ${runId}`)); }, 10000);
+  });
+};
+const exerciseLiveModeOwner = async (dir: string, runtime: string, mode: "plan" | "ship", action: "do" | "ship") => {
+  const script = join(dir, `mode-owner-${mode}.mjs`);
+  writeFileSync(script, `import { spawn } from "node:child_process";\nimport { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";\nconst loader = new DefaultResourceLoader({ cwd: process.cwd(), agentDir: process.cwd() + "/agent", settingsManager: SettingsManager.create(process.cwd(), process.cwd() + "/agent"), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [process.cwd() + "/.pi/extensions/subagent/index.ts"] });\nawait loader.reload(); const loaded = loader.getExtensions(); if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors)); loaded.runtime.appendEntry = () => undefined; loaded.runtime.sendMessage = () => undefined;\nconst extension = loaded.extensions[0]; const tool = extension.tools.get("subagent").definition; const base = { mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => process.env.PI_SESSION_ID }, modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true }, ui: { notify() {}, setWidget() {}, confirm: async () => true } };\nfor (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, { ...base, cwd: process.cwd() }); process.send({ ready: true });\nprocess.on("message", async (request) => { if (request.kind === "tool") { const result = await tool.execute(request.id, { coordinator: { mode: request.action, tickets: ["YM-1"] } }, undefined, () => undefined, { ...base, cwd: request.wrongCwd ? process.cwd() + "/foreign" : process.cwd() }); process.send({ id: request.id, result }); return; } const args = request.action === "do" ? ["--experimental-strip-types", "--no-warnings", process.cwd() + "/src/spawn.ts", "YM-1"] : ["--experimental-strip-types", "--no-warnings", process.cwd() + "/src/mode-tab.ts", "ship", "YM-1"]; const child = spawn(process.execPath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = ""; child.stdout.on("data", chunk => stdout += chunk); child.stderr.on("data", chunk => stderr += chunk); child.on("close", code => process.send({ id: request.id, code, stdout, stderr })); });\nsetInterval(() => {}, 1000);\n`);
+  const pane = `${mode}-live-pane`;
+  const session = `${mode}-live-session`;
+  const child = spawn(process.execPath, ["--experimental-strip-types", "--no-warnings", script], { cwd: dir, stdio: ["ignore", "ignore", "ignore", "ipc"], env: { ...process.env, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: session, YOKEMATE_MODE: mode, YOKEMATE_ROLE: "coordinator", YOKEMATE_TICKET: "YM-1", HERDR_PANE_ID: pane, YOKEMATE_PARENT_PANE: "main-pane" } });
+  try {
+    await new Promise<void>((resolve, reject) => { const timer = setTimeout(() => reject(new Error("mode owner startup timeout")), 10000); child.on("message", (message: any) => { if (!message?.ready) return; clearTimeout(timer); resolve(); }); });
+    writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), `${pane}.json`), JSON.stringify({ mode, ticket: "YM-1", cwd: dir, pid: child.pid, starttime: processStarttime(child.pid!), sessionId: session, parentPane: "main-pane" }));
+    let id = 0;
+    const request = <T>(payload: Record<string, unknown>) => new Promise<T>((resolve) => { const requestId = String(++id); const listener = (message: any) => { if (message?.id !== requestId) return; child.off("message", listener); resolve(message as T); }; child.on("message", listener); child.send({ ...payload, id: requestId, action }); });
+    const toolResult = await request<{ result: unknown }>({ kind: "tool" });
+    const cliResult = await request<{ code: number; stdout: string; stderr: string }>({ kind: "cli" });
+    const wrongRoot = await request<{ result: unknown }>({ kind: "tool", wrongCwd: true });
+    return { tool: JSON.stringify(toolResult.result), cli: `${cliResult.stdout}\n${cliResult.stderr}`, wrongRoot: JSON.stringify(wrongRoot.result) };
+  } finally {
+    child.kill("SIGKILL");
+    await once(child, "exit").catch(() => undefined);
+  }
 };
 
 test("public guard hook rereads one strict snapshot before any tool and preserves system context", async () => {
@@ -479,14 +516,20 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
   const { promisify } = await import("node:util");
   const { openDb } = await import("../src/db.ts");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-do-"));
+  const runtime = mkdtempSync(join(tmpdir(), "runtime-do-control-"));
   const env = { ...process.env };
   const script = process.argv[1];
   let shutdown: (() => Promise<void>) | undefined;
   try {
     Object.assign(process.env, reviewPaneStamp);
     clearCoordinatorOrigin();
+    process.env.HERDR_PANE_ID = "main-pane";
+    process.env.XDG_RUNTIME_DIR = runtime;
+    mkdirSync(socketDir(process.env, process.getuid!()), { recursive: true });
+    writeFileSync(join(socketDir(process.env, process.getuid!()), "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: null }));
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, "package.json"), join(dir, "package.json"));
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
@@ -516,6 +559,10 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const input = extension.handlers.get("input")![0]!;
     const approve = () => input({ type: "input", source: "interactive", text: "/do YM-1" } as never, ctx);
     const launch = () => tool.execute("do", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    const cliEnv = { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "main", HERDR_PANE_ID: "main-pane" };
+    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1"], { cwd: dir, env: cliEnv });
+    const packageCli = () => promisify(execFile)("pnpm", ["spawn", "YM-1"], { cwd: dir, env: cliEnv });
+    for (const launchCli of [cli, packageCli]) await assert.rejects(launchCli, (error: Error & { stdout?: string; stderr?: string }) => /current interactive approval/.test(`${error.stdout ?? ""}\n${error.stderr ?? ""}`));
     await approve();
     const first = await launch();
     const firstId = (first.details as { runId?: string }).runId;
@@ -528,7 +575,6 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const secondId = (second.details as { runId?: string }).runId;
     assert.ok(secondId, JSON.stringify(second));
     assert.notEqual(secondId, firstId);
-    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1"], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "main" } });
     set({});
     await approve();
     let cliRefusal: Error & { stdout?: string; stderr?: string } | undefined;
@@ -538,7 +584,22 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     await approve();
     const cliAllowed = await cli();
     const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
-    for (const { stamp, bypass } of [{ stamp: { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, bypass: { transitionCaller: false } }, { stamp: { YOKEMATE_ROLE: "executor" }, bypass: {} }] as const) {
+    for (const runId of [firstId, secondId, cliId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await approve();
+    const packageAllowed = await packageCli();
+    const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForRunMarker(join(dir, "work", "YM-1", "fixture-runs"), packageId);
+    const liveMode = await exerciseLiveModeOwner(dir, runtime, "plan", "do");
+    assert.match(liveMode.tool, /main chat only/);
+    assert.match(liveMode.cli, /main chat only/);
+    assert.match(liveMode.wrongRoot, /origin root mismatch/);
+    writeFileSync(join(socketDir(process.env, process.getuid!()), "plan-pane.json"), JSON.stringify({ mode: "plan", ticket: "YM-1", cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: "main-pane" }));
+    const modeStamp = { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", HERDR_PANE_ID: "plan-pane", YOKEMATE_PARENT_PANE: "main-pane" };
+    Object.assign(process.env, modeStamp);
+    const wrongRoot = await tool.execute("wrong-root", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, { ...ctx, cwd: join(dir, "foreign") } as ExtensionContext);
+    assert.match(JSON.stringify(wrongRoot), /origin root mismatch/);
+    for (const key of Object.keys(modeStamp)) delete process.env[key];
+    for (const { stamp, bypass } of [{ stamp: { YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", HERDR_PANE_ID: "plan-pane", YOKEMATE_PARENT_PANE: "main-pane" }, bypass: { transitionCaller: false } }, { stamp: { YOKEMATE_ROLE: "executor" }, bypass: {} }] as const) {
       set({ spawnCaller: false, ...bypass });
       await approve();
       Object.assign(process.env, stamp);
@@ -561,7 +622,7 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const uncapped = await launch();
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
-    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    for (const runId of [packageId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
     runtimeCases(["guards.duplicateDo"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["cli", "coordinator"]);
   } finally {
@@ -570,6 +631,7 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
     rmSync(dir, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
   }
 });
 
@@ -578,14 +640,20 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
   const { promisify } = await import("node:util");
   const { openDb } = await import("../src/db.ts");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-ship-"));
+  const runtime = mkdtempSync(join(tmpdir(), "runtime-ship-control-"));
   const env = { ...process.env };
   const script = process.argv[1];
   let shutdown: (() => Promise<void>) | undefined;
   try {
     Object.assign(process.env, reviewPaneStamp);
     clearCoordinatorOrigin();
+    process.env.HERDR_PANE_ID = "main-pane";
+    process.env.XDG_RUNTIME_DIR = runtime;
+    mkdirSync(socketDir(process.env, process.getuid!()), { recursive: true });
+    writeFileSync(join(socketDir(process.env, process.getuid!()), "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: null }));
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(root, "package.json"), join(dir, "package.json"));
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "ship-coordinator.md"), "fixture");
@@ -623,6 +691,10 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const input = extension.handlers.get("input")![0]!;
     const permit = () => input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
     const launch = (context = ctx) => tool.execute("ship", { coordinator: { mode: "ship", tickets: ["YM-1"] } }, undefined, () => undefined, context);
+    const cliEnv = { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "main", HERDR_PANE_ID: "main-pane" };
+    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "mode-tab.ts"), "ship", "YM-1"], { cwd: dir, env: cliEnv });
+    const packageCli = () => promisify(execFile)("pnpm", ["ship", "YM-1"], { cwd: dir, env: cliEnv });
+    for (const launchCli of [cli, packageCli]) await assert.rejects(launchCli, (error: Error & { stdout?: string; stderr?: string }) => /current interactive \/ship/.test(`${error.stdout ?? ""}\n${error.stderr ?? ""}`));
     await permit();
     const first = await launch();
     const firstId = (first.details as { runId?: string }).runId;
@@ -635,7 +707,6 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const secondId = (second.details as { runId?: string }).runId;
     assert.ok(secondId, JSON.stringify(second));
     assert.notEqual(secondId, firstId);
-    const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "mode-tab.ts"), "ship", "YM-1"], { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "main" } });
     set({});
     await permit();
     let cliRefusal: Error & { stdout?: string; stderr?: string } | undefined;
@@ -645,6 +716,15 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     await permit();
     const cliAllowed = await cli();
     const cliId = cliAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    for (const runId of [firstId, secondId, cliId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await permit();
+    const packageAllowed = await packageCli();
+    const packageId = packageAllowed.stdout.match(/background run ([a-f0-9-]+)/)![1]!;
+    await waitForRunMarker(join(dir, "fixture-runs"), packageId);
+    const liveMode = await exerciseLiveModeOwner(dir, runtime, "ship", "ship");
+    assert.match(liveMode.tool, /current interactive \/ship/);
+    assert.match(liveMode.cli, /current interactive \/ship/);
+    assert.match(liveMode.wrongRoot, /origin root mismatch/);
     await permit();
     const foreign = { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext;
     assert.match(JSON.stringify(await launch(foreign)), /current interactive \/ship/);
@@ -656,7 +736,7 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     const uncapped = await launch();
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
-    for (const runId of [firstId, secondId, cliId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    for (const runId of [packageId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
     runtimeCases(["guards.duplicateMode"], ["tool", "cli", "coordinator"]);
     runtimeCases(["guards.shipConfirmation"], ["cli"]);
   } finally {
@@ -665,6 +745,7 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
     rmSync(dir, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
   }
 });
 

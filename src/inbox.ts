@@ -28,6 +28,9 @@ export interface Sidecar {
   ticket: string | null;
   cwd: string;
   pid: number;
+  starttime: string;
+  sessionId: string;
+  parentPane: string | null;
 }
 
 export function socketDir(env: InboxEnv, uid: number): string {
