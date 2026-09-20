@@ -13,6 +13,7 @@
 import { join, resolve } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -192,9 +193,10 @@ export function judge(
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
   settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
+  const paneled = mode !== undefined && mode !== "";
+  assertMandatoryBoundary("workflow.assigned-scope", !!toolName && (!paneled || !!own?.root && !!own.dataRoot), "guard call has no owned scope");
   const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
-  const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
 
   if (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit") {

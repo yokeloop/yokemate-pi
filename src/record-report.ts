@@ -20,6 +20,7 @@ import { logMove } from "./move-log.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
 import { join, resolve } from "node:path";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface Part {
   repo: string;
@@ -42,7 +43,8 @@ export function recordReport(
 ): { repeat: boolean } {
   const settings = readRuntimeSettings(root);
   const verdict = verifyGate((deps.gather ?? gatherGateFacts)(root, ticket, parts.map((p) => ({ repo: p.repo, selector: p.pr }))));
-  if (!verdict.ok) throw new Error(verdict.reason);
+  assertMandatoryBoundary("workflow.quality-gates", verdict.ok, verdict.ok ? undefined : verdict.reason);
+  assertMandatoryBoundary("workflow.ready-pr-report", verdict.ok, verdict.ok ? undefined : verdict.reason);
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "record-report", env, ticket, () => {
     const work = db.prepare("SELECT id FROM work WHERE ticket = ?").get(ticket) as { id: number } | undefined;
@@ -57,6 +59,8 @@ export function recordReport(
     ).run(parts.map((p) => p.pr).join(" "), work.id);
   }, { settings });
   if (!out.ok) throw new Error(out.refuse);
+  const recorded = db.prepare("SELECT stage FROM work WHERE ticket=?").get(ticket) as { stage?: string } | undefined;
+  assertMandatoryBoundary("workflow.truthful-outcome", recorded?.stage === "review", "recorded PR report did not reach review");
   const data = dataRoot(root);
   logMove(data, ticket, "сделано", parts.map((p) => prLabel(p.pr)).join(", "));
   (deps.push ?? syncPush)(data, `${ticket} сделано`);

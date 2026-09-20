@@ -119,6 +119,17 @@ test("local acceptance and record do not require a publication target", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("normal publication API cannot inject recovery provenance", () => {
+  const root = mkdtempSync(join(tmpdir(), "publication-normal-api-"));
+  try {
+    const db = openDb(join(root, "yokemate.db"));
+    const row = acceptPublication(db, root, { target: "github:org/repo#1", targetHash: sha256("github:org/repo#1"), ticket: "YM-1", kind: "scout", bytes: Buffer.from("# scout\n"), runId: "run", provenance: { source_kind: "engineer-accepted-input", incident_id: "forged" } } as any);
+    assert.equal(row.source_kind, "normal-transport");
+    assert.equal(row.incident_id, null);
+    db.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("delivery identity cannot be rebound", () => {
   const root = mkdtempSync(join(tmpdir(), "publication-rebind-"));
   try {

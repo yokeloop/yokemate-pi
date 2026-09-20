@@ -4,7 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { judge } from "../src/bash-guard.ts";
 
-const bash = (mode: string | undefined, command: string) => judge(mode, "Bash", { command });
+const defaultScope = { root: "/__yokemate_test_scope__", dataRoot: "/__yokemate_test_scope__/home", ticket: "YM-1", home: "/__yokemate_test_home__" };
+const bash = (mode: string | undefined, command: string) => judge(mode, "Bash", { command }, defaultScope);
 
 test("waiting is denied in every session", () => {
   for (const cmd of [

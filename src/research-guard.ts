@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, realpathSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type ResearchRole = "worker" | "child";
 export interface ResearchIdentity {
@@ -119,7 +120,12 @@ export async function authorizeResearchMutation(request: MutationRequest): Promi
     "New content:", request.finalContent,
   ].join("\n");
   try {
-    return (await request.confirm(details)) ? { ok: true } : { ok: false, reason: "research code edit was not approved" };
+    const approved = await request.confirm(details);
+    if (approved) {
+      assertMandatoryBoundary("workflow.required-data", request.initialContent !== undefined && typeof request.finalContent === "string", "research mutation content is incomplete");
+      assertMandatoryBoundary("workflow.external-auth", request.hasUI === true && !!request.confirm, "research mutation lacks interactive authentication");
+    }
+    return approved ? { ok: true } : { ok: false, reason: "research code edit was not approved" };
   } catch (e) { return { ok: false, reason: `research consent UI failed: ${(e as Error).message}` }; }
 }
 

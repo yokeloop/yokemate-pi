@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { assertPlanBinding, type PlanBinding } from "./plan-binding.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface ApprovalParent { sessionId: string; runtimeId: string }
 export interface InputGeneration { serial: number; revision: number; inputHash: string }
@@ -45,10 +46,14 @@ export class DoAuthorityStore {
     return !workflowApproval;
   }
   check(ticket: string, binding: PlanBinding, parent: ApprovalParent): DoAuthority {
-    if (parent.sessionId !== this.parent.sessionId || parent.runtimeId !== this.parent.runtimeId) throw new Error("do approval parent session/runtime mismatch");
+    assertMandatoryBoundary("workflow.live-owner", parent.sessionId === this.parent.sessionId && parent.runtimeId === this.parent.runtimeId, "do approval parent session/runtime mismatch");
     const receipt = this.receipts.get(ticket);
-    if (!receipt || receipt.state === "revoked") throw new Error(`${ticket}: initial do requires a current interactive approval of the recorded plan`);
-    if (receipt.state === "consumed") throw new Error(`${ticket}: do approval already consumed`);
+    if (!receipt || receipt.state === "revoked") {
+      assertMandatoryBoundary("workflow.do-authority", false, `${ticket}: initial do requires a current interactive approval of the recorded plan`);
+      throw new Error("unreachable do authority refusal");
+    }
+    assertMandatoryBoundary("workflow.do-authority", true);
+    assertMandatoryBoundary("workflow.single-use", receipt.state !== "consumed", `${ticket}: do approval already consumed`);
     this.assertGeneration(receipt.generation);
     if (!receipt.binding || receipt.state === "pending") throw new Error(`${ticket}: do approval is waiting for the actual plan record`);
     assertPlanBinding(receipt.binding, binding);

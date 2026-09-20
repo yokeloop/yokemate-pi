@@ -55,16 +55,32 @@ test("plan scouts require an explicit or stamped ticket and keep it in correlati
 test("current accepted scout gates plan writers and a newer scout revokes prior permission", () => {
   const runs = new ChildRuns("owner", "session", "YM-1");
   assert.throws(() => new ChildRuns("owner", "session").admit("writer-unbound", [{ agent: "plan-writer", task: "write" }], cwd), /ticket binding/);
-  assert.throws(() => runs.admit("writer-early", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
+  assert.throws(() => runs.admit("writer-early", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
   const first = runs.admit("scout-one", [{ agent: "plan-scout", task: "scout one" }], cwd).children[0]!.identity;
   const accepted = resultEnvelope(first, "scout one", clean, "# Scout");
   accepted.artifact = { state: "accepted", path: "/artifact", hash: "a".repeat(64), bytes: 7, acceptanceId: 1 };
   assert.equal(runs.settle(accepted), true);
-  assert.equal(runs.admit("writer-one", [{ agent: "plan-writer", task: "write" }], cwd).children[0]!.identity.ticket, "YM-1");
+  assert.equal(runs.admit("writer-one", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd).children[0]!.identity.ticket, "YM-1");
   const newer = runs.admit("scout-two", [{ agent: "plan-scout", task: "scout two" }], cwd).children[0]!.identity;
-  assert.throws(() => runs.admit("writer-revoked", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
+  assert.throws(() => runs.admit("writer-revoked", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
   assert.equal(runs.settle(resultEnvelope(newer, "scout two", { ...clean, protocolError: true }, "beautiful final")), true);
-  assert.throws(() => runs.admit("writer-after-fault", [{ agent: "plan-writer", task: "write" }], cwd), /current accepted scout/);
+  assert.throws(() => runs.admit("writer-after-fault", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
+});
+
+test("plan writers require an explicit accepted scout binding and preserve it in child identity", () => {
+  const runs = new ChildRuns("owner", "session", "YM-1");
+  assert.throws(() => runs.admit("missing-input", [{ agent: "plan-writer", task: "write" }], cwd), /acceptedInputId/);
+  assert.throws(() => new ChildRuns("owner", "session").admit("missing-ticket", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /explicit ticket/);
+  const scout = runs.admit("scout", [{ agent: "plan-scout", task: "investigate" }], cwd).children[0]!.identity;
+  const accepted = resultEnvelope(scout, "investigate", clean, "# Scout");
+  accepted.artifact = { state: "accepted", path: "/artifact", hash: "a".repeat(64), bytes: 7, acceptanceId: 7 };
+  assert.equal(runs.settle(accepted), true);
+  assert.throws(() => runs.admit("wrong-input", [{ agent: "plan-writer", task: "write", acceptedInputId: 8 }], cwd), /current accepted scout/);
+  const identity = runs.admit("writer", [{ agent: "plan-writer", task: "write", ticket: "YM-1", acceptedInputId: 7 }], cwd).children[0]!.identity;
+  assert.equal(identity.ticket, "YM-1");
+  assert.equal(identity.acceptedInputId, 7);
+  assert.throws(() => runs.admit("foreign", [{ agent: "plan-writer", task: "write", ticket: "YM-2", acceptedInputId: 8 }], cwd), /differs/);
+  assert.throws(() => runs.admit("bad-revision", [{ agent: "plan-writer", task: "revise", ticket: "YM-1", acceptedInputId: 7, writerRevisionOf: "short" }], cwd), /full draft hash/);
 });
 
 test("review revisions are validated before admission and template hashes survive chain substitution", () => {

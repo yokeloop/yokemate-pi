@@ -26,6 +26,8 @@ function reportPublications(publications: PublicationOutcome[] | undefined): voi
 
 function reportReady(reply: ControlReply): void {
   reportPublications(reply.publications);
+  const recovery = (reply as ControlReply & { facts?: { recovery?: { sourceTransport?: string; candidateId?: string; incidentId?: string; acceptedInputId?: number; localRecord?: string; remotePublication?: { kind?: string; state?: string }[] } } }).facts?.recovery;
+  if (recovery) console.log(`${ticket}: source transport ${recovery.sourceTransport}; recovery candidate ${recovery.candidateId}; incident ${recovery.incidentId}; accepted-input ${recovery.acceptedInputId}; local record ${recovery.localRecord}; remote ${recovery.remotePublication?.map((item) => `${item.kind}:${item.state}`).join(",") ?? "not-started"}`);
   if (reply.handoff === "refused") fail(`${ticket}: handoff refused: ${reply.reason ?? "unavailable"}`);
   console.log(`${ticket}: ${reply.runId ? `background run ${reply.runId}` : reply.reason ?? "plan-only; ready for /do"}`);
 }

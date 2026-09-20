@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { subagentConcurrency, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type ListMode = "plan" | "do" | "ship";
 export type KeyRunState = "reserved" | "starting" | "active" | "refused" | "recorded" | "done" | "blocked" | "cancelled";
@@ -21,6 +22,7 @@ export interface ListAdmission {
   rejectDuplicate?: boolean;
 }
 export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; startup(value: ListStartup): boolean; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
+export interface RecoveryRun { readonly keyRunId: string; readonly generation: number; readonly recoveryRunId: string; state: "active" | "recorded" | "cancelled"; terminal?: ListTerminal }
 
 type Listener = (run: ListRun, entry: KeyRunEntry) => void;
 
@@ -34,6 +36,7 @@ export class ListRunRegistry {
   private readonly starts = new Map<string, (context: KeyRunContext) => Promise<ListTerminal | void>>();
   private readonly buffered = new Map<string, ListTerminal>();
   private readonly released = new Set<string>();
+  private readonly recoveries = new Map<string, RecoveryRun>();
   private readonly immediateListeners = new Set<Listener>();
   private readonly terminalListeners = new Set<Listener>();
   private readonly aggregateListeners = new Set<(aggregate: ListAggregate) => void>();
@@ -45,7 +48,8 @@ export class ListRunRegistry {
   onAggregate(listener: (aggregate: ListAggregate) => void): () => void { this.aggregateListeners.add(listener); return () => this.aggregateListeners.delete(listener); }
 
   admit(input: ListAdmission): ListRun {
-    if (!input.keys.length) throw new Error(`${input.mode} list needs at least one key`);
+    assertMandatoryBoundary("workflow.live-owner", !!input.parentSessionId && !!input.parentRuntimeId, "list run requires a live parent owner");
+    assertMandatoryBoundary("workflow.assigned-scope", input.keys.length > 0, `${input.mode} list needs at least one key`);
     const identities = input.keys.map((key, index) => ({ keyRunId: randomUUID(), key, index }));
     const identity: ListRunIdentity = Object.freeze({ listRunId: randomUUID(), parentSessionId: input.parentSessionId, parentRuntimeId: input.parentRuntimeId, mode: input.mode, keys: Object.freeze([...input.keys]) });
     const run: ListRun = { identity, settings: input.settings, entries: identities.map((entry) => ({ ...entry, state: "reserved" })), immediatePublished: false, aggregatePublished: false };
@@ -109,6 +113,29 @@ export class ListRunRegistry {
 
   wasLifetimeReleased(keyRunId: string): boolean { return this.released.has(keyRunId); }
 
+  admitRecovery(keyRunId: string, generation: number): RecoveryRun {
+    const found = this.find(keyRunId);
+    if (!found || found.entry.state !== "blocked" || !Number.isSafeInteger(generation) || generation < 1) throw new Error("only a blocked plan run can admit recovery");
+    const existing = this.recoveries.get(keyRunId);
+    if (existing) {
+      if (existing.generation !== generation) throw new Error("recovery generation changed");
+      return existing;
+    }
+    const recovery: RecoveryRun = { keyRunId, generation, recoveryRunId: `${keyRunId}:${generation}`, state: "active" };
+    this.recoveries.set(keyRunId, recovery);
+    return recovery;
+  }
+
+  recovery(keyRunId: string): RecoveryRun | undefined { return this.recoveries.get(keyRunId); }
+
+  settleRecovery(keyRunId: string, terminal: ListTerminal): boolean {
+    const recovery = this.recoveries.get(keyRunId);
+    if (!recovery || recovery.state !== "active" || terminal.outcome !== "recorded") return false;
+    recovery.state = "recorded";
+    recovery.terminal = { ...terminal, facts: terminal.facts && { ...terminal.facts } };
+    return true;
+  }
+
   start(listRunId: string, start: (context: KeyRunContext) => Promise<ListTerminal | void>): void {
     const run = this.requiredList(listRunId);
     for (const entry of run.entries) if (entry.immediate?.state === "accepted" && !terminalState(entry.state)) this.starts.set(entry.keyRunId, start);
@@ -143,6 +170,7 @@ export class ListRunRegistry {
   }
 
   settle(listRunId: string, keyRunId: string, terminal: ListTerminal): boolean {
+    assertMandatoryBoundary("workflow.terminal-lineage", !!listRunId && !!keyRunId, "terminal lineage is incomplete");
     const run = this.lists.get(listRunId);
     const entry = run?.entries.find((candidate) => candidate.keyRunId === keyRunId);
     if (!run || !entry || terminalState(entry.state)) return false;
@@ -154,11 +182,22 @@ export class ListRunRegistry {
     const list = this.lists.get(id);
     if (list) {
       let changed = false;
-      for (const entry of list.entries) changed = this.cancelEntry(list, entry, reason) || changed;
+      for (const entry of list.entries) {
+        changed = this.cancelEntry(list, entry, reason) || changed;
+        changed = this.cancelRecovery(entry.keyRunId, reason) || changed;
+      }
       return changed;
     }
     const found = this.find(id);
-    return found ? this.cancelEntry(found.run, found.entry, reason) : false;
+    return found ? this.cancelEntry(found.run, found.entry, reason) || this.cancelRecovery(id, reason) : this.cancelRecovery(id, reason);
+  }
+
+  cancelRecovery(keyRunId: string, reason = "cancelled"): boolean {
+    const recovery = this.recoveries.get(keyRunId);
+    if (!recovery || recovery.state !== "active") return false;
+    recovery.state = "cancelled";
+    recovery.terminal = { outcome: "cancelled", reason };
+    return true;
   }
 
   get(id: string): ListRun | { run: ListRun; entry: KeyRunEntry } | undefined { return this.lists.get(id) ?? this.find(id); }

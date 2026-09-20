@@ -89,6 +89,34 @@ test("list reservations precede starts and whole lifetimes share bounded capacit
   assert.deepEqual(registry.aggregate(run.identity.listRunId)?.results.map((entry) => entry.key), ["A-1", "B-1", "C-1"]);
 });
 
+test("blocked plan recovery records a separate generation without rewriting the terminal aggregate", () => {
+  const registry = new ListRunRegistry();
+  const run = registry.admit({ mode: "plan", keys: ["YM-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({}) });
+  registry.publishImmediate(run.identity.listRunId);
+  const key = run.entries[0]!.keyRunId;
+  assert.equal(registry.settle(run.identity.listRunId, key, { outcome: "blocked", reason: "transport" }), true);
+  const before = registry.aggregate(run.identity.listRunId)!;
+  const recovery = registry.admitRecovery(key, 2);
+  assert.equal(recovery.recoveryRunId, `${key}:2`);
+  assert.equal(registry.settleRecovery(key, { outcome: "recorded", facts: { planOnly: true } }), true);
+  assert.equal(registry.recovery(key)?.state, "recorded");
+  assert.deepEqual(registry.aggregate(run.identity.listRunId), before);
+});
+
+test("blocked plan recovery cancellation is terminal for the recovery generation only", () => {
+  const registry = new ListRunRegistry();
+  const run = registry.admit({ mode: "plan", keys: ["YM-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({}) });
+  registry.publishImmediate(run.identity.listRunId);
+  const key = run.entries[0]!.keyRunId;
+  registry.settle(run.identity.listRunId, key, { outcome: "blocked", reason: "transport" });
+  const aggregate = registry.aggregate(run.identity.listRunId)!;
+  registry.admitRecovery(key, 2);
+  assert.equal(registry.cancel(key, "parent cancelled recovery"), true);
+  assert.equal(registry.recovery(key)?.state, "cancelled");
+  assert.equal(registry.settleRecovery(key, { outcome: "recorded" }), false);
+  assert.deepEqual(registry.aggregate(run.identity.listRunId), aggregate);
+});
+
 test("durable plan recording releases its lifetime slot before auto-do admission", async () => {
   const registry = new ListRunRegistry();
   const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } });

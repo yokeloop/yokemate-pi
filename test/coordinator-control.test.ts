@@ -398,7 +398,8 @@ test("review control separates launcher, worker input and descendant record auth
     assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, cli, target, env)).state, "refused");
     assert.equal((await requestReviewControl(root, "review-started", { ticket: "YM-1", runId }, worker, target, env)).state, "accepted");
     const input = await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "на доработку" }, worker, target, env);
-    assert.equal(input.generation?.serial, 1);
+    assert.ok(input.generation && typeof input.generation === "object");
+    assert.equal(input.generation.serial, 1);
     assert.equal((await requestReviewControl(root, "review-extraction", { ticket: "YM-1", runId, generation: input.generation, extraction: { kind: "rework", evidence: [{ start: 0, end: 12, text: "на доработку" }] } }, worker, target, env)).state, "accepted");
     assert.equal((await requestReviewControl(root, "review-record", { ticket: "YM-1", runId, path: "/plan.md" }, cli, target, env)).rework?.runId, "do-run");
     assert.equal((await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "foreign" }, cli, target, env)).state, "refused");

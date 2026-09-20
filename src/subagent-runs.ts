@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
@@ -17,8 +18,10 @@ export interface ChildIdentity {
   cwd: string;
   ticket?: string;
   review?: ReviewRevision;
+  acceptedInputId?: number;
+  writerRevisionOf?: string;
 }
-export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision }
+export interface ChildTask { agent: string; task: string; cwd?: string; ticket?: string; review?: ReviewRevision; acceptedInputId?: number; writerRevisionOf?: string }
 export interface PublicationReference { state: "pending" | "complete"; target: string; revision: string; publicationId?: number; error?: string; path?: string; hash?: string; bytes?: number; targetHash?: string; acceptanceId?: number }
 export type ArtifactReference =
   | { state: "verified"; path: string; hash: string; bytes: number }
@@ -72,6 +75,7 @@ export interface ResultEnvelope {
   artifact?: ArtifactReference;
   publication?: PublicationReference;
   diagnostics?: ResultDiagnostics;
+  recovery?: { sourceTransport: "failed"; state: "candidate"; candidateId: string; failureHash: string; payloadHash: string; bytes: number };
 }
 export interface BatchEnvelope {
   version: 1;
@@ -93,6 +97,8 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
   const ticket = task.ticket ?? defaultTicket;
   if (["plan-scout", "plan-writer"].includes(task.agent) && !ticket) throw new Error(`${task.agent} requires an explicit ticket binding`);
   if (["plan-scout", "plan-writer"].includes(task.agent) && task.ticket && defaultTicket && task.ticket !== defaultTicket) throw new Error(`${task.agent} ticket differs from the stamped plan ticket`);
+  if (task.agent === "plan-writer") assertMandatoryBoundary("plan.writer.admission", Number.isSafeInteger(task.acceptedInputId) && task.acceptedInputId! > 0, "plan-writer requires an explicit ticket and acceptedInputId");
+  if (task.writerRevisionOf && !/^[a-f0-9]{64}$/.test(task.writerRevisionOf)) throw new Error("writerRevisionOf must be a full draft hash");
   if (task.agent === "task-reviewer" && !task.review) throw new Error("task-reviewer requires review.baseSha and review.headSha");
   if (task.review) {
     for (const sha of [task.review.baseSha, task.review.headSha]) {
@@ -102,7 +108,7 @@ export function reserveIdentity(ownerRunId: string, ownerSessionId: string, batc
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
     if (head !== task.review.headSha) throw new Error("review.headSha does not match HEAD in cwd");
   }
-  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}) };
+  return { ownerRunId, ownerSessionId, batchId, runId: randomUUID(), agent: task.agent, taskHash: sha256(task.task), cwd, ...(ticket ? { ticket } : {}), ...(task.review ? { review: { ...task.review } } : {}), ...(task.acceptedInputId ? { acceptedInputId: task.acceptedInputId } : {}), ...(task.writerRevisionOf ? { writerRevisionOf: task.writerRevisionOf } : {}) };
 }
 export function reviewerVerdict(text: string): "approved" | "changes_required" | null {
   try {
@@ -169,8 +175,8 @@ export class ChildRuns {
     for (const identity of identities) {
       if (identity.agent === "plan-writer") {
         if (identity.ticket && pendingScoutTickets.has(identity.ticket)) throw new Error(`plan-writer cannot share admission with an unsettled scout for ${identity.ticket}`);
-        this.assertPlanWriterAdmission(identity);
-        validate?.(identity);
+        if (validate) validate(identity);
+        else this.assertPlanWriterAdmission(identity);
       }
     }
     this.batches.set(batchId, identities);
@@ -207,12 +213,43 @@ export class ChildRuns {
   assertPlanWriterAdmission(identity: ChildIdentity): ResultEnvelope {
     if (identity.agent !== "plan-writer" || !identity.ticket) throw new Error("plan-writer requires an explicit ticket binding");
     const result = this.currentScout(identity.ticket);
-    if (!result || result.payloadOutcome !== "valid" || result.actualTaskHash !== result.identity.taskHash || result.artifact?.state !== "accepted") throw new Error(`plan-writer requires the current accepted scout for ${identity.ticket}`);
+    if (!result || result.payloadOutcome !== "valid" || result.actualTaskHash !== result.identity.taskHash || result.artifact?.state !== "accepted" || result.artifact.acceptanceId !== identity.acceptedInputId) throw new Error(`plan-writer requires the current accepted scout for ${identity.ticket}`);
     return result;
   }
 }
 
 const RECORD_LIMIT = 1024 * 1024;
+export type ScoutEvidenceErrorKind = "invalid_json" | "invalid_event" | "record_limit" | "partial_record" | "invalid_utf8" | "lost_source" | "exhausted_evidence";
+export interface ScoutEvidenceHistory {
+  kind: ScoutEvidenceErrorKind;
+  offset: number;
+  count: number;
+  hash: string;
+  eventSequence: number;
+}
+export interface ScoutCompletenessEvidence {
+  stdoutBytes: number;
+  eventCount: number;
+  finalSequence?: number;
+  finalBytes: number;
+  finalHash: string;
+  sessionId?: string;
+  stopReason?: string;
+  errors: readonly ScoutEvidenceHistory[];
+  recordLimit: boolean;
+  partialRecord: boolean;
+  invalidUtf8: boolean;
+  lostSource: boolean;
+  exhaustedEvidence: boolean;
+  activeTools: number;
+  retry: boolean;
+  compaction: boolean;
+  summaryRetry: boolean;
+  agentSettled: boolean;
+  settledSequence?: number;
+  queueKnown: boolean;
+  queueEmpty: boolean;
+}
 const eventNames = new Set(["session", "entry_appended", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished", "queue_update", "extension_error", "response", "extension_ui_request"]);
 const parserCounter = (): Record<ParserErrorKind, number> => ({ invalid_json: 0, invalid_event: 0, record_limit: 0, partial_record: 0 });
 
@@ -227,10 +264,22 @@ export class JsonlObservation {
   private firstError?: ParserErrorFact;
   private lastError?: ParserErrorFact;
   private errorCounters = parserCounter();
+  private errorHistory: ScoutEvidenceHistory[] = [];
+  private eventSequence = 0;
+  private finalSequence?: number;
+  private recordLimit = false;
+  private partialRecord = false;
+  private invalidUtf8 = false;
+  private lostSource = false;
+  private exhaustedEvidence = false;
   private tools = new Set<string>();
   private retry = false;
   private compaction = false;
   private summaryRetry = false;
+  private agentSettled = false;
+  private settledSequence?: number;
+  private queueKnown = false;
+  private queueEmpty = false;
   private counts: Record<string, number> = {};
   private stdoutHash = createHash("sha256");
   private assistantSeen = false;
@@ -248,14 +297,26 @@ export class JsonlObservation {
   constructor(onEvent?: (event: Record<string, any>) => void) { this.onEvent = onEvent; }
   get protocolError(): boolean { return this.errors > 0; }
   get incomplete(): boolean { return this.tools.size > 0 || this.retry || this.compaction || this.summaryRetry; }
-  private error(kind: ParserErrorKind): void {
+  markLostSource(): void { this.error("lost_source"); }
+  markExhaustedEvidence(): void { this.error("exhausted_evidence"); }
+  private error(kind: ScoutEvidenceErrorKind): void {
     if (kind === "record_limit" && this.recordLimited) return;
-    const fact = { kind, offset: this.offset };
+    const parserKind: ParserErrorKind = kind === "invalid_utf8" ? "invalid_json" : kind === "lost_source" || kind === "exhausted_evidence" ? "invalid_event" : kind;
+    const fact = { kind: parserKind, offset: this.offset };
     this.errors++;
-    this.errorCounters[kind]++;
+    this.errorCounters[parserKind]++;
     this.firstError ??= fact;
     this.lastError = fact;
     if (kind === "record_limit") this.recordLimited = true;
+    const hash = this.recordHash.copy().digest("hex");
+    const prior = this.errorHistory.at(-1);
+    if (prior?.kind === kind && prior.offset === this.offset && prior.hash === hash) prior.count++;
+    else this.errorHistory.push({ kind, offset: this.offset, count: 1, hash, eventSequence: this.eventSequence });
+    if (kind === "record_limit") this.recordLimit = true;
+    if (kind === "partial_record") this.partialRecord = true;
+    if (kind === "invalid_utf8") this.invalidUtf8 = true;
+    if (kind === "lost_source" || kind === "record_limit" || kind === "partial_record" || kind === "invalid_utf8") this.lostSource = true;
+    if (kind === "exhausted_evidence") this.exhaustedEvidence = true;
   }
   write(chunk: Buffer): void {
     if (this.ended || !chunk.length) return;
@@ -300,7 +361,7 @@ export class JsonlObservation {
     if (this.recordLimited) return;
     let text: string;
     try { text = new TextDecoder("utf-8", { fatal: true }).decode(line); }
-    catch { this.error("invalid_json"); return; }
+    catch { this.error("invalid_utf8"); return; }
     this.parse(text);
   }
   private resetRecord(): void {
@@ -327,6 +388,11 @@ export class JsonlObservation {
     try { event = JSON.parse(line); } catch { this.error("invalid_json"); return; }
     if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !this.validAgentEndSummary(event)) { this.error("invalid_event"); return; }
     const name = eventNames.has(event.type) ? event.type : "other";
+    this.eventSequence++;
+    if (this.agentSettled && event.type !== "agent_settled") {
+      this.agentSettled = false;
+      this.settledSequence = undefined;
+    }
     this.counts[name] = (this.counts[name] ?? 0) + 1;
     this.lastEventAt = new Date().toISOString();
     if (event.type === "session" && typeof event.id === "string" && /^[a-f0-9-]{36}$/.test(event.id)) this.sessionId = event.id;
@@ -342,6 +408,7 @@ export class JsonlObservation {
       this.model = typeof message.model === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.model) ? message.model : undefined;
       this.provider = typeof message.provider === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.provider) ? message.provider : undefined;
       this.finalAt = this.lastEventAt;
+      this.finalSequence = this.eventSequence;
     }
     if (event.type === "tool_execution_start" && typeof event.toolCallId === "string") this.tools.add(sha256(event.toolCallId));
     if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") this.tools.delete(sha256(event.toolCallId));
@@ -351,7 +418,22 @@ export class JsonlObservation {
     if (event.type === "compaction_end") this.compaction = false;
     if (event.type === "summarization_retry_scheduled" || event.type === "summarization_retry_attempt_start") this.summaryRetry = true;
     if (event.type === "summarization_retry_finished") this.summaryRetry = false;
+    if (event.type === "queue_update") {
+      this.queueKnown = true;
+      this.queueEmpty = !(Array.isArray(event.steering) && event.steering.length) && !(Array.isArray(event.followUp) && event.followUp.length);
+    }
+    if (event.type === "agent_settled") {
+      this.agentSettled = true;
+      this.settledSequence = this.eventSequence;
+      if (!this.queueKnown) {
+        this.queueKnown = true;
+        this.queueEmpty = true;
+      }
+    }
     this.onEvent?.(event);
+  }
+  evidence(): ScoutCompletenessEvidence {
+    return Object.freeze({ stdoutBytes: this.stdoutBytes, eventCount: this.eventSequence, finalSequence: this.finalSequence, finalBytes: Buffer.byteLength(this.finalText), finalHash: sha256(this.finalText), sessionId: this.sessionId, stopReason: this.stopReason, errors: Object.freeze(this.errorHistory.map((entry) => Object.freeze({ ...entry }))), recordLimit: this.recordLimit, partialRecord: this.partialRecord, invalidUtf8: this.invalidUtf8, lostSource: this.lostSource, exhaustedEvidence: this.exhaustedEvidence, activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, agentSettled: this.agentSettled, settledSequence: this.settledSequence, queueKnown: this.queueKnown, queueEmpty: this.queueEmpty });
   }
   metadata(): StreamDiagnostics {
     return {
@@ -729,7 +811,7 @@ export class OwnedChildState {
     return !!tasks?.some((task) => {
       let cwd: string;
       try { cwd = realpathSync(task.cwd ?? identity.cwd); } catch { return false; }
-      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && (task.ticket ?? (task.agent === "plan-scout" ? identity.ticket : undefined)) === identity.ticket && JSON.stringify(task.review) === JSON.stringify(identity.review);
+      return task.agent === identity.agent && sha256(task.task) === identity.taskHash && cwd === identity.cwd && (task.ticket ?? (["plan-scout", "plan-writer"].includes(task.agent) ? identity.ticket : undefined)) === identity.ticket && JSON.stringify(task.review) === JSON.stringify(identity.review) && task.acceptedInputId === identity.acceptedInputId && task.writerRevisionOf === identity.writerRevisionOf;
     });
   }
   accept(value: unknown): boolean {

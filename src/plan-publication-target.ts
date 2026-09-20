@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { originOwnerRepo, ticketNumber, type RemoteOf } from "./github.ts";
 import { sha256 } from "./subagent-runs.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type TargetResolutionError = "target_unavailable" | "remote_conflict";
 export class PublicationTargetFailure extends Error {
@@ -53,9 +54,11 @@ export function publicationTargetLabel(db: DatabaseSync, ticket: string): string
 export function resolvePublicationTarget(db: DatabaseSync, ticket: string, remoteOf: RemoteOf = gitRemote): PublicationTarget {
   const prefix = ticket.split("-")[0]!;
   const rows = db.prepare("SELECT tracker,tracker_key,path FROM project WHERE tracker_key=? ORDER BY id").all(prefix) as unknown as { tracker: string; tracker_key: string; path: string }[];
-  if (!rows.length) throw new PublicationTargetFailure("target_unavailable");
+  try { assertMandatoryBoundary("workflow.required-data", rows.length > 0, "publication target unavailable"); }
+  catch { throw new PublicationTargetFailure("target_unavailable"); }
   const trackers = new Set(rows.map((row) => row.tracker));
-  if (trackers.size !== 1) throw new PublicationTargetFailure("remote_conflict");
+  try { assertMandatoryBoundary("workflow.target-identity", trackers.size === 1, "publication target conflict"); }
+  catch { throw new PublicationTargetFailure("remote_conflict"); }
   const tracker = rows[0]!.tracker;
   if (tracker !== "github") {
     const server = `youtrack-${tracker}`;
