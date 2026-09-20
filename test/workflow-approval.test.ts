@@ -73,6 +73,20 @@ test("fresh input, revocation and shutdown cannot restore stale authority", () =
   assert.throws(() => new DoAuthorityStore(parent).check("YM-1", binding, parent), /approval/);
 });
 
+test("English negative execution commands revoke their addressed active cycle", () => {
+  for (const [index, raw] of ["Do not run YM-1", "Don't implement YM-1", "Don’t execute YM-1", "No execution for YM-1"].entries()) {
+    const store = new DoAuthorityStore(parent);
+    const generation = store.beginInput(raw);
+    store.approve("exact-do", "YM-1", binding, generation);
+    const runId = `negative-${index}`;
+    store.consume("YM-1", binding, parent, runId);
+    assert.equal(isWorkflowCandidate(raw), true);
+    assert.equal(validateExtraction({ kind: "revoke", ticket: "YM-1", binding: null, actions: ["stop"], evidence: [{ start: 0, end: raw.length, text: raw }] }, raw, [binding]).kind, "revoke");
+    assert.deepEqual(store.revoke("YM-1"), [runId]);
+    assert.throws(() => store.checkCycle(runId, binding), /cycle/);
+  }
+});
+
 test("model extraction is strict and bound to literal current input and known binding references", () => {
   const raw = "план согласован YM-1, запускай";
   const value = { kind: "approve-ready-do", ticket: "YM-1", binding: "content", actions: ["do"], evidence: [{ start: 0, end: raw.length, text: raw }] };

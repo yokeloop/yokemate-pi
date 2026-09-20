@@ -849,9 +849,11 @@ export default function (pi: ExtensionAPI) {
 	const warnedWorkflowExtractions = new WeakSet<PendingWorkflowExtraction>();
 	interface WorkflowGenerationCapture { parent: ApprovalParent; store: DoAuthorityStore; generation: InputGeneration; operation?: PendingWorkflowExtraction }
 	type WorkflowConsumerMetadata = { requestId?: string; toolCallId?: string; listRunId?: string; keyRunId?: string };
+	type PlanRecordCompletion = { runId?: string; reason: string; facts: Record<string, unknown>; publications: PublicationOutcome[]; handoff: "plan-only" | "started" | "refused" };
 	const planRunGenerations = new Map<string, WorkflowGenerationCapture>();
 	const planRunMetadata = new Map<string, WorkflowConsumerMetadata>();
 	const planRecordGenerations = new Map<number, WorkflowGenerationCapture>();
+	const planRecordCompletions = new Map<number, Promise<PlanRecordCompletion>>();
 	const captureWorkflowGeneration = (): WorkflowGenerationCapture | undefined => {
 		if (!authority || !controlIdentity) return;
 		const generation = authority.generation();
@@ -1361,7 +1363,7 @@ export default function (pi: ExtensionAPI) {
 				const snapshotPath = writePublicationArtifact(ENGINE_ROOT, ticket, "plan", snapshot.contentHash, snapshot.bytes);
 				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}) });
 				const capture = planRunId ? planRunGenerations.get(planRunId) : !origin.mode && origin.sessionId === sessionId ? captureWorkflowGeneration() : undefined;
-				if (capture && !planRecordGenerations.has(record.id)) planRecordGenerations.set(record.id, capture);
+				if (capture && !record.successful_record && !planRecordCompletions.has(record.id) && !planRecordGenerations.has(record.id)) planRecordGenerations.set(record.id, capture);
 				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
@@ -1385,7 +1387,7 @@ export default function (pi: ExtensionAPI) {
 				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult, recordId?: number) => {
+		const completePlanRecordOnce = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult, recordId?: number): Promise<PlanRecordCompletion> => {
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
@@ -1433,6 +1435,15 @@ export default function (pi: ExtensionAPI) {
 				planRunMetadata.delete(planRunId);
 			}
 			return { runId, reason, facts, publications, handoff };
+		};
+		const completePlanRecord = (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult, recordId?: number): Promise<PlanRecordCompletion> => {
+			if (!recordId) return completePlanRecordOnce(ticket, recordedPath, binding, publications, planRunId, record);
+			const existing = planRecordCompletions.get(recordId);
+			if (existing) return existing.then((outcome) => ({ ...outcome, publications, facts: { ...outcome.facts, publications } }));
+			const completion = completePlanRecordOnce(ticket, recordedPath, binding, publications, planRunId, record, recordId);
+			planRecordCompletions.set(recordId, completion);
+			void completion.catch(() => { if (planRecordCompletions.get(recordId) === completion) planRecordCompletions.delete(recordId); });
+			return completion;
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {

@@ -209,9 +209,9 @@ const TICKET = "[A-Z][A-Z0-9]*-\\d+";
 const execution = /\b(?:do|execute|implement|run|start|proceed|ship)\b|(?:выполн|реализ|запуска|запусти|делай|сделай|приступ)/iu;
 const planning = /\b(?:plan|draft|prepare)\b|(?:спланир|составь\s+план|подготовь\s+план|планир)/iu;
 const ready = /\b(?:approved|ready|agreed|accepted)\b|(?:согласован|одобрен|утвержд[её]н|план\s+готов|готово)/iu;
-const stop = /\b(?:stop|cancel|revoke|abort)\b|(?:останов|отмени|отменя|не\s+(?:запуска|выполня|делай|реализ))/iu;
+const stop = /\b(?:stop|cancel|revoke|abort|(?:do\s+not|don['’]t|not)\s+(?:do|execute|implement|run|start|proceed|ship)|no\s+(?:execution|implementation))\b|(?:останов|отмени|отменя|не\s+(?:запуска|выполня|делай|реализ))/iu;
 const questionOrHypothesis = /\?|\b(?:if|would|could|should|whether|hypothetically)\b|(?:если|можно\s+ли|стоит\s+ли|следует\s+ли|надо\s+ли|а\s+что\s+если|гипотет)/iu;
-const negativeExecution = /\b(?:do\s+not|don't|not\s+(?:do|execute|implement|run|start)|no\s+(?:execution|implementation))\b|(?:не\s+(?:надо\s+)?(?:выполня|запуска|делай|реализ|приступ))/iu;
+const negativeExecution = /\b(?:(?:do\s+not|don['’]t|not)\s+(?:do|execute|implement|run|start|proceed|ship)|no\s+(?:execution|implementation))\b|(?:не\s+(?:надо\s+)?(?:выполня|запуска|делай|реализ|приступ))/iu;
 function orderedPlanDo(text: string): boolean {
   const plan = planning.exec(text)?.index ?? -1;
   const run = execution.exec(text)?.index ?? -1;
