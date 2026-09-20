@@ -3,6 +3,7 @@
 import { after, test } from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { resolveRuntimeSettings } from "../src/guard-policy.ts";
 import assert from "node:assert/strict";
@@ -21,6 +22,9 @@ for (const dir of [fixture, repo, nested, foreign, clone]) {
 mkdirSync(join(repo, "node_modules", ".bin"), { recursive: true });
 for (const bin of ["tsc", "npm", "pnpm", "sh"]) writeFileSync(join(repo, "node_modules", ".bin", bin), "fixture");
 symlinkSync(foreign, join(repo, "escape"));
+const typescriptStore = join(repo, "node_modules", ".pnpm", "typescript@fixture", "node_modules", "typescript");
+mkdirSync(typescriptStore, { recursive: true });
+symlinkSync(typescriptStore, join(repo, "node_modules", "typescript"));
 writeFileSync(join(fixture, "pnpm-workspace.yaml"), "packages: []\n");
 after(() => rmSync(fixture, { recursive: true, force: true }));
 const defaultScope = { root: fixture, dataRoot: join(fixture, "home"), ticket: "YM-1", home: "/__yokemate_test_home__", cwd: repo, project: JSON.stringify(["org/repo"]) };
@@ -31,6 +35,23 @@ test("package targets deny the exact bare npm test from a wrapper before executi
   assert.equal(existsSync(join(fixture, "package.json")), true);
   assert.equal(judge("do", "Bash", { command: "npm test" }, { ...defaultScope, cwd: wrapper })?.decision, "deny");
 });
+
+for (const manager of ["npm", "pnpm"]) {
+  test(`package targets preserve logical cd through a symlink for ${manager}`, () => {
+    const scope = { ...defaultScope, cwd: wrapper };
+    for (const ascent of ["../..", "../../.."]) {
+      const chain = `cd '${repo}/node_modules/typescript' && cd ${ascent}`;
+      const pwd = spawnSync("/bin/bash", ["--noprofile", "--norc", "-c", `${chain} && pwd -L`], {
+        cwd: wrapper, env: { PATH: process.env.PATH }, encoding: "utf8",
+      });
+      assert.equal(pwd.status, 0, pwd.stderr);
+      assert.equal(pwd.stdout.trim(), ascent === "../.." ? repo : wrapper);
+      const verdict = judge("do", "Bash", { command: `${chain} && ${manager} test` }, scope);
+      if (ascent === "../..") assert.equal(verdict, null);
+      else assert.equal(verdict?.decision, "deny");
+    }
+  });
+}
 
 test("package targets accept literal assigned operations and script argument boundaries", () => {
   for (const command of [

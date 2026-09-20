@@ -252,7 +252,8 @@ function packageTargetVerdict(command: string, own?: PackageScope): Verdict | nu
     if (new Set(parts).size !== parts.length) return deny("ambiguous assigned repository names");
     allowed = parts[0]!;
     const inside = (parent: string, path: string) => path === parent || path.startsWith(parent + sep);
-    let cwd: string | undefined = realpathSync(own.cwd);
+    let logicalCwd: string | undefined = resolve(own.cwd);
+    let cwd: string | undefined = realpathSync(logicalCwd);
     if (!inside(root, cwd) || !statSync(cwd).isDirectory()) return deny("host cwd outside engine scope");
     if (unsupported || (segments.some((s) => s.words[0] === "cd") && segments.some((s) => s.next === "||"))) return deny("unsupported package shell syntax");
     const nearest = (start: string, file: string): string | undefined => {
@@ -267,8 +268,9 @@ function packageTargetVerdict(command: string, own?: PackageScope): Verdict | nu
       if (!words.length) continue;
       if (words[0] === "cd") {
         changedCwd = true;
-        cwd = !segment.dynamic && words.length === 2 && cwd && segment.next === "&&" && !words[1]!.startsWith("-")
-          ? realpathSync(resolve(cwd, words[1]!)) : undefined;
+        logicalCwd = !segment.dynamic && words.length === 2 && cwd && logicalCwd && segment.next === "&&" && !words[1]!.startsWith("-")
+          ? resolve(logicalCwd, words[1]!) : undefined;
+        cwd = logicalCwd ? realpathSync(logicalCwd) : undefined;
         if (cwd && !statSync(cwd).isDirectory()) cwd = undefined;
       } else if (detected(segment)) {
         if (!/^(npm|pnpm)$/.test(words[0]!) || segment.dynamic || changedEnvironment) return deny("unsupported or dynamic package invocation");
