@@ -283,6 +283,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(calls, callsBeforeOrdinary);
     assert.equal(notifications.length, notificationsBeforeOrdinary);
+    const skippedEntry = appended.filter((entry) => entry.type === "yokemate-workflow-extraction").at(-1) as any;
+    assert.deepEqual({ phase: skippedEntry.data?.phase, outcome: skippedEntry.data?.outcome, action: skippedEntry.data?.action, bindingCount: skippedEntry.data?.bindingCount, bindingBytes: skippedEntry.data?.bindingBytes, elapsedMs: skippedEntry.data?.elapsedMs }, { phase: "terminal", outcome: "none", action: "skipped", bindingCount: 0, bindingBytes: 0, elapsedMs: 0 });
+    assert.doesNotMatch(JSON.stringify(skippedEntry), /Исправь обычный баг/);
     extraction = "approve-ready-do";
     holdExtraction = true;
     const entered = new Promise<void>((resolve) => { extractionEntered = resolve; });

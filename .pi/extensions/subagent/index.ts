@@ -918,17 +918,25 @@ export default function (pi: ExtensionAPI) {
 		return operation;
 	};
 	const fenceListRuns = async (reason: string) => {
-		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
+		const entries = [...listRuns.activeEntries()];
+		const cancellations: string[] = [];
+		const coordinatorStops: string[] = [];
+		const agentStops: string[] = [];
+		for (const entry of entries) {
 			if (recordingPlans.has(entry.keyRunId)) {
 				cancelledRecordingPlans.add(entry.keyRunId);
 				recorderControllers.get(entry.keyRunId)?.abort();
-				return;
+				continue;
 			}
-			const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
-			listRuns.cancel(entry.keyRunId, reason);
-			if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
-			if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
-		}));
+			cancellations.push(entry.keyRunId);
+			if (coordinators.get(entry.keyRunId)) coordinatorStops.push(entry.keyRunId);
+			if (typeof entry.immediate?.facts?.agentName === "string") agentStops.push(entry.immediate.facts.agentName);
+		}
+		listRuns.cancelMany(cancellations, reason);
+		await Promise.all([
+			...coordinatorStops.map((runId) => cancelCoordinator(runId, "parent_cancel_run", true)),
+			...agentStops.map((agentName) => herdrAsync(["agent", "stop", agentName]).catch(() => {})),
+		]);
 	};
 	const revokeAuthority = async (reason: WorkflowCancellationReason = "parent_cancel") => {
 		shipPermits.invalidate();
@@ -1054,7 +1062,14 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { ctx.ui.notify(`${ticket}: ${(error as Error).message}`, "error"); }
 				return;
 			}
-			if (text.startsWith("/") || !isWorkflowCandidate(event.text)) return;
+			if (text.startsWith("/")) return;
+			if (!isWorkflowCandidate(event.text)) {
+				const skippedAt = new Date().toISOString();
+				const skippedParent = { ...controlIdentity };
+				const skippedGeneration = { ...generation };
+				setImmediate(() => appendWorkflowEntry("yokemate-workflow-extraction", { phase: "terminal", parentSessionId: skippedParent.sessionId, parentRuntimeId: skippedParent.runtimeId, serial: skippedGeneration.serial, revision: skippedGeneration.revision, inputHash: skippedGeneration.inputHash, startedAt: skippedAt, finishedAt: skippedAt, elapsedMs: 0, outcome: "none", action: "skipped", bindingCount: 0, bindingBytes: 0 }));
+				return;
+			}
 			startWorkflowExtraction(event.text, ctx, controlIdentity, authority, generation);
 		} catch (error) {
 			ctx.ui.notify((error as Error).message, "error");
@@ -1532,6 +1547,7 @@ export default function (pi: ExtensionAPI) {
 						cancelled = true;
 					};
 					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
+					const listCancellations: string[] = [];
 					for (const entry of entries) {
 						planRunGenerations.delete(entry.keyRunId);
 						planRunMetadata.delete(entry.keyRunId);
@@ -1541,11 +1557,12 @@ export default function (pi: ExtensionAPI) {
 							recorderControllers.get(entry.keyRunId)?.abort();
 							cancelled = true;
 						} else {
-							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
+							listCancellations.push(entry.keyRunId);
 							queueStop(entry.keyRunId, "parent_control_cancel", true);
 						}
 						for (const coordinatorRunId of stopped) if (coordinatorRunId !== entry.keyRunId) queueStop(coordinatorRunId, "parent_cancel_run");
 					}
+					cancelled = listRuns.cancelMany(listCancellations) || cancelled;
 					if (!target && direct) {
 						for (const coordinatorRunId of authority?.revoke(direct.identity.ticket) ?? []) if (coordinatorRunId !== runId) queueStop(coordinatorRunId, "parent_cancel_run");
 						queueStop(runId, "parent_control_cancel");
