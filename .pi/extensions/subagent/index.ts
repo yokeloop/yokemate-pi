@@ -918,13 +918,16 @@ export default function (pi: ExtensionAPI) {
 		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
 		return operation;
 	};
+	const upgradeRecordingFence = (runId: string): boolean => {
+		if (!recordingPlans.has(runId)) return false;
+		recorderFences.fence(runId, true);
+		recorderControllers.get(runId)?.abort();
+		return true;
+	};
 	const fenceListRuns = async (reason: string) => {
+		for (const runId of recordingPlans) upgradeRecordingFence(runId);
 		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
-			if (recordingPlans.has(entry.keyRunId)) {
-				recorderFences.fence(entry.keyRunId, true);
-				recorderControllers.get(entry.keyRunId)?.abort();
-				return;
-			}
+			if (upgradeRecordingFence(entry.keyRunId)) return;
 			const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
 			listRuns.cancel(entry.keyRunId, reason);
 			if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
@@ -1476,13 +1479,12 @@ export default function (pi: ExtensionAPI) {
 					const target = listRuns.get(runId);
 					if (target) {
 						const entries = "run" in target ? [target.entry] : target.entries;
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
 						const active = entries.filter((entry) => !["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state));
-						if (!active.length) return cancellationResult(runId, "list", "already_terminal", true);
+						if (!active.length) return cancellationResult(runId, "list", recording.length ? "cancellation_requested" : "already_terminal", recording.length === 0);
 						let pending = false;
 						for (const entry of active) {
-							if (recordingPlans.has(entry.keyRunId)) {
-								recorderFences.fence(entry.keyRunId, true);
-								recorderControllers.get(entry.keyRunId)?.abort();
+							if (upgradeRecordingFence(entry.keyRunId)) {
 								for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 								pending = true;
 								continue;
@@ -1911,14 +1913,17 @@ export default function (pi: ExtensionAPI) {
 						const owned = "run" in list ? list.run.identity.parentSessionId === sessionId : list.identity.parentSessionId === sessionId;
 						if (!owned) return resultResponse(cancellationResult(params.cancelRun, "list", "not_owned", false, "list run belongs to another owner"));
 						const entries = "run" in list ? [list.entry] : list.entries;
-						if (entries.every((entry) => ["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state))) return resultResponse(cancellationResult(params.cancelRun, "list", "already_terminal", true));
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
+						if (!recording.length && entries.every((entry) => ["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state))) return resultResponse(cancellationResult(params.cancelRun, "list", "already_terminal", true));
 						for (const entry of entries) {
+							if (recording.some((candidate) => candidate.keyRunId === entry.keyRunId)) { listRuns.cancel(entry.keyRunId); continue; }
 							const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
 							listRuns.cancel(entry.keyRunId);
 							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
 							if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
-						return resultResponse(cancellationResult(params.cancelRun, "list", "cancelled", true), `${params.cancelRun} cancelled`);
+						const outcome = cancellationResult(params.cancelRun, "list", recording.length ? "cancellation_requested" : "cancelled", recording.length === 0);
+						return resultResponse(outcome, recording.length ? JSON.stringify(outcome) : `${params.cancelRun} cancelled`);
 					}
 					if (process.env.YOKEMATE_MODE) {
 						const parent = resolveCoordinatorParent(root);
