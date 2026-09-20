@@ -19,6 +19,8 @@ const source = join(import.meta.dirname, "..");
 const cases = [
   { name: "observed canary path", final: (path: string) => `[k7x2] ${path}`, valid: true },
   { name: "bare path", final: (path: string) => path, valid: true },
+  { name: "bare path with spaces", final: (path: string) => path, valid: true, spaced: true },
+  { name: "decorated path with spaces", final: (path: string) => `[k7x2] ${path}`, valid: true, spaced: true },
   { name: "two paths", final: (path: string) => `${path} ${path}`, valid: false },
   { name: "two lines", final: (path: string) => `[k7x2] ${path}\n${path}`, valid: false },
   { name: "prose prefix", final: (path: string) => `Saved plan: ${path}`, valid: false },
@@ -112,7 +114,7 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
     const scout = { id: sourceResult.artifact.acceptanceId };
     const folder = join(root, "home/knowledge/org/repo/ai/YM-1");
     mkdirSync(folder, { recursive: true });
-    let planPath = join(folder, "plan.md");
+    let planPath = join(folder, scenario.spaced ? "plan with spaces.md" : "plan.md");
     const planText = `# ${scenario.fault === "ticket" ? "YM-2" : "YM-1"} — fixture\n\n## Goal\nExercise writer result.\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Work\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Production.\n\n## Acceptance\nThe fixture records the plan.\n`;
     writeFileSync(planPath, planText);
     if (scenario.fault === "outside") {

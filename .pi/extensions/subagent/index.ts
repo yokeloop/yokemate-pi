@@ -2399,7 +2399,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash !== result.identity.taskHash) {
 			try {
-				const target = /^(?:\[k7x2\] )?(\/[^\s\x00-\x1f\x7f`"<>]+)$/.exec(result.payload.trim());
+				const target = /^(?:\[k7x2\] )?(\/[^\x00-\x1f\x7f]+)$/.exec(result.payload.trim());
 				if (!target) throw new Error("writer result must contain one absolute path with only the optional [k7x2] prefix");
 				const draft = readCandidatePlanSnapshot(ENGINE_ROOT, result.identity.ticket, target[1]!);
 				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
