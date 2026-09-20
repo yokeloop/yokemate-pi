@@ -44,7 +44,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { type PlanCompletionContext, currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -725,6 +725,8 @@ export default function (pi: ExtensionAPI) {
 	let shuttingDown = false;
 	let sessionGeneration = 0;
 	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
+	let nextScoutSequence = 0;
+	const scoutSequenceByRunId = new Map<string, number>();
 	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
 	const publicationTail = new Map<string, Promise<unknown>>();
 	const localPublicationErrors = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
@@ -970,12 +972,6 @@ export default function (pi: ExtensionAPI) {
 	const recorderControllers = new Map<string, AbortController>();
 	const recorderCompletions = new Map<string, Promise<void>>();
 	const recorderFences = new PlanRecorderFences();
-	const planContinuationGenerations = new Map<string, number>();
-	const assertPlanContinuation = (runId: string | undefined, generation: number | undefined): void => {
-		if (!runId) return;
-		const found = listRuns.get(runId);
-		if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) || planContinuationGenerations.get(runId) !== generation) throw new Error("plan run is no longer active");
-	};
 	const shipPermits = new ShipPermitStore();
 	const workflowIngress = new WorkflowIngressWitnessStore();
 	const breakGlassPermits = new BreakGlassPermitStore();
@@ -1463,11 +1459,12 @@ export default function (pi: ExtensionAPI) {
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "review worker registration refused");
 			} catch (error) { ctx.ui.notify(`automatic rework handoff unavailable: ${(error as Error).message}`, "warning"); }
 		}
-		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
+		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID !== undefined && process.env.YOKEMATE_TICKET) {
 			try {
+				if (!process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("empty plan run id");
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan worker registration refused");
-			} catch (error) { ctx.ui.notify(`no automatic do handoff: ${(error as Error).message}`, "warning"); }
+			} catch (error) { ctx.ui.notify(`plan registration refused: ${(error as Error).message}`, "warning"); }
 		}
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
@@ -1535,18 +1532,19 @@ export default function (pi: ExtensionAPI) {
 			continuation?.();
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, planRunId?: string, record?: PlanRecordResult) => {
+		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, context: PlanCompletionContext, record?: PlanRecordResult) => {
 			const settings = readRuntimeSettings(ENGINE_ROOT);
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
+			const planRunId = context.kind === "registered" ? context.runId : undefined;
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
 			const recovery = planRunId ? listRuns.recovery(planRunId) : undefined;
-			if (planRunId && (!found || !("run" in found) || (["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) && !(found.entry.state === "blocked" && recovery?.state === "active")))) throw new Error("plan run is no longer active");
+			if (context.kind === "registered" && context.listRunId && (!found || !("run" in found) || (["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) && !(found.entry.state === "blocked" && recovery?.state === "active")))) throw new Error("plan run is no longer active");
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
 			if (planRunId && !recovery && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
-			let reason = "plan-only; ready for /do; a new interactive approval is required";
-			let handoff: "plan-only" | "started" | "refused" = "plan-only";
+			let reason = context.kind === "save-only" ? "plan-only; ready for /do; automatic handoff unavailable" : "plan-only; ready for /do; a new interactive approval is required";
+			let handoff: "plan-only" | "unavailable" | "started" | "refused" = context.kind === "save-only" ? "unavailable" : "plan-only";
 			const provenanceDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 			let recovered = false;
 			let recoveryStatus: Record<string, unknown> | undefined;
@@ -1560,7 +1558,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} finally { provenanceDb.close(); }
 			if (recovered) authority!.revoke(ticket);
-			if (!recovered && (!planRunId || !recorderFences.active(planRunId))) {
+			if (context.kind !== "save-only" && !recovered && (!planRunId || !recorderFences.active(planRunId))) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					try {
@@ -1578,13 +1576,12 @@ export default function (pi: ExtensionAPI) {
 					} catch (error) { reason = (error as Error).message; handoff = "refused"; }
 				}
 			} else if (recovered) reason = "engineer-accepted-input recorded plan-only; a fresh /do approval is required";
-			else reason = "plan recorded after cancellation; automatic do handoff revoked";
+			else if (planRunId && recorderFences.active(planRunId)) reason = "plan recorded after cancellation; automatic do handoff revoked";
 			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, ...(recoveryStatus ? { recovery: recoveryStatus } : {}), handoff: { state: handoff, runId, reason } };
 			if (planRunId && found && "run" in found) {
 				const settled = recovery ? listRuns.settleRecovery(planRunId, { outcome: "recorded", facts }) : listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts });
 				if (!settled) throw new Error("plan run lost its terminal claim");
 			}
-			if (planRunId) planContinuationGenerations.delete(planRunId);
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
@@ -1684,41 +1681,33 @@ export default function (pi: ExtensionAPI) {
 				},
 				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),
 				reviewEnded: async (_ticket, reviewRunId, reason) => { await revokeReviewRun(reviewRunId, reason); },
-				publishPlanScout: async (ticket, acceptanceId, origin) => {
+				publishPlanScout: async (ticket, acceptanceId, child, origin) => {
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let acceptance;
 					try {
 						acceptance = publicationAcceptanceById(db, acceptanceId);
-						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_session_id !== origin.sessionId || !acceptance.owner_run_id || !acceptance.batch_id || !acceptance.task_hash) throw new Error("accepted scout identity does not match its live plan worker");
+						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_run_id !== child.ownerRunId || acceptance.owner_session_id !== child.ownerSessionId || acceptance.batch_id !== child.batchId || acceptance.run_id !== child.runId || acceptance.task_hash !== child.taskHash || child.agent !== "plan-scout" || child.ticket !== ticket || path.resolve(child.cwd) !== path.resolve(ENGINE_ROOT) || child.ownerSessionId !== origin.sessionId) throw new Error("accepted scout identity does not match its delivery");
 						assertPublishable(readPublicationArtifact(ENGINE_ROOT, acceptance));
 					} finally { db.close(); }
-					const child: ChildIdentity = { ownerRunId: acceptance.owner_run_id, ownerSessionId: acceptance.owner_session_id, batchId: acceptance.batch_id, runId: acceptance.run_id, agent: "plan-scout", taskHash: acceptance.task_hash, cwd: ENGINE_ROOT, ticket };
 					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, acceptanceId: acceptance.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
-				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin, planRunId, generation) => {
-					if (planRunId && generation !== undefined) {
-						const found = listRuns.get(planRunId);
-						if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state)) throw new Error("plan run is no longer active");
-						planContinuationGenerations.set(planRunId, generation);
-					}
-					assertPlanContinuation(planRunId, generation);
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
 					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
-					assertPlanContinuation(planRunId, generation);
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
-					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
+					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, binding: prepared.binding, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
-				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, _originOrRunId, _legacyOrigin, planRunId, generation) => {
-					if (typeof recordIdOrOrigin !== "number") throw new Error("legacy plan record needs a local record id");
-					const continuation = () => assertPlanContinuation(planRunId, generation);
-					continuation();
+				planRecorded: async (ticket, recordedPath, recordId, _origin, context, verifyCompletion, prior) => {
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
-					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding, continuation);
+					const continuation = () => verifyCompletion(binding);
 					continuation();
+					const publications = await publishRecordedArtifacts(recordId, binding, continuation);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, recordIdOrOrigin, planRunId);
+					verifyCompletion(binding);
+					if (prior) return { ...prior, publications, ...(prior.facts ? { facts: { ...prior.facts, publications } } : {}) };
+					return completePlanRecord(ticket, recordedPath, binding, publications, recordId, context);
 				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
@@ -1743,17 +1732,21 @@ export default function (pi: ExtensionAPI) {
 					});
 					return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
 				},
-				planFinished: async (_ticket, planRunId, outcome, reason) => {
-					planContinuationGenerations.delete(planRunId);
-					const found = listRuns.get(planRunId);
-					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
+				planFinished: async (_ticket, context, outcome, reason) => {
+					if (context.kind !== "registered") return;
+					const planRunId = context.runId;
 					if (recordingPlans.has(planRunId)) {
 						recorderFences.fence(planRunId, false);
 						recorderControllers.get(planRunId)?.abort();
 					}
+					if (!context.listRunId) return;
+					const found = listRuns.get(planRunId);
+					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
 					if (!listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
-				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
+				recordPlan: async (ticket, planPath, origin, context, acceptanceId, verifyCompletion) => {
+					if (context.kind !== "registered") throw new Error("owned plan record requires a registered run");
+					const planRunId = context.runId;
 					const controller = new AbortController();
 					const generation = sessionGeneration;
 					let resolveCompletion!: () => void;
@@ -1776,7 +1769,8 @@ export default function (pi: ExtensionAPI) {
 						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding, continuation);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
-						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, prepared.record.id, planRunId, result);
+						verifyCompletion(prepared.binding);
+						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, prepared.record.id, context, result);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
 							const found = listRuns.get(planRunId);
@@ -2058,7 +2052,6 @@ export default function (pi: ExtensionAPI) {
 		deliveries.clear();
 		diagnostics.clear();
 		recorderFences.clear();
-		planContinuationGenerations.clear();
 		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
@@ -2155,7 +2148,7 @@ export default function (pi: ExtensionAPI) {
 	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
 		ENGINE_ROOT,
 		operation,
-		{ ticket: result.identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, ...payload },
+		{ ticket: result.identity.ticket!, ...(process.env.YOKEMATE_PLAN_RUN_ID !== undefined ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), child: result.identity, scoutSequence: scoutSequenceByRunId.get(result.identity.runId), ...payload },
 		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
 		resolveCoordinatorParent(ENGINE_ROOT),
 	);
@@ -2631,6 +2624,7 @@ export default function (pi: ExtensionAPI) {
 				if (mode === "chain") for (const child of ack.children.slice(1)) runs!.defer(child.identity);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
+					if (identity.agent === "plan-scout") scoutSequenceByRunId.set(identity.runId, 2 * ++nextScoutSequence);
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
 					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), ownerPid: process.pid, ownerStarttime: processStarttime(process.pid), runtime: { node: process.version, pi: "0.85.1", contract: 1 }, extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, requestedTask: tasks[index]!.task, cancellationInitiator: "unknown", deliveries: {} };
 					const diagnostic = { metadata, save: (completed: boolean) => {
@@ -2644,7 +2638,7 @@ export default function (pi: ExtensionAPI) {
 					? Promise.all(ack.children.filter(({ identity }) => identity.agent === "plan-scout" && identity.ticket).map(async ({ identity }) => {
 						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 						try { revokePendingPlanRecords(db, identity.ticket!); } finally { db.close(); }
-						const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, child: identity, scoutSequence: scoutSequenceByRunId.get(identity.runId)! - 1 }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), resolveCoordinatorParent(ENGINE_ROOT));
 						if (reply.state !== "accepted") throw new Error(reply.reason ?? "current scout admission was not fenced");
 					}))
 					: Promise.resolve([]);
