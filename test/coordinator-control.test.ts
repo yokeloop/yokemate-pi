@@ -5,9 +5,20 @@ import { once } from "node:events";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, PlanRecorderFences, processStarttime, requestCoordinator, requestCoordinatorCancel, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestShipFinalize } from "../src/coordinator-control.ts";
 import { cancellationResult } from "../src/subagent-runs.ts";
 import { socketDir } from "../src/inbox.ts";
+
+test("logical recorder fences do not stop the conversational agent unless teardown upgrades them", () => {
+  const fences = new PlanRecorderFences();
+  fences.fence("logical", false);
+  assert.equal(fences.active("logical"), true);
+  assert.deepEqual(fences.consume("logical"), { fenced: true, stopAgent: false });
+  fences.fence("teardown", false);
+  fences.fence("teardown", true);
+  assert.deepEqual(fences.consume("teardown"), { fenced: true, stopAgent: true });
+  assert.deepEqual(fences.consume("teardown"), { fenced: false, stopAgent: false });
+});
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {
   const root = mkdtempSync(join(tmpdir(), "coordinator-control-"));

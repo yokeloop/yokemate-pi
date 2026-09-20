@@ -42,7 +42,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent, PlanRecorderFences } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -873,7 +873,7 @@ export default function (pi: ExtensionAPI) {
 	const lockedRecordingPlans = new Set<string>();
 	const recorderControllers = new Map<string, AbortController>();
 	const recorderCompletions = new Map<string, Promise<void>>();
-	const cancelledRecordingPlans = new Set<string>();
+	const recorderFences = new PlanRecorderFences();
 	const planContinuationGenerations = new Map<string, number>();
 	const assertPlanContinuation = (runId: string | undefined, generation: number | undefined): void => {
 		if (!runId) return;
@@ -921,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 	const fenceListRuns = async (reason: string) => {
 		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
 			if (recordingPlans.has(entry.keyRunId)) {
-				cancelledRecordingPlans.add(entry.keyRunId);
+				recorderFences.fence(entry.keyRunId, true);
 				recorderControllers.get(entry.keyRunId)?.abort();
 				return;
 			}
@@ -1317,7 +1317,7 @@ export default function (pi: ExtensionAPI) {
 			let runId: string | undefined;
 			let reason = "plan-only; ready for /do; a new interactive approval is required";
 			let handoff: "plan-only" | "started" | "refused" = "plan-only";
-			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
+			if (!planRunId || !recorderFences.active(planRunId)) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					try {
@@ -1406,7 +1406,7 @@ export default function (pi: ExtensionAPI) {
 					const found = listRuns.get(planRunId);
 					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
 					if (recordingPlans.has(planRunId)) {
-						cancelledRecordingPlans.add(planRunId);
+						recorderFences.fence(planRunId, false);
 						recorderControllers.get(planRunId)?.abort();
 					}
 					if (!listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
@@ -1425,7 +1425,7 @@ export default function (pi: ExtensionAPI) {
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
 						const continuation = () => {
-							if (cancelledRecordingPlans.has(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
+							if (recorderFences.active(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
 						};
 						continuation();
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
@@ -1449,11 +1449,12 @@ export default function (pi: ExtensionAPI) {
 						recordingPlans.delete(planRunId);
 						lockedRecordingPlans.delete(planRunId);
 						recorderControllers.delete(planRunId);
-						if (cancelledRecordingPlans.delete(planRunId)) {
+						const fence = recorderFences.consume(planRunId);
+						if (fence.fenced) {
 							const found = listRuns.get(planRunId);
 							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
 							listRuns.cancel(planRunId, "plan recorder cancelled before publication and handoff");
-							if (agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
+							if (fence.stopAgent && agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
 						resolveCompletion();
 						recorderCompletions.delete(planRunId);
@@ -1480,7 +1481,7 @@ export default function (pi: ExtensionAPI) {
 						let pending = false;
 						for (const entry of active) {
 							if (recordingPlans.has(entry.keyRunId)) {
-								cancelledRecordingPlans.add(entry.keyRunId);
+								recorderFences.fence(entry.keyRunId, true);
 								recorderControllers.get(entry.keyRunId)?.abort();
 								for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 								pending = true;
@@ -1611,6 +1612,7 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.clear();
 		deliveries.clear();
 		diagnostics.clear();
+		recorderFences.clear();
 		planContinuationGenerations.clear();
 		runs = undefined;
 		runningAgents.clear();
