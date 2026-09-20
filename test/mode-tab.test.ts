@@ -144,6 +144,7 @@ test("package and Node plan lists show ready, queued and mixed parent admission 
   const registry = new ListRunRegistry();
   const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 6, maxConcurrency: 2, maxDetached: 6 } });
   const listIds: string[] = [];
+  const launches: Promise<Awaited<ReturnType<typeof launchPlanKey>>>[] = [];
   const previous = { PATH: process.env.PATH, JOURNAL: process.env.JOURNAL };
   process.env.PATH = f.env.PATH;
   process.env.JOURNAL = f.env.JOURNAL;
@@ -155,10 +156,12 @@ test("package and Node plan lists show ready, queued and mixed parent admission 
       setImmediate(() => {
         registry.start(run.identity.listRunId, async (lane) => {
           const item = request.targets[lane.index]!;
-          const facts = await launchPlanKey(f.root, request, item, lane.keyRunId, request.model!, async (pane) => {
+          const launch = launchPlanKey(f.root, request, item, lane.keyRunId, request.model!, async (pane) => {
             const reply = await requestPlanControl(f.root, "bind-plan", { ticket: lane.key, runId: lane.keyRunId, pane }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: f.root }, target, f.env);
             if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
           });
+          launches.push(launch);
+          const facts = await launch;
           lane.active({ ...facts });
         });
         registry.publishImmediate(run.identity.listRunId);
@@ -205,12 +208,17 @@ test("package and Node plan lists show ready, queued and mixed parent admission 
       ]);
       assert.match(stderr, /^YM-3: fixture admission refusal/m);
       await waitForLaunches();
+      await Promise.all(launches);
+      assert.deepEqual(admitted.entries.filter((item) => item.state === "active").map((item) => item.key), ["YM-1", "YM-2"]);
       const calls = readFileSync(join(f.root, "journal.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]);
       assert.equal(calls.filter((call) => call[1] === "create" || call[1] === "split").length, 2);
       assert.deepEqual(calls.filter((call) => call[1] === "prompt").map((call) => call[3]).sort(), ["/skill:plan YM-1", "/skill:plan YM-2"]);
       for (const item of [...admitted.entries].reverse()) registry.cancel(item.keyRunId);
     }
   } finally {
+    for (const listId of listIds) registry.cancel(listId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await Promise.allSettled(launches);
     await new Promise<void>((resolve) => parent.close(() => resolve()));
     if (previous.PATH === undefined) delete process.env.PATH; else process.env.PATH = previous.PATH;
     if (previous.JOURNAL === undefined) delete process.env.JOURNAL; else process.env.JOURNAL = previous.JOURNAL;
