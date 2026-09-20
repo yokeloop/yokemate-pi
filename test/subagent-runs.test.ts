@@ -237,7 +237,14 @@ test("unconfirmed process identity releases cancellation wait and compact repeat
   const cleanupIdentity = cleanupRuns.admit("cleanup", [{ agent: "worker", task: "prompt" }], cwd).children[0]!.identity;
   cleanupRuns.start(cleanupIdentity);
   const cleanupTerminal = cleanupRuns.claimTerminal(cleanupIdentity, "prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  const pendingCleanupCancellation = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel");
+  assert.equal(pendingCleanupCancellation.result.status, "cancellation_requested");
+  assert.equal(pendingCleanupCancellation.waitForCleanup, true);
   cleanupRuns.markCancellationUnconfirmed(cleanupIdentity.runId, "temporary prompt cleanup could not be verified");
+  const failedCleanupCancellation = await pendingCleanupCancellation.completion;
+  assert.equal(failedCleanupCancellation.status, "cancellation_requested");
+  assert.equal(failedCleanupCancellation.cancellationInitiator, undefined);
+  assert.match(failedCleanupCancellation.reason ?? "", /cleanup could not be verified/);
   cleanupRuns.settle(cleanupTerminal);
   cleanupRuns.compactBatch("cleanup");
   const cleanupRepeat = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel").result;

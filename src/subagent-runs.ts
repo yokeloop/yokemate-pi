@@ -222,7 +222,9 @@ export class ChildRuns {
     }
     if (child.claim || child.result) {
       const result = this.cancellationResult(child, "cancellation_requested", false, "terminal cleanup is still pending");
-      const completion = child.cleanupPromise?.then(() => this.cancellationResult(child, "already_terminal", true)) ?? Promise.resolve(result);
+      const completion = child.cleanupPromise
+        ? Promise.race([child.cleanupPromise.then(() => this.cancellationResult(child, "already_terminal", true)), child.cancellationPromise!])
+        : Promise.resolve(result);
       return { result, first: false, shouldSignal: false, waitForCleanup: true, completion };
     }
     const first = !child.intent;

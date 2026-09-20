@@ -1291,7 +1291,11 @@ export default function (pi: ExtensionAPI) {
 				if (!scout || scout.ticket !== binding.ticket) throw new PublicationFailure("artifact_invalid");
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
 			} finally { db.close(); }
-			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
+			const verify = () => {
+				continuation?.();
+				try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); }
+				catch { throw new PublicationFailure("binding_changed"); }
+			};
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
 			continuation?.();
 			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
@@ -1420,11 +1424,14 @@ export default function (pi: ExtensionAPI) {
 						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin);
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
-						if (cancelledRecordingPlans.has(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
+						const continuation = () => {
+							if (cancelledRecordingPlans.has(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
+						};
+						continuation();
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
 						const pushed = result.push;
 						if (pushed?.state === "deferred" || pushed?.state === "error") ctx.ui.notify(`git-sync: ${pushed.reason}`, "warning");
-						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
+						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding, continuation);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
 						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result);
