@@ -15,11 +15,15 @@ const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
 const provider = join(root, "test/fixtures/subagent-runtime-provider.ts");
 const piVersion = JSON.parse(readFileSync(join(root, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
-const cli = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+const piPackage = realpathSync(join(root, "node_modules/@earendil-works/pi-coding-agent"));
+const cli = join(piPackage, "dist/cli.js");
 const baselineSha = "b5c36542da67f79f1c88e5bdffe49620b53a8115";
-const unpatchedPi = readdirSync(join(root, "node_modules/.pnpm")).find((name) => name.startsWith("@earendil-works+pi-coding-agent@0.85.1_") && !name.includes("patch_hash"));
-if (!unpatchedPi) throw new Error("unpatched Pi 0.85.1 fixture is unavailable");
-const unpatchedCli = realpathSync(join(root, "node_modules/.pnpm", unpatchedPi, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
+const unpatchedStore = mkdtempSync(join(root, "node_modules/.pnpm/.ym226-unpatched-"));
+cpSync(join(resolve(piPackage, "../../.."), "node_modules"), join(unpatchedStore, "node_modules"), { recursive: true });
+const unpatchedPackage = join(unpatchedStore, "node_modules/@earendil-works/pi-coding-agent");
+execFileSync("patch", ["-p1", "--reverse", "--batch", "--input", join(root, "patches/@earendil-works__pi-coding-agent@0.85.1.patch")], { cwd: unpatchedPackage, stdio: "pipe" });
+const unpatchedCli = join(unpatchedPackage, "dist/cli.js");
+process.once("exit", () => rmSync(unpatchedStore, { recursive: true, force: true }));
 
 test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when parent control is unavailable", { timeout: 30000 }, async () => {
   const sandbox = mkdtempSync(join(tmpdir(), "plan-scout-terminal-"));
@@ -452,7 +456,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         assert.equal(childSnapshot.resources.extension.path, runtimeExtension);
       }
     }
-    console.log(JSON.stringify({ piVersion, scenario, cli: fileProvenance(runtimeCli), extension: fileProvenance(runtimeExtension), baseSha: scenario.startsWith("baseline_") ? baselineSha : head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, finalBytes: Buffer.byteLength(result.payload), finalHash: createHash("sha256").update(result.payload).digest("hex"), exitCode: result.exitCode, signal: result.signal })) }));
+    console.log(JSON.stringify({ piVersion, scenario, cli: fileProvenance(runtimeCli), producer: fileProvenance(resolve(runtimeCli, "../modes/json-event.js")), extension: fileProvenance(runtimeExtension), baseSha: scenario.startsWith("baseline_") ? baselineSha : head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, finalBytes: Buffer.byteLength(result.payload), finalHash: createHash("sha256").update(result.payload).digest("hex"), exitCode: result.exitCode, signal: result.signal })) }));
     rpc.acceptTerminal();
   } finally {
     clearTimeout(timeout);
