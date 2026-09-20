@@ -111,6 +111,23 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
   assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
 });
 
+test("request response hook runs before later events from the same JSONL chunk", async () => {
+  const order: string[] = [];
+  const rpc = startCoordinatorRpc(prepared, identity, expected, {
+    onEvent(event) { if (event.type === "terminal_probe") order.push("terminal"); },
+  }, {
+    invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture, "same-chunk-work-terminal"] },
+    readyTimeoutMs: 1000,
+    stopGraceMs: 100,
+  });
+  try {
+    await rpc.ready;
+    const response = await rpc.request({ id: "run-1:work", type: "prompt", message: "work" }, () => order.push("ack"));
+    assert.equal(response.success, true);
+    assert.deepEqual(order, ["ack", "terminal"]);
+  } finally { await rpc.stop(); }
+});
+
 test("RPC stop absorbs expected EPIPE and resolves", async () => {
   let stdinClosed!: () => void;
   const closed = new Promise<void>((resolve) => { stdinClosed = resolve; });

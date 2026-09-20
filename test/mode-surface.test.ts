@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openModeSurface, parseSurfaceArgs } from "../src/mode-surface.ts";
+import { closeModeSurface, openModeSurface, parseSurfaceArgs } from "../src/mode-surface.ts";
 
 test("surface controls stop at the first separator and protect mode option values", () => {
   assert.deepEqual(parseSurfaceArgs(["YM-1"]), { surface: "tab", model: undefined, words: ["YM-1"], literal: [] });
@@ -14,6 +14,22 @@ test("surface controls stop at the first separator and protect mode option value
   });
   assert.deepEqual(parseSurfaceArgs(["--project", "--model"], ["--project"]).words, ["--project", "--model"]);
   assert.deepEqual(parseSurfaceArgs(["--tab"]).words, ["--tab"]);
+});
+
+test("awaited close targets only the stored exact surface ID", async () => {
+  const calls: string[][] = [];
+  const tab = await closeModeSurface({ surface: "tab", paneId: "pane", tabId: "tab", cleanup() {} }, async (args) => { calls.push(args); return { result: {} }; });
+  const split = await closeModeSurface({ surface: "split", paneId: "split", cleanup() {} }, async (args) => { calls.push(args); return { result: {} }; });
+  assert.deepEqual(tab, { state: "closed" });
+  assert.deepEqual(split, { state: "closed" });
+  assert.deepEqual(calls, [["tab", "close", "tab"], ["pane", "close", "split"]]);
+});
+
+test("awaited close reports missing IDs, command errors and timeout", async () => {
+  assert.match((await closeModeSurface({ surface: "tab", paneId: "pane", cleanup() {} }, async () => ({ result: {} }))).reason ?? "", /tab id/);
+  assert.match((await closeModeSurface({ surface: "split", paneId: "", cleanup() {} }, async () => ({ result: {} }))).reason ?? "", /pane id/);
+  assert.match((await closeModeSurface({ surface: "split", paneId: "pane", cleanup() {} }, async () => { throw new Error("disappeared"); })).reason ?? "", /disappeared/);
+  assert.match((await closeModeSurface({ surface: "split", paneId: "pane", cleanup() {} }, async () => new Promise(() => {}), 5)).reason ?? "", /timed out/);
 });
 
 for (const surface of ["tab", "split"] as const) {

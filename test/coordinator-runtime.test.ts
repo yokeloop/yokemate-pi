@@ -162,6 +162,36 @@ test("list children retain parent list and key identity", async () => {
   assert.deepEqual(contexts.map(({ listRunId, parentRunId, keyRunId }) => ({ listRunId, parentRunId, keyRunId })), run.entries.map((entry) => ({ listRunId: run.identity.listRunId, parentRunId: run.identity.listRunId, keyRunId: entry.keyRunId })));
 });
 
+test("startup outcomes are retained across queue, refusal, fast terminal and late waiters", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, rejectKey: (key) => key === "B-1" ? "refused by fixture" : undefined });
+  const refused = await registry.waitForStartup(run.entries[1]!.keyRunId);
+  assert.deepEqual(refused, { state: "refused", reason: "refused by fixture" });
+  registry.publishImmediate(run.identity.listRunId);
+  registry.start(run.identity.listRunId, async (context) => {
+    context.startup({ state: "started", runId: context.keyRunId, facts: { ack: true } });
+    return { outcome: "blocked", reason: "fast terminal" };
+  });
+  const started = await registry.waitForStartup(run.entries[0]!.keyRunId);
+  assert.equal(started.state, "started");
+  assert.equal(started.runId, run.entries[0]!.keyRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await registry.waitForStartup(run.entries[0]!.keyRunId), started);
+});
+
+test("cancellation and pre-start failure settle startup once and fence late ACK", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  registry.publishImmediate(run.identity.listRunId);
+  assert.equal(registry.cancel(run.entries[1]!.keyRunId, "stopped before startup"), true);
+  assert.deepEqual(await registry.waitForStartup(run.entries[1]!.keyRunId), { state: "cancelled", reason: "stopped before startup" });
+  assert.equal(registry.settleStartup(run.entries[1]!.keyRunId, { state: "started", runId: "late" }), false);
+  registry.start(run.identity.listRunId, async () => { throw new Error("handshake failed"); });
+  assert.deepEqual(await registry.waitForStartup(run.entries[0]!.keyRunId), { state: "failed", reason: "handshake failed" });
+});
+
 test("duplicate off keeps independent atomic reservations and release does not hide siblings", () => {
   for (const mode of ["do", "ship"] as const) {
     const registry = new CoordinatorRegistry();

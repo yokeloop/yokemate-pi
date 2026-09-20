@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { THINKING_LEVELS } from "./pi-model.ts";
 
 export interface RpcEvent { type: string; id?: string; [key: string]: unknown }
-export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>): Promise<RpcEvent>; acceptTerminal(): void; hasLiveDescendants(): boolean; diagnosticSnapshot(): Record<string, unknown>; ready: Promise<void>; stop(reason?: string): Promise<void>; childState: OwnedChildState; events: RpcEvent[] }
+export interface CoordinatorRpc { process: ChildProcess; send(command: Record<string, unknown>): void; request(command: Record<string, unknown>, onResponse?: (event: RpcEvent) => void): Promise<RpcEvent>; acceptTerminal(): void; hasLiveDescendants(): boolean; diagnosticSnapshot(): Record<string, unknown>; ready: Promise<void>; stop(reason?: string): Promise<void>; childState: OwnedChildState; events: RpcEvent[] }
 export interface RpcCallbacks { onEvent?(event: RpcEvent): void; onBlocked?(reason: string): void; onDiagnostic?(snapshot: Record<string, unknown>, completed: boolean): void; onUiRequest?(event: RpcEvent, reply: (response: Record<string, unknown>) => void): void }
 export interface CoordinatorRpcOptions { invocation?: { command: string; args: string[] }; readyTimeoutMs?: number; stopGraceMs?: number }
 
@@ -90,7 +90,7 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     }
   };
   const events: RpcEvent[] = [];
-  const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
+  const pending = new Map<string, { resolve(event: RpcEvent): void; reject(error: Error): void; timer: NodeJS.Timeout; onResponse?: (event: RpcEvent) => void }>();
 
   let closed = false;
   let stopping = false;
@@ -126,10 +126,10 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (stopping) throw new Error("coordinator RPC is stopping");
     write(command);
   };
-  const request = (command: Record<string, unknown>) => new Promise<RpcEvent>((resolve, reject) => {
+  const request = (command: Record<string, unknown>, onResponse?: (event: RpcEvent) => void) => new Promise<RpcEvent>((resolve, reject) => {
     const id = typeof command.id === "string" ? command.id : `${identity.runId}:${Math.random().toString(36).slice(2)}`;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`coordinator RPC command timed out: ${command.type ?? "unknown"}`)); }, 30_000);
-    pending.set(id, { resolve, reject, timer });
+    pending.set(id, { resolve, reject, timer, onResponse });
     try { send({ ...command, id }); } catch (error) { clearTimeout(timer); pending.delete(id); reject(error as Error); }
   });
   const maybeReady = () => {
@@ -153,7 +153,12 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
     if (event.type === "extension_error" && event.event === "send_message") { childState.recordDeliveryError(); metadata.deliveryError = "send_message"; save(false); }
     if (event.type === "response" && typeof event.id === "string") {
       const waiter = pending.get(event.id);
-      if (waiter) { clearTimeout(waiter.timer); pending.delete(event.id); waiter.resolve(event); }
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        pending.delete(event.id);
+        try { waiter.onResponse?.(event); waiter.resolve(event); }
+        catch (error) { waiter.reject(error as Error); }
+      }
       if (event.id === `${identity.runId}:commands`) {
         const commandsValue = isRecord(event.data) ? event.data.commands : undefined;
         const commands = Array.isArray(commandsValue) ? commandsValue.filter(isRecord).map((command) => command.name) : [];

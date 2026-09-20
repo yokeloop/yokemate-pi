@@ -8,7 +8,7 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, formatHerdrError, herdr, herdrRaw, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
-import { currentControlOrigin, requestPlanControl, requestPlanLaunch, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, requestPlanLaunch, requestReviewControl, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
@@ -323,6 +323,8 @@ if (import.meta.filename === process.argv[1]) {
       }
 
       let planRunId: string | undefined;
+      let reviewRunId: string | undefined;
+      let reviewRuntimeId: string | undefined;
       if (mode === "plan" && ticket) {
         try {
           const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
@@ -331,12 +333,23 @@ if (import.meta.filename === process.argv[1]) {
           env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
         } catch (error) { console.error(`${ticket}: no automatic do handoff: ${(error as Error).message}`); }
       }
+      if (mode === "review" && ticket && process.env.PI_SESSION_ID) {
+        reviewRuntimeId = randomUUID();
+        const reply = await requestReviewControl(ROOT, "register-review", { ticket, workerRuntimeId: reviewRuntimeId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+        if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "review registration refused");
+        reviewRunId = reply.runId;
+        env.push(`YOKEMATE_REVIEW_RUN_ID=${reviewRunId}`, `YOKEMATE_REVIEW_RUNTIME_ID=${reviewRuntimeId}`);
+      }
       const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
       const { paneId } = opened;
       try {
         if (planRunId) {
           const reply = await requestPlanControl(ROOT, "bind-plan", { ticket, runId: planRunId, pane: paneId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
           if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
+        }
+        if (reviewRunId) {
+          const reply = await requestReviewControl(ROOT, "bind-review", { ticket, runId: reviewRunId, pane: paneId, surface, ...(opened.tabId ? { tabId: opened.tabId } : {}) }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+          if (reply.state !== "accepted") throw new Error(reply.reason ?? "review surface binding refused");
         }
         startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
         herdr(["agent", "prompt", agentName, prompt]);

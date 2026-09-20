@@ -33,18 +33,38 @@ export function parseSurfaceArgs(argv: string[], valueOptions: readonly string[]
 }
 
 export interface OpenedSurface {
+  surface: Surface;
   paneId: string;
   tabId?: string;
   cleanup(): void;
 }
 
+export interface CloseSurfaceOutcome { state: "closed" | "failed"; reason?: string }
+
+export async function closeModeSurface(opened: OpenedSurface, run: (args: string[]) => Promise<unknown> = herdrAsync, timeoutMs = 5000): Promise<CloseSurfaceOutcome> {
+  const args = opened.surface === "tab"
+    ? opened.tabId ? ["tab", "close", opened.tabId] : undefined
+    : opened.paneId ? ["pane", "close", opened.paneId] : undefined;
+  if (!args) return { state: "failed", reason: opened.surface === "tab" ? "review tab id is missing" : "review split pane id is missing" };
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      run(args),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`review ${opened.surface} close timed out after ${timeoutMs}ms`)), timeoutMs); }),
+    ]);
+    return { state: "closed" };
+  } catch (error) {
+    return { state: "failed", reason: error instanceof Error ? error.message : String(error) };
+  } finally { clearTimeout(timer); }
+}
+
 export async function openModeSurfaceAsync(surface: Surface, parentPane: string, parentWorkspace: string, cwd: string, label: string, env: string[]): Promise<OpenedSurface> {
   if (surface === "split") {
     const { pane } = (await herdrAsync(["pane", "split", parentPane, "--direction", "down", "--cwd", cwd, ...env.flatMap((entry) => ["--env", entry])]) as { result: { pane: { pane_id: string } } }).result;
-    return { paneId: pane.pane_id, cleanup: () => void herdrAsync(["pane", "close", pane.pane_id]) };
+    return { surface, paneId: pane.pane_id, cleanup: () => void herdrAsync(["pane", "close", pane.pane_id]) };
   }
   const { tab, root_pane } = (await herdrAsync(["tab", "create", "--workspace", parentWorkspace, "--cwd", cwd, "--label", label, ...env.flatMap((entry) => ["--env", entry])]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
-  return { paneId: root_pane.pane_id, tabId: tab.tab_id, cleanup: () => void herdrAsync(["tab", "close", tab.tab_id]) };
+  return { surface, paneId: root_pane.pane_id, tabId: tab.tab_id, cleanup: () => void herdrAsync(["tab", "close", tab.tab_id]) };
 }
 
 export function openModeSurface(
@@ -61,11 +81,11 @@ export function openModeSurface(
       "pane", "split", parentPane, "--direction", "down", "--cwd", cwd,
       ...env.flatMap((e) => ["--env", e]),
     ]) as { result: { pane: { pane_id: string } } }).result;
-    return { paneId: pane.pane_id, cleanup: () => void run(["pane", "close", pane.pane_id]) };
+    return { surface, paneId: pane.pane_id, cleanup: () => void run(["pane", "close", pane.pane_id]) };
   }
   const { tab, root_pane } = (run([
     "tab", "create", "--workspace", parentWorkspace, "--cwd", cwd, "--label", label,
     ...env.flatMap((e) => ["--env", e]),
   ]) as { result: { tab: { tab_id: string }; root_pane: { pane_id: string } } }).result;
-  return { paneId: root_pane.pane_id, tabId: tab.tab_id, cleanup: () => void run(["tab", "close", tab.tab_id]) };
+  return { surface, paneId: root_pane.pane_id, tabId: tab.tab_id, cleanup: () => void run(["tab", "close", tab.tab_id]) };
 }
