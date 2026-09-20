@@ -105,6 +105,26 @@ test("remote target changes are pending while local binding failures remain bloc
   assert.equal(posts, 0);
 });
 
+test("logical stop during a remote listing fences the next publication write", async () => {
+  const document = row("# Report\nbody\n");
+  let releaseListing!: () => void;
+  let listingStarted!: () => void;
+  let active = true;
+  let posts = 0;
+  const started = new Promise<void>((resolve) => { listingStarted = resolve; });
+  const publishing = publishDocument(document.row, document.bytes, {
+    list: async () => { listingStarted(); await new Promise<void>((resolve) => { releaseListing = resolve; }); return []; },
+    add: async () => { posts++; },
+  }, { canonicalUrl: input("body").canonicalUrl, verifyBinding: () => { if (!active) throw new Error("plan run is no longer active"); } });
+  await started;
+  active = false;
+  releaseListing();
+  const result = await publishing;
+  assert.equal(result.complete, false);
+  assert.equal(result.error, "unavailable");
+  assert.equal(posts, 0);
+});
+
 test("binding changes stop multipart publication before the next remote write", async () => {
   const text = "# Report\n" + "line value\n".repeat(5000);
   const document = row(text);

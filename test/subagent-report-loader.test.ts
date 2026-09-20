@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createServer, type Socket } from "node:net";
 import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { reportContent, sha256, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
@@ -116,6 +117,128 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closing the runtime", { timeout: 30000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ym228-cancel-"));
+  const socketPath = join(dir, "cancel.sock");
+  const agentDir = join(dir, "agent");
+  const promptTmp = join(dir, "tmp");
+  mkdirSync(promptTmp);
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = promptTmp;
+  const previousArgv = process.argv[1];
+  const previousSocket = process.env.RUNTIME_SETTINGS_TEST_SOCKET;
+  const previousMode = process.env.SUBAGENT_CANCEL_MODE;
+  const previousRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const previousTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
+  const previousOwner = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE, YOKEMATE_RUN_ID: process.env.YOKEMATE_RUN_ID, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_PLAN_RUN_ID: process.env.YOKEMATE_PLAN_RUN_ID, PI_SESSION_ID: process.env.PI_SESSION_ID };
+  const sockets = new Set<Socket>();
+  const events: any[] = [];
+  const waiters: Array<() => void> = [];
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        events.push({ ...JSON.parse(buffer.slice(0, newline)), socket });
+        buffer = buffer.slice(newline + 1);
+        for (const wake of waiters.splice(0)) wake();
+      }
+    });
+  });
+  const waitEvent = async (predicate: (event: any) => boolean) => {
+    while (!events.some(predicate)) await new Promise<void>((resolve) => waiters.push(resolve));
+    return events.find(predicate)!;
+  };
+  try {
+    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: cancellation fixture\n---\nReturn only after release.\n");
+    process.env.RUNTIME_SETTINGS_TEST_SOCKET = socketPath;
+    process.env.SUBAGENT_CANCEL_MODE = "term";
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    delete process.env.YOKEMATE_RUN_ID;
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const states: any[] = [];
+    const reports: any[] = [];
+    loaded.runtime.appendEntry = (_type, data) => { states.push(data); };
+    loaded.runtime.sendMessage = (message) => { if ((message as any).customType === "subagent-report") reports.push(message); };
+    const tool = loaded.extensions[0]!.tools.get("subagent")!.definition;
+    const widgets: unknown[] = [];
+    const ctx = { cwd: dir, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "cancel-owner" }, ui: { setWidget: (_key: string, value: unknown) => widgets.push(value) } } as unknown as ExtensionContext;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test/fixtures/runtime-settings-child.mjs");
+    const promptsBefore = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-")));
+    const launched = await tool.execute("cancel-term", { agent: "worker", task: "held TERM child" }, undefined, () => undefined, ctx);
+    const runId = (launched.details as any).children[0].identity.runId;
+    const child = await waitEvent((event) => event.task?.includes("held TERM child"));
+    const foreign = await tool.execute("foreign", { cancelRun: runId }, undefined, () => undefined, { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext);
+    assert.equal((foreign.details as any).status, "not_owned");
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+    const cancelling = tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await waitEvent((event) => event.pid === child.pid && event.phase === "term");
+    assert.notEqual(widgets.at(-1), undefined);
+    const cancelled = await cancelling;
+    assert.equal((cancelled.details as any).status, "cancelled");
+    assert.equal((cancelled.details as any).targetKind, "ordinary");
+    assert.equal((cancelled.details as any).processOutcome, "cancelled");
+    assert.equal((cancelled.details as any).exitCode, 0);
+    assert.equal((cancelled.details as any).signal, null);
+    assert.equal((cancelled.details as any).cancellationInitiator, "tool_cancel");
+    assert.throws(() => process.kill(child.pid, 0));
+    await waitFor(() => reports.filter((message) => message.details?.envelope?.identity?.runId === runId || message.details?.envelope?.results?.some((result: any) => result.identity.runId === runId)).length === 2);
+    assert.equal(reports.find((message) => message.details?.envelope?.identity?.runId === runId).details.envelope.processOutcome, "cancelled");
+    assert.equal((await tool.execute("repeat", { cancelRun: runId }, undefined, () => undefined, ctx) as any).details.status, "already_terminal");
+    assert.equal((await tool.execute("unknown", { cancelRun: "11111111-1111-4111-8111-111111111111" }, undefined, () => undefined, ctx) as any).details.status, "unknown");
+    const mixed = await tool.execute("mixed", { cancelRun: "11111111-1111-4111-8111-111111111111", agent: "worker", task: "must not launch" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in mixed && mixed.isError, true);
+    assert.match((mixed.content[0] as any).text, /cannot be combined/);
+    await waitFor(() => widgets.at(-1) === undefined);
+    assert.deepEqual(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-") && !promptsBefore.has(name)), []);
+
+    process.env.SUBAGENT_CANCEL_MODE = "kill";
+    const killLaunch = await tool.execute("cancel-kill", { agent: "worker", task: "held KILL child" }, undefined, () => undefined, ctx);
+    const killRunId = (killLaunch.details as any).children[0].identity.runId;
+    const killChild = await waitEvent((event) => event.task?.includes("held KILL child"));
+    const killed = await tool.execute("kill", { cancelRun: killRunId }, undefined, () => undefined, ctx);
+    assert.ok(events.some((event) => event.pid === killChild.pid && event.phase === "term-ignored"));
+    assert.equal((killed.details as any).status, "cancelled");
+    assert.equal((killed.details as any).signal, "SIGKILL");
+    assert.equal((killed.details as any).exitCode, null);
+    assert.throws(() => process.kill(killChild.pid, 0));
+    assert.ok(states.some((state) => state.children?.some((entry: any) => entry.identity.runId === killRunId)));
+    assert.ok(states.some((state) => state.children?.length === 0));
+
+    Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_PLAN_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_TICKET: "YM-1" });
+    delete process.env.PI_SESSION_ID;
+    const planFinish = loaded.extensions[0]!.tools.get("plan_finish")!.definition;
+    const stopped = await planFinish.execute("finish", { outcome: "cancelled", reason: "fixture stop" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in stopped && stopped.isError, true);
+    assert.doesNotMatch((stopped.content[0] as any).text, /PI_SESSION_ID/);
+    const fenced = await tool.execute("after-stop", { agent: "worker", task: "must stay conversational" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in fenced && fenced.isError, true);
+    assert.match((fenced.content[0] as any).text, /plan run is stopped/);
+  } finally {
+    process.argv[1] = previousArgv;
+    if (previousSocket === undefined) delete process.env.RUNTIME_SETTINGS_TEST_SOCKET; else process.env.RUNTIME_SETTINGS_TEST_SOCKET = previousSocket;
+    if (previousMode === undefined) delete process.env.SUBAGENT_CANCEL_MODE; else process.env.SUBAGENT_CANCEL_MODE = previousMode;
+    if (previousRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = previousRelay;
+    if (previousTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = previousTarget;
+    for (const [key, value] of Object.entries(previousOwner)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    if (previousTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmpdir;
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("real loader sends one compact parent terminal for every coordinator terminal path", async () => {
   const verified = await coordinatorTerminalScenario("verified");

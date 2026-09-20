@@ -17,7 +17,7 @@ import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, 
 import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { boundBatchResult, cancellationResult, type CancellationResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
 import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
@@ -44,7 +44,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -77,8 +77,18 @@ const COLLAPSED_ITEM_COUNT = 10;
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
-const cancellationByProcess = new Map<ChildProcess, (initiator: string) => void>();
-const childCompletions = new Map<ChildProcess, Promise<void>>();
+interface OrdinaryProcess {
+	identity: ChildIdentity;
+	process: ChildProcess;
+	pid: number;
+	starttime: string;
+	closed: boolean;
+	termSent: boolean;
+	killSent: boolean;
+	killTimer?: NodeJS.Timeout;
+}
+const ordinaryProcesses = new Map<string, OrdinaryProcess>();
+let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -88,11 +98,10 @@ let activeUnits = 0;
 // (задачи сверх maxConcurrency) и следующий шаг цепочки поднимаются позже — в
 // те миллисекунды, что pi ещё дочитывает ввод, — и осиротели бы. Флаг
 // закрывает очередь; turn_start снимает его, если сессия вернулась.
-let shuttingDown = false;
-
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
 const batches = new Set<string>();
+const batchModes = new Map<string, "single" | "parallel" | "chain">();
 
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
@@ -300,6 +309,8 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	cleanupError?: string;
+	cleanupPath?: string;
 	step?: number;
 }
 
@@ -364,14 +375,32 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
+class PromptCleanupFailure extends Error {
+	readonly dir: string;
+	readonly writeFailure: ReturnType<typeof errorMetadata>;
+	readonly cleanupFailure: ReturnType<typeof errorMetadata>;
+	constructor(dir: string, writeError: unknown, cleanupError: unknown) {
+		super("temporary prompt write and cleanup failed");
+		this.dir = dir;
+		this.writeFailure = errorMetadata(writeError);
+		this.cleanupFailure = errorMetadata(cleanupError);
+	}
+}
+
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
 	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
+	try {
+		await withFileMutationQueue(filePath, async () => {
+			await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
+		});
+		return { dir: tmpDir, filePath };
+	} catch (error) {
+		try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); }
+		catch (cleanupError) { throw new PromptCleanupFailure(tmpDir, error, cleanupError); }
+		throw error;
+	}
 }
 
 let pinnedPiCli: string | undefined;
@@ -414,6 +443,7 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onSpawn: ((proc: ChildProcess) => void) | undefined,
 	identity: ChildIdentity,
+	lifecycle: ChildRuns,
 	diagnostic: { metadata: Record<string, unknown>; save(completed: boolean): void },
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
@@ -469,10 +499,18 @@ async function runSingleAgent(
 	};
 
 	try {
+		if (!lifecycle.canSpawn(identity)) {
+			currentResult.envelope = lifecycle.claimNoSpawn(identity);
+			return currentResult;
+		}
 		if (agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
+			if (!lifecycle.canSpawn(identity)) {
+				currentResult.envelope = lifecycle.claimNoSpawn(identity);
+				return currentResult;
+			}
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
@@ -528,42 +566,41 @@ async function runSingleAgent(
 			refreshObservation(stream);
 			diagnostic.save(false);
 		};
-		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
+		if (!lifecycle.canSpawn(identity)) {
+			currentResult.envelope = lifecycle.claimNoSpawn(identity);
+			return currentResult;
+		}
+		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" }>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
 			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, YOKEMATE_SUBAGENT_JSON_CONTRACT: "1", ...(child?.env ?? {}) };
 			delete env.HERDR_PANE_ID;
 			delete env.YOKEMATE_PARENT_PANE;
 			let spawnError: Error | undefined;
-			let cancelled = false;
-			let killTimer: NodeJS.Timeout | undefined;
 			const proc = spawn(invocation.command, invocation.args, { cwd: child?.cwd ?? identity.cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			const starttime = proc.pid ? processStarttime(proc.pid) : undefined;
 			diagnostic.metadata.pid = proc.pid;
-			diagnostic.metadata.starttime = proc.pid ? processStarttime(proc.pid) : undefined;
+			diagnostic.metadata.starttime = starttime;
 			diagnostic.metadata.spawnAt = new Date().toISOString();
-			cancellationByProcess.set(proc, (initiator) => {
-				cancelled = true;
-				if (diagnostic.metadata.cancellationInitiator === "unknown") diagnostic.metadata.cancellationInitiator = initiator;
-				refreshObservation();
-				diagnostic.save(false);
-			});
+			if (proc.pid && starttime && lifecycle.attachProcess(identity, proc.pid, starttime)) ordinaryProcesses.set(identity.runId, { identity, process: proc, pid: proc.pid, starttime, closed: false, termSent: false, killSent: false });
 			diagnostic.save(false);
 			onSpawn?.(proc);
-			const abort = () => {
-				cancellationByProcess.get(proc)?.("tool_abort_signal");
-				proc.kill("SIGTERM");
-				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
-			};
+			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId); };
 			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
 			proc.once("close", (exitCode, signalName) => {
-				clearTimeout(killTimer);
+				const owned = ordinaryProcesses.get(identity.runId);
+				if (owned) {
+					owned.closed = true;
+					clearTimeout(owned.killTimer);
+				}
 				signal?.removeEventListener("abort", abort);
 				observation.end();
-				cancellationByProcess.delete(proc);
 				diagnostic.metadata.closeAt = new Date().toISOString();
-				resolve({ exitCode, signal: signalName, processOutcome: cancelled ? "cancelled" : spawnError ? "spawn_error" : signalName ? "signaled" : "exited" });
+				const processOutcome = spawnError ? "spawn_error" : signalName ? "signaled" : "exited";
+				lifecycle.claimTerminal(identity, task, { exitCode, signal: signalName, processOutcome, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream: observation.metadata(), stderr: { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") }, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
+				resolve({ exitCode, signal: signalName, processOutcome });
 			});
 			if (signal?.aborted) abort();
 			else signal?.addEventListener("abort", abort, { once: true });
@@ -572,8 +609,8 @@ async function runSingleAgent(
 		refreshObservation();
 		const stream = observation.metadata();
 		const stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
-		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
-		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "protocol_error" && process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID) {
+		currentResult.envelope = lifecycle.claimed(identity) ?? resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "protocol_error" && currentResult.envelope.processOutcome !== "cancelled" && process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID) {
 			try {
 				const parent = resolveCoordinatorParent(ENGINE_ROOT);
 				const planningIdentity = process.env.YOKEMATE_PLAN_RUN_ID;
@@ -593,7 +630,7 @@ async function runSingleAgent(
 				} else diagnostic.metadata.scoutCandidate = { refusal: captured.reason };
 			} catch (error) { diagnostic.metadata.scoutCandidate = { refusal: "audit-unavailable", error: errorMetadata(error) }; }
 		}
-		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid" && currentResult.envelope.processOutcome !== "cancelled") {
 			const bytes = normalizeScoutMarkdown(observation.finalText);
 			try {
 				assertPublishable(bytes);
@@ -605,7 +642,8 @@ async function runSingleAgent(
 				currentResult.envelope.artifact = { state: "blocked", hash: sha256(bytes), bytes: bytes.length, reason: code };
 			}
 		}
-		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
+		refreshObservation();
+		diagnostic.metadata.terminal = { processOutcome: currentResult.envelope.processOutcome, exitCode: currentResult.envelope.exitCode, signal: currentResult.envelope.signal, stopReason: observation.stopReason };
 		diagnostic.metadata.actualTaskHash = currentResult.envelope.actualTaskHash;
 		diagnostic.metadata.usage = { ...currentResult.usage };
 		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), retainedBytes: Buffer.byteLength(currentResult.envelope.payload), retainedHash: sha256(currentResult.envelope.payload), truncated: currentResult.envelope.payload !== observation.finalText, verdict: currentResult.envelope.reviewVerdict };
@@ -615,18 +653,15 @@ async function runSingleAgent(
 		if (snapshotStorage && currentResult.envelope.diagnostics) currentResult.envelope.diagnostics.snapshotStorage = { ...snapshotStorage };
 		return currentResult;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
+		if (tmpPromptDir) {
+			try { fs.rmSync(tmpPromptDir, { recursive: true, force: true }); }
+			catch (error) {
+				currentResult.cleanupError = "temporary prompt cleanup could not be verified";
+				currentResult.cleanupPath = tmpPromptDir;
+				diagnostic.metadata.cleanupError = { reason: currentResult.cleanupError, path: tmpPromptDir, cleanupFailure: errorMetadata(error) };
+				diagnostic.save(true);
 			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+		}
 	}
 }
 
@@ -670,7 +705,7 @@ const SubagentParams = Type.Object({
 	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
 	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
-	cancelRun: Type.Optional(Type.String()),
+	cancelRun: Type.Optional(Type.String({ description: "Exact ordinary ACK, coordinator, list, or list-key run UUID to cancel", pattern: "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89aAbB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$" })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
@@ -687,6 +722,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
 	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
+	let shuttingDown = false;
+	let sessionGeneration = 0;
+	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
 	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
 	const publicationTail = new Map<string, Promise<unknown>>();
 	const localPublicationErrors = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
@@ -923,14 +961,21 @@ export default function (pi: ExtensionAPI) {
 	};
 	listRuns.onTerminal((run, entry) => {
 		if (entry.immediate?.state === "accepted" && !listRuns.wasLifetimeReleased(entry.keyRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
-		if (entry.terminal?.outcome === "cancelled" && typeof entry.immediate?.facts?.agentName === "string") void herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
 		deliverListMessage(run.identity.listRunId, { customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
 	});
 	listRuns.onAggregate((aggregate) => deliverListMessage(aggregate.listRunId, { customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
 	const recordingPlans = new Set<string>();
+	const stoppedPlanRuns = new Set<string>();
 	const lockedRecordingPlans = new Set<string>();
 	const recorderControllers = new Map<string, AbortController>();
-	const cancelledRecordingPlans = new Set<string>();
+	const recorderCompletions = new Map<string, Promise<void>>();
+	const recorderFences = new PlanRecorderFences();
+	const planContinuationGenerations = new Map<string, number>();
+	const assertPlanContinuation = (runId: string | undefined, generation: number | undefined): void => {
+		if (!runId) return;
+		const found = listRuns.get(runId);
+		if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) || planContinuationGenerations.get(runId) !== generation) throw new Error("plan run is no longer active");
+	};
 	const shipPermits = new ShipPermitStore();
 	const workflowIngress = new WorkflowIngressWitnessStore();
 	const breakGlassPermits = new BreakGlassPermitStore();
@@ -998,13 +1043,16 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (stopObserver) review.stopObserver();
 	};
+	const upgradeRecordingFence = (runId: string): boolean => {
+		if (!recordingPlans.has(runId)) return false;
+		recorderFences.fence(runId, true);
+		recorderControllers.get(runId)?.abort();
+		return true;
+	};
 	const fenceListRuns = async (reason: string) => {
+		for (const runId of recordingPlans) upgradeRecordingFence(runId);
 		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
-			if (recordingPlans.has(entry.keyRunId)) {
-				cancelledRecordingPlans.add(entry.keyRunId);
-				recorderControllers.get(entry.keyRunId)?.abort();
-				return;
-			}
+			if (upgradeRecordingFence(entry.keyRunId)) return;
 			const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
 			listRuns.cancel(entry.keyRunId, reason);
 			if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
@@ -1405,6 +1453,8 @@ export default function (pi: ExtensionAPI) {
 		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
+		sessionGeneration += 1;
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_REVIEW_RUN_ID && process.env.YOKEMATE_TICKET) {
@@ -1458,7 +1508,7 @@ export default function (pi: ExtensionAPI) {
 				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
-		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding): Promise<PublicationOutcome[]> => {
+		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding, continuation?: () => void): Promise<PublicationOutcome[]> => {
 			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 			let record;
 			let scout;
@@ -1470,12 +1520,19 @@ export default function (pi: ExtensionAPI) {
 				if (!scout || scout.ticket !== binding.ticket) throw new PublicationFailure("artifact_invalid");
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
 			} finally { db.close(); }
-			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
+			const verify = () => {
+				continuation?.();
+				try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); }
+				catch { throw new PublicationFailure("binding_changed"); }
+			};
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
+			continuation?.();
 			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			continuation?.();
 			const planOutcome: PublicationOutcome = scoutOutcome.error === "target_changed"
 				? { kind: "plan", state: "pending", target: scoutOutcome.target, revision: record.content_hash, ...(record.publication_id ? { publicationId: record.publication_id } : {}), error: "target_changed" }
 				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}), ...(record.writer_run_id && record.writer_task_hash && record.writer_actual_task_hash ? { writer: { runId: record.writer_run_id, taskHash: record.writer_task_hash, actualTaskHash: record.writer_actual_task_hash } } : {}) }); }, verifyBinding: verify });
+			continuation?.();
 			return [scoutOutcome, planOutcome];
 		};
 		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, planRunId?: string, record?: PlanRecordResult) => {
@@ -1503,7 +1560,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} finally { provenanceDb.close(); }
 			if (recovered) authority!.revoke(ticket);
-			if (!recovered && (!planRunId || !cancelledRecordingPlans.has(planRunId))) {
+			if (!recovered && (!planRunId || !recorderFences.active(planRunId))) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
 				if (advance) {
 					try {
@@ -1527,6 +1584,7 @@ export default function (pi: ExtensionAPI) {
 				const settled = recovery ? listRuns.settleRecovery(planRunId, { outcome: "recorded", facts }) : listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts });
 				if (!settled) throw new Error("plan run lost its terminal claim");
 			}
+			if (planRunId) planContinuationGenerations.delete(planRunId);
 			return { runId, reason, facts, publications, handoff };
 		};
 		try {
@@ -1638,19 +1696,29 @@ export default function (pi: ExtensionAPI) {
 					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, acceptanceId: acceptance.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
-				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin, planRunId, generation) => {
+					if (planRunId && generation !== undefined) {
+						const found = listRuns.get(planRunId);
+						if (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state)) throw new Error("plan run is no longer active");
+						planContinuationGenerations.set(planRunId, generation);
+					}
+					assertPlanContinuation(planRunId, generation);
 					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
+					assertPlanContinuation(planRunId, generation);
 					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
 					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
 				},
-				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, originOrRunId) => {
+				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, _originOrRunId, _legacyOrigin, planRunId, generation) => {
 					if (typeof recordIdOrOrigin !== "number") throw new Error("legacy plan record needs a local record id");
+					const continuation = () => assertPlanContinuation(planRunId, generation);
+					continuation();
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
-					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
+					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding, continuation);
+					continuation();
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, recordIdOrOrigin, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					return completePlanRecord(ticket, recordedPath, binding, publications, recordIdOrOrigin, planRunId);
 				},
 				launchPlan: async (request, controlOrigin) => {
 					const settings = readRuntimeSettings(ENGINE_ROOT);
@@ -1676,11 +1744,21 @@ export default function (pi: ExtensionAPI) {
 					return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
 				},
 				planFinished: async (_ticket, planRunId, outcome, reason) => {
+					planContinuationGenerations.delete(planRunId);
 					const found = listRuns.get(planRunId);
-					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
+					if (recordingPlans.has(planRunId)) {
+						recorderFences.fence(planRunId, false);
+						recorderControllers.get(planRunId)?.abort();
+					}
+					if (!listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
 				},
 				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
 					const controller = new AbortController();
+					const generation = sessionGeneration;
+					let resolveCompletion!: () => void;
+					const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+					recorderCompletions.set(planRunId, completion);
 					recordingPlans.add(planRunId);
 					recorderControllers.set(planRunId, controller);
 					let locallyRecorded = false;
@@ -1688,10 +1766,14 @@ export default function (pi: ExtensionAPI) {
 						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin);
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
+						const continuation = () => {
+							if (recorderFences.active(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
+						};
+						continuation();
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
 						const pushed = result.push;
 						if (pushed?.state === "deferred" || pushed?.state === "error") ctx.ui.notify(`git-sync: ${pushed.reason}`, "warning");
-						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
+						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding, continuation);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
 						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, prepared.record.id, planRunId, result);
@@ -1709,11 +1791,15 @@ export default function (pi: ExtensionAPI) {
 						recordingPlans.delete(planRunId);
 						lockedRecordingPlans.delete(planRunId);
 						recorderControllers.delete(planRunId);
-						if (cancelledRecordingPlans.delete(planRunId)) {
+						const fence = recorderFences.consume(planRunId);
+						if (fence.fenced) {
 							const found = listRuns.get(planRunId);
 							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
-							if (agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
+							listRuns.cancel(planRunId, "plan recorder cancelled before publication and handoff");
+							if (fence.stopAgent && agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
+						resolveCompletion();
+						recorderCompletions.delete(planRunId);
 					}
 				},
 				launch: async (request, controlOrigin) => {
@@ -1730,23 +1816,30 @@ export default function (pi: ExtensionAPI) {
 				},
 				cancel: async (runId, _origin) => {
 					const target = listRuns.get(runId);
-					let cancelled = false;
-					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
-					for (const entry of entries) {
-						if (recordingPlans.has(entry.keyRunId)) {
-							cancelledRecordingPlans.add(entry.keyRunId);
-							recorderControllers.get(entry.keyRunId)?.abort();
-							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
-							cancelled = true;
-						} else {
-							const cancellingRecovery = listRuns.recovery(entry.keyRunId)?.state === "active";
-							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
-							if (cancellingRecovery && typeof entry.immediate?.facts?.agentName === "string") await herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
+					if (target) {
+						const entries = "run" in target ? [target.entry] : target.entries;
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
+						const active = entries.filter((entry) => (!["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state) || listRuns.recovery(entry.keyRunId)?.state === "active"));
+						if (!active.length) return cancellationResult(runId, "list", recording.length ? "cancellation_requested" : "already_terminal", recording.length === 0);
+						let pending = recording.length > 0;
+						for (const entry of active) {
+							if (upgradeRecordingFence(entry.keyRunId)) {
+								for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
+								pending = true;
+								continue;
+							}
+							const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
+							listRuns.cancel(entry.keyRunId);
 							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
+							if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
+						return cancellationResult(runId, "list", pending ? "cancellation_requested" : "cancelled", !pending);
 					}
-					if (!target && coordinators.get(runId)) { await cancelCoordinator(runId, "parent_control_cancel", cancelled); cancelled = true; }
-					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+					const coordinator = coordinators.get(runId);
+					if (!coordinator) return cancellationResult(runId, "unknown", "unknown", false);
+					if (["done", "blocked"].includes(coordinator.state)) return cancellationResult(runId, "coordinator", "already_terminal", true);
+					await cancelCoordinator(runId, "parent_control_cancel");
+					return cancellationResult(runId, "coordinator", "cancelled", true);
 				},
 				merge: async (runId, request, mergeOrigin) => {
 					const run = coordinators.get(runId);
@@ -1897,14 +1990,18 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerCommand("yokemate-child-cancel", {
 		description: "Record an owned parent cancellation before teardown.",
-		handler: async (args) => {
+		handler: async (args, ctx) => {
 			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
 			if (payload.runId !== ownedReadyRunId || !["parent_rpc_stop", "parent_control_cancel", "parent_cancel_run", "parent_session_shutdown"].includes(payload.reason)) throw new Error("invalid owned child cancellation");
-			for (const mark of cancellationByProcess.values()) mark(payload.reason);
+			const sessionId = ctx.sessionManager.getSessionId();
+			await Promise.all((runs?.active() ?? []).map((child) => requestOrdinaryCancellation(child.identity.runId, payload.reason, payload.runId, sessionId)));
 		},
 	});
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		sessionGeneration += 1;
+		const sessionId = latestCtx?.sessionManager?.getSessionId?.();
+		const ordinaryStops = sessionId && runs ? runs.shutdownActive().map((child) => requestOrdinaryCancellation(child.identity.runId, "session_shutdown", runs!.ownerRunId, sessionId)) : [];
 		uninstallIngress?.();
 		uninstallIngress = undefined;
 		auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
@@ -1932,6 +2029,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		emitChildState();
 		await fenceListRuns("parent session shutdown");
+		await Promise.all([...recorderCompletions.values()]);
 		authority?.revoke();
 		authority = undefined;
 		shipPermits.invalidate();
@@ -1947,25 +2045,27 @@ export default function (pi: ExtensionAPI) {
 		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
 		coordinatorChildren.clear();
-		await Promise.all([...detached].map(async (proc) => {
-			const completion = childCompletions.get(proc);
-			cancellationByProcess.get(proc)?.("session_shutdown");
-			const timer = setTimeout(() => { if (cancellationByProcess.has(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 5000);
-			try {
-				try { proc.kill("SIGTERM"); } catch {}
-				await completion;
-			} finally { clearTimeout(timer); }
-		}));
+		await Promise.all(ordinaryStops);
+		await Promise.all([...batchCompletions.values()].map((completion) => completion.promise));
+		await Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity)));
 		await Promise.all(coordinatorStops);
 		detached.clear();
+		ordinaryProcesses.clear();
 		batches.clear();
+		batchModes.clear();
+		batchCompletions.clear();
+		sentBatches.clear();
+		deliveries.clear();
+		diagnostics.clear();
+		recorderFences.clear();
+		planContinuationGenerations.clear();
+		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
 		renderRunningWidget();
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
-		shuttingDown = false;
 		latestCtx = ctx;
 		renderRunningWidget();
 	});
@@ -2031,11 +2131,13 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.add(batchId);
 		sendReport(batch);
 		batches.delete(batchId);
+		batchModes.delete(batchId);
 		for (const result of batch.results) {
 			reportAdmissions.delete(result.identity.runId);
 			reportSettledAt.delete(result.identity.runId);
 		}
 		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
+		runs?.compactBatch(batchId);
 	};
 	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "target_unavailable", "target_changed", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
 	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
@@ -2088,7 +2190,7 @@ export default function (pi: ExtensionAPI) {
 		} finally { db.close(); }
 	};
 	const settleResult = async (result: ResultEnvelope, report: boolean) => {
-		if (!runs || settlingRuns.has(result.identity.runId)) return;
+		if (!runs || runs.children.get(result.identity.runId)?.result || settlingRuns.has(result.identity.runId)) return;
 		settlingRuns.add(result.identity.runId);
 		try {
 		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash !== result.identity.taskHash) {
@@ -2109,7 +2211,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
-			if (!runs.isCurrentScout(result.identity)) {
+			if (!runs.isCurrentScout(result.identity) || stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID ?? "") || result.processOutcome === "cancelled") {
 				persistScoutBlock(result, "artifact_invalid");
 			} else if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
@@ -2163,18 +2265,70 @@ export default function (pi: ExtensionAPI) {
 		} finally { settlingRuns.delete(result.identity.runId); }
 	};
 
+	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId) => {
+		if (!runs) return cancellationResult(runId, "unknown", "unknown", false);
+		if (runs.children.has(runId) && !runs.owns(runId, ownerRunId, ownerSessionId)) return cancellationResult(runId, "ordinary", "not_owned", false, "ordinary run belongs to another owner");
+		const request = runs.requestCancel(runId, initiator);
+		if (request.result.targetKind === "unknown") return request.result;
+		if (request.first) {
+			const diagnostic = diagnostics.get(runId);
+			if (diagnostic) {
+				diagnostic.metadata.cancellationInitiator = initiator;
+				diagnostic.save(false);
+			}
+		}
+		const identity = runs.children.get(runId)?.identity;
+		const claimed = identity ? runs.claimed(identity) : undefined;
+		if (identity && claimed && request.first) {
+			runs.completeCleanup(identity);
+			void settleResult(claimed, batchModes.get(identity.batchId) !== "chain").then(() => settleBatch(identity.batchId));
+		}
+		if (request.shouldSignal) {
+			const owned = ordinaryProcesses.get(runId);
+			const attached = identity ? runs.process(identity) : undefined;
+			const verified = !!owned && !!attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !runs.claimed(owned.identity) && !owned.termSent;
+			if (!verified) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			let sent = false;
+			try { sent = owned.process.kill("SIGTERM"); } catch {}
+			if (!sent) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			owned.termSent = true;
+			owned.killTimer = setTimeout(() => {
+				const current = ordinaryProcesses.get(runId);
+				if (current !== owned || current.closed || current.killSent || runs?.claimed(current.identity)) return;
+				if (processStarttime(current.pid) !== current.starttime || current.process.pid !== current.pid) {
+					runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+					return;
+				}
+				let killed = false;
+				try { killed = current.process.kill("SIGKILL"); } catch {}
+				if (killed) current.killSent = true;
+				else runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			}, 5000);
+			owned.killTimer.unref();
+		}
+		return request.waitForCleanup ? await request.completion : request.result;
+	};
+
 	pi.registerTool({
 		name: "plan_finish",
 		label: "Plan finish",
 		description: "Finish the owned plan run as blocked or cancelled.",
 		parameters: Type.Object({ outcome: StringEnum(["blocked", "cancelled"] as const), reason: Type.String() }),
-		async execute(_id, params): Promise<any> {
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
 			if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_PLAN_RUN_ID) return { content: [{ type: "text", text: "plan_finish is available only to an owned plan worker" }], isError: true };
+			const planRunId = process.env.YOKEMATE_PLAN_RUN_ID;
+			stoppedPlanRuns.add(planRunId);
+			const sessionId = ctx.sessionManager.getSessionId();
+			const cancellations = Promise.all((runs?.active() ?? []).map((child) => requestOrdinaryCancellation(child.identity.runId, "plan_finish", planRunId, sessionId)));
 			try {
-				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
+				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: planRunId, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan finish refused");
-				return { content: [{ type: "text", text: `${params.outcome} recorded` }] };
-			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+				const physical = await cancellations;
+				return { content: [{ type: "text", text: `${params.outcome} recorded; ${JSON.stringify(physical)}` }], details: { planRunId, cancellations: physical } };
+			} catch (error) {
+				const physical = await cancellations;
+				return { content: [{ type: "text", text: `${(error as Error).message}; ${JSON.stringify(physical)}` }], details: { planRunId, cancellations: physical }, isError: true };
+			}
 		},
 	});
 
@@ -2243,26 +2397,62 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Delegate tasks to specialized subagents with isolated context, or cancel one exact owned run UUID.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder), cancel (cancelRun only).",
 			`Agents come from the nearest ${CONFIG_DIR_NAME}/agents — the yokemate root in the main chat, work/<TICKET>/${CONFIG_DIR_NAME}/agents in the task tab.`,
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
+			const admittedGeneration = sessionGeneration;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
+			if (!params.cancelRun && shuttingDown) return { content: [{ type: "text", text: "parent session is shutting down; only cancellation remains available" }], isError: true };
+			if (!params.cancelRun && process.env.YOKEMATE_PLAN_RUN_ID && stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID)) return { content: [{ type: "text", text: "plan run is stopped; only cancellation and conversation remain available" }], isError: true };
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
+			const currentSessionId = ctx.sessionManager?.getSessionId?.();
+			const sessionId = currentSessionId ?? `unavailable:${process.pid}`;
 			if (params.cancelRun) {
+				if (!currentSessionId) return { content: [{ type: "text", text: "cancellation requires the current session identity" }], isError: true };
+				const mixed = [params.coordinator, params.agent, params.task, params.ticket, params.tasks, params.chain, params.review, params.cwd].some((value) => value !== undefined);
+				if (mixed) return { content: [{ type: "text", text: "cancelRun cannot be combined with launch parameters" }], isError: true };
+				if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(params.cancelRun)) return { content: [{ type: "text", text: "cancelRun must be an exact UUID" }], isError: true };
+				const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
+				const resultResponse = (result: CancellationResult, text = JSON.stringify(result)) => ({ content: [{ type: "text" as const, text }], details: result, ...(["unknown", "not_owned"].includes(result.status) ? { isError: true } : {}) });
 				try {
-					if (coordinators.get(params.cancelRun)) {
-						const cancelled = listRuns.cancel(params.cancelRun);
-						const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run", cancelled);
-						return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] };
+					if (runs?.children.has(params.cancelRun)) return resultResponse(await requestOrdinaryCancellation(params.cancelRun, "tool_cancel", ownerRunId, sessionId));
+					const coordinator = coordinators.get(params.cancelRun);
+					if (coordinator) {
+						if (coordinator.identity.parentSessionId !== sessionId) return resultResponse(cancellationResult(params.cancelRun, "coordinator", "not_owned", false, "coordinator run belongs to another owner"));
+						if (["done", "blocked"].includes(coordinator.state)) return resultResponse(cancellationResult(params.cancelRun, "coordinator", "already_terminal", true), `${params.cancelRun} cancelled`);
+						const logical = listRuns.cancel(params.cancelRun);
+						await cancelCoordinator(params.cancelRun, "parent_cancel_run", logical);
+						return resultResponse(cancellationResult(params.cancelRun, "coordinator", "cancelled", true), `${params.cancelRun} cancelled`);
 					}
-					if (listRuns.cancel(params.cancelRun)) return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
-					throw new Error(`unknown coordinator run ${params.cancelRun}`);
+					const list = listRuns.get(params.cancelRun);
+					if (list) {
+						const owned = "run" in list ? list.run.identity.parentSessionId === sessionId : list.identity.parentSessionId === sessionId;
+						if (!owned) return resultResponse(cancellationResult(params.cancelRun, "list", "not_owned", false, "list run belongs to another owner"));
+						const entries = "run" in list ? [list.entry] : list.entries;
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
+						if (!recording.length && entries.every((entry) => ["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state))) return resultResponse(cancellationResult(params.cancelRun, "list", "already_terminal", true));
+						for (const entry of entries) {
+							if (recording.some((candidate) => candidate.keyRunId === entry.keyRunId)) { listRuns.cancel(entry.keyRunId); continue; }
+							const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
+							listRuns.cancel(entry.keyRunId);
+							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
+							if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
+						}
+						const outcome = cancellationResult(params.cancelRun, "list", recording.length ? "cancellation_requested" : "cancelled", recording.length === 0);
+						return resultResponse(outcome, recording.length ? JSON.stringify(outcome) : `${params.cancelRun} cancelled`);
+					}
+					if (process.env.YOKEMATE_MODE) {
+						const parent = resolveCoordinatorParent(root);
+						const reply = await requestCoordinatorCancel(root, params.cancelRun, currentControlOrigin(root, sessionId), parent);
+						if (reply.state === "accepted" && reply.cancellation) return resultResponse(reply.cancellation, reply.cancellation.status === "cancelled" ? `${params.cancelRun} cancelled` : JSON.stringify(reply.cancellation));
+						if (reply.state === "refused") return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false, reply.reason ?? "parent cancellation refused"));
+					}
+					return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false));
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (ownedBinding) {
@@ -2362,23 +2552,35 @@ export default function (pi: ExtensionAPI) {
 			};
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
-				let completeChild: (() => void) | undefined;
-				let envelope: ResultEnvelope;
+				let envelope: ResultEnvelope | undefined;
 				let output = "";
+				let cleanupError: string | undefined;
+				let cleanupPath: string | undefined;
 				try {
-					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
+					runs!.resolveTask(identity, task);
+					if (shuttingDown) {
+						envelope = runs!.claimNoSpawn(identity);
+						if (!envelope) throw new Error("subagent run cannot be fenced during shutdown");
+						return { envelope, output };
+					}
+					if (!runs!.start(identity)) {
+						envelope = runs!.claimed(identity) ?? runs!.claimNoSpawn(identity);
+						if (!envelope) throw new Error("subagent run cannot start");
+						return { envelope, output };
+					}
 					assertPlanWriterAdmission(identity);
 					task = await admitPlanWriter(identity, diagnostics.get(identity.runId)?.metadata.requestedTask as string ?? task, task, true);
-					runs!.start(identity);
+					runs!.resolveTask(identity, task);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
 						child = proc;
-						childCompletions.set(proc, new Promise<void>((resolve) => { completeChild = resolve; }));
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
-					}, identity, diagnostics.get(identity.runId)!);
+					}, identity, runs!, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
-					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+					cleanupError = result.cleanupError;
+					cleanupPath = result.cleanupPath;
+					envelope = result.envelope ?? runs!.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
 					const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
@@ -2387,16 +2589,26 @@ export default function (pi: ExtensionAPI) {
 					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes, retainedHash, truncated: originalPayload === undefined ? false : originalPayload.bytes !== retainedBytes || originalPayload.hash !== retainedHash, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
+					if (error instanceof PromptCleanupFailure) {
+						cleanupError = "temporary prompt cleanup could not be verified";
+						cleanupPath = error.dir;
+					}
 					const diagnostic = diagnostics.get(identity.runId);
-					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
-					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
+					if (diagnostic) {
+						diagnostic.metadata.spawnError = errorMetadata(error);
+						if (error instanceof PromptCleanupFailure) diagnostic.metadata.cleanupError = { reason: cleanupError, path: error.dir, writeFailure: error.writeFailure, cleanupFailure: error.cleanupFailure };
+						diagnostic.save(true);
+					}
+					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
+					if (!envelope) throw error;
 				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
-					if (child) childCompletions.delete(child);
-					completeChild?.();
+					ordinaryProcesses.delete(identity.runId);
+					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupPath ? `${cleanupError}: ${cleanupPath}` : cleanupError);
+					else runs!.completeCleanup(identity);
 				}
-				return { envelope, output };
+				return { envelope: envelope!, output };
 			};
 			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
 				tasks = await Promise.all(tasks.map(async (task) => {
@@ -2410,11 +2622,13 @@ export default function (pi: ExtensionAPI) {
 					if (input.state !== "accepted" || !input.acceptanceId) throw new Error(input.reason ?? "plan writer accepted input is unavailable");
 					return { ...task, ticket, acceptedInputId: input.acceptanceId };
 				}));
+				if (shuttingDown || sessionGeneration !== admittedGeneration) throw new Error("parent session changed before subagent admission");
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission);
 				for (const [index, child] of ack.children.entries()) await admitPlanWriter(child.identity, tasks[index]!.task, tasks[index]!.task, false);
+				if (mode === "chain") for (const child of ack.children.slice(1)) runs!.defer(child.identity);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
@@ -2436,6 +2650,10 @@ export default function (pi: ExtensionAPI) {
 					: Promise.resolve([]);
 				activeUnits += units;
 				batches.add(toolCallId);
+				batchModes.set(toolCallId, mode);
+				let resolveCompletion!: () => void;
+				const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+				batchCompletions.set(toolCallId, { promise: completion, resolve: resolveCompletion });
 				emitChildState();
 				const execute = async () => {
 					try {
@@ -2452,7 +2670,14 @@ export default function (pi: ExtensionAPI) {
 							for (let i = 0; i < tasks.length; i++) {
 								const identity = ack.children[i]!.identity;
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
-								const { envelope: result, output } = failed ? { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output: "" } : await runDetachedAgent(mode, identity, task, i + 1);
+								let terminal: { envelope: ResultEnvelope; output: string };
+								if (failed) {
+									runs!.resolveTask(identity, task);
+									const envelope = runs!.claimNoSpawn(identity)!;
+									runs!.completeCleanup(identity);
+									terminal = { envelope, output: "" };
+								} else terminal = await runDetachedAgent(mode, identity, task, i + 1);
+								const { envelope: result, output } = terminal;
 								await settleResult(result, false);
 								failed ||= failedEnvelope(result);
 								previous = output;
@@ -2465,7 +2690,11 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 						settleBatch(toolCallId);
-					} finally { activeUnits -= units; }
+					} finally {
+						activeUnits -= units;
+						batchCompletions.get(toolCallId)?.resolve();
+						batchCompletions.delete(toolCallId);
+					}
 				};
 				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
 				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack, display: { version: 1, members: ack.children.map(({ identity }) => ({ taskExcerpt: reportAdmissions.get(identity.runId)?.taskExcerpt ?? "" })) } } };
@@ -2528,6 +2757,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			if (args.cancelRun) return new Text(theme.fg("toolTitle", theme.bold("subagent cancel ")) + theme.fg("accent", args.cancelRun), 0, 0);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +

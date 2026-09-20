@@ -234,7 +234,7 @@ const cases = [
   ["read_heavy_24", "valid"], ["read_heavy_32", "valid"], ["read_heavy_parallel", "valid"],
   ["parallel_max", "valid"], ["chain_max", "valid"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
-  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
+  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["public_cancel", "incomplete"], ["public_cancel_parallel", "valid"], ["public_cancel_chain", "valid"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
 
 async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1], signal: AbortSignal): Promise<void> {
@@ -246,6 +246,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const runtimeExtension = join(sandbox, ".pi/extensions/subagent/index.ts");
   mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
   mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
+  mkdirSync(join(sandbox, ".pi/extensions"), { recursive: true });
   mkdirSync(join(sandbox, "tmp"), { recursive: true });
   mkdirSync(relayFacts, { recursive: true });
   mkdirSync(folder, { recursive: true });
@@ -259,6 +260,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   }
   mkdirSync(join(sandbox, "test/fixtures"), { recursive: true });
   cpSync(join(root, "test/fixtures/subagent-json-relay.mjs"), join(sandbox, "test/fixtures/subagent-json-relay.mjs"));
+  symlinkSync(join(root, ".pi/skills"), join(sandbox, ".pi/skills"));
   symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
   symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
   writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
@@ -278,18 +280,24 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   }
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
+  const observedPhases: string[] = [];
+  let cancellationReleased = false;
   let working!: () => void;
   const childWorking = new Promise<void>((resolve) => { working = resolve; });
   const server = createServer((socket) => {
     sockets.add(socket);
+    socket.on("error", () => undefined);
     socket.once("close", () => sockets.delete(socket));
     let buffer = "";
     socket.on("data", (chunk) => {
       buffer += chunk.toString();
       if (!buffer.includes("\n")) return;
       const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      observedPhases.push(event.phase);
       if (event.phase === "loaded") loaded.push(event);
       if (scenario === "parent_cancel" && event.phase === "child-working") working();
+      else if (scenario.startsWith("public_cancel") && event.phase === "child-working" && !cancellationReleased) return;
+      else if (scenario.startsWith("public_cancel") && event.phase === "public-cancel-result") { cancellationReleased = true; for (const candidate of sockets) candidate.end("release\n"); }
       else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
       else socket.end("release\n");
     });
@@ -320,7 +328,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
           if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
-      { invocation: { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
+      { invocation: { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(sandbox, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
     await untilAborted(rpc.ready, signal);
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
@@ -356,7 +364,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       return;
     }
     const deliveryTimeout = scenario === "chain_max" || scenario.includes("read_heavy") ? 45000 : 10000;
-    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), deliveryTimeout); })]), signal);
+    await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed; phases=${observedPhases.join(",")}`)), deliveryTimeout); })]), signal);
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
@@ -411,8 +419,24 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
+    if (scenario.startsWith("public_cancel")) {
+      const cancelled = results.filter((result: any) => result.processOutcome === "cancelled");
+      assert.equal(cancelled.length, 1);
+      assert.equal(cancelled[0].cancellationInitiator, "tool_cancel");
+      if (scenario === "public_cancel_parallel") {
+        assert.equal(results.length, 8);
+        assert.ok(results.slice(0, -1).every((result: any) => result.processOutcome === "exited"));
+      }
+      if (scenario === "public_cancel_chain") {
+        assert.equal(results.length, 3);
+        assert.equal(results[1].processOutcome, "cancelled");
+        assert.equal(results[2].processOutcome, "not_started");
+      }
+      assert.ok(observedPhases.includes("public-cancel-result"));
+      assert.ok(rpc.events.some((event) => event.type === "tool_execution_start" && event.toolName === "subagent" && (event.args as any)?.cancelRun));
+    }
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
-    if (scenario === "spawn_error") assert.equal(results[0].processOutcome, "spawn_error");
+    if (["spawn_error", "write_cleanup_error"].includes(scenario)) assert.equal(results[0].processOutcome, "spawn_error");
     if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
@@ -459,7 +483,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
       const ownedSnapshots = snapshots.filter((snapshot) => snapshot.ownerRunId === `owner-${scenario.replaceAll("_", "-")}`);
       assert.doesNotMatch(JSON.stringify(ownedSnapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-      if (!["diagnostic_error", "spawn_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
+      if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario) && !scenario.startsWith("public_cancel") && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
         const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
         assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
         assert.equal(childSnapshot.resources.guard.path, join(sandbox, "src/guards.ts"));
