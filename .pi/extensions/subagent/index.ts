@@ -1104,7 +1104,7 @@ export default function (pi: ExtensionAPI) {
 		const workflowCapture = request.mode === "do" && !lane ? captureWorkflowGeneration() : undefined;
 		if (request.mode === "do" && !lane) await awaitWorkflowGeneration(workflowCapture, ctx, workflowConsumerFacts("do", metadata, request.tickets[0]));
 		if (workflowCapture) assertWorkflowCapture(workflowCapture);
-		settings = readRuntimeSettings(ENGINE_ROOT);
+		settings = lane?.context.settings ?? readRuntimeSettings(ENGINE_ROOT);
 		checks = coordinatorChecks(settings);
 		const currentRefusal = checks.checkCaller(origin, request);
 		if (currentRefusal) throw new Error(currentRefusal);
@@ -1179,7 +1179,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
-			if (request.mode === "do") markDoRunning(root, prepared, origin);
+			if (request.mode === "do") markDoRunning(root, prepared, origin, settings);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (rpc && !terminalReported) {
 					try {
