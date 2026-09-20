@@ -105,6 +105,7 @@ let cancelledRunId: string | undefined;
           message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           childTurns++;
           if (scenario === "plan_scout" || scenario === "plan_scout_terminal" || scenario === "plan_scout_failed_send") message.content = [{ type: "text", text: `# Scout\n\n## Facts and sources\n${"evidence line\n".repeat(5000)}EVIDENCE-TAIL${scenario === "plan_scout_failed_send" ? "-FAILED-SEND" : ""}${process.env.WORKFLOW_SCOUT_REVISION ?? ""}\n\n## Assumptions\n- Fixture assumption.\n\n## Forks and recommendations\n- Fixture recommendation.\n` }];
+          if (scenario === "plan_writer") message.content = [{ type: "text", text: readFileSync(process.env.YM204_FIXTURE_READ_FILE!, "utf8") }];
           if (scenario === "plan_scout_secret") message.content = [{ type: "text", text: `# Scout\n${"evidence line\n".repeat(5000)}\nconst token = "literal-secret-value"` }];
           if (scenario === "parallel_max" || scenario === "chain_max") message.content = [{ type: "text", text: JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: '"'.repeat(24000), fix: "fixture" }] }) }];
           if (scenario === "chain_long") message.content = [{ type: "text", text: text.includes("step-1") ? "x".repeat(60 * 1024) + "UNTRUNCATED-TAIL" : text.includes("UNTRUNCATED-TAIL") ? "tail received" : "tail missing" }];

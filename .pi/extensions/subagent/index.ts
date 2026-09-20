@@ -2399,7 +2399,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash !== result.identity.taskHash) {
 			try {
-				const draft = readCandidatePlanSnapshot(ENGINE_ROOT, result.identity.ticket, result.payload.trim());
+				const target = /^(?:\[k7x2\] )?(\/[^\s\x00-\x1f\x7f`"<>]+)$/.exec(result.payload.trim());
+				if (!target) throw new Error("writer result must contain one absolute path with only the optional [k7x2] prefix");
+				const draft = readCandidatePlanSnapshot(ENGINE_ROOT, result.identity.ticket, target[1]!);
 				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 				try {
 					const dispatch = state.prepare("SELECT planning_identity FROM workflow_writer_dispatch WHERE writer_run_id=? AND accepted_input_id=? AND actual_task_hash=?").get(result.identity.runId, String(result.identity.acceptedInputId), result.actualTaskHash) as { planning_identity?: string } | undefined;
