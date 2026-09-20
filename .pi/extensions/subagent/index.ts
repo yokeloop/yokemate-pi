@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
-import { appendIncidentEvent, appendRecoveryAttempt, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
+import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -65,6 +65,7 @@ import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
 import { installWorkflowIngress, WorkflowIngressWitnessStore, type WorkflowIngressWitness } from "../../../src/workflow-ingress.ts";
 import { BreakGlassPermitStore, parseBreakGlass, previewScoutAcceptance, resolveScoutAcceptance, type BreakGlassPreview, type PlanSnapshotIdentity } from "../../../src/workflow-break-glass.ts";
+import { assertMandatoryBoundary } from "../../../src/workflow-boundaries.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -560,6 +561,7 @@ async function runSingleAgent(
 					const registration = await requestPlanControl(ENGINE_ROOT, "register-scout-candidate", { ticket: identity.ticket, runId: planningIdentity, candidateId, failureHash: captured.candidate.failedEnvelopeHash, generation }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), parent);
 					if (registration.state !== "accepted") throw new Error(registration.reason ?? "candidate lineage registration refused");
 					scoutCandidateIds.set(identity.runId, candidateId);
+					currentResult.envelope.recovery = { sourceTransport: "failed", state: "candidate", candidateId, failureHash: captured.candidate.failedEnvelopeHash, payloadHash: captured.candidate.contentHash, bytes: captured.candidate.bytes };
 					diagnostic.metadata.scoutCandidate = { id: candidateId, hash: captured.candidate.contentHash, bytes: captured.candidate.bytes, failureHash: captured.candidate.failedEnvelopeHash };
 				} else diagnostic.metadata.scoutCandidate = { refusal: captured.reason };
 			} catch (error) { diagnostic.metadata.scoutCandidate = { refusal: "audit-unavailable", error: errorMetadata(error) }; }
@@ -915,7 +917,15 @@ export default function (pi: ExtensionAPI) {
 		if (!previews.length || !controlIdentity) return;
 		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		try {
-			for (const preview of previews) appendRecoveryAttempt(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputGeneration: preview.inputGeneration, inputHash: preview.inputHash, scopeHash: preview.scopeHash, targetHash: preview.targetHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, payloadHash: preview.candidateHash, failureHash: preview.failureHash, reason: preview.reason, outcome });
+			db.exec("BEGIN IMMEDIATE");
+			for (const preview of previews) {
+				appendRecoveryAttempt(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputGeneration: preview.inputGeneration, inputHash: preview.inputHash, scopeHash: preview.scopeHash, targetHash: preview.targetHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, payloadHash: preview.candidateHash, failureHash: preview.failureHash, reason: preview.reason, outcome });
+				appendRecoveryDecision(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputHash: preview.inputHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, code: `${outcome}-permit`, blockers: [`${outcome}-permit`], reason: preview.reason, outcome });
+			}
+			db.exec("COMMIT");
+		} catch (error) {
+			try { db.exec("ROLLBACK"); } catch {}
+			throw error;
 		} finally { db.close(); }
 	};
 	let uiTail: Promise<void> = Promise.resolve();
@@ -1039,7 +1049,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (text.startsWith("/")) return;
 			extractingWorkflow = true;
-			if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("workflow extraction requires a configured model and external authentication");
+			const extractionModel = ctx.model;
+			assertMandatoryBoundary("workflow.external-auth", !!extractionModel && ctx.modelRegistry.hasConfiguredAuth(extractionModel), "workflow extraction requires a configured model and external authentication");
 			const bindings: PlanBinding[] = [];
 			if (fs.existsSync(path.join(ENGINE_ROOT, "yokemate.db"))) {
 				const db = new DatabaseSync(path.join(ENGINE_ROOT, "yokemate.db"), { readOnly: true });
@@ -1053,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
 			let timer: NodeJS.Timeout | undefined;
 			try {
 				const message = await Promise.race([
-					ctx.modelRegistry.complete(ctx.model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, bindings }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 1024 }),
+					ctx.modelRegistry.complete(extractionModel!, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, bindings }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 1024 }),
 					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("workflow extraction timed out")); }, 15000); }),
 				]);
 				authority.assertGeneration(generation);
@@ -1362,8 +1373,16 @@ export default function (pi: ExtensionAPI) {
 			let handoff: "plan-only" | "started" | "refused" = "plan-only";
 			const provenanceDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 			let recovered = false;
-			try { recovered = planRecordById(provenanceDb, recordId)?.source_kind === "engineer-accepted-input"; }
-			finally { provenanceDb.close(); }
+			let recoveryStatus: Record<string, unknown> | undefined;
+			try {
+				const recorded = planRecordById(provenanceDb, recordId);
+				recovered = recorded?.source_kind === "engineer-accepted-input";
+				if (recovered && recorded) {
+					assertMandatoryBoundary("workflow.audit", Number.isSafeInteger(recorded.scout_acceptance), "recovered plan record has no accepted input");
+					const accepted = publicationAcceptanceById(provenanceDb, recorded.scout_acceptance!);
+					recoveryStatus = { sourceTransport: "failed", recovery: "engineer-accepted-input", candidateId: recorded.candidate_id, incidentId: recorded.incident_id, acceptedInputId: recorded.scout_acceptance, localRecord: "planned", remotePublication: publications.map((outcome) => ({ kind: outcome.kind, state: outcome.state, target: outcome.target, error: outcome.error })), sourceRunId: accepted?.source_run_id };
+				}
+			} finally { provenanceDb.close(); }
 			if (recovered) authority!.revoke(ticket);
 			if (!recovered && (!planRunId || !cancelledRecordingPlans.has(planRunId))) {
 				const advance = authority!.record(binding, settings.policy.workflowApproval);
@@ -1384,7 +1403,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} else if (recovered) reason = "engineer-accepted-input recorded plan-only; a fresh /do approval is required";
 			else reason = "plan recorded after cancellation; automatic do handoff revoked";
-			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
+			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, ...(recoveryStatus ? { recovery: recoveryStatus } : {}), handoff: { state: handoff, runId, reason } };
 			if (planRunId && found && "run" in found) {
 				const settled = recovery ? listRuns.settleRecovery(planRunId, { outcome: "recorded", facts }) : listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts });
 				if (!settled) throw new Error("plan run lost its terminal claim");
@@ -1506,7 +1525,9 @@ export default function (pi: ExtensionAPI) {
 							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
 							cancelled = true;
 						} else {
+							const cancellingRecovery = listRuns.recovery(entry.keyRunId)?.state === "active";
 							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
+							if (cancellingRecovery && typeof entry.immediate?.facts?.agentName === "string") await herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
 							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
 						}
 					}
@@ -1539,12 +1560,14 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			let state: DatabaseSync | undefined;
 			let preview: BreakGlassPreview | undefined;
+			let decision: { candidateId: string; ticket: string; reason: string; inputHash: string } | undefined;
 			try {
 				const sessionId = ctx.sessionManager.getSessionId();
 				if (ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE || !controlIdentity || controlIdentity.sessionId !== sessionId || !ingressWitness) throw new Error("break-glass requires a fresh typed submit in verified MAIN TUI");
 				const raw = `/break-glass${args ? ` ${args}` : ""}`;
 				if (ingressWitness.raw !== raw || ingressWitness.runtimeId !== controlIdentity.runtimeId) throw new Error("break-glass requires the current exact typed submit");
 				const command = parseBreakGlass(raw);
+				decision = { candidateId: command.candidateId, ticket: command.ticket, reason: command.reason, inputHash: ingressWitness.hash };
 				state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 				const candidate = state.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
 				if (!candidate || candidate.ticket !== command.ticket) throw new Error("unknown recovery candidate");
@@ -1592,10 +1615,22 @@ export default function (pi: ExtensionAPI) {
 				ingressWitness = undefined;
 				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId}; accepted-input ${accepted.acceptance.id}; source-run ${candidate.run_id}; failure failed-transport-envelope ${candidate.failed_envelope_hash}; status accepted as ${accepted.planningIdentity}; result remains plan-only`, "warning");
 			} catch (error) {
-				const outcome = /expired/i.test((error as Error).message) ? "expiry" : "refusal";
-				try { auditRecoveryPreviews(breakGlassPermits.revoke(), outcome); }
-				catch (auditError) { ctx.ui.notify(`break-glass audit failed: ${(auditError as Error).message}`, "error"); }
-				ctx.ui.notify(`break-glass refused: ${(error as Error).message}`, "error");
+				const message = (error as Error).message;
+				const outcome = /expired/i.test(message) ? "expiry" : "refusal";
+				try {
+					auditRecoveryPreviews(breakGlassPermits.revoke(), outcome);
+					if (decision && controlIdentity) {
+						const audit = state ?? openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						const code = /unknown recovery candidate|candidate.*(?:changed|stale)/i.test(message) ? "candidate-unavailable"
+							: /lineage|live/i.test(message) ? "lineage-unavailable"
+							: /target|plan|scope|binding/i.test(message) ? "snapshot-invalid"
+							: /declined/i.test(message) ? "engineer-declined"
+							: outcome === "expiry" ? "permit-expired" : "recovery-refused";
+						appendRecoveryDecision(audit, { ...decision, action: "accept-plan-scout-input", sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, code, blockers: [code], outcome, reason: decision.reason });
+						if (!state) audit.close();
+					}
+				} catch (auditError) { ctx.ui.notify(`break-glass audit failed: ${(auditError as Error).message}`, "error"); }
+				ctx.ui.notify(`break-glass refused: ${message}`, "error");
 			} finally { state?.close(); }
 		},
 	});
@@ -1994,7 +2029,7 @@ export default function (pi: ExtensionAPI) {
 				if (identity.agent !== "plan-writer") return expandedTask;
 				if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_PLAN_RUN_ID || !identity.ticket || !identity.acceptedInputId) throw new Error("plan-writer requires its owned live plan worker");
 				if (!identity.writerRevisionOf && requestedTask.includes("{previous}")) throw new Error("initial plan-writer input cannot come from {previous}");
-				if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("plan-writer requires configured external authentication");
+				assertMandatoryBoundary("workflow.external-auth", !!ctx.model && ctx.modelRegistry.hasConfiguredAuth(ctx.model), "plan-writer requires configured external authentication");
 				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 				try {
 					const accepted = publicationAcceptanceById(state, identity.acceptedInputId);

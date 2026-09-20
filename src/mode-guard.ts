@@ -40,7 +40,10 @@ export interface ModeEnv {
  */
 export function decide(env: ModeEnv, mode: Mode, ticket?: string, settings: RuntimeSettings = readRuntimeSettings()): Decision {
   const ticketParts = ticket ? ticket.split(mode === "plan" ? " " : mode === "do" || mode === "ship" ? "+" : "\0") : [];
-  assertMandatoryBoundary("workflow.target-identity", MODES.includes(mode) && ticketParts.every((part) => /^[A-Z][A-Z0-9]*-\d+$/.test(part)), "invalid mode target identity");
+  const validTarget = mode === "worklog"
+    ? ticketParts.every((part) => /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(part))
+    : ticketParts.every((part) => /^[A-Z][A-Z0-9]*-\d+$/.test(part));
+  assertMandatoryBoundary("workflow.target-identity", MODES.includes(mode) && validTarget, "invalid mode target identity");
   const { policy } = settings;
   const here = env.YOKEMATE_MODE;
   if (!here) return { kind: "launch" };

@@ -193,10 +193,10 @@ export function judge(
   own?: { root: string; dataRoot: string; ticket?: string; home?: string },
   settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
-  assertMandatoryBoundary("workflow.assigned-scope", !!toolName, "guard call has no tool identity");
+  const paneled = mode !== undefined && mode !== "";
+  assertMandatoryBoundary("workflow.assigned-scope", !!toolName && (!paneled || !!own?.root && !!own.dataRoot), "guard call has no owned scope");
   const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
-  const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
 
   if (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit") {

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
 import { commitExact, gitMutationLockPath, pushWithRetryAsync, type ExactSyncResult } from "./git-sync.ts";
@@ -14,6 +14,7 @@ import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicati
 import { appendIncidentEvent, incidentById, writerDraftFor } from "./workflow-incident-state.ts";
 import { resolvePublicationTarget } from "./plan-publication-target.ts";
 import { sha256 } from "./subagent-runs.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
 export interface RecordPlanOptions { expectedBinding: PlanBinding; recordId: number; signal?: AbortSignal; onLocked?(): void }
@@ -65,7 +66,10 @@ export function recordPlanCore(root: string, ticket: string, expectedBinding: Pl
   let sideEffects = false;
   try {
     out = applyMove(db, "plan", env, ticket, () => {
-      if (incident) appendIncidentEvent(db, incident, { kind: "effect-start", code: "record-plan", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "started" });
+      if (incident) {
+        assertMandatoryBoundary("workflow.audit", !!scout.continuation_id && !!record.writer_run_id, "recovered record audit lineage is incomplete");
+        appendIncidentEvent(db, incident, { kind: "effect-start", code: "record-plan", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "started" });
+      }
       db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
       markSuccessfulRecord(db, record.id);
       if (incident) appendIncidentEvent(db, incident, { kind: "outcome", code: "local-record", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "planned" });
@@ -76,6 +80,7 @@ export function recordPlanCore(root: string, ticket: string, expectedBinding: Pl
   const logged = sideEffects ? logMoveDetailed(data, ticket, "запланировано", `план ${basename(plan, ".md")}`) : null;
   const targets = [dataRelative, ...(logged ? [relative(data, logged.path)] : [])];
   const localSync = sideEffects ? commitExact(data, `${ticket} план`, targets) : { state: "unchanged" as const };
+  assertMandatoryBoundary("workflow.truthful-outcome", existsSync(plan), "local plan record outcome cannot be verified");
   return { ticket, plan, repeat: !sideEffects, recorded: true, journal: logged?.path, localSync };
 }
 

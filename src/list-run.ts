@@ -21,7 +21,7 @@ export interface ListAdmission {
   rejectDuplicate?: boolean;
 }
 export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
-export interface RecoveryRun { readonly keyRunId: string; readonly generation: number; readonly recoveryRunId: string; state: "active" | "recorded"; terminal?: ListTerminal }
+export interface RecoveryRun { readonly keyRunId: string; readonly generation: number; readonly recoveryRunId: string; state: "active" | "recorded" | "cancelled"; terminal?: ListTerminal }
 
 type Listener = (run: ListRun, entry: KeyRunEntry) => void;
 
@@ -160,11 +160,22 @@ export class ListRunRegistry {
     const list = this.lists.get(id);
     if (list) {
       let changed = false;
-      for (const entry of list.entries) changed = this.cancelEntry(list, entry, reason) || changed;
+      for (const entry of list.entries) {
+        changed = this.cancelEntry(list, entry, reason) || changed;
+        changed = this.cancelRecovery(entry.keyRunId, reason) || changed;
+      }
       return changed;
     }
     const found = this.find(id);
-    return found ? this.cancelEntry(found.run, found.entry, reason) : false;
+    return found ? this.cancelEntry(found.run, found.entry, reason) || this.cancelRecovery(id, reason) : this.cancelRecovery(id, reason);
+  }
+
+  cancelRecovery(keyRunId: string, reason = "cancelled"): boolean {
+    const recovery = this.recoveries.get(keyRunId);
+    if (!recovery || recovery.state !== "active") return false;
+    recovery.state = "cancelled";
+    recovery.terminal = { outcome: "cancelled", reason };
+    return true;
   }
 
   get(id: string): ListRun | { run: ListRun; entry: KeyRunEntry } | undefined { return this.lists.get(id) ?? this.find(id); }

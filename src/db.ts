@@ -332,6 +332,22 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (owner_run_id,owner_session_id,batch_id,run_id,task_hash,failed_envelope_hash)
     );
 
+    CREATE TABLE IF NOT EXISTS workflow_recovery_decision (
+      id TEXT PRIMARY KEY,
+      candidate_id TEXT,
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      source_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      blockers_json TEXT,
+      reason TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS workflow_recovery_attempt (
       id TEXT PRIMARY KEY,
       candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
@@ -438,6 +454,16 @@ export function openDb(path: string): DatabaseSync {
       UNIQUE (accepted_input_id,planning_identity,writer_run_id)
     );
 
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_decision_no_update BEFORE UPDATE ON workflow_recovery_decision BEGIN SELECT RAISE(ABORT,'workflow recovery decisions are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_decision_no_delete BEFORE DELETE ON workflow_recovery_decision BEGIN SELECT RAISE(ABORT,'workflow recovery decisions are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS plan_scout_candidate_no_update BEFORE UPDATE ON plan_scout_candidate BEGIN SELECT RAISE(ABORT,'plan scout candidates are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS plan_scout_candidate_no_delete BEFORE DELETE ON plan_scout_candidate BEGIN SELECT RAISE(ABORT,'plan scout candidates are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_no_update BEFORE UPDATE ON workflow_incident BEGIN SELECT RAISE(ABORT,'workflow incidents are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_no_delete BEFORE DELETE ON workflow_incident BEGIN SELECT RAISE(ABORT,'workflow incidents are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_claim_no_update BEFORE UPDATE ON workflow_incident_claim BEGIN SELECT RAISE(ABORT,'workflow incident claims are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_claim_no_delete BEFORE DELETE ON workflow_incident_claim BEGIN SELECT RAISE(ABORT,'workflow incident claims are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_writer_dispatch_no_update BEFORE UPDATE ON workflow_writer_dispatch BEGIN SELECT RAISE(ABORT,'workflow writer dispatches are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_writer_dispatch_no_delete BEFORE DELETE ON workflow_writer_dispatch BEGIN SELECT RAISE(ABORT,'workflow writer dispatches are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_update BEFORE UPDATE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_delete BEFORE DELETE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_update BEFORE UPDATE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;

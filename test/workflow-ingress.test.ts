@@ -8,6 +8,12 @@ class FakeEditor implements EditorComponent {
   focused = false;
   wantsKeyRelease = true;
   mouseEvents = 0;
+  actionHandlers = new Map<any, () => void>();
+  onEscape?: () => void;
+  onCtrlD?: () => void;
+  onPasteImage?: () => void;
+  onExtensionShortcut?: (data: string) => boolean;
+  workingStatus: unknown;
   onSubmit?: (text: string) => void;
   onChange?: (text: string) => void;
   getText() { return this.text; }
@@ -26,6 +32,8 @@ class FakeEditor implements EditorComponent {
   handleMouse() { this.mouseEvents++; return undefined; }
   render() { return [this.text]; }
   invalidate() {}
+  onAction(action: any, handler: () => void) { this.actionHandlers.set(action, handler); }
+  setWorkingStatusIndicator(indicator: unknown) { this.workingStatus = indicator; }
 }
 
 test("delegating editor witnesses only an actual host submit and snapshots raw expanded text before trim and clear", () => {
@@ -41,6 +49,21 @@ test("delegating editor witnesses only an actual host submit and snapshots raw e
   assert.equal(wrapped.focused, true);
   assert.equal(wrapped.wantsKeyRelease, true);
   assert.equal(wrapped.handleMouse?.({} as never), undefined);
+  const custom = wrapped as any;
+  const escape = () => undefined;
+  custom.onEscape = escape;
+  custom.onCtrlD = escape;
+  custom.onPasteImage = escape;
+  custom.onExtensionShortcut = () => true;
+  custom.onAction("app.interrupt", escape);
+  custom.setWorkingStatusIndicator("working");
+  const delegate = (custom as { delegate: FakeEditor }).delegate;
+  assert.equal(delegate.onEscape, escape);
+  assert.equal(delegate.onCtrlD, escape);
+  assert.equal(delegate.onPasteImage, escape);
+  assert.equal(delegate.onExtensionShortcut?.("x"), true);
+  assert.equal(delegate.actionHandlers.get("app.interrupt"), escape);
+  assert.equal(delegate.workingStatus, "working");
   wrapped.setText("  exact raw  ");
   wrapped.handleInput("COMPLETE");
   assert.deepEqual(raw, []);

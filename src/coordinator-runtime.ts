@@ -1,6 +1,7 @@
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { randomUUID } from "node:crypto";
 import type { CoordinatorMode, CoordinatorOrigin, CoordinatorRequest, PreparedCoordinator } from "./coordinator-launch.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface RuntimeIdentity { runId: string; parentRunId?: string; listRunId?: string; keyRunId?: string; parentSessionId: string; mode: CoordinatorMode; ticket: string; project: string[]; role: "coordinator" | "executor"; cwd: string; model: string }
 export type RuntimeState = "preparing" | "starting" | "active" | "finishing" | "done" | "blocked";
@@ -53,11 +54,17 @@ export class CoordinatorRegistry {
 export class ShipPermitStore {
   private permit?: { tickets: string[]; parentSessionId: string; serial: number; used: boolean };
   private serial = 0;
-  observeInteractiveShip(tickets: string[], parentSessionId: string): void { this.permit = { tickets: [...tickets], parentSessionId, serial: ++this.serial, used: false }; }
+  observeInteractiveShip(tickets: string[], parentSessionId: string): void {
+    assertMandatoryBoundary("workflow.explicit-ship", tickets.length > 0 && tickets.every((ticket) => /^[A-Z][A-Z0-9]*-\d+$/.test(ticket)), "ship permit needs explicit ticket targets");
+    assertMandatoryBoundary("workflow.live-owner", !!parentSessionId, "ship permit needs a live parent session");
+    this.permit = { tickets: [...tickets], parentSessionId, serial: ++this.serial, used: false };
+  }
   invalidate(): void { this.permit = undefined; }
   consume(tickets: string[], parentSessionId: string): boolean {
     const permit = this.permit;
     if (!permit || permit.used || permit.parentSessionId !== parentSessionId || permit.tickets.join("\u0000") !== tickets.join("\u0000")) return false;
+    assertMandatoryBoundary("workflow.single-use", !permit.used, "ship permit is already consumed");
+    assertMandatoryBoundary("workflow.explicit-ship", true);
     permit.used = true;
     return true;
   }

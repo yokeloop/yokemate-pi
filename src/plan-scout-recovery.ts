@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertPublishable } from "./plan-publication.ts";
 import { writePublicationArtifact } from "./plan-publication-state.ts";
 import { sha256, type ChildIdentity, type ResultEnvelope, type ScoutCompletenessEvidence } from "./subagent-runs.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type ScoutCandidateRefusal =
   | "foreign-child"
@@ -95,6 +96,7 @@ export function evaluateScoutCompleteness(input: CaptureScoutCandidateInput): Sc
 export function captureScoutCandidate(input: CaptureScoutCandidateInput): ScoutCandidateResult {
   const refusal = evaluateScoutCompleteness(input);
   if (refusal) return { state: "refused", reason: refusal };
+  assertMandatoryBoundary("plan.scout.complete-bytes", input.evidence.agentSettled && input.evidence.queueKnown && input.evidence.queueEmpty, "scout completeness evidence is not terminal");
   const bytes = Buffer.from(input.finalText, "utf8");
   const contentHash = sha256(bytes);
   const artifactPath = writePublicationArtifact(input.root, input.identity.ticket!, "scout", contentHash, bytes);

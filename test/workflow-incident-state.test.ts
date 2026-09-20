@@ -7,7 +7,7 @@ import { openDb } from "../src/db.ts";
 import { captureScoutCandidate } from "../src/plan-scout-recovery.ts";
 import { acceptPlanRecord, acceptPublicationDelivery, acceptRecoveredPublication, acceptRecoveredScoutArtifact, acceptScoutArtifact, publicationAcceptanceById, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { ChildRuns, JsonlObservation, resultEnvelope, sha256 } from "../src/subagent-runs.ts";
-import { appendRecoveryAttempt, claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, recordWriterDraft, safeIncidentReason } from "../src/workflow-incident-state.ts";
+import { appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, consumeScoutIncident, persistScoutCandidate, readIncidentEvents, recordWriterDraft, safeIncidentReason } from "../src/workflow-incident-state.ts";
 
 function candidateFixture(root: string) {
   mkdirSync(join(root, ".pi"), { recursive: true });
@@ -65,12 +65,26 @@ test("candidate consumption, acceptance and audit commit atomically and survive 
     assert.equal(linked.publication_id, publication.id);
     assert.equal(publication.source_kind, "engineer-accepted-input");
     assert.deepEqual(readIncidentEvents(db, consumed.incident.id).map((event) => event.kind), ["grant", "consume"]);
-    assert.throws(() => consumeScoutIncident(db, incidentInput(row.id, row.content_hash), () => undefined), /UNIQUE/);
+    assert.throws(() => consumeScoutIncident(db, incidentInput(row.id, row.content_hash), () => undefined), /already consumed/);
+    db.exec("CREATE TRIGGER fail_dispatch_audit BEFORE INSERT ON workflow_incident_event WHEN NEW.kind='dispatch' BEGIN SELECT RAISE(ABORT,'injected audit failure'); END");
+    assert.throws(() => claimWriterDispatch(db, consumed.incident, { acceptedInputId: String(consumed.value.id), planningIdentity: consumed.incident.planning_identity, kind: "initial", writerRunId: "writer-failed", taskHash: sha256("writer failed task"), actualTaskHash: sha256("writer failed task") }), /injected audit failure/);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM workflow_writer_dispatch").get()?.n, 0);
+    db.exec("DROP TRIGGER fail_dispatch_audit");
     const writer = claimWriterDispatch(db, consumed.incident, { acceptedInputId: String(consumed.value.id), planningIdentity: consumed.incident.planning_identity, kind: "initial", writerRunId: "writer-run", taskHash: sha256("writer task"), actualTaskHash: sha256("writer task") });
     assert.ok(writer);
     assert.throws(() => claimWriterDispatch(db, consumed.incident, { acceptedInputId: String(consumed.value.id), planningIdentity: consumed.incident.planning_identity, kind: "initial", writerRunId: "writer-two", taskHash: sha256("writer task two"), actualTaskHash: sha256("writer task two") }), /UNIQUE/);
-    assert.throws(() => db.prepare("UPDATE workflow_incident_event SET code='changed'").run(), /append-only/);
-    assert.throws(() => db.prepare("DELETE FROM workflow_incident_event").run(), /append-only/);
+    for (const statement of [
+      "UPDATE plan_scout_candidate SET ticket='YM-2'",
+      "DELETE FROM plan_scout_candidate",
+      "UPDATE workflow_incident SET target_hash='changed'",
+      "DELETE FROM workflow_incident",
+      "UPDATE workflow_incident_claim SET action='changed'",
+      "DELETE FROM workflow_incident_claim",
+      "UPDATE workflow_writer_dispatch SET task_hash='changed'",
+      "DELETE FROM workflow_writer_dispatch",
+      "UPDATE workflow_incident_event SET code='changed'",
+      "DELETE FROM workflow_incident_event",
+    ]) assert.throws(() => db.prepare(statement).run(), /append-only/);
     db.close();
     db = openDb(path);
     const acceptance = publicationAcceptanceById(db, consumed.value.id)!;
@@ -111,7 +125,11 @@ test("refusal, revoke and expiry attempts are durable append-only audit facts", 
     const db = openDb(join(root, "yokemate.db"));
     const row = persistScoutCandidate(db, root, candidate);
     for (const outcome of ["refusal", "revoke", "expiry"] as const) appendRecoveryAttempt(db, { candidateId: row.id, ticket: row.ticket, action: "accept-plan-scout-input", inputGeneration: 1, inputHash: sha256("input"), scopeHash: sha256("scope"), targetHash: sha256("target"), sourceUid: process.getuid!(), sourceSessionId: "session", sourceRuntimeId: "runtime", payloadHash: row.content_hash, failureHash: row.failed_envelope_hash, reason: "Transport recovery decision.", outcome });
+    appendRecoveryDecision(db, { candidateId: "missing-candidate", ticket: "YM-1", action: "accept-plan-scout-input", inputHash: sha256("input"), sourceUid: process.getuid!(), sourceSessionId: "session", sourceRuntimeId: "runtime", code: "candidate-unavailable", blockers: ["candidate-unavailable"], reason: "Transport recovery decision.", outcome: "refusal" });
     assert.equal(db.prepare("SELECT count(*) AS n FROM workflow_recovery_attempt").get()?.n, 3);
+    assert.deepEqual({ ...db.prepare("SELECT code,blockers_json FROM workflow_recovery_decision").get() }, { code: "candidate-unavailable", blockers_json: '["candidate-unavailable"]' });
+    assert.throws(() => db.prepare("UPDATE workflow_recovery_decision SET code='changed'").run(), /append-only/);
+    assert.throws(() => db.prepare("DELETE FROM workflow_recovery_decision").run(), /append-only/);
     assert.throws(() => db.prepare("DELETE FROM workflow_recovery_attempt").run(), /append-only/);
     db.close();
   } finally { rmSync(root, { recursive: true, force: true }); }

@@ -164,7 +164,7 @@ export function buildReportDisplay(
     kind: envelope.kind,
     ...(starts.length && terminalAt !== undefined ? { durationMs: Math.max(0, terminalAt - Math.min(...starts)) } : {}),
     ...(envelope.kind === "result" && firstAdmission ? { taskExcerpt: firstAdmission.taskExcerpt, ordinal: firstAdmission.ordinal } : {}),
-    ...(envelope.kind === "result" ? { brief: reportBrief(envelope.payload) } : {}),
+    ...(envelope.kind === "result" ? { brief: envelope.recovery ? `transport failed; recovery candidate ${envelope.recovery.candidateId}; publication ${envelope.publication?.state ?? "not-started"}` : reportBrief(envelope.payload) } : {}),
     ...(firstFailure ? { failureReason: reportFailureReason(firstFailure, diagnostics.get(firstFailure.identity.runId)) } : {}),
     ...(diagnosticCode ? { diagnosticCode } : {}),
     ...(envelope.kind === "result" ? {} : { members }),

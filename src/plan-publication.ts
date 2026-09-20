@@ -1,5 +1,6 @@
 import { sha256 } from "./subagent-runs.ts";
 import type { PublicationError, PublicationKind, PublicationRow } from "./plan-publication-state.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export const COMMENT_BUDGET = 24_576;
 const markerPrefix = "<!-- yokemate-plan-publication:";
@@ -238,6 +239,8 @@ export function reconcilePublication(input: PublicationFrameInput, comments: Rem
 const localPublicationFailures = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
 
 export async function publishDocument(row: PublicationRow, bytes: Buffer, adapter: PublicationAdapter, options: { canonicalUrl: string; knowledgePath?: string; verifyBinding?: () => void | Promise<void> }): Promise<PublishResult> {
+  assertMandatoryBoundary("workflow.external-auth", typeof adapter.list === "function" && typeof adapter.add === "function", "publication adapter is not authenticated");
+  assertMandatoryBoundary("workflow.audit", row.source_kind === "normal-transport" || !!row.incident_id, "recovered publication has no incident provenance");
   const provenance = row.source_kind === "engineer-accepted-input"
     ? { source: "engineer-accepted-input" as const, incident: row.incident_id!, candidate: row.candidate_id!, sourceRun: row.source_run_id!, failureHash: row.failure_hash!, payloadHash: row.payload_hash!, skipped: row.skipped_json!, preserved: row.preserved_json!, reason: row.incident_reason! }
     : undefined;

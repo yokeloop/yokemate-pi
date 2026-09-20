@@ -46,6 +46,7 @@ export interface ResultEnvelope {
   reviewVerdict: "approved" | "changes_required" | null;
   artifact?: ArtifactReference;
   publication?: PublicationReference;
+  recovery?: { sourceTransport: "failed"; state: "candidate"; candidateId: string; failureHash: string; payloadHash: string; bytes: number };
 }
 export interface BatchEnvelope {
   version: 1;
@@ -306,6 +307,10 @@ export class JsonlObservation {
     if (!event || typeof event !== "object" || typeof event.type !== "string") { this.error("invalid_event"); return; }
     const name = eventNames.has(event.type) ? event.type : "other";
     this.eventSequence++;
+    if (this.agentSettled && event.type !== "agent_settled") {
+      this.agentSettled = false;
+      this.settledSequence = undefined;
+    }
     this.counts[name] = (this.counts[name] ?? 0) + 1;
     this.lastEventAt = new Date().toISOString();
     if (event.type === "session" && typeof event.id === "string" && /^[a-f0-9-]{36}$/.test(event.id)) this.sessionId = event.id;
@@ -337,8 +342,10 @@ export class JsonlObservation {
     if (event.type === "agent_settled") {
       this.agentSettled = true;
       this.settledSequence = this.eventSequence;
-      this.queueKnown = true;
-      this.queueEmpty = true;
+      if (!this.queueKnown) {
+        this.queueKnown = true;
+        this.queueEmpty = true;
+      }
     }
     this.onEvent?.(event);
   }

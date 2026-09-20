@@ -36,6 +36,8 @@ test("briefs and concrete failure reasons are display-only and bounded", () => {
     [{ ...base, processOutcome: "not_started" as const, payloadOutcome: "incomplete" as const }, {}, "not started"],
   ] as const;
   for (const [envelope, facts, expected] of classes) assert.equal(reportFailureReason(envelope, facts), expected);
+  const recovery = { ...base, recovery: { sourceTransport: "failed" as const, state: "candidate" as const, candidateId: "candidate-id", failureHash: "a".repeat(64), payloadHash: "b".repeat(64), bytes: 42 } };
+  assert.equal(buildReportDisplay(recovery, new Map(), Date.now()).brief, "transport failed; recovery candidate candidate-id; publication not-started");
 });
 
 test("display snapshots preserve envelopes, normalize controls and fit JSON budgets", () => {

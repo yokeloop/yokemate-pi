@@ -67,6 +67,23 @@ test("refuses loss, stale terminal state, foreign identity and non-protocol fail
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("settled evidence never erases a known nonempty queue and later activity requires a new terminal cycle", () => {
+  const observed = new JsonlObservation();
+  const write = (event: unknown) => observed.write(Buffer.from(JSON.stringify(event) + "\n"));
+  write({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final" }], stopReason: "stop" } });
+  write({ type: "queue_update", steering: [{ text: "continue" }], followUp: [] });
+  write({ type: "agent_settled" });
+  assert.equal(observed.evidence().agentSettled, true);
+  assert.equal(observed.evidence().queueEmpty, false);
+  write({ type: "queue_update", steering: [], followUp: [] });
+  assert.equal(observed.evidence().agentSettled, false);
+  write({ type: "agent_settled" });
+  assert.equal(observed.evidence().agentSettled, true);
+  assert.equal(observed.evidence().queueEmpty, true);
+  write({ type: "turn_start" });
+  assert.equal(observed.evidence().agentSettled, false);
+});
+
 test("invalid UTF-8 and record overflow remain monotonic loss evidence while genuine replacement text is valid", () => {
   const invalid = new JsonlObservation();
   invalid.write(Buffer.from([0xff, 0x0a]));

@@ -14,6 +14,7 @@ import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 import type { Mode as ModelMode } from "./mode-guard.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 function incompleteTerminalCapture(error: unknown): boolean {
   const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
@@ -224,6 +225,8 @@ if (import.meta.filename === process.argv[1]) {
   }
 
   if (mode === "ship") {
+    assertMandatoryBoundary("workflow.target-identity", ticket.split("+").every((key) => /^[A-Z][A-Z0-9]*-\d+$/.test(key)), "invalid ship target identity");
+    assertMandatoryBoundary("workflow.explicit-ship", argv[0] === "ship", "ship requires the explicit typed launcher");
     let shipModel: string | undefined;
     const modelIndex = tail.indexOf("--model");
     if (modelIndex >= 0) {

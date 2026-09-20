@@ -3,7 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { ScoutCandidate } from "./plan-scout-recovery.ts";
 import { readPublicationArtifact } from "./plan-publication-state.ts";
 import { errorMetadata, sha256 } from "./subagent-runs.ts";
-import { assertRecoveryBoundary, RECOVERY_ACTION } from "./workflow-boundaries.ts";
+import { assertMandatoryBoundary, assertRecoveryBoundary, RECOVERY_ACTION } from "./workflow-boundaries.ts";
 
 export type WorkflowIncidentEventKind = "grant" | "refusal" | "revoke" | "expiry" | "consume" | "dispatch" | "effect-start" | "outcome";
 export interface ScoutCandidateRow {
@@ -174,6 +174,35 @@ export function appendIncidentEvent(db: DatabaseSync, incident: WorkflowIncident
   return db.prepare("SELECT * FROM workflow_incident_event WHERE id=?").get(Number(result.lastInsertRowid)) as unknown as WorkflowIncidentEventRow;
 }
 
+export interface RecoveryDecisionInput {
+  candidateId?: string;
+  ticket: string;
+  action: string;
+  inputHash: string;
+  sourceUid: number;
+  sourceSessionId: string;
+  sourceRuntimeId: string;
+  code: string;
+  blockers?: readonly string[];
+  reason: string;
+  outcome: "refusal" | "revoke" | "expiry";
+}
+
+export function appendRecoveryDecision(db: DatabaseSync, input: RecoveryDecisionInput): string {
+  assertRecoveryBoundary("plan.scout.transport-input", input.action);
+  safeHash(input.inputHash, "input hash");
+  if (!Number.isSafeInteger(input.sourceUid) || input.sourceUid < 0) throw new Error("invalid recovery decision source");
+  const id = randomUUID();
+  db.prepare(`INSERT INTO workflow_recovery_decision
+    (id,candidate_id,ticket,action,input_hash,source_uid,source_session_id,source_runtime_id,code,blockers_json,reason,outcome)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    id, input.candidateId ?? null, input.ticket, RECOVERY_ACTION, input.inputHash, input.sourceUid,
+    safeId(input.sourceSessionId, "source session"), safeId(input.sourceRuntimeId, "source runtime"), safeCode(input.code, "decision code"),
+    safeCodes(input.blockers, "blockers"), safeIncidentReason(input.reason), input.outcome,
+  );
+  return id;
+}
+
 export interface RecoveryAttemptInput {
   candidateId: string;
   ticket: string;
@@ -233,6 +262,8 @@ export function consumeScoutIncident<T>(db: DatabaseSync, input: ConsumeScoutInc
   try {
     const candidate = scoutCandidateById(db, input.candidateId);
     if (!candidate || candidate.ticket !== input.ticket || candidate.planning_identity !== input.planningIdentity) throw new Error("candidate identity changed");
+    const priorClaim = db.prepare("SELECT incident_id FROM workflow_incident_claim WHERE candidate_id=? AND action=?").get(candidate.id, RECOVERY_ACTION);
+    assertMandatoryBoundary("workflow.single-use", !priorClaim, "recovery candidate was already consumed");
     const id = randomUUID();
     db.prepare(`INSERT INTO workflow_incident
       (id,candidate_id,ticket,action,planning_identity,input_generation,input_hash,scope_hash,target_hash,plan_state,plan_hash,plan_scope_hash,plan_path_hash,reason,source_uid,source_session_id,source_runtime_id)
@@ -271,11 +302,22 @@ export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncident
   for (const [value, label] of [[input.acceptedInputId, "accepted input"], [input.planningIdentity, "planning identity"], [input.writerRunId, "writer run"]] as const) safeId(value, label);
   safeHash(input.taskHash, "writer task hash");
   safeHash(input.actualTaskHash, "writer actual task hash");
-  db.prepare(`INSERT INTO workflow_writer_dispatch
-    (id,accepted_input_id,planning_identity,dispatch_kind,revision_of,writer_run_id,task_hash,actual_task_hash)
-    VALUES (?,?,?,?,?,?,?,?)`).run(id, input.acceptedInputId, input.planningIdentity, input.kind, revisionOf, input.writerRunId, input.taskHash, input.actualTaskHash);
-  if (incident) appendIncidentEvent(db, incident, { kind: "dispatch", code: input.kind, continuationId: input.planningIdentity, writerId: input.writerRunId, payloadHash: input.actualTaskHash, failureHash: scoutCandidateById(db, incident.candidate_id)?.failed_envelope_hash, effect: "plan-writer", outcome: "claimed" });
-  return id;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`INSERT INTO workflow_writer_dispatch
+      (id,accepted_input_id,planning_identity,dispatch_kind,revision_of,writer_run_id,task_hash,actual_task_hash)
+      VALUES (?,?,?,?,?,?,?,?)`).run(id, input.acceptedInputId, input.planningIdentity, input.kind, revisionOf, input.writerRunId, input.taskHash, input.actualTaskHash);
+    if (incident) {
+      const candidate = scoutCandidateById(db, incident.candidate_id);
+      assertMandatoryBoundary("workflow.audit", !!candidate, "writer dispatch incident candidate is missing");
+      appendIncidentEvent(db, incident, { kind: "dispatch", code: input.kind, continuationId: input.planningIdentity, writerId: input.writerRunId, payloadHash: input.actualTaskHash, failureHash: candidate!.failed_envelope_hash, effect: "plan-writer", outcome: "claimed" });
+    }
+    db.exec("COMMIT");
+    return id;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
 }
 
 export interface WriterDraftRow {

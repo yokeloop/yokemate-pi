@@ -3,7 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { acceptRecoveredScoutArtifact, readPublicationArtifact, type PublicationAcceptanceRow } from "./plan-publication-state.ts";
 import { sha256 } from "./subagent-runs.ts";
 import { consumeScoutIncident, safeIncidentReason, scoutCandidateById, type ScoutCandidateRow } from "./workflow-incident-state.ts";
-import { assertRecoveryBoundary, RECOVERY_ACTION } from "./workflow-boundaries.ts";
+import { assertMandatoryBoundary, assertRecoveryBoundary, RECOVERY_ACTION } from "./workflow-boundaries.ts";
 import type { WorkflowIngressWitness } from "./workflow-ingress.ts";
 
 export interface BreakGlassCommand {
@@ -155,6 +155,7 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
   input.store.assert(input.preview.permitId, input.witness, current);
   const candidate = exactCandidate(input.db, input.root, { ticket: current.ticket, action: current.action, candidateId: current.candidateId, reason: current.reason }, current.planningRunId, current.failureHash);
   const expectedContinuation = { planningIdentity: `${candidate.planning_identity}:${candidate.generation + 1}`, generation: candidate.generation + 1 };
+  assertMandatoryBoundary("workflow.single-use", input.store.active().some((permit) => permit.permitId === input.preview.permitId), "break-glass permit is no longer current");
   const consumed = consumeScoutIncident(input.db, {
     candidateId: candidate.id,
     ticket: current.ticket,
@@ -172,6 +173,7 @@ export async function resolveScoutAcceptance(input: ResolveScoutAcceptanceInput)
     bypassed: current.bypassed,
     preserved: current.preserved,
   }, (incident, row) => acceptRecoveredScoutArtifact(input.db, input.root, incident, row, row.content_hash, ["failed-transport-envelope"], current.preserved, expectedContinuation.planningIdentity, expectedContinuation.generation));
+  assertMandatoryBoundary("workflow.audit", !!consumed.incident.id && consumed.value.incident_id === consumed.incident.id, "durable recovery audit was not committed");
   input.store.consume(input.preview.permitId);
   const continuation = await input.continueLineage();
   if (continuation.planningIdentity !== expectedContinuation.planningIdentity || continuation.generation !== expectedContinuation.generation) throw new Error("recovery continuation identity changed");

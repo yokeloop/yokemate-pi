@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { bindCoordinatorControl, processStarttime, requestPlanControl } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, processStarttime, requestCoordinatorCancel, requestPlanControl } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 
 async function listening(server: import("node:net").Server) {
@@ -57,6 +57,9 @@ test("only a live blocked plan lineage can continue one registered candidate gen
     const writer = await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "writer-run", acceptanceId: 7 }, worker, target, env);
     assert.equal(writer.state, "accepted");
     assert.equal(writer.planningIdentity, `${runId}:2`);
+    assert.equal((await requestCoordinatorCancel(root, runId, main, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "read-plan-writer-input", { ticket: "YM-1", runId }, worker, target, env)).state, "refused");
+    assert.equal((await requestPlanControl(root, "admit-plan-writer", { ticket: "YM-1", runId, candidateId, failureHash, generation: 2, writerRunId: "late-writer", acceptanceId: 7 }, worker, target, env)).state, "refused");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
