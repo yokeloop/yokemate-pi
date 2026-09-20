@@ -502,6 +502,7 @@ test("save-only completion is unconfirmed when its owner dies during publication
   mkdirSync(runtimeDir, { recursive: true });
   let release!: () => void;
   let started!: () => void;
+  let completions = 0;
   const callbackStarted = new Promise<void>((resolve) => { started = resolve; });
   const barrier = new Promise<void>((resolve) => { release = resolve; });
   const server = bindCoordinatorControl(root, {
@@ -509,7 +510,7 @@ test("save-only completion is unconfirmed when its owner dies during publication
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
     publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: binding.contentHash }),
     preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => ({ reason: "prepared", recordId: 10, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }),
-    planRecorded: async (_ticket, _path, _recordId, _origin, _context, verify) => { started(); await barrier; verify(binding); return { reason: "ready", handoff: "unavailable" }; },
+    planRecorded: async (_ticket, _path, _recordId, _origin, context, verify) => { completions++; assert.equal(context.kind, "save-only"); started(); await barrier; verify(binding); return { reason: "ready", handoff: "unavailable" }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
   const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
   let cliPid = 0;
@@ -533,6 +534,10 @@ test("save-only completion is unconfirmed when its owner dies during publication
     const result = await completion;
     assert.equal(result.state, "refused");
     assert.match(result.reason ?? "", /owner or scout changed/);
+    const reconciliation = await requestPlanControl(root, "plan-recorded", { ticket: "YM-8", path: binding.path, recordId: 10 }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, target, env);
+    assert.equal(reconciliation.state, "refused");
+    assert.match(reconciliation.reason ?? "", /owner or scout changed/);
+    assert.equal(completions, 2);
   } finally {
     release?.();
     if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}

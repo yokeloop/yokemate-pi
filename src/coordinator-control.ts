@@ -137,6 +137,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const preparedPlans = new Map<string, PreparedPlanRecord>();
   const numericRecords = new Map<string, { owner: ControlOrigin; path: string; recordId: number; binding?: PlanBinding; promise?: Promise<PlanRecordOutcome>; reply?: PlanRecordOutcome }>();
   const completedNumericRecords = new Map<string, { path: string; binding: PlanBinding; contextKind: PlanCompletionContext["kind"]; reply: PlanRecordOutcome }>();
+  const preparedNumericContexts = new Map<string, { path: string; context: Extract<PlanCompletionContext, { kind: "save-only" }>; worker: SaveOnlyWorker; prepared: PreparedPlanRecord }>();
   const inflightNumericRecords = new Map<string, { path: string; contextKind: PlanCompletionContext["kind"]; promise: Promise<{ outcome: PlanRecordOutcome; binding: PlanBinding }> }>();
   const sameProcess = (a: ControlOrigin, b: ControlOrigin) => a.pid === b.pid && a.starttime === b.starttime && a.sessionId === b.sessionId && a.pane === b.pane;
   const problemKey = (origin: ControlOrigin) => `${origin.sessionId}\u0000${origin.pane ?? ""}`;
@@ -436,8 +437,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (!outcome.binding || outcome.binding.ticket !== ticket || resolve(outcome.binding.path) !== resolve(envelope.path) || outcome.binding.contentHash !== envelope.contentHash || outcome.scoutAcceptance !== acceptanceId || outcome.revision !== outcome.binding.contentHash) throw new Error("binding_changed");
       const prepared = { recordId: outcome.recordId, path: outcome.binding.path, contentHash: outcome.binding.contentHash, acceptanceId: outcome.scoutAcceptance, binding: { ...outcome.binding, repositories: [...outcome.binding.repositories] }, snapshotPath: outcome.snapshotPath };
       if (context.kind === "registered") planRun!.prepared = prepared;
-      else if (context.kind === "save-only") saveOnly!.prepared = prepared;
-      else {
+      else if (context.kind === "save-only") {
+        saveOnly!.prepared = prepared;
+        preparedNumericContexts.set(`${ticket}\u0000${prepared.recordId}`, { path: prepared.path, context, worker: saveOnly!, prepared });
+      } else {
         preparedPlans.set(scoutKey, prepared);
         numericRecords.delete(`${context.kind}\u0000${scoutKey}`);
       }
@@ -493,17 +496,18 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (!envelope.path || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
       let recordContext = context;
       let recordSaveOnly = saveOnly;
+      let recordPrepared: PreparedPlanRecord | undefined;
       let recordScoutKey = scoutKey;
       if (context.kind === "main") {
-        for (const [candidateKey, candidate] of saveOnlyWorkers) {
-          if (candidate.ticket !== ticket || !candidate.prepared || candidate.prepared.recordId !== envelope.recordId || resolve(candidate.prepared.path) !== resolve(envelope.path) || candidate.scoutAcceptance !== candidate.prepared.acceptanceId || !ownerLive(candidate.owner, ticket)) continue;
-          recordContext = { kind: "save-only", admissionId: candidate.admissionId };
-          recordSaveOnly = candidate;
-          recordScoutKey = candidateKey;
-          break;
+        const provenance = preparedNumericContexts.get(`${ticket}\u0000${envelope.recordId}`);
+        if (provenance && resolve(provenance.path) === resolve(envelope.path)) {
+          recordContext = provenance.context;
+          recordSaveOnly = provenance.worker;
+          recordPrepared = provenance.prepared;
+          recordScoutKey = saveOnlyKey(provenance.worker.owner, ticket);
         }
       }
-      const prepared = recordContext.kind === "registered" ? planRun!.prepared : recordContext.kind === "save-only" ? recordSaveOnly!.prepared : preparedPlans.get(recordScoutKey);
+      const prepared = recordPrepared ?? (recordContext.kind === "registered" ? planRun!.prepared : recordContext.kind === "save-only" ? recordSaveOnly!.prepared : preparedPlans.get(recordScoutKey));
       if (recordContext.kind !== "main" && (!prepared || prepared.recordId !== envelope.recordId || resolve(prepared.path) !== resolve(envelope.path) || prepared.acceptanceId !== (recordContext.kind === "save-only" ? recordSaveOnly!.scoutAcceptance : acceptanceId))) throw new Error("prepared plan record binding changed");
       const state = recordContext.kind === "registered" ? planRun! : recordContext.kind === "save-only" ? recordSaveOnly! : undefined;
       if (state?.recordReply) {
