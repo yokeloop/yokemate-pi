@@ -514,7 +514,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, state.recordBinding);
         const pendingReconciliation = context.kind === "main" && recordContext.kind === "save-only" && (state.recordReply.publication === "pending" || state.recordReply.publications?.some((publication) => publication.state === "pending"));
-        if (!pendingReconciliation) return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...state.recordReply };
+        if (!pendingReconciliation) {
+          if (recordContext.kind === "save-only" && !ownerLive(recordSaveOnly!.owner, ticket)) throw new Error("plan completion owner is no longer live");
+          return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...state.recordReply };
+        }
       }
       if (state?.recordPromise) {
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("plan record is already running with another binding");

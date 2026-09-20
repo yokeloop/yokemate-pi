@@ -485,6 +485,12 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     assert.match(changed.reason ?? "", /retry binding changed/);
     const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 10 }, cli, target, env);
     assert.equal(foreign.state, "refused");
+    writeFileSync(binding.path, readFileSync(binding.path, "utf8").replace("Verify changed completion.", "Verify completion."));
+    owner.kill("SIGKILL");
+    await once(owner, "exit");
+    const deadOwnerRetry = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, target, env);
+    assert.equal(deadOwnerRetry.state, "refused");
+    assert.match(deadOwnerRetry.reason ?? "", /owner is no longer live/);
   } finally {
     releaseCompletion?.();
     releaseReverseCompletion?.();
