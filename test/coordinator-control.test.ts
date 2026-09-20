@@ -232,6 +232,45 @@ test("registered pane chains are immutable and revalidated after ancestor death"
   }
 });
 
+test("coordinator control correlates metadata and deduplicates in-flight launch requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-idempotent-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-idempotent-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const target = { sessionId: "session", runtimeId: "runtime" };
+  const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+  const dispatches: unknown[] = [];
+  let launches = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const server = bindCoordinatorControl(root, {
+    async launch(_request, _origin, dispatch) { launches++; dispatches.push(dispatch); await held; return { runId: "run-1" }; },
+    status: (requestId) => ({ requestId, state: "status" }),
+    async cancel() {},
+  }, { root, ...target, pid: process.pid, starttime: origin.starttime, cwd: root }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const dispatch = { requestId: "request-1", toolCallId: "tool-1" };
+    const first = requestCoordinator(root, { mode: "do", tickets: ["YM-1"] }, origin, target, env, dispatch);
+    const second = requestCoordinator(root, { mode: "do", tickets: ["YM-1"] }, origin, target, env, dispatch);
+    while (launches === 0) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(launches, 1);
+    const collision = await requestCoordinator(root, { mode: "do", tickets: ["YM-2"] }, origin, target, env, dispatch);
+    assert.equal(collision.state, "refused");
+    assert.match(collision.reason ?? "", /collision/);
+    release();
+    assert.deepEqual(await first, await second);
+    assert.deepEqual(dispatches, [dispatch]);
+    const replay = await requestCoordinator(root, { mode: "do", tickets: ["YM-1"] }, origin, target, env, dispatch);
+    assert.equal(replay.state, "accepted");
+    assert.equal(launches, 1);
+  } finally {
+    release();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test("coordinator parent resolver distinguishes sidecar failures", () => {
   const root = mkdtempSync(join(tmpdir(), "coordinator-parent-"));
   const runtime = mkdtempSync(join(tmpdir(), "coordinator-parent-runtime-"));

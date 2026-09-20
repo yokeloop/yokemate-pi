@@ -117,6 +117,24 @@ test("blocked plan recovery cancellation is terminal for the recovery generation
   assert.deepEqual(registry.aggregate(run.identity.listRunId), aggregate);
 });
 
+test("whole-list cancellation cannot pump a queued sibling between terminal settlements", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 1, maxDetached: 3 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  const starts: string[] = [];
+  registry.start(run.identity.listRunId, async (context) => {
+    starts.push(context.key);
+    context.active();
+    return new Promise(() => {});
+  });
+  registry.publishImmediate(run.identity.listRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(starts, ["A-1"]);
+  assert.equal(registry.cancel(run.identity.listRunId, "parent cancellation"), true);
+  assert.deepEqual(starts, ["A-1"]);
+  assert.ok(run.entries.every((entry) => entry.terminal?.outcome === "cancelled"));
+});
+
 test("durable plan recording releases its lifetime slot before auto-do admission", async () => {
   const registry = new ListRunRegistry();
   const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } });

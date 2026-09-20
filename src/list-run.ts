@@ -42,6 +42,7 @@ export class ListRunRegistry {
   private readonly aggregateListeners = new Set<(aggregate: ListAggregate) => void>();
   private readonly startupWaiters = new Map<string, Set<(startup: ListStartup) => void>>();
   private running = 0;
+  private pumpSuspended = 0;
 
   onImmediate(listener: Listener): () => void { this.immediateListeners.add(listener); return () => this.immediateListeners.delete(listener); }
   onTerminal(listener: Listener): () => void { this.terminalListeners.add(listener); return () => this.terminalListeners.delete(listener); }
@@ -180,16 +181,26 @@ export class ListRunRegistry {
 
   cancel(id: string, reason = "cancelled"): boolean {
     const list = this.lists.get(id);
-    if (list) {
-      let changed = false;
-      for (const entry of list.entries) {
-        changed = this.cancelEntry(list, entry, reason) || changed;
-        changed = this.cancelRecovery(entry.keyRunId, reason) || changed;
-      }
-      return changed;
+    if (list) return this.cancelMany(list.entries.map((entry) => entry.keyRunId), reason);
+    return this.cancelMany([id], reason);
+  }
+
+  cancelMany(ids: readonly string[], reason = "cancelled"): boolean {
+    const targets = [...new Set(ids)].map((id) => this.find(id)).filter((found): found is { run: ListRun; entry: KeyRunEntry } => Boolean(found && !terminalState(found.entry.state)));
+    let recoveryChanged = false;
+    for (const id of new Set(ids)) recoveryChanged = this.cancelRecovery(id, reason) || recoveryChanged;
+    if (!targets.length) return recoveryChanged;
+    this.pumpSuspended++;
+    try {
+      for (const { entry } of targets) this.starts.delete(entry.keyRunId);
+      for (const { entry } of targets) this.controllers.get(entry.keyRunId)?.abort(reason);
+      for (const { entry } of targets) this.settleStartup(entry.keyRunId, { state: "cancelled", reason });
+      for (const { run, entry } of targets) this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "cancelled", reason });
+      return true;
+    } finally {
+      this.pumpSuspended--;
+      this.pump();
     }
-    const found = this.find(id);
-    return found ? this.cancelEntry(found.run, found.entry, reason) || this.cancelRecovery(id, reason) : this.cancelRecovery(id, reason);
   }
 
   cancelRecovery(keyRunId: string, reason = "cancelled"): boolean {
@@ -210,6 +221,7 @@ export class ListRunRegistry {
   }
 
   private pump(): void {
+    if (this.pumpSuspended) return;
     for (const run of this.lists.values()) {
       if (!run.immediatePublished) continue;
       const limit = subagentConcurrency(run.settings, run.entries.length);
@@ -240,14 +252,6 @@ export class ListRunRegistry {
     this.publishAggregate(run);
     this.pump();
     return true;
-  }
-
-  private cancelEntry(run: ListRun, entry: KeyRunEntry, reason: string): boolean {
-    if (terminalState(entry.state)) return false;
-    this.controllers.get(entry.keyRunId)?.abort(reason);
-    this.starts.delete(entry.keyRunId);
-    this.settleStartup(entry.keyRunId, { state: "cancelled", reason });
-    return this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "cancelled", reason });
   }
 
   private publishAggregate(run: ListRun): void {

@@ -94,15 +94,14 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   return { mode: "do", tickets: [ticket], model, cwd: folder, plan, plans: { [ticket]: plan }, parts, expected, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:do-worker ${ticket}. The plan is at ${plan} — read it fully; it lists the affected repositories and the contract between parts. Work only inside ${folder}. Project passports (worktrees fork from these clones):\n${passports}\nWhen the PRs are open and green, run pnpm record-report ${ticket} --part <org/repo>:<role>:<branch>:<pr-url> from the task folder root yourself, then call coordinator_finish done.` };
 }
 
-export function markDoRunning(root: string, prepared: PreparedCoordinator, origin: CoordinatorOrigin): void {
-  const settings = readRuntimeSettings(root);
+export function markDoRunning(root: string, prepared: PreparedCoordinator, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root)): void {
   if (prepared.mode !== "do" || !prepared.plan || !prepared.expected) fail("prepared do request is incomplete");
   const ticket = prepared.tickets[0]!;
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "spawn", origin, ticket, () => {
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES (?, ?, 'running') ON CONFLICT (ticket) DO UPDATE SET stage = 'running'").run(ticket, ticketUrl(db, ticket));
     db.prepare("UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(prepared.cwd, prepared.plan!, ticket);
-  }, { allowFresh: true, expected: prepared.expected, settings });
+  }, { allowFresh: true, expected: prepared.expected, settings: snapshot });
   if (!out.ok) fail(out.refuse);
 }
 

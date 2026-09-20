@@ -592,15 +592,20 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".env.local"), "");
     const settings = join(dir, ".pi", "settings.json");
-    const set = (guards: Record<string, boolean>, maxDetached = 8) => writeFileSync(settings, JSON.stringify({ guardPolicy: { guards }, subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached } }));
+    const set = (guards: Record<string, boolean>, maxDetached = 8, maxParallelTasks = 1, maxConcurrency = 1) => writeFileSync(settings, JSON.stringify({ guardPolicy: { guards }, subagent: { maxParallelTasks, maxConcurrency, maxDetached } }));
     set({});
     const planDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(planDir, { recursive: true });
     const plan = join(planDir, "plan.md");
+    const planTwoDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-2-work");
+    mkdirSync(planTwoDir, { recursive: true });
+    const planTwo = join(planTwoDir, "plan.md");
     writeFileSync(plan, "# YM-1 — fixture\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
+    writeFileSync(planTwo, "# YM-2 — fixture\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'x','YM','test/model')").run(join(dir, "clone"));
     db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);
+    db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-2','u','planned',?)").run(planTwo);
     db.close();
     const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
     await loader.reload();
@@ -614,8 +619,8 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     const input = extension.handlers.get("input")![0]!;
-    const approve = () => input({ type: "input", source: "interactive", text: "/do YM-1" } as never, ctx);
-    const launch = () => tool.execute("do", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    const approve = (text = "/do YM-1") => input({ type: "input", source: "interactive", text } as never, ctx);
+    const launch = (tickets = ["YM-1"]) => tool.execute("do", { coordinator: { mode: "do", tickets } }, undefined, () => undefined, ctx);
     const cliEnv = { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "main", HERDR_PANE_ID: "main-pane" };
     const cli = () => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1"], { cwd: dir, env: cliEnv });
     const packageCli = () => promisify(execFile)("pnpm", ["spawn", "YM-1"], { cwd: dir, env: cliEnv });
@@ -670,6 +675,10 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
       assert.ok(allowedId, JSON.stringify(allowed));
       for (const key of Object.keys(stamp)) delete process.env[key];
       await tool.execute("cancel", { cancelRun: allowedId }, undefined, () => undefined, ctx);
+      set({ spawnCaller: false, duplicateDo: false, ...bypass });
+      await approve();
+      const replacement = await launch();
+      assert.ok((replacement.details as { runId?: string } | undefined)?.runId, JSON.stringify(replacement));
     }
     set({ duplicateDo: false }, 1);
     await approve();
@@ -680,6 +689,27 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     const uncappedId = (uncapped.details as { runId?: string }).runId;
     assert.ok(uncappedId, JSON.stringify(uncapped));
     for (const runId of [packageId, uncappedId]) await tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+
+    set({ duplicateDo: false }, 8, 2, 1);
+    await approve("/do YM-1 YM-2");
+    const pinnedBatch = await launch(["YM-1", "YM-2"]);
+    const pinnedRuns = (pinnedBatch.details as { runs?: { ticket: string; runId: string }[] } | undefined)?.runs ?? [];
+    assert.equal(pinnedRuns.length, 2, JSON.stringify(pinnedBatch));
+    const firstPinned = pinnedRuns.find((run) => run.ticket === "YM-1")!;
+    const secondFixture = join(dir, "work", "YM-2", "fixture-runs");
+    const waitFor = async (predicate: () => boolean) => {
+      const deadline = Date.now() + 5000;
+      while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(predicate(), "timed out waiting for queued coordinator lane");
+    };
+    await waitFor(() => existsSync(join(dir, "work", "YM-1", "fixture-runs")));
+    assert.equal(existsSync(secondFixture), false);
+    writeFileSync(settings, "{");
+    await tool.execute("cancel", { cancelRun: firstPinned.runId }, undefined, () => undefined, ctx);
+    await waitFor(() => existsSync(secondFixture) && readFileSync(secondFixture, "utf8").trim().length > 0);
+    set({ duplicateDo: false }, 8, 2, 1);
+    await tool.execute("cancel", { cancelRun: pinnedRuns.find((run) => run.ticket === "YM-2")!.runId }, undefined, () => undefined, ctx);
+
     runtimeCases(["guards.duplicateDo"], ["tool", "cli", "pane", "ordinary", "coordinator"]);
     runtimeCases(["guards.detachedLimit", "subagent.maxDetached"], ["cli", "coordinator"]);
   } finally {
@@ -850,9 +880,17 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     writeFileSync(file, JSON.stringify({ guardPolicy: { yolo: true } }));
     assert.equal(await input({ type: "input", source: "interactive", text: "запусти готовый план YM-1" } as never, ctx), undefined);
-    assert.match(notifications.at(-1) ?? "", /workflow extraction unavailable: .*configured model and external authentication.*continuing without inferred workflow approval/);
+    assert.deepEqual(notifications, []);
     const malformedRequest = await tool.execute("invalid", { coordinator: { mode: "do", tickets: ["../YM-1"] } }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(malformedRequest), /invalid ticket key/);
+    assert.deepEqual(notifications, []);
+    const missingModel = await tool.execute("missing-model", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.match(JSON.stringify(missingModel), /workflow extraction unavailable: outcome=model_error/);
+    assert.match(notifications.at(-1) ?? "", /workflow extraction unavailable: outcome=model_error, elapsedMs=\d+; no inferred workflow approval/);
+    const warningCount = notifications.length;
+    await tool.execute("missing-model-repeat", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
+    assert.equal(notifications.length, warningCount);
+    assert.equal(await input({ type: "input", source: "interactive", text: "replace candidate" } as never, ctx), undefined);
     const launch = async (tickets = ["YM-1"]) => {
       const result = await tool.execute("ship", { coordinator: { mode: "ship", tickets } }, undefined, () => undefined, ctx);
       for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: "ship", result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
@@ -872,8 +910,9 @@ test("coordinator public admission rereads ship confirmation and never manufactu
     set(false);
     await input({ type: "input", source: "interactive", text: "/ship YM-1" } as never, ctx);
     writeFileSync(file, JSON.stringify({ subagent: { maxDetached: 0 } }));
-    assert.deepEqual(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), { action: "handled" });
-    assert.match(notifications.at(-1) ?? "", /subagent.maxDetached/);
+    const notificationsBeforeSkippedInput = notifications.length;
+    assert.equal(await input({ type: "input", source: "interactive", text: "replace this permit" } as never, ctx), undefined);
+    assert.equal(notifications.length, notificationsBeforeSkippedInput);
     set(false);
     assert.match(await launch(), /current interactive \/ship/);
     for (const enabled of [true, false]) {

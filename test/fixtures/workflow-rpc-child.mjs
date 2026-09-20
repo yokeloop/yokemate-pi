@@ -2,6 +2,8 @@ import { appendFileSync } from "node:fs";
 import net from "node:net";
 import readline from "node:readline";
 const send = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+const modelIndex = process.argv.indexOf("--model");
+const [provider, id] = (modelIndex > 0 ? process.argv[modelIndex + 1] : "test/model").split("/");
 let recorded = false;
 if (process.env.WORKFLOW_EVENT_SOCKET) {
   const eventSocket = net.createConnection(process.env.WORKFLOW_EVENT_SOCKET);
@@ -13,7 +15,7 @@ if (process.env.WORKFLOW_EVENT_SOCKET) {
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const command = JSON.parse(line);
   if (command.type === "get_commands") send({ type: "response", id: command.id, success: true, data: { commands: [{ name: "yokemate-coordinator-ready" }, { name: `skill:${process.env.YOKEMATE_MODE}-worker` }] } });
-  else if (command.type === "get_state") send({ type: "response", id: command.id, success: true, data: { model: { provider: "test", id: "model" }, thinkingLevel: "high", sessionId: `child-${process.pid}` } });
+  else if (command.type === "get_state") send({ type: "response", id: command.id, success: true, data: { model: { provider, id }, thinkingLevel: "high", sessionId: `child-${process.pid}` } });
   else if (command.type === "prompt") {
     if (!recorded && command.id === `${process.env.YOKEMATE_RUN_ID}:work`) {
       recorded = true;

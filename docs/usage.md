@@ -87,7 +87,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> [--model <m>] [--m
 
 ### Runtime snapshot и approval
 
-Один `readRuntimeSettings` читает policy и subagent limits до guarded decision; принятый ordinary batch сохраняет snapshot до конца. Следующее решение видит изменение файла без reload; отдельный transition write после подготовки перечитывает settings и всегда сохраняет expected-stage CAS. Task-local settings, settings.local.json, паспорт, environment и tool arguments не являются overrides. Child settings содержат только абсолютные engine extensions, не копию limits.
+Ordinary batch читает policy и subagent limits перед guarded decision и сохраняет snapshot до конца. Top-level coordinator сначала делает предварительную caller-проверку, после ожидания workflow extraction авторитетно перечитывает settings, а принятый list закрепляет этот admission snapshot за всеми lanes, включая их transition write. Следующее независимое решение видит изменение файла без reload; отдельные transition entrypoints перечитывают settings и всегда сохраняют expected-stage CAS. Task-local settings, settings.local.json, паспорт, environment и tool arguments не являются overrides. Child settings содержат только абсолютные engine extensions, не копию limits.
 
 Приоритет: явный `guards.<id>` и workflowApproval сильнее yolo; затем legacy defaults. Все guards и workflowApproval по умолчанию true. Limits: maxParallelTasks=8, maxConcurrency=4, maxDetached=8. Если задан только maxParallelTasks, соседние defaults становятся min(4, parallel) и max(8, parallel). Unknown owned fields, non-boolean policy, non-integer/positive limits, broken/unreadable JSON и несовместимые limits блокируют action с абсолютным source path. Другие Pi-owned root fields не проверяются.
 
