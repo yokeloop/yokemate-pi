@@ -215,7 +215,12 @@ test("D01 coordinator honors explicitly isolated session storage", () => {
   }
 });
 
-test("coordinator invocation keeps a session under the task folder", () => {
+test("coordinator invocation keeps a session under the task folder when storage is unset", (t) => {
+  const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR; else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+  });
+  delete process.env.PI_CODING_AGENT_SESSION_DIR;
   const args = coordinatorInvocationArgs({ mode: "do", model: "test/model", cwd: "/tasks/YM-1", skillsPath: "/skills", resourcesPath: "/resources" });
   assert.ok(!args.includes("--no-session"));
   assert.equal(args[args.indexOf("--session-dir") + 1], "/tasks/YM-1/sessions");

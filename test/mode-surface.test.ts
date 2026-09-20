@@ -33,7 +33,14 @@ test("awaited close reports missing IDs, command errors and timeout", async () =
 });
 
 for (const surface of ["tab", "split"] as const) {
-  test(`${surface} opens and cleans up only returned IDs`, () => {
+  test(`${surface} opens and cleans up only returned IDs without configured Pi isolation`, (t) => {
+    const previous = new Map(["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"].map((key) => [key, process.env[key]]));
+    t.after(() => {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    });
+    for (const key of previous.keys()) delete process.env[key];
     const calls: string[][] = [];
     const opened = openModeSurface(surface, "w1:p-parent", "w1", "/root", "label", ["A=b"], (args) => {
       calls.push(args);
