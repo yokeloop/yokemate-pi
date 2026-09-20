@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, type Socket } from "node:net";
-import { cpSync, mkdtempSync, mkdirSync, readdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readdirSync, symlinkSync, writeFileSync, readFileSync, realpathSync, rmSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -327,12 +327,22 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       await untilAborted(childWorking, signal);
       const fs = await import("node:fs");
       const snapshotDir = join(sandbox, "sessions/subagent-runs");
-      const beforeStop = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8"))).filter((snapshot) => snapshot.ownerRunId === "owner-parent-cancel");
-      const runningChild = beforeStop.find((snapshot) => snapshot.agent === "task-reviewer");
-      assert.ok(runningChild, "parent_cancel admission snapshot missing");
+      const runningChild = await untilAborted(new Promise<any>((resolve, reject) => {
+        let timer: NodeJS.Timeout | undefined;
+        const watcher = watch(snapshotDir, inspect);
+        function inspect() {
+          const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
+          const snapshot = snapshots.find((entry) => entry.ownerRunId === "owner-parent-cancel" && entry.agent === "task-reviewer" && entry.stream.phase === "thinking");
+          if (!snapshot) return;
+          clearTimeout(timer);
+          watcher.close();
+          resolve(snapshot);
+        }
+        timer = setTimeout(() => { watcher.close(); reject(new Error("parent_cancel thinking checkpoint missing")); }, 5000);
+        inspect();
+      }), signal);
       assert.equal(runningChild.lifecycle.processClosed, false);
       assert.ok(runningChild.stream.stdoutBytes > 0);
-      assert.equal(runningChild.stream.phase, "thinking");
       rpc.acceptTerminal();
       await rpc.stop("parent_control_cancel");
       const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
