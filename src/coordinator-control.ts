@@ -508,7 +508,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         }
       }
       const prepared = recordPrepared ?? (recordContext.kind === "registered" ? planRun!.prepared : recordContext.kind === "save-only" ? recordSaveOnly!.prepared : preparedPlans.get(recordScoutKey));
-      if (recordContext.kind !== "main" && (!prepared || prepared.recordId !== envelope.recordId || resolve(prepared.path) !== resolve(envelope.path) || prepared.acceptanceId !== (recordContext.kind === "save-only" ? recordSaveOnly!.scoutAcceptance : acceptanceId))) throw new Error("prepared plan record binding changed");
+      const preparedAcceptance = recordContext.kind === "save-only" ? recordSaveOnly!.scoutAcceptance : acceptanceId;
+      if ((!prepared && recordContext.kind !== "main") || (prepared && (prepared.recordId !== envelope.recordId || resolve(prepared.path) !== resolve(envelope.path) || prepared.acceptanceId !== preparedAcceptance))) throw new Error("prepared plan record binding changed");
       const state = recordContext.kind === "registered" ? planRun! : recordContext.kind === "save-only" ? recordSaveOnly! : undefined;
       if (state?.recordReply) {
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("recorded plan retry binding changed");

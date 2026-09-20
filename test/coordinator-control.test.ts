@@ -393,17 +393,25 @@ test("a restarted control server refuses an unbound main replay of an old save-o
   writeFileSync(join(runtimeDir, "save-restart-pane.json"), JSON.stringify({ pid: process.pid, cwd: root, mode: "plan", ticket: "YM-6" }));
   const worker = { sessionId: "save-restart-session", pid: process.pid, starttime, cwd: root, pane: "save-restart-pane", parentPane: "main", mode: "plan", ticket: "YM-6", role: "coordinator" };
   const identity = { root, ...target, pid: process.pid, starttime, cwd: root, pane: "main" };
+  let completions = 0;
   const first = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
     publishPlanScout: async () => ({ reason: "published", publication: "complete", target: "fixture", revision: binding.contentHash }),
     preparePlanPublication: async (_ticket, _path, _hash, acceptanceId) => ({ reason: "prepared", recordId: 77, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }),
+    planRecorded: async () => { completions++; return { reason: "unexpected", handoff: "started" }; },
   }, identity, env);
-  let completions = 0;
   try {
     if (!first.listening) await once(first, "listening");
     const child = { ...scoutChild(worker, "YM-6", "restart"), cwd: root };
     assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-6", acceptanceId: 6, child }, worker, target, env)).state, "accepted");
     assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-6", path: binding.path, contentHash: binding.contentHash }, worker, target, env)).recordId, 77);
+    const main = { sessionId: target.sessionId, pid: process.pid, starttime, cwd: root };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-6", acceptanceId: 8, child: { ...scoutChild(main, "YM-6", "main-prepared"), cwd: root } }, main, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-6", path: binding.path, contentHash: binding.contentHash }, main, target, env)).recordId, 77);
+    const wrongPreparedId = await requestPlanControl(root, "plan-recorded", { ticket: "YM-6", path: binding.path, recordId: 78 }, main, target, env);
+    assert.equal(wrongPreparedId.state, "refused");
+    assert.match(wrongPreparedId.reason ?? "", /prepared plan record binding changed/);
+    assert.equal(completions, 0);
     await new Promise<void>((resolve) => first.close(() => resolve()));
     const restarted = bindCoordinatorControl(root, {
       launch: async () => { throw new Error("unexpected launch"); }, status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
