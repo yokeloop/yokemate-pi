@@ -8,4 +8,5 @@ docs/plans/
 .pi/settings.local.json
 .pi/plan-publications/
 .pi/subagent-reports/
+/sessions/subagent-runs/
 home/

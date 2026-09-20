@@ -4,6 +4,12 @@ import { createHash } from "node:crypto";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+function exactProfile(bytes: number, tail: string): string {
+  const prefix = "# Scout\n\n## Facts and sources\n- Протокол проверен.\n\n";
+  const suffix = `\n${tail}\n\n## Assumptions\n- Deterministic.\n\n## Forks and recommendations\n- Keep framing bounded.\n`;
+  return prefix + "x".repeat(bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)) + suffix;
+}
+
 export default function (pi: ExtensionAPI) {
   const barrier = (phase: string, data: unknown = {}) => new Promise<void>((resolve, reject) => {
     const socket = connect(process.env.YM204_FIXTURE_SOCKET!);
@@ -13,10 +19,11 @@ export default function (pi: ExtensionAPI) {
   });
   const scenario = process.env.YM204_FIXTURE_SCENARIO;
   let childTurns = 0;
+  let reportSends = 0;
   if ((scenario === "delivery_sync" || scenario === "delivery_async") && process.env.YOKEMATE_ROLE === "coordinator") {
     const original = AgentSession.prototype.sendCustomMessage;
     AgentSession.prototype.sendCustomMessage = function (message, options) {
-      if (message.customType === "subagent-report") {
+      if (message.customType === "subagent-report" && ++reportSends === 1) {
         if (scenario === "delivery_sync") throw new Error("fixture synchronous transport error");
         return Promise.reject(new Error("fixture asynchronous transport error"));
       }
@@ -68,6 +75,23 @@ export default function (pi: ExtensionAPI) {
           message.content.push({ type: "thinking", thinking: "fixture thinking" });
           stream.push({ type: "thinking_start", contentIndex: 0, partial: message });
           stream.push({ type: "thinking_delta", contentIndex: 0, delta: "fixture thinking", partial: message });
+          const heavyReads = text.includes("read-heavy-32") ? 32 : text.includes("read-heavy-24") ? 24 : 0;
+          if (heavyReads) {
+            childTurns++;
+            await barrier("child-working", { pid: process.pid, turn: childTurns });
+            if (childTurns <= heavyReads + 3) {
+              const tool = childTurns <= heavyReads
+                ? { id: `read-${childTurns}`, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } }
+                : { id: `shell-${childTurns}`, name: "bash", arguments: { command: ["grep -n fixture", "find . -maxdepth 1 -type f", "ls -la"][childTurns - heavyReads - 1] } };
+              message.stopReason = "toolUse";
+              message.content = [{ type: "toolCall", ...tool } as any];
+              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+            } else message.content = [{ type: "text", text: exactProfile(heavyReads === 24 ? 16070 : 25684, heavyReads === 24 ? "READ-HEAVY-216-TAIL" : "READ-HEAVY-217-TAIL") }];
+            stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+            stream.end();
+            return;
+          }
           await barrier(scenario ? "child-working" : text.includes("review-B") ? "B-working" : "A-working", { pid: process.pid });
           message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           childTurns++;
@@ -79,8 +103,6 @@ export default function (pi: ExtensionAPI) {
           if (scenario === "invalid" || (scenario === "chain" && text.includes("step-2"))) message.content = [{ type: "text", text: "{}" }];
           if (scenario === "output_limit") message.content = [{ type: "text", text: JSON.stringify({ status: "approved", findings: [], padding: "x".repeat(51 * 1024) }) }];
           if (scenario === "protocol_invalid") fs.writeSync(1, "{private malformed}\n");
-          if (scenario === "protocol_partial") fs.writeSync(1, '{"private-partial":');
-          if (scenario === "protocol_overflow") fs.writeSync(1, "x".repeat(1024 * 1024 + 1) + "\n");
           if (scenario === "old_final" && childTurns === 1) {
             message.stopReason = "toolUse";
             message.content.push({ type: "toolCall", id: "read-fixture", name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } });
@@ -103,7 +125,14 @@ export default function (pi: ExtensionAPI) {
           };
           if (!calledA) {
             calledA = true;
-            if (scenario === "plan_scout_terminal") {
+            if (scenario?.includes("read_heavy")) {
+              message.stopReason = "toolUse";
+              const items = scenario.includes("parallel") ? ["read-heavy-24", "read-heavy-32"] : [scenario.includes("32") ? "read-heavy-32" : "read-heavy-24"];
+              const tasks = items.map((task) => ({ agent: "plan-scout", task, ticket: "YM-204" }));
+              message.content = [{ type: "toolCall", id: "read-heavy", name: "subagent", arguments: tasks.length === 1 ? tasks[0] : { tasks } }];
+              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+            } else if (scenario === "plan_scout_terminal") {
               message.stopReason = "toolUse";
               message.content = [{ type: "toolCall", id: "scout-terminal", name: "subagent", arguments: { agent: "plan-scout", task: "Return a complete fixture scout.", ticket: "YM-1" } }];
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });

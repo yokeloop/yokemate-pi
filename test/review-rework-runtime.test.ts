@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -36,6 +36,7 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
     cpSync(join(source, ".pi", "agents", "do"), join(dir, ".pi", "agents", "do"), { recursive: true });
     cpSync(join(source, "package.json"), join(dir, "package.json"));
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { workflowApproval, guards: { duplicateDo: false, duplicateMode: false } } }));
@@ -68,6 +69,8 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     if (workflowApproval) delete process.env.WORKFLOW_FAST_TERMINAL;
     else process.env.WORKFLOW_FAST_TERMINAL = "1";
     for (const key of ["YOKEMATE_MODE", "YOKEMATE_ROLE", "YOKEMATE_TICKET", "YOKEMATE_REVIEW_RUN_ID", "YOKEMATE_REVIEW_RUNTIME_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
     const runtimeDir = socketDir(process.env, process.getuid!());
     mkdirSync(runtimeDir, { recursive: true });

@@ -63,9 +63,13 @@ test("raw interactive authority flows through real plan CLI and parent control w
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, "package.json"), join(dir, "package.json"));
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    mkdirSync(join(dir, "test", "fixtures"), { recursive: true });
+    cpSync(join(source, "test/fixtures/subagent-json-relay.mjs"), join(dir, "test/fixtures/subagent-json-relay.mjs"));
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "agents", "plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
+    writeFileSync(join(dir, ".pi", "agents", "plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read\n---\nRead the accepted scout.\n");
     const agentDir = join(dir, "agent");
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     symlinkSync(join(source, "test/fixtures/subagent-runtime-provider.ts"), join(agentDir, "extensions/provider.ts"));
@@ -165,14 +169,20 @@ test("raw interactive authority flows through real plan CLI and parent control w
     };
     const workflowChild = process.argv[1];
     process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+    delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+    delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
     process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     assert.equal(process.env.PI_SESSION_ID, undefined);
     const scoutEnvelope = await runScout("scout-long");
-    assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope.artifact));
+    assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope));
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
     assert.match(readFileSync(scoutEnvelope.artifact.path, "utf8"), /EVIDENCE-TAIL/);
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
     assert.doesNotMatch(scoutEnvelope.payload, /EVIDENCE-TAIL/);
+    const acceptedScoutBytes = readFileSync(scoutEnvelope.artifact.path);
+    writeFileSync(scoutEnvelope.artifact.path, "tampered");
+    await assert.rejects(() => tool.execute("writer-tampered", { agent: "plan-writer", task: "Read the accepted scout.", ticket: "YM-1" }, undefined, () => undefined, ctx), /artifact_invalid|artifact changed|binding is invalid/);
+    writeFileSync(scoutEnvelope.artifact.path, acceptedScoutBytes);
     const scoutRemote = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
     assert.ok(scoutRemote.length >= 3);
     const reconstructedScout = scoutRemote.map((comment) => comment.body.slice(comment.body.indexOf("\n\n---\n\n") + 7)).join("");
@@ -189,7 +199,11 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get(), undefined);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     process.env.YM204_FIXTURE_SCENARIO = "protocol_overflow";
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(dir, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_FAULT = "record_overflow";
     const invalidScout = await runScout("scout-protocol-overflow");
+    delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+    delete process.env.YOKEMATE_SUBAGENT_TEST_FAULT;
     assert.equal(invalidScout.payloadOutcome, "protocol_error");
     assert.equal(invalidScout.artifact.state, "blocked");
     assert.equal(invalidScout.publication, undefined);
@@ -217,6 +231,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
     assert.equal(unresolvedScout.publication.target, "unresolved/YM-1");
     assert.match(notifications.slice(warningsBeforeUnresolved).join("\n"), /warning: scout publication → unresolved\/YM-1: target_unavailable/);
     delete process.env.YOKEMATE_RUN_ID;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
     process.argv[1] = workflowChild;
     await input("/plan YM-1");
     const unresolvedRecord = await recordProcess();
@@ -375,6 +391,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
         await input("Plan and then do YM-1");
       }
       process.env.YOKEMATE_RUN_ID = "duplicate-mode-owner";
+      delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+      delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
       process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
       const before = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
       const scoutResult = await runScout(`legacy-${label}-scout`);
@@ -382,6 +400,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       assert.equal(scoutResult.publication.state, scoutExpected === "complete" ? "complete" : "pending", label);
       if (scoutExpected !== "complete") assert.equal(scoutResult.publication.error, scoutExpected, label);
       delete process.env.YOKEMATE_RUN_ID;
+      process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
       process.argv[1] = workflowChild;
       const result = await recordProcess();
       assertPublicationResult(`legacy-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
@@ -475,7 +495,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
       let ownedScout: any;
       if (label === "scout-pending") {
         const scoutEnvironment = Object.fromEntries(["YM204_FIXTURE_SCENARIO", "WORKFLOW_SCOUT_REVISION", "WORKFLOW_GH_FAIL", "WORKFLOW_GH_FAIL_KIND", "WORKFLOW_GH_CONFLICT_KIND"].map((key) => [key, process.env[key] ?? null]));
-        const ownedScoutMessage = await sendOwned<{ result: any }>({ kind: "scout", runId: ownedRunId, callId: `owned-${label}-scout`, env: scoutEnvironment });
+        const ownedScoutMessage = await sendOwned<{ result: any }>({ kind: "scout", runId: ownedRunId, callId: `owned-${label}-scout`, env: { ...scoutEnvironment, YOKEMATE_SUBAGENT_TEST_RELAY: null, YOKEMATE_SUBAGENT_TEST_TARGET: null } });
         ownedScout = ownedScoutMessage.result;
       } else {
         const ownedStarted = await runOwnedControl("plan-started", { ticket: "YM-1", runId: ownedRunId });
@@ -490,6 +510,8 @@ test("raw interactive authority flows through real plan CLI and parent control w
       if (initialScoutExpected !== "complete") assert.equal(ownedScout.publication.error, initialScoutExpected, label);
       const commentsBeforeOwnedRecord = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
+      process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
+      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
       process.argv[1] = workflowChild;
       let result: { stdout: string; stderr: string };
       try {

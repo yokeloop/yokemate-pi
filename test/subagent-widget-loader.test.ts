@@ -13,6 +13,8 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
   const agentDir = join(dir, "agent");
   const script = process.argv[1];
   const cwd = process.cwd();
+  const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const target = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
   let timer: NodeJS.Timeout | undefined;
   try {
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
@@ -53,7 +55,8 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
       } },
     } as ExtensionContext;
     process.chdir(dir);
-    process.argv[1] = join(root, "test", "fixtures", "subagent-widget-child.js");
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test", "fixtures", "subagent-widget-child.js");
     const headSha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const result = await tool.definition.execute("widget-test", { agent: "task-reviewer", task: "review the diff", cwd: root, review: { baseSha: headSha, headSha } }, undefined, () => undefined, ctx);
     assert.equal("isError" in result && result.isError, false);
@@ -68,6 +71,8 @@ test("RPC with hasUI sends child widget lines and clears them on completion", as
     clearTimeout(timer);
     process.argv[1] = script;
     process.chdir(cwd);
+    if (relay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = relay;
+    if (target === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = target;
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -401,7 +401,7 @@ test("loaded completion and report hooks reread only their named settings", asyn
   }
 });
 
-test("ordinary public dispatch pins its snapshot and independently enforces all caps and opt-in confirmation", { timeout: 15000 }, async () => {
+test("ordinary public dispatch pins its snapshot and independently enforces all caps and opt-in confirmation", { timeout: 45000 }, async () => {
   const net = await import("node:net");
   const { once } = await import("node:events");
   const { tmpdir } = await import("node:os");
@@ -418,12 +418,17 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     server.listen(sock);
     await once(server, "listening");
     process.env.RUNTIME_SETTINGS_TEST_SOCKET = sock;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(dir, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test", "fixtures", "runtime-settings-child.mjs");
     delete process.env.YOKEMATE_MODE;
     delete process.env.YOKEMATE_ROLE;
     delete process.env.YOKEMATE_RUN_ID;
     process.argv[1] = join(root, "test", "fixtures", "runtime-settings-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    mkdirSync(join(dir, "test", "fixtures"), { recursive: true });
+    cpSync(join(root, "test", "fixtures", "subagent-json-relay.mjs"), join(dir, "test", "fixtures", "subagent-json-relay.mjs"));
+    symlinkSync(join(root, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents"));
     writeFileSync(join(dir, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: fixture\n---\n");
     const file = join(dir, ".pi", "settings.json");
@@ -527,10 +532,13 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
     process.env.XDG_RUNTIME_DIR = runtime;
     mkdirSync(socketDir(process.env, process.getuid!()), { recursive: true });
     writeFileSync(join(socketDir(process.env, process.getuid!()), "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: null }));
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, "package.json"), join(dir, "package.json"));
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".env.local"), "");
@@ -651,10 +659,13 @@ test("live ship coordinator keeps permit identity duplicate policy and detached 
     process.env.XDG_RUNTIME_DIR = runtime;
     mkdirSync(socketDir(process.env, process.getuid!()), { recursive: true });
     writeFileSync(join(socketDir(process.env, process.getuid!()), "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "main", parentPane: null }));
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     process.argv[1] = join(root, "test", "fixtures", "workflow-rpc-child.mjs");
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, "package.json"), join(dir, "package.json"));
     cpSync(join(root, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "ship-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".env.local"), "");

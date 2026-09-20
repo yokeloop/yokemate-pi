@@ -62,7 +62,7 @@ import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../sr
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 import { finalizeShip } from "../../../src/ship-finalize.ts";
 import { PublicationTargetFailure, publicationTargetLabel, resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, revokePendingPlanRecords, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationRow } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
@@ -366,20 +366,24 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
+let pinnedPiCli: string | undefined;
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+	if (!pinnedPiCli) {
+		const packageRoot = fs.realpathSync(path.join(ENGINE_ROOT, "node_modules", "@earendil-works", "pi-coding-agent"));
+		const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+		if (manifest.version !== "0.85.1") throw new Error("pinned Pi 0.85.1 is unavailable");
+		const contract = fs.readFileSync(path.join(packageRoot, "dist", "modes", "json-event.js"), "utf8");
+		if (!contract.includes("YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1")) throw new Error("pinned Pi JSON contract patch is unavailable");
+		pinnedPiCli = fs.realpathSync(path.join(packageRoot, "dist", "cli.js"));
 	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
+	const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+	if (relay && process.env.NODE_TEST_CONTEXT) {
+		const canonicalRelay = fs.realpathSync(relay);
+		const fixtureRoot = fs.realpathSync(path.join(ENGINE_ROOT, "test", "fixtures"));
+		if (path.dirname(canonicalRelay) !== fixtureRoot || path.basename(canonicalRelay) !== "subagent-json-relay.mjs") throw new Error("invalid test JSON relay");
+		return { command: process.execPath, args: [canonicalRelay, pinnedPiCli, ...args] };
 	}
-
-	return { command: "pi", args };
+	return { command: process.execPath, args: [pinnedPiCli, ...args] };
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -495,16 +499,31 @@ async function runSingleAgent(
 				emitUpdate();
 			}
 		});
-		const refreshObservation = () => {
-			diagnostic.metadata.stream = observation.metadata();
+		const refreshObservation = (stream = observation.metadata()) => {
+			diagnostic.metadata.stream = stream;
 			diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
 			diagnostic.metadata.sessionId = observation.sessionId;
 			diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
 		};
+		let lastProgressSnapshot = 0;
+		let priorParserErrors = 0;
+		let priorPhase: string = "unknown";
+		const checkpointProgress = () => {
+			const stream = observation.metadata();
+			const now = Date.now();
+			const firstFault = priorParserErrors === 0 && stream.parserErrors > 0;
+			const phaseChanged = stream.phase !== priorPhase;
+			priorParserErrors = stream.parserErrors;
+			priorPhase = stream.phase;
+			if (!firstFault && !phaseChanged && now - lastProgressSnapshot < 1000) return;
+			lastProgressSnapshot = now;
+			refreshObservation(stream);
+			diagnostic.save(false);
+		};
 		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
-			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, ...(child?.env ?? {}) };
+			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, YOKEMATE_SUBAGENT_JSON_CONTRACT: "1", ...(child?.env ?? {}) };
 			delete env.HERDR_PANE_ID;
 			delete env.YOKEMATE_PARENT_PANE;
 			let spawnError: Error | undefined;
@@ -527,7 +546,7 @@ async function runSingleAgent(
 				proc.kill("SIGTERM");
 				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
 			};
-			proc.stdout.on("data", (data: Buffer) => observation.write(data));
+			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
 			proc.once("close", (exitCode, signalName) => {
@@ -542,7 +561,10 @@ async function runSingleAgent(
 			else signal?.addEventListener("abort", abort, { once: true });
 		});
 		currentResult.exitCode = terminal.exitCode;
-		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
+		refreshObservation();
+		const stream = observation.metadata();
+		const stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
+		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
 		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
 			const bytes = normalizeScoutMarkdown(observation.finalText);
 			try {
@@ -555,11 +577,14 @@ async function runSingleAgent(
 				currentResult.envelope.artifact = { state: "blocked", hash: sha256(bytes), bytes: bytes.length, reason: code };
 			}
 		}
-		refreshObservation();
 		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
+		diagnostic.metadata.actualTaskHash = currentResult.envelope.actualTaskHash;
 		diagnostic.metadata.usage = { ...currentResult.usage };
 		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), retainedBytes: Buffer.byteLength(currentResult.envelope.payload), retainedHash: sha256(currentResult.envelope.payload), truncated: currentResult.envelope.payload !== observation.finalText, verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.metadata.artifact = currentResult.envelope.artifact;
 		diagnostic.save(true);
+		const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+		if (snapshotStorage && currentResult.envelope.diagnostics) currentResult.envelope.diagnostics.snapshotStorage = { ...snapshotStorage };
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -730,7 +755,7 @@ export default function (pi: ExtensionAPI) {
 		const result = await publishAccepted(row!.id, input.verifyBinding);
 		return { kind: input.kind, state: result.complete ? "complete" : "pending", target: result.target, revision: result.revision, publicationId: row!.id, ...(result.error ? { error: result.error } : {}) };
 	};
-	let snapshots: RunSnapshots | undefined;
+	const snapshots = new RunSnapshots(ENGINE_ROOT);
 	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
 	const reportAdmissions = new Map<string, ReportAdmissionDisplay>();
 	const reportSettledAt = new Map<string, number>();
@@ -738,6 +763,7 @@ export default function (pi: ExtensionAPI) {
 	const reportArchives = new Map<string, { facts: Record<string, unknown> }>();
 	const coordinatorAdmissions = new Map<string, { startedAt: number; taskExcerpt: string }>();
 	const sentBatches = new Set<string>();
+	const settlingRuns = new Set<string>();
 	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
 	const diagnosticFacts = (runId: string): ReportDiagnosticFacts => {
 		const metadata = diagnostics.get(runId)?.metadata ?? {};
@@ -781,6 +807,7 @@ export default function (pi: ExtensionAPI) {
 				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
 				if (details?.deliveryId !== delivery.deliveryId || details.envelopeHash !== delivery.envelopeHash) continue;
 				delivery.state = "observed";
+				delivery.observedAt = new Date().toISOString();
 				for (const runId of delivery.runIds) {
 					const diagnostic = diagnostics.get(runId);
 					if (diagnostic) {
@@ -1629,9 +1656,6 @@ export default function (pi: ExtensionAPI) {
 					assertPlanBinding(payload.prepared.doBinding, readRecordedPlanBinding(ENGINE_ROOT, payload.prepared.doBinding.ticket));
 					ownedBinding = payload.prepared.doBinding;
 				}
-				if (payload.prepared?.plan) {
-					try { snapshots = new RunSnapshots(payload.prepared.diagnosticRoot ?? ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
-				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
 				emitChildState();
 				ownedReadyRunId = identity.runId;
@@ -1678,6 +1702,24 @@ export default function (pi: ExtensionAPI) {
 		try { await endOwnedReview("review session shutdown"); }
 		catch (error) { latestCtx?.ui.notify(`review shutdown fencing failed: ${(error as Error).message}`, "error"); }
 		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent session shutdown")));
+		for (const { delivery, envelope } of deliveries.values()) {
+			if (!["pending", "enqueued"].includes(delivery.state)) continue;
+			delivery.state = "delivery_unknown";
+			delivery.code = "parent_shutdown";
+			delivery.failedAt = new Date().toISOString();
+			for (const runId of delivery.runIds) {
+				const diagnostic = diagnostics.get(runId);
+				if (!diagnostic) continue;
+				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, failedAt: delivery.failedAt, code: delivery.code };
+				diagnostic.metadata.deliveries = states;
+				diagnostic.save(true);
+			}
+			const retained = reportArchives.get(delivery.deliveryId);
+			if (retained) retained.facts = archiveFacts(envelope, delivery);
+			updateReportArchive(delivery.deliveryId);
+		}
+		emitChildState();
 		await fenceListRuns("parent session shutdown");
 		authority?.revoke();
 		authority = undefined;
@@ -1722,6 +1764,25 @@ export default function (pi: ExtensionAPI) {
 		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope });
 		return deliveries.get(delivery.deliveryId)!;
 	};
+	const failDelivery = (deliveryId: string, code: string): void => {
+		const entry = deliveries.get(deliveryId);
+		if (!entry || entry.delivery.state === "observed" || ["delivery_failed", "delivery_unknown"].includes(entry.delivery.state)) return;
+		entry.delivery.state = "delivery_failed";
+		entry.delivery.code = code;
+		entry.delivery.failedAt = new Date().toISOString();
+		for (const runId of entry.delivery.runIds) {
+			const diagnostic = diagnostics.get(runId);
+			if (!diagnostic) continue;
+			const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+			states[deliveryId] = { state: entry.delivery.state, envelopeHash: entry.delivery.envelopeHash, failedAt: entry.delivery.failedAt, code };
+			diagnostic.metadata.deliveries = states;
+			diagnostic.save(true);
+		}
+		const retained = reportArchives.get(deliveryId);
+		if (retained) retained.facts = archiveFacts(entry.envelope, entry.delivery);
+		updateReportArchive(deliveryId);
+		emitChildState();
+	};
 	const sendReport = (envelope: ReportEnvelope): void => {
 		const { delivery } = registerDelivery(envelope);
 		if (delivery.state !== "pending") return;
@@ -1736,9 +1797,9 @@ export default function (pi: ExtensionAPI) {
 		emitChildState();
 		if (shuttingDown) delivery.state = "delivery_unknown";
 		else try {
-			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true });
+			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true, yokemateSendId: delivery.deliveryId, onYokemateSendError: (sendId) => failDelivery(sendId, "send_rejected") });
 			if (delivery.state === "pending") delivery.state = "enqueued";
-		} catch { delivery.state = "delivery_failed"; }
+		} catch { failDelivery(delivery.deliveryId, "send_throw"); }
 		for (const runId of delivery.runIds) {
 			const diagnostic = diagnostics.get(runId);
 			if (diagnostic) {
@@ -1793,10 +1854,27 @@ export default function (pi: ExtensionAPI) {
 		} catch { safe = "unavailable"; }
 		persistScoutBlock(result, safe);
 	};
+	const assertPlanWriterAdmission = (identity: ChildIdentity): void => {
+		if (identity.agent !== "plan-writer" || !identity.ticket || !runs) return;
+		const scout = runs.assertPlanWriterAdmission(identity);
+		const reference = scout.artifact;
+		if (!reference || reference.state !== "accepted") throw new Error(`plan-writer requires the current accepted scout for ${identity.ticket}`);
+		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		try {
+			const acceptance = publicationAcceptanceById(db, reference.acceptanceId);
+			if (!acceptance || acceptance.ticket !== identity.ticket || acceptance.owner_run_id !== scout.identity.ownerRunId || acceptance.owner_session_id !== scout.identity.ownerSessionId || acceptance.batch_id !== scout.identity.batchId || acceptance.run_id !== scout.identity.runId || acceptance.task_hash !== scout.identity.taskHash || acceptance.content_hash !== reference.hash || acceptance.artifact_path !== reference.path || acceptance.bytes !== reference.bytes) throw new Error(`plan-writer scout binding is invalid for ${identity.ticket}`);
+			const bytes = readPublicationArtifact(ENGINE_ROOT, acceptance);
+			if (bytes.length !== reference.bytes || sha256(bytes) !== reference.hash) throw new Error(`plan-writer scout artifact changed for ${identity.ticket}`);
+		} finally { db.close(); }
+	};
 	const settleResult = async (result: ResultEnvelope, report: boolean) => {
-		if (!runs?.settle(result)) return;
+		if (!runs || settlingRuns.has(result.identity.runId)) return;
+		settlingRuns.add(result.identity.runId);
+		try {
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
-			if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
+			if (!runs.isCurrentScout(result.identity)) {
+				persistScoutBlock(result, "artifact_invalid");
+			} else if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
 			} else {
 				let acceptanceId: number | undefined;
@@ -1819,7 +1897,23 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		reportSettledAt.set(result.identity.runId, Date.now());
+		const settledAt = Date.now();
+		const diagnostic = diagnostics.get(result.identity.runId);
+		if (diagnostic) {
+			diagnostic.metadata.settledAt = new Date(settledAt).toISOString();
+			diagnostic.metadata.closeAt ??= new Date(settledAt).toISOString();
+			diagnostic.metadata.terminal ??= { processOutcome: result.processOutcome, exitCode: result.exitCode, signal: result.signal, stopReason: result.stopReason };
+			diagnostic.metadata.artifact = result.artifact;
+			diagnostic.metadata.publication = result.publication;
+			const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
+			diagnostic.metadata.payload = { ...originalPayload, outcome: result.payloadOutcome, retainedBytes: Buffer.byteLength(result.payload), retainedHash: sha256(result.payload), truncated: result.diagnostics?.final.truncated ?? false, verdict: result.reviewVerdict, outputLimit: result.outputLimit };
+			diagnostic.save(true);
+			const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+			if (snapshotStorage && result.diagnostics) result.diagnostics.snapshotStorage = { ...snapshotStorage };
+		}
+		result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
+		if (!runs.settle(result)) return;
+		reportSettledAt.set(result.identity.runId, settledAt);
 		if (report) registerDelivery(result);
 		const batch = runs.batch(result.identity.batchId);
 		if (batch) {
@@ -1827,6 +1921,7 @@ export default function (pi: ExtensionAPI) {
 			if (!report) registerDelivery({ ...batch, kind: "chain" });
 		}
 		if (report) sendReport(result);
+		} finally { settlingRuns.delete(result.identity.runId); }
 	};
 
 	pi.registerTool({
@@ -1989,6 +2084,7 @@ export default function (pi: ExtensionAPI) {
 				let output = "";
 				try {
 					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
+					assertPlanWriterAdmission(identity);
 					runs!.start(identity);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
@@ -1998,7 +2094,7 @@ export default function (pi: ExtensionAPI) {
 						trackRunning(proc, identity.agent, task);
 					}, identity, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
-					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
+					envelope = result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
 					const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
@@ -2022,20 +2118,38 @@ export default function (pi: ExtensionAPI) {
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
-				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
-					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), ownerPid: process.pid, ownerStarttime: processStarttime(process.pid), runtime: { node: process.version, pi: "0.85.1", contract: 1 }, extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
+					const diagnostic = { metadata, save: (completed: boolean) => {
+						const status = snapshots.write(identity.ownerRunId, identity.runId, metadata, completed);
+						metadata.snapshotStorage = status;
+					} };
 					diagnostics.set(identity.runId, diagnostic);
 					diagnostic.save(false);
 				}
+				const admissionFence = process.env.YOKEMATE_MODE === "plan"
+					? Promise.all(ack.children.filter(({ identity }) => identity.agent === "plan-scout" && identity.ticket).map(async ({ identity }) => {
+						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						try { revokePendingPlanRecords(db, identity.ticket!); } finally { db.close(); }
+						const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						if (reply.state !== "accepted") throw new Error(reply.reason ?? "current scout admission was not fenced");
+					}))
+					: Promise.resolve([]);
 				activeUnits += units;
 				batches.add(toolCallId);
 				emitChildState();
 				const execute = async () => {
 					try {
+						try { await admissionFence; }
+						catch {
+							for (const { identity } of ack.children) await settleResult(resultEnvelope(identity, tasks[ack.children.findIndex((child) => child.identity.runId === identity.runId)]!.task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), mode !== "chain");
+							if (mode === "chain") sendReport(runs!.batch(toolCallId, "chain")!);
+							settleBatch(toolCallId);
+							return;
+						}
 						if (mode === "chain") {
 							let previous = "";
 							let failed = false;

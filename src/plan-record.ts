@@ -49,6 +49,11 @@ export function recordPlanCore(root: string, ticket: string, expectedBinding: Pl
   let sideEffects = false;
   try {
     out = applyMove(db, "plan", env, ticket, () => {
+      const current = planRecordById(db, record.id);
+      if (!current || current.scout_acceptance === null || current.scout_acceptance !== record.scout_acceptance || current.successful_record !== record.successful_record) throw new Error("binding_changed");
+      const currentScout = publicationAcceptanceById(db, current.scout_acceptance);
+      if (!currentScout || currentScout.ticket !== ticket) throw new Error("artifact_invalid");
+      assertPublishable(readPublicationArtifact(root, currentScout));
       db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
       markSuccessfulRecord(db, record.id);
     }, { settings });
