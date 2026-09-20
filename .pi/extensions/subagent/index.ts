@@ -927,6 +927,7 @@ export default function (pi: ExtensionAPI) {
 		const runIds = new Set(explicitRunIds);
 		for (const ticket of new Set(tickets)) for (const runId of store?.revoke(ticket) ?? []) runIds.add(runId);
 		let cancelled = false;
+		const immediateRunIds: string[] = [];
 		for (const runId of runIds) {
 			planRunGenerations.delete(runId);
 			planRunMetadata.delete(runId);
@@ -934,10 +935,12 @@ export default function (pi: ExtensionAPI) {
 				cancelledRecordingPlans.add(runId);
 				recorderControllers.get(runId)?.abort();
 				cancelled = true;
+				continue;
 			}
+			immediateRunIds.push(runId);
 		}
-		cancelled = listRuns.cancelMany([...runIds], reason) || cancelled;
-		const coordinatorRunIds = [...runIds].filter((runId) => Boolean(coordinators.get(runId)));
+		cancelled = listRuns.cancelMany(immediateRunIds, reason) || cancelled;
+		const coordinatorRunIds = immediateRunIds.filter((runId) => Boolean(coordinators.get(runId)));
 		return { runIds, coordinatorRunIds, cancelled: cancelled || coordinatorRunIds.length > 0 };
 	};
 	const fenceListRuns = async (reason: string) => {
