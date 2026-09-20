@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PlanBinding } from "../src/plan-binding.ts";
 import { processStarttime } from "../src/coordinator-control.ts";
-import { ReviewReworkStore, validateReviewReworkExtraction } from "../src/review-rework.ts";
+import { ReviewReworkStore, validateReviewReworkExtraction, adaptReviewReworkQuotes } from "../src/review-rework.ts";
 
 const binding: PlanBinding = { ticket: "YM-1", path: "/knowledge/rework.md", contentHash: "content", scopeHash: "scope", repositories: ["org/repo"] };
 const owner = {
@@ -140,6 +140,24 @@ test("candidate failure is retained and cannot reuse the old verdict", async () 
     return { state: "refused", recorded: false, reason: "still invalid" };
   });
   assert.equal(outcome.state, "refused");
+});
+
+test("review quote protocol locates unique unchanged UTF-16 spans without model arithmetic", () => {
+  const raw = "План доработки согласован. На доработку.";
+  const quotes = { kind: "rework", evidence: [{ text: "На доработку." }] };
+  assert.deepEqual(adaptReviewReworkQuotes(quotes, raw, "YM-1"), { kind: "rework", evidence: [{ start: 27, end: 40, text: "На доработку." }] });
+  const observed = JSON.parse('{"kind":"rework","evidence":[{"start":26,"end":39,"text":"На доработку."}]}');
+  assert.throws(() => validateReviewReworkExtraction(observed, raw, "YM-1"), /literal evidence span mismatch/);
+  assert.throws(() => adaptReviewReworkQuotes(observed, raw, "YM-1"), /quote/);
+  assert.deepEqual(adaptReviewReworkQuotes({ kind: "revoke", evidence: [{ text: "стоп 🚀" }] }, "🚀 е\u0301: стоп 🚀", "YM-1"), { kind: "revoke", evidence: [{ start: 7, end: 14, text: "стоп 🚀" }] });
+  assert.deepEqual(adaptReviewReworkQuotes({ kind: "none" }, raw, "YM-1"), { kind: "none" });
+  for (const value of [null, [], {}, { kind: "other" }, { kind: "none", evidence: [] }, { ...quotes, extra: true }, { kind: "rework" }, { kind: "rework", evidence: [] }, { kind: "rework", evidence: Array(9).fill({ text: "На доработку." }) }, { kind: "rework", evidence: ["На доработку."] }, { kind: "rework", evidence: [{ text: "" }] }, { kind: "rework", evidence: [{}] }, { kind: "rework", evidence: [{ text: "На доработку.", extra: true }] }, { kind: "rework", evidence: [{ text: "На доработку!" }] }]) {
+    assert.throws(() => adaptReviewReworkQuotes(value, raw, "YM-1"), /quote/);
+  }
+  assert.throws(() => adaptReviewReworkQuotes(quotes, `${raw} На доработку.`, "YM-1"), /ambiguous/);
+  assert.throws(() => adaptReviewReworkQuotes({ kind: "rework", evidence: [{ text: "аа" }] }, "ааа", "YM-1"), /ambiguous/);
+  assert.throws(() => adaptReviewReworkQuotes(quotes, `${raw} YM-2`, "YM-1"), /foreign/);
+  assert.throws(() => adaptReviewReworkQuotes({ kind: "rework", evidence: [{ text: "ё" }] }, "е\u0308", "YM-1"), /missing/);
 });
 
 test("review extraction accepts literal UTF-16 evidence and rejects foreign tickets or loose schema", () => {

@@ -78,12 +78,15 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     writeFileSync(join(runtimeDir, "review-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "review-session", parentPane: "main-pane", cwd: dir, mode: "review", ticket: "YM-1" }));
     const notifications: string[] = [];
     let confirms = 0;
+    let observedWrongOffsets = false;
     const modelRegistry = {
       getAll: () => [{ provider: "test", id: "review", name: "review" }, { provider: "test", id: "model", name: "model" }],
       hasConfiguredAuth: () => true,
       complete: async (_model: unknown, context: { messages: { content: string }[] }) => {
         const raw = JSON.parse(context.messages[0]!.content).raw as string;
-        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ kind: "rework", evidence: [{ start: 0, end: raw.length, text: raw }] }) }] };
+        return { stopReason: "stop", content: [{ type: "text", text: observedWrongOffsets
+          ? '{"kind":"rework","evidence":[{"start":26,"end":39,"text":"На доработку."}]}'
+          : JSON.stringify({ kind: "rework", evidence: [{ text: raw === "План доработки согласован. На доработку." ? "На доработку." : raw }] }) }] };
       },
     };
     const ui = { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } };
@@ -115,6 +118,10 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
     await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
     for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "Итог: отправляй на доработку" } as never, { ...workerCtx, mode: "rpc" } as ExtensionContext);
     await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
+    observedWrongOffsets = true;
+    for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "План доработки согласован. На доработку." } as never, workerCtx);
+    await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
+    observedWrongOffsets = false;
     if (workflowApproval) {
       const failedDb = openDb(join(dir, "yokemate.db"));
       failedDb.prepare("UPDATE project SET mode_models=? WHERE tracker_key='YM'").run(JSON.stringify({ review: "test/review", do: "missing/model" }));
@@ -137,7 +144,7 @@ async function runCase(workflowApproval: boolean, entry: "node" | "package") {
       assert.deepEqual(parseOutput(repeated.stdout, repeated.stderr), failure);
       for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "После исправления снова отправляй на доработку" } as never, workerCtx);
     } else {
-      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "Итог: отправляй на доработку" } as never, workerCtx);
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "План доработки согласован. На доработку." } as never, workerCtx);
     }
     const result = await accept();
     const outcome = parseOutput(result.stdout, result.stderr) as { state: string; recorded: boolean; runId: string; model: string; plan: string; contentHash: string; close: { state: string } };

@@ -52,7 +52,7 @@ import { ListRunRegistry, type KeyRunContext } from "../../../src/list-run.ts";
 import { launchPlanKey } from "../../../src/plan-launch.ts";
 import { herdrAsync } from "../../../src/herdr.ts";
 import { closeModeSurface } from "../../../src/mode-surface.ts";
-import { observeProcessIdentity, ReviewReworkStore, REVIEW_REWORK_EXTRACTION_INSTRUCTION, validateReviewReworkExtraction, type ReviewHandoffOutcome } from "../../../src/review-rework.ts";
+import { observeProcessIdentity, ReviewReworkStore, REVIEW_REWORK_EXTRACTION_INSTRUCTION, adaptReviewReworkQuotes, validateReviewReworkExtraction, type ReviewHandoffOutcome } from "../../../src/review-rework.ts";
 import { recordReviewRework } from "../../../src/accept.ts";
 import { logMove } from "../../../src/move-log.ts";
 import { syncPush } from "../../../src/git-sync.ts";
@@ -1244,7 +1244,7 @@ export default function (pi: ExtensionAPI) {
 					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller!.abort(); reject(new Error("review verdict extraction timed out")); }, 15_000); }),
 				]);
 				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("review verdict extraction did not return a clean no-tools result");
-				const extraction = validateReviewReworkExtraction(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, ticket);
+				const extraction = adaptReviewReworkQuotes(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, ticket);
 				const extracted = await requestReviewControl(ENGINE_ROOT, "review-extraction", { ticket, runId, generation: begun.generation, extraction }, origin, parent);
 				if (extracted.state !== "accepted") throw new Error(extracted.reason ?? "review verdict registration refused");
 			} catch (error) { ctx.ui.notify((error as Error).message, "warning"); }

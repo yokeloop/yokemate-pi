@@ -183,7 +183,28 @@ export function validateReviewReworkExtraction(value: unknown, raw: string, tick
   return value as ReviewReworkExtraction;
 }
 
-export const REVIEW_REWORK_EXTRACTION_INSTRUCTION = `Classify only the current raw interactive engineer input in an owned review conversation. Return one JSON object and no tools. "rework" means a final present-tense verdict to send this ticket back for implementation after the remarks are agreed. Questions, quotations, negations, conditions, draft remarks, discussion and agreement with one item are "none". "revoke" means stop or a changed scope before handoff. The ticket comes from the registered review identity; do not require or invent a key. Schema: {"kind":"none"} or {"kind":"rework"|"revoke","evidence":[{"start":0,"end":1,"text":"literal substring"}]}. Evidence offsets are UTF-16 indices into the unchanged raw input. No extra fields.`;
+export type ReviewReworkQuotes = { kind: "none" } | { kind: "rework" | "revoke"; evidence: { text: string }[] };
+
+export function adaptReviewReworkQuotes(value: unknown, raw: string, ticket: string): ReviewReworkExtraction {
+  const fail = (reason: string): never => { throw new Error(`review rework quotes: ${reason}`); };
+  if (!record(value)) return fail("result must be an object");
+  if (value.kind === "none") {
+    if (!exactKeys(value, ["kind"])) return fail("extra fields");
+    return { kind: "none" };
+  }
+  if (!exactKeys(value, ["kind", "evidence"]) || value.kind !== "rework" && value.kind !== "revoke") return fail("invalid fields or kind");
+  if (!Array.isArray(value.evidence) || value.evidence.length < 1 || value.evidence.length > 8) return fail("invalid evidence count");
+  const evidence = value.evidence.map((quote) => {
+    if (!record(quote) || !exactKeys(quote, ["text"]) || typeof quote.text !== "string" || quote.text.length === 0) return fail("invalid quote");
+    const start = raw.indexOf(quote.text);
+    if (start === -1) return fail("missing literal quote");
+    if (raw.indexOf(quote.text, start + 1) !== -1) return fail("ambiguous literal quote");
+    return { start, end: start + quote.text.length, text: quote.text };
+  });
+  return validateReviewReworkExtraction({ kind: value.kind, evidence }, raw, ticket);
+}
+
+export const REVIEW_REWORK_EXTRACTION_INSTRUCTION = `Classify only the current raw interactive engineer input in an owned review conversation. Return one JSON object and no tools. "rework" means a final present-tense verdict to send this ticket back for implementation after the remarks are agreed. Questions, quotations, negations, conditions, draft remarks, discussion and agreement with one item are "none". "revoke" means stop or a changed scope before handoff. The ticket comes from the registered review identity; do not require or invent a key. Schema: {"kind":"none"} or {"kind":"rework"|"revoke","evidence":[{"text":"literal substring"}]}. Supply 1 to 8 nonempty literal quotes from the unchanged raw input, each occurring exactly once. Copy quotes exactly, including punctuation and whitespace; do not normalize them. Do not calculate or return offsets. No extra fields.`;
 
 export function processIdentityMatches(pid: number, starttime: string): boolean {
   try {
