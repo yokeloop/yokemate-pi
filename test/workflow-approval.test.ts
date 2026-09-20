@@ -32,6 +32,18 @@ test("do authority binds exact parent, ticket, plan, generation and single-use c
   assert.throws(() => store.checkCycle("run-1", binding), /cycle/);
 });
 
+test("targeted revoke returns every consumed cycle for the same ticket", () => {
+  const store = new DoAuthorityStore(parent);
+  const generation = store.beginInput("run YM-1 twice");
+  store.approve("exact-do", "YM-1", binding, generation);
+  store.consume("YM-1", binding, parent, "run-1");
+  store.approve("exact-do", "YM-1", binding, generation);
+  store.consume("YM-1", binding, parent, "run-2");
+  assert.deepEqual(store.revoke("YM-1").sort(), ["run-1", "run-2"]);
+  assert.throws(() => store.checkCycle("run-1", binding), /cycle/);
+  assert.throws(() => store.checkCycle("run-2", binding), /cycle/);
+});
+
 test("advance authority only binds an actual record and workflowApproval always stops it", () => {
   for (const stop of [true, false]) {
     const store = new DoAuthorityStore(parent);

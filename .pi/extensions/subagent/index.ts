@@ -848,6 +848,10 @@ export default function (pi: ExtensionAPI) {
 	const observedTurnSignals = new WeakSet<AbortSignal>();
 	const warnedWorkflowExtractions = new WeakSet<PendingWorkflowExtraction>();
 	interface WorkflowGenerationCapture { parent: ApprovalParent; store: DoAuthorityStore; generation: InputGeneration; operation?: PendingWorkflowExtraction }
+	type WorkflowConsumerMetadata = { requestId?: string; toolCallId?: string; listRunId?: string; keyRunId?: string };
+	const planRunGenerations = new Map<string, WorkflowGenerationCapture>();
+	const planRunMetadata = new Map<string, WorkflowConsumerMetadata>();
+	const planRecordGenerations = new Map<number, WorkflowGenerationCapture>();
 	const captureWorkflowGeneration = (): WorkflowGenerationCapture | undefined => {
 		if (!authority || !controlIdentity) return;
 		const generation = authority.generation();
@@ -916,6 +920,23 @@ export default function (pi: ExtensionAPI) {
 		cancellingCoordinators.set(runId, operation);
 		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
 		return operation;
+	};
+	const fenceTargetedWorkflow = (tickets: readonly string[], explicitRunIds: readonly string[], reason: string, store = authority) => {
+		const runIds = new Set(explicitRunIds);
+		for (const ticket of new Set(tickets)) for (const runId of store?.revoke(ticket) ?? []) runIds.add(runId);
+		let cancelled = false;
+		for (const runId of runIds) {
+			planRunGenerations.delete(runId);
+			planRunMetadata.delete(runId);
+			if (recordingPlans.has(runId)) {
+				cancelledRecordingPlans.add(runId);
+				recorderControllers.get(runId)?.abort();
+				cancelled = true;
+			}
+		}
+		cancelled = listRuns.cancelMany([...runIds], reason) || cancelled;
+		const coordinatorRunIds = [...runIds].filter((runId) => Boolean(coordinators.get(runId)));
+		return { runIds, coordinatorRunIds, cancelled: cancelled || coordinatorRunIds.length > 0 };
 	};
 	const fenceListRuns = async (reason: string) => {
 		const entries = [...listRuns.activeEntries()];
@@ -1007,11 +1028,8 @@ export default function (pi: ExtensionAPI) {
 				return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => store.approve("post-plan-approval", extraction.ticket, current, generation) };
 			}
 			return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => {
-				const stopped = store.revoke(extraction.ticket);
-				setImmediate(() => { for (const runId of stopped) {
-					if (coordinators.get(runId)) void cancelCoordinator(runId, "parent_cancel_run").catch(() => {});
-					else listRuns.cancel(runId, "workflow revoked");
-				} });
+				const fenced = fenceTargetedWorkflow([extraction.ticket], [], "workflow revoked", store);
+				setImmediate(() => { void Promise.all(fenced.coordinatorRunIds.map((runId) => cancelCoordinator(runId, "parent_cancel_run"))).catch(() => {}); });
 			} };
 		}));
 	};
@@ -1076,7 +1094,6 @@ export default function (pi: ExtensionAPI) {
 			return { action: "handled" as const };
 		}
 	});
-	type WorkflowConsumerMetadata = { requestId?: string; toolCallId?: string; listRunId?: string; keyRunId?: string };
 	const workflowConsumerFacts = (kind: string, metadata: WorkflowConsumerMetadata, ticket?: string): Record<string, unknown> => ({ consumerKind: kind, ...(ticket ? { ticket } : {}), ...(safeWorkflowId(metadata.requestId) ? { requestId: safeWorkflowId(metadata.requestId) } : {}), ...(safeWorkflowId(metadata.toolCallId) ? { toolCallId: safeWorkflowId(metadata.toolCallId) } : {}), ...(safeWorkflowId(metadata.listRunId) ? { listRunId: safeWorkflowId(metadata.listRunId) } : {}), ...(safeWorkflowId(metadata.keyRunId) ? { keyRunId: safeWorkflowId(metadata.keyRunId) } : {}) });
 	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings | undefined, lane?: { context: KeyRunContext; doBinding?: PlanBinding }, metadata: WorkflowConsumerMetadata = {}) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
@@ -1330,9 +1347,9 @@ export default function (pi: ExtensionAPI) {
 			shipPermits.invalidate();
 			return undefined;
 		});
-		const planRunGenerations = new Map<string, WorkflowGenerationCapture>();
-		const planRunMetadata = new Map<string, WorkflowConsumerMetadata>();
-		const planRecordGenerations = new Map<number, WorkflowGenerationCapture>();
+		planRunGenerations.clear();
+		planRunMetadata.clear();
+		planRecordGenerations.clear();
 		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin, planRunId?: string) => {
 			const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 			assertPublishable(snapshot.bytes);
@@ -1539,36 +1556,13 @@ export default function (pi: ExtensionAPI) {
 					if (!target && !direct) throw new Error(`unknown coordinator run ${runId}`);
 					workflowExtraction?.cancel("parent_cancel");
 					shipPermits.invalidate();
-					let cancelled = false;
-					const pendingStops = new Map<string, { reason: "parent_control_cancel" | "parent_cancel_run"; suppress: boolean }>();
-					const queueStop = (coordinatorRunId: string, reason: "parent_control_cancel" | "parent_cancel_run", suppress = false) => {
-						if (!coordinators.get(coordinatorRunId)) return;
-						pendingStops.set(coordinatorRunId, { reason, suppress });
-						cancelled = true;
-					};
 					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
-					const listCancellations: string[] = [];
-					for (const entry of entries) {
-						planRunGenerations.delete(entry.keyRunId);
-						planRunMetadata.delete(entry.keyRunId);
-						const stopped = authority?.revoke(entry.key) ?? [];
-						if (recordingPlans.has(entry.keyRunId)) {
-							cancelledRecordingPlans.add(entry.keyRunId);
-							recorderControllers.get(entry.keyRunId)?.abort();
-							cancelled = true;
-						} else {
-							listCancellations.push(entry.keyRunId);
-							queueStop(entry.keyRunId, "parent_control_cancel", true);
-						}
-						for (const coordinatorRunId of stopped) if (coordinatorRunId !== entry.keyRunId) queueStop(coordinatorRunId, "parent_cancel_run");
-					}
-					cancelled = listRuns.cancelMany(listCancellations) || cancelled;
-					if (!target && direct) {
-						for (const coordinatorRunId of authority?.revoke(direct.identity.ticket) ?? []) if (coordinatorRunId !== runId) queueStop(coordinatorRunId, "parent_cancel_run");
-						queueStop(runId, "parent_control_cancel");
-					}
-					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
-					await Promise.all([...pendingStops].map(([coordinatorRunId, stop]) => cancelCoordinator(coordinatorRunId, stop.reason, stop.suppress)));
+					const explicitRunIds = target ? entries.map((entry) => entry.keyRunId) : [runId];
+					const explicit = new Set(explicitRunIds);
+					const tickets = target ? entries.map((entry) => entry.key) : [direct!.identity.ticket];
+					const fenced = fenceTargetedWorkflow(tickets, explicitRunIds, "parent control cancel");
+					if (!fenced.cancelled) throw new Error(`unknown coordinator run ${runId}`);
+					await Promise.all(fenced.coordinatorRunIds.map((coordinatorRunId) => cancelCoordinator(coordinatorRunId, explicit.has(coordinatorRunId) ? "parent_control_cancel" : "parent_cancel_run", Boolean(target && explicit.has(coordinatorRunId)))));
 				},
 				merge: async (runId, request, mergeOrigin) => {
 					const run = coordinators.get(runId);
@@ -1906,23 +1900,18 @@ export default function (pi: ExtensionAPI) {
 			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
 			if (params.cancelRun) {
 				try {
-					if (coordinators.get(params.cancelRun)) {
-						workflowExtraction?.cancel("parent_cancel");
-						shipPermits.invalidate();
-						const target = coordinators.get(params.cancelRun)!;
-						authority?.revoke(target.identity.ticket);
-						const cancelled = listRuns.cancel(params.cancelRun);
-						const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run", cancelled);
-						return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] };
-					}
+					const direct = coordinators.get(params.cancelRun);
 					const listTarget = listRuns.get(params.cancelRun);
-					if (listTarget) {
-						workflowExtraction?.cancel("parent_cancel");
-						shipPermits.invalidate();
-						for (const entry of "run" in listTarget ? [listTarget.entry] : listTarget.entries) authority?.revoke(entry.key);
-					}
-					if (listRuns.cancel(params.cancelRun)) return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
-					throw new Error(`unknown coordinator run ${params.cancelRun}`);
+					if (!direct && !listTarget) throw new Error(`unknown coordinator run ${params.cancelRun}`);
+					workflowExtraction?.cancel("parent_cancel");
+					shipPermits.invalidate();
+					const entries = listTarget ? "run" in listTarget ? [listTarget.entry] : listTarget.entries : [];
+					const explicitRunIds = listTarget ? entries.map((entry) => entry.keyRunId) : [params.cancelRun];
+					const tickets = listTarget ? entries.map((entry) => entry.key) : [direct!.identity.ticket];
+					const fenced = fenceTargetedWorkflow(tickets, explicitRunIds, "parent cancel");
+					if (!fenced.cancelled) throw new Error(`unknown coordinator run ${params.cancelRun}`);
+					await Promise.all(fenced.coordinatorRunIds.map((runId) => cancelCoordinator(runId, "parent_cancel_run", true)));
+					return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (ownedBinding) {

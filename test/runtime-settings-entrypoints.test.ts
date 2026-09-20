@@ -552,6 +552,10 @@ test("live do coordinator keeps single-use approval duplicate policy and detache
       assert.ok(allowedId, JSON.stringify(allowed));
       for (const key of Object.keys(stamp)) delete process.env[key];
       await tool.execute("cancel", { cancelRun: allowedId }, undefined, () => undefined, ctx);
+      set({ spawnCaller: false, duplicateDo: false, ...bypass });
+      await approve();
+      const replacement = await launch();
+      assert.ok((replacement.details as { runId?: string } | undefined)?.runId, JSON.stringify(replacement));
     }
     set({ duplicateDo: false }, 1);
     await approve();
