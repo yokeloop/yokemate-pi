@@ -115,6 +115,10 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
   const dir = mkdtempSync(join(tmpdir(), "ym228-cancel-"));
   const socketPath = join(dir, "cancel.sock");
   const agentDir = join(dir, "agent");
+  const promptTmp = join(dir, "tmp");
+  mkdirSync(promptTmp);
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = promptTmp;
   const previousArgv = process.argv[1];
   const previousSocket = process.env.RUNTIME_SETTINGS_TEST_SOCKET;
   const previousMode = process.env.SUBAGENT_CANCEL_MODE;
@@ -217,6 +221,7 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
     if (previousSocket === undefined) delete process.env.RUNTIME_SETTINGS_TEST_SOCKET; else process.env.RUNTIME_SETTINGS_TEST_SOCKET = previousSocket;
     if (previousMode === undefined) delete process.env.SUBAGENT_CANCEL_MODE; else process.env.SUBAGENT_CANCEL_MODE = previousMode;
     for (const [key, value] of Object.entries(previousOwner)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    if (previousTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmpdir;
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(dir, { recursive: true, force: true });
