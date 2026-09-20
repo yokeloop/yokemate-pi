@@ -296,7 +296,10 @@ function packageTargetVerdict(command: string, own?: PackageScope): Verdict | nu
             operation = w;
             if (!["run", "run-script", "install", "ci", "exec"].includes(w)) script = w;
           } else if ((operation === "run" || operation === "run-script") && !script) script = w;
-          else if (operation === "exec") break;
+          else if (operation === "exec") {
+            if (manager === "npm") return deny("npm exec requires -- before the local tool; use npm exec --no -- <tool>");
+            break;
+          }
           else if (!script) return deny("unsupported install arguments");
           if (manager === "pnpm" && script) { i++; break; }
         }

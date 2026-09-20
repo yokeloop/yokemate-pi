@@ -67,6 +67,32 @@ test("package targets accept literal assigned operations and script argument bou
   ]) assert.equal(bash("do", command), null, command);
 });
 
+for (const command of [
+  `npm exec tsc --prefix '${fixture}' --no`,
+  "npm exec tsc --workspace foreign --no",
+  "npm exec tsc --package typescript --no",
+  "npm exec tsc --no",
+  `npm exec tsc -- --prefix '${fixture}'`,
+]) {
+  test(`package targets require npm exec delimiter before the tool: ${command}`, () => {
+    assert.equal(bash("do", command)?.decision, "deny");
+  });
+}
+
+test("package targets keep explicit npm exec and pnpm exec tool arguments as data", () => {
+  for (const command of [
+    `npm exec --no -- tsc --prefix '${fixture}' --workspace foreign --package typescript`,
+    `npm --prefix '${repo}' exec --no -- tsc --noEmit`,
+    `npm exec --prefix '${repo}' --no -- tsc --noEmit`,
+    `pnpm exec tsc --prefix '${fixture}' --workspace foreign --package typescript`,
+  ]) assert.equal(bash("do", command), null, command);
+  for (const command of [
+    `npm exec --prefix '${fixture}' --no -- tsc`,
+    "npm exec --workspace foreign --no -- tsc",
+    "npm exec --package typescript --no -- tsc",
+  ]) assert.equal(bash("do", command)?.decision, "deny", command);
+});
+
 test("package targets reject unassigned ambiguous and unsupported execution", () => {
   for (const command of [
     `npm --prefix '${fixture}' test`, `pnpm -C '${foreign}' build`, `npm --prefix '${clone}' ci`,
