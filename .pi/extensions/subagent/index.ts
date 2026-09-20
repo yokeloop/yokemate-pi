@@ -1207,7 +1207,6 @@ export default function (pi: ExtensionAPI) {
 		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
-		shuttingDown = false;
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID !== undefined && process.env.YOKEMATE_TICKET) {

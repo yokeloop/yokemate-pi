@@ -394,8 +394,12 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
   let completions = 0;
   let releaseCompletion!: () => void;
   let markCompletionStarted!: () => void;
+  let releaseReverseCompletion!: () => void;
+  let markReverseCompletionStarted!: () => void;
   const completionStarted = new Promise<void>((resolve) => { markCompletionStarted = resolve; });
   const completionBarrier = new Promise<void>((resolve) => { releaseCompletion = resolve; });
+  const reverseCompletionStarted = new Promise<void>((resolve) => { markReverseCompletionStarted = resolve; });
+  const reverseCompletionBarrier = new Promise<void>((resolve) => { releaseReverseCompletion = resolve; });
   const server = bindCoordinatorControl(root, {
     launch: async () => { throw new Error("unexpected launch"); },
     status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
@@ -405,8 +409,8 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
       assert.match(child.runId, /^scout-save/);
       return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) };
     },
-    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }; },
-    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.equal(recordId, 9); assert.equal(context.kind, "save-only"); markCompletionStarted(); await completionBarrier; verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
+    preparePlanPublication: async (_ticket, _path, _hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: preparations > 2 ? 10 : 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }; },
+    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.ok(recordId === 9 || recordId === 10); assert.equal(context.kind, "save-only"); if (recordId === 9) { markCompletionStarted(); await completionBarrier; } else { markReverseCompletionStarted(); await reverseCompletionBarrier; } verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
   const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
   let cliPid = 0;
@@ -459,14 +463,27 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     assert.equal(completions, 1);
     assert.equal(publications, 2);
     assert.equal(preparations, 2);
+    const reverseChild = { ...scoutChild(worker, "YM-7", "save-reverse"), ownerRunId: child.ownerRunId, runId: "scout-save-reverse", cwd: root };
+    assert.equal((await requestPlanControl(root, "publish-plan-scout", { ticket: "YM-7", acceptanceId: 7, child: reverseChild }, worker, target, env)).state, "accepted");
+    assert.equal((await requestPlanControl(root, "prepare-plan-publication", { ticket: "YM-7", path: binding.path, contentHash: binding.contentHash }, cli, target, env)).recordId, 10);
+    const mainFirst = requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, target, env);
+    await reverseCompletionStarted;
+    const saveOnlySecond = requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, cli, target, env);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    releaseReverseCompletion();
+    const [mainFirstResult, saveOnlySecondResult] = await Promise.all([mainFirst, saveOnlySecond]);
+    assert.equal(mainFirstResult.handoff, "unavailable");
+    assert.equal(saveOnlySecondResult.handoff, "unavailable");
+    assert.equal(completions, 2);
     writeFileSync(binding.path, readFileSync(binding.path, "utf8").replace("Verify completion.", "Verify changed completion."));
-    const changed = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 9 }, cli, target, env);
+    const changed = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, cli, target, env);
     assert.equal(changed.state, "refused");
     assert.match(changed.reason ?? "", /retry binding changed/);
-    const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 9 }, cli, target, env);
+    const foreign = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: "/other.md", recordId: 10 }, cli, target, env);
     assert.equal(foreign.state, "refused");
   } finally {
     releaseCompletion?.();
+    releaseReverseCompletion?.();
     if (cliPid) try { process.kill(cliPid, "SIGKILL"); } catch {}
     if (owner.exitCode === null) owner.kill("SIGKILL");
     await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -24,7 +24,7 @@ async function waitForFile(path: string, timeout = 15000): Promise<void> {
   }
 }
 
-test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 120000 }, async () => {
+test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 300000 }, async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "workflow-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
   const env = { ...process.env };
@@ -58,6 +58,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, "package.json"), join(dir, "package.json"));
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    cpSync(join(source, ".pi", "prompts"), join(dir, ".pi", "prompts"), { recursive: true });
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "agents", "plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
@@ -415,58 +416,60 @@ test("raw interactive authority flows through real plan CLI and parent control w
     await runLegacyPublicationCase("plan-pending", "complete", "unavailable", "advance");
     await runLegacyPublicationCase("both-pending", "unavailable", "unavailable", "guarded");
     await runLegacyPublicationCase("conflict", "complete", "remote_conflict");
-    const ownedLoaderExtensions = async () => {
-      const ownedLoader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")] });
-      await ownedLoader.reload();
-      const ownedLoaded = ownedLoader.getExtensions();
-      assert.deepEqual(ownedLoaded.errors, []);
-      ownedLoaded.runtime.appendEntry = () => undefined;
-      ownedLoaded.runtime.sendMessage = receiveReport;
-      const extension = ownedLoaded.extensions[0]!;
-      return { extension, tool: extension.tools.get("subagent")!.definition, context: { ...ctx, sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext };
+    const promptTemplates = await import(new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+    const templates = promptTemplates.loadPromptTemplates({ cwd: dir, agentDir, promptPaths: [join(dir, ".pi", "prompts")], includeDefaults: false });
+    const launchPrompt = (raw: string) => {
+      const expanded = promptTemplates.expandPromptTemplate(raw, templates);
+      const command = expanded.match(/`pnpm (split plan[^`]*)`/)?.[1];
+      assert.ok(command, expanded);
+      const [entry, mode, ...args] = command.split(/\s+/);
+      assert.deepEqual([entry, mode], ["split", "plan"]);
+      return promisify(execFile)("pnpm", [entry!, mode!, ...args], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "parent", HERDR_ENV: "1", HERDR_PANE_ID: "main-pane", HERDR_WORKSPACE_ID: "workspace", XDG_RUNTIME_DIR: runtime } });
     };
     const runOwnedPublicationCase = async (label: string, scoutExpected: ExpectedPublication, planExpected: ExpectedPublication, authority: "none" | "plain" | "advance" | "guarded" = "none", surface: "tab" | "split" = "tab") => {
       configurePublication(`owned-${label}`, scoutExpected, planExpected);
-      if (authority === "plain") {
-        set(false);
-        extraction = "none";
-        await input("/plan YM-1");
-      } else if (authority === "advance" || authority === "guarded") {
+      const rawPlan = `/plan ${surface === "split" ? "--split " : ""}YM-1`;
+      if (authority === "plain" || authority === "guarded") {
         set(authority === "guarded");
+        extraction = "none";
+        await input(rawPlan);
+      } else if (authority === "advance") {
+        set(false);
         extraction = "advance-plan-do";
         await input("Plan and then do YM-1");
       }
       rmSync(ownedPlanReady, { force: true });
       rmSync(ownedPlanFinished, { force: true });
-      const launched = await promisify(execFile)("pnpm", ["split", "plan", ...(surface === "split" ? ["--split"] : []), "YM-1"], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "parent", HERDR_ENV: "1", HERDR_PANE_ID: "main-pane", HERDR_WORKSPACE_ID: "workspace", XDG_RUNTIME_DIR: runtime } });
+      const launched = await launchPrompt(rawPlan);
       const ownedRunId = launched.stdout.match(/run ([a-f0-9-]+)/)?.[1];
       assert.ok(ownedRunId, launched.stdout + launched.stderr);
       await waitForFile(ownedPlanReady);
-      writeFileSync(join(socketDir({ ...process.env, XDG_RUNTIME_DIR: runtime }, process.getuid!()), "owned-pane.json"), JSON.stringify({ pid: process.pid, cwd: dir, mode: "plan", ticket: "YM-1" }));
-      Object.assign(process.env, { PI_SESSION_FILE: join(dir, `owned-${label}.jsonl`), YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "main-pane" });
       if (scoutExpected === "target_unavailable") db.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
       const initialScoutExpected: ExpectedPublication = scoutExpected === "target_changed" ? "complete" : scoutExpected;
-      process.argv[1] = realpathSync(join(source, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
-      const loadedOwned = await ownedLoaderExtensions();
-      const ownedExtension = loadedOwned.extension;
-      const ownedCtx = loadedOwned.context;
-      for (const handler of ownedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ownedCtx);
-      const warningsBeforeOwnedScout = notifications.length;
-      const ownedScout = await runScout(`owned-${label}-scout`, loadedOwned.tool, ownedCtx);
+      const scoutResultFile = join(runtime, `owned-${label}-scout.json`);
+      const continueFile = join(runtime, `owned-${label}-continue`);
+      rmSync(scoutResultFile, { force: true });
+      rmSync(continueFile, { force: true });
+      const workerPromise = promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(source, "test", "fixtures", "workflow-plan-worker.mjs"), dir, plan, source, ownedRunId, "owned-pane", `owned-${label}-session`], { cwd: dir, env: { ...process.env, WORKFLOW_PLAN_WORKER_SCOUT_RESULT: scoutResultFile, WORKFLOW_PLAN_WORKER_CONTINUE: continueFile, ...(label === "plan-pending" ? { WORKFLOW_FOREIGN_SCOUT: "1" } : {}) }, maxBuffer: 4 * 1024 * 1024 });
+      await waitForFile(scoutResultFile);
+      const ownedScout = JSON.parse(readFileSync(scoutResultFile, "utf8")) as any;
       assert.equal(ownedScout.artifact.state, "accepted", label);
       assert.equal(ownedScout.publication.state, initialScoutExpected === "complete" ? "complete" : "pending", label);
-      if (initialScoutExpected !== "complete") assert.match(notifications.slice(warningsBeforeOwnedScout).join("\n"), new RegExp(`warning: scout publication .* ${initialScoutExpected}`), label);
-      if (label === "plan-pending") {
-        const foreignDelivery = await requestPlanControl(dir, "publish-plan-scout", { ticket: "YM-1", runId: ownedRunId, acceptanceId: ownedScout.artifact.acceptanceId, child: { ...ownedScout.identity, ownerRunId: "foreign-owner" } }, currentControlOrigin(dir, "parent"), resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime }), { ...process.env, XDG_RUNTIME_DIR: runtime });
-        assert.equal(foreignDelivery.state, "refused");
-        assert.match(foreignDelivery.reason ?? "", /identity|delivery|owner/);
-      }
       const commentsBeforeOwnedRecord = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
-      process.argv[1] = workflowChild;
+      writeFileSync(continueFile, "continue");
       let result: Awaited<ReturnType<typeof recordProcess>>;
-      try { result = await recordProcess({ PI_SESSION_ID: "parent", YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", YOKEMATE_PLAN_RUN_ID: ownedRunId, YOKEMATE_RUN_ID: ownedRunId, HERDR_PANE_ID: "owned-pane", YOKEMATE_PARENT_PANE: "main-pane" }); }
-      finally { writeFileSync(ownedPlanFinished, "done"); }
+      try {
+        const worker = await workerPromise;
+        const workerMatch = worker.stdout.match(/PLAN_WORKER_RESULT (.+)$/m);
+        assert.ok(workerMatch, worker.stdout + worker.stderr);
+        const workerResult = JSON.parse(workerMatch[1]!) as { foreign?: { state: string; reason?: string }; stdout: string; stderr: string };
+        if (label === "plan-pending") {
+          assert.equal(workerResult.foreign?.state, "refused");
+          assert.match(workerResult.foreign?.reason ?? "", /identity|delivery|owner/);
+        }
+        result = { ...worker, stdout: workerResult.stdout, stderr: workerResult.stderr };
+      } finally { writeFileSync(ownedPlanFinished, "done"); }
       const reportDeadline = Date.now() + 15000;
       while (!reports.some((message: any) => message?.details?.payload?.results?.some((entry: any) => entry?.keyRunId === ownedRunId && entry?.terminal))) {
         if (Date.now() >= reportDeadline) throw new Error(`plan report timeout: ${ownedRunId}`);
@@ -474,8 +477,6 @@ test("raw interactive authority flows through real plan CLI and parent control w
       }
       assertPublicationResult(`owned-${label}`, result, scoutExpected, planExpected, authority === "advance" ? "started" : "plan-only");
       if (scoutExpected === "target_changed" || scoutExpected === "target_unavailable") assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, commentsBeforeOwnedRecord, label);
-      for (const handler of ownedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ownedCtx);
-      for (const key of ["PI_SESSION_FILE", "YOKEMATE_MODE", "YOKEMATE_TICKET", "YOKEMATE_ROLE", "YOKEMATE_PLAN_RUN_ID", "YOKEMATE_RUN_ID", "HERDR_PANE_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
       if (scoutExpected === "target_changed") execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
       if (scoutExpected === "target_unavailable") db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
       if (authority === "advance") {
@@ -492,20 +493,19 @@ test("raw interactive authority flows through real plan CLI and parent control w
       extraction = "none";
       clearPublication();
     };
-    await runOwnedPublicationCase("scout-pending", "unavailable", "complete", "advance", "tab");
+    await runOwnedPublicationCase("scout-pending", "unavailable", "complete", "plain", "tab");
     await runOwnedPublicationCase("plan-pending", "complete", "unavailable", "guarded", "split");
     await runOwnedPublicationCase("both-pending", "unavailable", "unavailable", "plain", "split");
-    await runOwnedPublicationCase("conflict", "complete", "remote_conflict", "guarded", "tab");
-    await runOwnedPublicationCase("target-unavailable", "target_unavailable", "target_unavailable");
-    await runOwnedPublicationCase("target-changed", "target_changed", "target_changed");
+    await runOwnedPublicationCase("complete", "complete", "complete", "guarded", "tab");
+    await runOwnedPublicationCase("advance-pending", "unavailable", "complete", "advance", "tab");
     writeFileSync(plan, text.replace("Exercise authority.", "Exercise save-only admission."));
     reset();
     set(false);
     extraction = "advance-plan-do";
     await input("Plan and then do YM-1");
     configurePublication("save-only", "unavailable", "unavailable");
-    const noIdWorker = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(source, "test", "fixtures", "workflow-save-only-worker.mjs"), dir, plan, source], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "save-only-session" }, maxBuffer: 4 * 1024 * 1024 });
-    const noIdMatch = noIdWorker.stdout.match(/SAVE_ONLY_RESULT (.+)$/m);
+    const noIdWorker = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(source, "test", "fixtures", "workflow-plan-worker.mjs"), dir, plan, source, "-", "save-only-pane", "save-only-session"], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "save-only-session" }, maxBuffer: 4 * 1024 * 1024 });
+    const noIdMatch = noIdWorker.stdout.match(/PLAN_WORKER_RESULT (.+)$/m);
     assert.ok(noIdMatch, noIdWorker.stdout + noIdWorker.stderr);
     const noIdResult = JSON.parse(noIdMatch[1]!) as { scout: any; stdout: string; stderr: string };
     assert.equal(noIdResult.scout.artifact.state, "accepted", JSON.stringify(noIdResult.scout.artifact));

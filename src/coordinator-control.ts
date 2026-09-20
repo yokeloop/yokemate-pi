@@ -319,10 +319,24 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           planRun!.scoutGeneration = generation;
           planRun!.scoutAcceptance = undefined;
           planRun!.prepared = undefined;
+          if (!planRun!.recordPromise) {
+            planRun!.recordPath = undefined;
+            planRun!.recordId = undefined;
+            planRun!.recordBinding = undefined;
+            planRun!.recordReply = undefined;
+            if (planRun!.terminal === "recorded") planRun!.terminal = undefined;
+          }
         } else if (context.kind === "save-only") {
           saveOnly!.scoutGeneration = generation;
           saveOnly!.scoutAcceptance = undefined;
           saveOnly!.prepared = undefined;
+          if (!saveOnly!.recordPromise) {
+            saveOnly!.recordPath = undefined;
+            saveOnly!.recordId = undefined;
+            saveOnly!.recordBinding = undefined;
+            saveOnly!.recordReply = undefined;
+            if (saveOnly!.terminal === "recorded") saveOnly!.terminal = undefined;
+          }
         } else {
           scoutGenerations.set(scoutKey, generation);
           scoutAcceptances.delete(scoutKey);
@@ -477,9 +491,21 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
 
     if (envelope.operation === "plan-recorded") {
       if (!envelope.path || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
-      const prepared = context.kind === "registered" ? planRun!.prepared : context.kind === "save-only" ? saveOnly!.prepared : preparedPlans.get(scoutKey);
-      if (context.kind !== "main" && (!prepared || prepared.recordId !== envelope.recordId || resolve(prepared.path) !== resolve(envelope.path) || prepared.acceptanceId !== acceptanceId)) throw new Error("prepared plan record binding changed");
-      const state = context.kind === "registered" ? planRun! : context.kind === "save-only" ? saveOnly! : undefined;
+      let recordContext = context;
+      let recordSaveOnly = saveOnly;
+      let recordScoutKey = scoutKey;
+      if (context.kind === "main") {
+        for (const [candidateKey, candidate] of saveOnlyWorkers) {
+          if (candidate.ticket !== ticket || !candidate.prepared || candidate.prepared.recordId !== envelope.recordId || resolve(candidate.prepared.path) !== resolve(envelope.path) || candidate.scoutAcceptance !== candidate.prepared.acceptanceId || !ownerLive(candidate.owner, ticket)) continue;
+          recordContext = { kind: "save-only", admissionId: candidate.admissionId };
+          recordSaveOnly = candidate;
+          recordScoutKey = candidateKey;
+          break;
+        }
+      }
+      const prepared = recordContext.kind === "registered" ? planRun!.prepared : recordContext.kind === "save-only" ? recordSaveOnly!.prepared : preparedPlans.get(recordScoutKey);
+      if (recordContext.kind !== "main" && (!prepared || prepared.recordId !== envelope.recordId || resolve(prepared.path) !== resolve(envelope.path) || prepared.acceptanceId !== (recordContext.kind === "save-only" ? recordSaveOnly!.scoutAcceptance : acceptanceId))) throw new Error("prepared plan record binding changed");
+      const state = recordContext.kind === "registered" ? planRun! : recordContext.kind === "save-only" ? recordSaveOnly! : undefined;
       if (state?.recordReply) {
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, state.recordBinding);
@@ -489,18 +515,18 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("plan record is already running with another binding");
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...(await state.recordPromise) };
       }
-      const numericKey = `${context.kind}\u0000${scoutKey}`;
+      const numericKey = `${recordContext.kind}\u0000${recordScoutKey}`;
       const completedKey = `${ticket}\u0000${envelope.recordId}`;
       const globalInflight = inflightNumericRecords.get(completedKey);
-      if (context.kind === "main" && !prepared && globalInflight) {
+      if (globalInflight) {
         if (globalInflight.path !== envelope.path) throw new Error("recorded plan retry binding changed");
         const result = await globalInflight.promise;
         verifyRecordedRetry(ticket, result.binding);
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...result.outcome };
       }
-      const prior = context.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
+      const prior = recordContext.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
       let numeric = numericRecords.get(numericKey);
-      if (!state && numeric && context.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
+      if (!state && numeric && recordContext.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
         numericRecords.delete(numericKey);
         numeric = undefined;
       }
@@ -513,16 +539,16 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...(await numeric.promise!) };
       }
       if (prior) {
-        if (context.kind !== "main" || prior.path !== envelope.path) throw new Error("recorded plan retry binding changed");
+        if (recordContext.kind !== "main" || prior.path !== envelope.path) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, prior.binding);
       }
-      const completionGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
+      const completionGeneration = recordContext.kind === "registered" ? planRun!.scoutGeneration : recordContext.kind === "save-only" ? recordSaveOnly!.scoutGeneration : scoutGenerations.get(recordScoutKey);
       let completedBinding: PlanBinding | undefined;
       const verifyCompletion = (binding: PlanBinding) => {
-        if (context.kind === "registered" && (!planRun!.worker || !ownerLive(planRun!.worker, ticket) || planRun!.prepared !== prepared || planRun!.scoutAcceptance !== acceptanceId || planRun!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
-        if (context.kind === "save-only" && (!ownerLive(saveOnly!.owner, ticket) || saveOnly!.prepared !== prepared || saveOnly!.scoutAcceptance !== acceptanceId || saveOnly!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
-        if (context.kind === "problem" && (!packageState || !problemOwnerMatches(packageState.owner) || preparedPlans.get(scoutKey) !== prepared || scoutAcceptances.get(scoutKey) !== acceptanceId || scoutGenerations.get(scoutKey) !== completionGeneration)) throw new Error("plan completion owner or scout changed");
-        if (context.kind === "main" && !processMatches(origin.pid, origin.starttime)) throw new Error("plan completion owner is no longer live");
+        if (recordContext.kind === "registered" && (!planRun!.worker || !ownerLive(planRun!.worker, ticket) || planRun!.prepared !== prepared || planRun!.scoutAcceptance !== acceptanceId || planRun!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (recordContext.kind === "save-only" && (!ownerLive(recordSaveOnly!.owner, ticket) || recordSaveOnly!.prepared !== prepared || recordSaveOnly!.scoutAcceptance !== prepared!.acceptanceId || recordSaveOnly!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (recordContext.kind === "problem" && (!packageState || !problemOwnerMatches(packageState.owner) || preparedPlans.get(recordScoutKey) !== prepared || scoutAcceptances.get(recordScoutKey) !== acceptanceId || scoutGenerations.get(recordScoutKey) !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (recordContext.kind === "main" && !processMatches(origin.pid, origin.starttime)) throw new Error("plan completion owner is no longer live");
         if (prepared) assertPlanBinding(prepared.binding, binding);
         if (prior) assertPlanBinding(prior.binding, binding);
         completedBinding = { ...binding, repositories: [...binding.repositories] };
@@ -531,10 +557,10 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       let rejectGlobal!: (reason: unknown) => void;
       const globalPromise = new Promise<{ outcome: PlanRecordOutcome; binding: PlanBinding }>((resolve, reject) => { resolveGlobal = resolve; rejectGlobal = reject; });
       void globalPromise.catch(() => {});
-      const globalEntry = { path: envelope.path, contextKind: prior?.contextKind ?? context.kind, promise: globalPromise };
+      const globalEntry = { path: envelope.path, contextKind: prior?.contextKind ?? recordContext.kind, promise: globalPromise };
       const ownsGlobalEntry = !inflightNumericRecords.has(completedKey);
       if (ownsGlobalEntry) inflightNumericRecords.set(completedKey, globalEntry);
-      const parentPromise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, origin, context, verifyCompletion, prior?.reply);
+      const parentPromise = parent.planRecorded(ticket, envelope.path, envelope.recordId!, recordContext.kind === "save-only" ? recordSaveOnly!.owner : origin, recordContext, verifyCompletion, prior?.reply);
       const verifiedPromise = parentPromise.then((outcome) => {
         const binding = completedBinding;
         if (!binding) throw new Error("plan completion was not verified");
@@ -565,8 +591,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           numeric!.reply = outcome;
           numeric!.promise = undefined;
         }
-        completedNumericRecords.set(completedKey, { path: envelope.path, binding, contextKind: prior?.contextKind ?? context.kind, reply: outcome });
-        if (context.kind === "main" || context.kind === "problem") preparedPlans.delete(scoutKey);
+        completedNumericRecords.set(completedKey, { path: envelope.path, binding, contextKind: prior?.contextKind ?? recordContext.kind, reply: outcome });
+        if (recordContext.kind === "main" || recordContext.kind === "problem") preparedPlans.delete(recordScoutKey);
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...outcome };
       } catch (error) {
         if (state) {
