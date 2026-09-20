@@ -1482,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
 						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
 						const active = entries.filter((entry) => !["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state));
 						if (!active.length) return cancellationResult(runId, "list", recording.length ? "cancellation_requested" : "already_terminal", recording.length === 0);
-						let pending = false;
+						let pending = recording.length > 0;
 						for (const entry of active) {
 							if (upgradeRecordingFence(entry.keyRunId)) {
 								for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
