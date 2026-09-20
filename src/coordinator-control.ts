@@ -513,7 +513,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (state?.recordReply) {
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, state.recordBinding);
-        return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...state.recordReply };
+        const pendingReconciliation = context.kind === "main" && recordContext.kind === "save-only" && (state.recordReply.publication === "pending" || state.recordReply.publications?.some((publication) => publication.state === "pending"));
+        if (!pendingReconciliation) return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...state.recordReply };
       }
       if (state?.recordPromise) {
         if (state.recordPath !== envelope.path || state.recordId !== envelope.recordId) throw new Error("plan record is already running with another binding");
@@ -528,7 +529,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         verifyRecordedRetry(ticket, result.binding);
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...result.outcome };
       }
-      const prior = recordContext.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
+      const prior = context.kind === "main" && recordContext.kind === "main" && prepared ? undefined : completedNumericRecords.get(completedKey);
       let numeric = numericRecords.get(numericKey);
       if (!state && numeric && recordContext.kind === "main" && (prior || prepared) && !processMatches(numeric.owner.pid, numeric.owner.starttime)) {
         numericRecords.delete(numericKey);
@@ -543,14 +544,14 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
         return { requestId: envelope.requestId, state: "accepted", recordId: envelope.recordId, ...(await numeric.promise!) };
       }
       if (prior) {
-        if (recordContext.kind !== "main" || prior.path !== envelope.path) throw new Error("recorded plan retry binding changed");
+        if (context.kind !== "main" || prior.path !== envelope.path) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, prior.binding);
       }
       const completionGeneration = recordContext.kind === "registered" ? planRun!.scoutGeneration : recordContext.kind === "save-only" ? recordSaveOnly!.scoutGeneration : scoutGenerations.get(recordScoutKey);
       let completedBinding: PlanBinding | undefined;
       const verifyCompletion = (binding: PlanBinding) => {
         if (recordContext.kind === "registered" && (!planRun!.worker || !ownerLive(planRun!.worker, ticket) || planRun!.prepared !== prepared || planRun!.scoutAcceptance !== acceptanceId || planRun!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
-        if (recordContext.kind === "save-only" && (!ownerLive(recordSaveOnly!.owner, ticket) || recordSaveOnly!.prepared !== prepared || recordSaveOnly!.scoutAcceptance !== prepared!.acceptanceId || recordSaveOnly!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
+        if (recordContext.kind === "save-only" && !(context.kind === "main" && prior) && (!ownerLive(recordSaveOnly!.owner, ticket) || recordSaveOnly!.prepared !== prepared || recordSaveOnly!.scoutAcceptance !== prepared!.acceptanceId || recordSaveOnly!.scoutGeneration !== completionGeneration)) throw new Error("plan completion owner or scout changed");
         if (recordContext.kind === "problem" && (!packageState || !problemOwnerMatches(packageState.owner) || preparedPlans.get(recordScoutKey) !== prepared || scoutAcceptances.get(recordScoutKey) !== acceptanceId || scoutGenerations.get(recordScoutKey) !== completionGeneration)) throw new Error("plan completion owner or scout changed");
         if (recordContext.kind === "main" && !processMatches(origin.pid, origin.starttime)) throw new Error("plan completion owner is no longer live");
         if (prepared) assertPlanBinding(prepared.binding, binding);

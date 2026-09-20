@@ -410,7 +410,7 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
       return { reason: "target_unavailable", publication: "pending", target: "unresolved/YM-7", revision: "a".repeat(64) };
     },
     preparePlanPublication: async (_ticket, _path, _hash, acceptanceId, _origin, context) => { preparations++; assert.equal(context.kind, "save-only"); return { reason: "prepared", recordId: preparations > 2 ? 10 : 9, snapshotPath: "/snapshot", scoutAcceptance: acceptanceId, revision: binding.contentHash, binding }; },
-    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.ok(recordId === 9 || recordId === 10); assert.equal(context.kind, "save-only"); if (recordId === 9) { markCompletionStarted(); await completionBarrier; } else { markReverseCompletionStarted(); await reverseCompletionBarrier; } verify(binding); return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable" }; },
+    planRecorded: async (_ticket, _path, recordId, _origin, context, verify) => { completions++; assert.ok(recordId === 9 || recordId === 10); assert.equal(context.kind, "save-only"); if (recordId === 9) { markCompletionStarted(); await completionBarrier; } else { markReverseCompletionStarted(); await reverseCompletionBarrier; } verify(binding); const complete = completions >= 3; return { reason: "plan-only; ready for /do; automatic handoff unavailable", handoff: "unavailable", publications: [{ kind: "plan", state: complete ? "complete" : "pending", target: "fixture", revision: binding.contentHash, ...(complete ? {} : { error: "unavailable" as const }) }] }; },
   }, { root, ...target, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root, pane: "main" }, env);
   const owner = spawn(process.execPath, ["-e", `const{spawn}=require('child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});console.log(c.pid);setInterval(()=>{},1000)`], { stdio: ["ignore", "pipe", "ignore"] });
   let cliPid = 0;
@@ -475,6 +475,10 @@ test("a correlated scout admits one live save-only worker and its CLI descendant
     assert.equal(mainFirstResult.handoff, "unavailable");
     assert.equal(saveOnlySecondResult.handoff, "unavailable");
     assert.equal(completions, 2);
+    const publicationReconciliation = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, { sessionId: target.sessionId, pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, target, env);
+    assert.equal(publicationReconciliation.handoff, "unavailable");
+    assert.equal(publicationReconciliation.publications?.[0]?.state, "complete");
+    assert.equal(completions, 3);
     writeFileSync(binding.path, readFileSync(binding.path, "utf8").replace("Verify completion.", "Verify changed completion."));
     const changed = await requestPlanControl(root, "plan-recorded", { ticket: "YM-7", path: binding.path, recordId: 10 }, cli, target, env);
     assert.equal(changed.state, "refused");
