@@ -1,11 +1,128 @@
 // Smoke for the PreToolUse guard (REFACTORING-PLAN A1): waits die everywhere,
 // launches die while coding, the engineer's browser and home stay theirs.
-import { test } from "node:test";
+import { after, test } from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resolveRuntimeSettings } from "../src/guard-policy.ts";
 import assert from "node:assert/strict";
 import { judge } from "../src/bash-guard.ts";
 
-const defaultScope = { root: "/__yokemate_test_scope__", dataRoot: "/__yokemate_test_scope__/home", ticket: "YM-1", home: "/__yokemate_test_home__" };
+const fixture = mkdtempSync(join(tmpdir(), "package-target-"));
+const wrapper = join(fixture, "work", "YM-1");
+const repo = join(wrapper, "repo");
+const nested = join(repo, "nested package");
+const foreign = join(fixture, "work", "YM-2", "repo");
+const clone = join(fixture, "projects", "org", "repo");
+for (const dir of [fixture, repo, nested, foreign, clone]) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fixture", scripts: { test: "never-executed" } }));
+}
+mkdirSync(join(repo, "node_modules", ".bin"), { recursive: true });
+for (const bin of ["tsc", "npm", "pnpm", "sh"]) writeFileSync(join(repo, "node_modules", ".bin", bin), "fixture");
+symlinkSync(foreign, join(repo, "escape"));
+writeFileSync(join(fixture, "pnpm-workspace.yaml"), "packages: []\n");
+after(() => rmSync(fixture, { recursive: true, force: true }));
+const defaultScope = { root: fixture, dataRoot: join(fixture, "home"), ticket: "YM-1", home: "/__yokemate_test_home__", cwd: repo, project: JSON.stringify(["org/repo"]) };
 const bash = (mode: string | undefined, command: string) => judge(mode, "Bash", { command }, defaultScope);
+
+test("package targets deny the exact bare npm test from a wrapper before execution", () => {
+  assert.equal(existsSync(join(wrapper, "package.json")), false);
+  assert.equal(existsSync(join(fixture, "package.json")), true);
+  assert.equal(judge("do", "Bash", { command: "npm test" }, { ...defaultScope, cwd: wrapper })?.decision, "deny");
+});
+
+test("package targets accept literal assigned operations and script argument boundaries", () => {
+  for (const command of [
+    "npm test", "npm run build", "npm run-script typecheck", "pnpm build", "pnpm run build",
+    "pnpm typecheck && pnpm lint", "npm ci", "npm install", "pnpm install --ignore-workspace --frozen-lockfile --prod=false",
+    "pnpm exec tsc --noEmit", "npm exec --no -- tsc --noEmit",
+    `cd '${repo}' && npm test && pnpm build`, `npm --prefix '${repo}' test`, `npm --prefix='${repo}' run build`,
+    `pnpm --dir '${repo}' test`, `pnpm --dir='${repo}' run build`, `pnpm -C '${repo}' typecheck`,
+    `cd '${nested}' && npm test`, `pnpm --dir '${nested}' test`,
+    "pnpm run test --dir /foreign --filter other", "pnpm test --prefix /foreign",
+    "npm run test -- --prefix /foreign --workspace other", "npm test -- --prefix /foreign",
+    "echo 'npm test'; npm test", "echo FOO=value && npm test", "npm test; pnpm test", "npm test || pnpm test",
+  ]) assert.equal(bash("do", command), null, command);
+});
+
+test("package targets reject unassigned ambiguous and unsupported execution", () => {
+  for (const command of [
+    `npm --prefix '${fixture}' test`, `pnpm -C '${foreign}' build`, `npm --prefix '${clone}' ci`,
+    `cd '${repo}/escape' && npm test`, `pnpm --dir '${repo}/escape' exec tsc`,
+    `cd '${repo}' && npm test; npm --prefix '${fixture}' test`,
+    `npm --prefix '${fixture}' test && cd '${repo}' && npm test`,
+    `cd '${repo}' ; npm test`, `cd '${repo}' || npm test`, `true || cd '${repo}' && npm test`,
+    `cd /missing && true; npm test`, `cd '${repo}' && npm test || npm test`,
+    'cd "$REPO" && npm test', 'npm --prefix "$REPO" test', 'pnpm -C "$(pwd)" test',
+    'npm --prefix', 'pnpm --dir= test', 'pnpm --filter other test', 'pnpm -r test', 'pnpm -w test',
+    'npm test --workspace other', 'npm --workspaces test', 'npm run test --prefix /foreign',
+    'pnpm install', 'pnpm install --ignore-workspace=false', 'pnpm install --ignore-workspace --dir /foreign',
+    'npm install --global', 'pnpm --config.dir=/foreign test', 'npm --unknown test',
+    'YOKEMATE_PROJECT=[] npm test', 'npm_config_prefix=/foreign npm test', 'env -C /foreign npm test',
+    'export npm_config_prefix=/foreign; npm test', `export npm_config_workspace=other; pnpm --dir '${repo}' test`, 'command npm test', 'bash -c "npm test"',
+    'echo "npm test" | sh', 'echo "$(npm test)"', 'echo "`npm test`"', 'sudo bash -c "npm test"', '(npm test)', 'npm test | tee log',
+    'npm exec --package typescript -- tsc', 'pnpm dlx tsc', 'pnpm exec missing',
+    'pnpm fetch', 'pnpm deploy /foreign', 'npm config set prefix /foreign',
+    `pnpm exec npm --prefix '${fixture}' test`, `npm exec --no -- pnpm --dir '${fixture}' test`, `pnpm exec sh -c 'npm --prefix ${fixture} test'`,
+  ]) assert.equal(bash("do", command)?.decision, "deny", command);
+  for (const cwd of [wrapper, fixture, foreign, clone, join(repo, "escape")]) {
+    assert.equal(judge("do", "Bash", { command: "npm test" }, { ...defaultScope, cwd })?.decision, "deny", cwd);
+  }
+});
+
+test("package targets preserve engine orchestration and data rather than granting script-wide bypass", () => {
+  for (const command of ["pnpm where do YM-1", "pnpm ready YM-1", "pnpm gate YM-1", "pnpm record-report YM-1", "pnpm pr-link YM-1 url", "npm run where -- do YM-1"]) {
+    assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper }), null, command);
+  }
+  for (const command of ["npm test", "pnpm test", "pnpm exec tsc", "npm ci", "pnpm run metrics"]) {
+    assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper })?.decision, "deny", command);
+  }
+  for (const command of ["grep -n 'npm test' src/x", 'echo "pnpm --dir /foreign test"', "git commit -m 'npm test'", "cat pnpm-lock.yaml", "ls node_modules/.pnpm", 'echo "$HOME npm test"', 'grep "$PATTERN pnpm build" src/x']) {
+    assert.equal(judge("do", "Bash", { command }, { ...defaultScope, cwd: wrapper }), null, command);
+  }
+  for (const mode of [undefined, "review", "ship", "plan"]) assert.equal(judge(mode, "Bash", { command: "npm test" }, { ...defaultScope, cwd: wrapper }), null);
+});
+
+test("package targets fail closed on missing or malformed host identity independent of settings", () => {
+  const yolo = resolveRuntimeSettings({ guardPolicy: { yolo: true } });
+  for (const scope of [
+    { ...defaultScope, cwd: undefined }, { ...defaultScope, cwd: "relative" }, { ...defaultScope, cwd: "/missing" },
+    { ...defaultScope, project: undefined }, { ...defaultScope, project: "{" }, { ...defaultScope, project: "[]" },
+    { ...defaultScope, project: '["../repo"]' }, { ...defaultScope, project: '["org/repo","other/repo"]' },
+    { ...defaultScope, project: '[{"repo":"org/repo","path":"/foreign"}]' }, { ...defaultScope, ticket: "../YM-1" },
+  ]) assert.equal(judge("do", "Bash", { command: "npm test" }, scope, yolo)?.decision, "deny", JSON.stringify(scope));
+  assert.equal(judge("do", "Bash", { command: "npm test" }, { ...defaultScope, cwd: wrapper }, yolo)?.decision, "deny");
+  assert.equal(judge("do", "Bash", { command: "npm test" }, defaultScope, yolo), null);
+});
+
+test("package targets accept a part-owned workspace and reject symlinked manifests and parts", () => {
+  writeFileSync(join(repo, "pnpm-workspace.yaml"), "packages: []\n");
+  try { assert.equal(bash("do", "pnpm install --frozen-lockfile"), null); }
+  finally { rmSync(join(repo, "pnpm-workspace.yaml")); }
+  const linked = join(wrapper, "linked");
+  symlinkSync(clone, linked);
+  assert.equal(judge("do", "Bash", { command: "npm test" }, { ...defaultScope, cwd: linked, project: '["org/linked"]' })?.decision, "deny");
+  const bad = join(repo, "bad");
+  mkdirSync(bad);
+  symlinkSync(join(foreign, "package.json"), join(bad, "package.json"));
+  assert.equal(bash("do", `pnpm -C '${bad}' test`)?.decision, "deny");
+});
+
+test("package targets cover every assigned part and npm workspace installation effects", () => {
+  const second = join(wrapper, "second");
+  mkdirSync(second);
+  writeFileSync(join(second, "package.json"), "{}");
+  const scope = { ...defaultScope, cwd: wrapper, project: '["org/repo","org/second"]' };
+  assert.equal(judge("do", "Bash", { command: "cd ./second && npm test" }, scope), null);
+  assert.equal(judge("do", "Bash", { command: "npm --prefix ./second test && pnpm --dir ./repo build" }, scope), null);
+  writeFileSync(join(fixture, "package.json"), '{"workspaces":["work/*/*"]}');
+  try {
+    assert.equal(bash("do", "npm ci")?.decision, "deny");
+    assert.equal(bash("do", `npm --prefix '${repo}' ci`), null);
+    assert.equal(bash("do", "pnpm test"), null);
+  } finally { writeFileSync(join(fixture, "package.json"), "{}"); }
+});
 
 test("waiting is denied in every session", () => {
   for (const cmd of [

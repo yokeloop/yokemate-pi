@@ -11,7 +11,7 @@
 // guard must not paralyze the work it protects (same policy as bash-guard).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
@@ -90,6 +90,8 @@ export default function guards(pi: ExtensionAPI) {
     }
     try {
       const settings = readRuntimeSettings(ROOT);
+      if (process.env.YOKEMATE_MODE === "do" && event.toolName === "bash")
+        assertMandatoryBoundary("workflow.assigned-scope", typeof ctx.cwd === "string" && isAbsolute(ctx.cwd), "package operation needs an absolute host cwd; use cd '<assigned worktree>' && npm test");
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
       const callCwd = resolve(ctx.cwd);
@@ -99,6 +101,8 @@ export default function guards(pi: ExtensionAPI) {
         dataRoot: dataRootOf(ROOT),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
+        cwd: ctx.cwd,
+        project: process.env.YOKEMATE_PROJECT,
       }, settings);
       if (!v) return undefined;
       if (v.decision === "deny") return { block: true, reason: v.reason };

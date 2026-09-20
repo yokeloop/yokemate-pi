@@ -119,6 +119,71 @@ test("public guard hook rereads one strict snapshot before any tool and preserve
   }
 });
 
+test("registered and legacy Bash entries enforce package targets even under YOLO and inherited do mode", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-package-"));
+  const env = { ...process.env };
+  try {
+    cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, ".pi"));
+    const task = join(dir, "work", "YM-1");
+    const part = join(task, "repo");
+    mkdirSync(part, { recursive: true });
+    writeFileSync(join(dir, "package.json"), '{"name":"engine","scripts":{"test":"never-executed"}}');
+    writeFileSync(join(part, "package.json"), '{"name":"part","scripts":{"test":"never-executed"}}');
+    const settings = join(dir, ".pi", "settings.json");
+    writeFileSync(settings, "{}");
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, "agent"), settingsManager: SettingsManager.create(dir, join(dir, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(dir, "src", "guards.ts")] });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const hook = loader.getExtensions().extensions[0]!.handlers.get("tool_call")![0]!;
+    process.env.YOKEMATE_MODE = "do";
+    process.env.YOKEMATE_TICKET = "YM-1";
+    process.env.YOKEMATE_PROJECT = '["org/repo"]';
+    const call = (command: string, ...cwd: unknown[]) => hook({ type: "tool_call", toolCallId: "target", toolName: "bash", input: { command, cwd: part } } as never, { cwd: cwd.length ? cwd[0] : task, hasUI: false } as ExtensionContext);
+    const cli = (command: string, cwd = task) => {
+      const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd, env: { PATH: process.env.PATH, YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1", YOKEMATE_PROJECT: process.env.YOKEMATE_PROJECT }, input: JSON.stringify({ tool_name: "Bash", tool_input: { command, cwd: part } }), encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput : undefined;
+    };
+    for (const policy of [{}, { yolo: true }, { guards: { codingLaunch: false, wait: false } }]) {
+      writeFileSync(settings, JSON.stringify({ guardPolicy: policy }));
+      for (const role of [undefined, "coordinator", "executor"]) {
+        if (role) process.env.YOKEMATE_ROLE = role; else delete process.env.YOKEMATE_ROLE;
+        for (const command of ["npm test", "pnpm build", "npm ci", "pnpm exec tsc", "YOKEMATE_PROJECT=[] npm test"]) {
+          const blocked = await call(command) as { block: boolean; reason: string };
+          assert.equal(blocked.block, true, command);
+          assert.match(blocked.reason, /workflow.assigned-scope/);
+          assert.ok(blocked.reason.includes(part));
+          assert.equal(cli(command).permissionDecision, "deny", command);
+        }
+        assert.equal(await call("npm test", part), undefined);
+        assert.equal(cli("npm test", part), undefined);
+        assert.equal(await call(`cd '${part}' && npm test`), undefined);
+        assert.equal(await call(`npm --prefix '${part}' test`), undefined);
+        for (const script of ["where", "ready", "gate", "record-report", "pr-link"]) {
+          assert.equal(await call(`pnpm ${script} YM-1`), undefined, script);
+          assert.equal(cli(`pnpm ${script} YM-1`), undefined, script);
+        }
+      }
+    }
+    for (const cwd of [undefined, null, 42, "relative", join(dir, "missing")]) assert.equal((await call("npm test", cwd) as { block: boolean }).block, true);
+    const malformedEvent = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: task, env: { PATH: process.env.PATH, YOKEMATE_MODE: "do" }, input: JSON.stringify({ tool_input: { command: "npm test" } }), encoding: "utf8" });
+    assert.equal(malformedEvent.status, 0, malformedEvent.stderr);
+    assert.equal(JSON.parse(malformedEvent.stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.match(malformedEvent.stdout, /workflow.assigned-scope/);
+    for (const identity of [undefined, "{", "[]", '["../repo"]']) {
+      if (identity === undefined) delete process.env.YOKEMATE_PROJECT; else process.env.YOKEMATE_PROJECT = identity;
+      assert.equal((await call("npm test", part) as { block: boolean }).block, true);
+      assert.equal(cli("npm test", part).permissionDecision, "deny");
+    }
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
+    Object.assign(process.env, env);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("typed runtime context renders every applicable setting on off and neighbor", async () => {
   const { GUARD_IDS, RUNTIME_SETTING_KEYS, RUNTIME_SETTINGS_MATRIX } = await import("../src/guard-policy.ts");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "runtime-typed-"));
@@ -175,7 +240,12 @@ test("public file and Bash guards disable only their named refusal", async () =>
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
     const hook = loader.getExtensions().extensions[0]!.handlers.get("tool_call")![0]!;
-    const ctx = { cwd: dir, hasUI: false } as ExtensionContext;
+    const part = join(dir, "work", "YM-1", "repo");
+    mkdirSync(part, { recursive: true });
+    writeFileSync(join(part, "package.json"), '{"scripts":{"dev":"never-executed"}}');
+    process.env.YOKEMATE_TICKET = "YM-1";
+    process.env.YOKEMATE_PROJECT = '["org/repo"]';
+    const ctx = { cwd: part, hasUI: false } as ExtensionContext;
     const rows = [
       ["settingsWrite", "do", "write", { path: file }],
       ["settingsWrite", "do", "edit", { path: file }],
@@ -227,13 +297,13 @@ test("public file and Bash guards disable only their named refusal", async () =>
       const cliEvent = toolName === "bash"
         ? { tool_name: "Bash", tool_input: input }
         : { tool_name: toolName === "write" ? "Write" : toolName === "edit" ? "Edit" : "NotebookEdit", tool_input: { file_path: "path" in input ? input.path : input.notebook_path } };
-      const cli = () => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify(cliEvent), encoding: "utf8" }).stdout;
+      const cli = () => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: part, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1", YOKEMATE_PROJECT: '["org/repo"]' }, input: JSON.stringify(cliEvent), encoding: "utf8" }).stdout;
       writeFileSync(file, "{}");
       assert.match(cli(), /permissionDecision":"deny/, `${key}/cli/on`);
       writeFileSync(file, JSON.stringify({ guardPolicy: { guards: { [key]: false } } }));
       assert.equal(cli().trim(), "", `${key}/cli/off`);
       const neighborEvent = { tool_name: "Bash", tool_input: key === "wait" ? { command: "pnpm dev" } : { command: "sleep 1" } };
-      const neighbor = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: dir, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1" }, input: JSON.stringify(neighborEvent), encoding: "utf8" }).stdout;
+      const neighbor = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "bash-guard.ts")], { cwd: part, env: { PATH: process.env.PATH, YOKEMATE_MODE: mode, YOKEMATE_TICKET: "YM-1", YOKEMATE_PROJECT: '["org/repo"]' }, input: JSON.stringify(neighborEvent), encoding: "utf8" }).stdout;
       assert.match(neighbor, /permissionDecision":"deny/, `${key}/cli/neighbor`);
       runtimeCases([`guards.${key}`], ["tool", "cli", "pane", "ordinary", ...(["noteFileWrite", "noteShellWrite"].includes(key) ? [] : ["coordinator"])]);
     }
