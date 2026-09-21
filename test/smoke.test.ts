@@ -1343,6 +1343,78 @@ test("interactive templates preserve surface controls and literal tail with spli
 });
 
 
+test("grill-docs instruction contract", () => {
+  const root = join(import.meta.dirname, "..");
+  const path = join(root, ".pi/skills/grill-docs/SKILL.md");
+  assert.equal(fs.existsSync(path), true);
+  const skill = fs.readFileSync(path, "utf8");
+  assert.match(skill, /^---\nname: grill-docs\ndescription: [^\n]+\n---/);
+  assert.match(skill, /glossary.*ADR.*code.*history/is);
+  assert.match(skill, /plain text.*one question at a time/is);
+  assert.match(skill, /2–4.*recommended.*first.*free-form/is);
+  assert.match(skill, /all three.*hard to reverse.*surprising without context.*real trade-off/is);
+  assert.match(skill, /explicit (?:instruction|permission).*write/is);
+  assert.match(skill, /create (?:files and directories|them) lazily/is);
+  assert.match(skill, /no open questions.*ask no questions/is);
+  assert.doesNotMatch(skill, /AskUserQuestion|question quota|mandatory ADR/i);
+});
+
+test("plan applies grill-docs in Interview and Questions", () => {
+  const root = join(import.meta.dirname, "..");
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  const interview = skill.slice(skill.indexOf("### Interview"), skill.indexOf("### The cut"));
+  assert.match(interview, /read `\.\.\/grill-docs\/SKILL\.md` relative to this skill directory/i);
+  assert.match(interview, /apply it before.*four fields/is);
+  const reconnaissance = skill.slice(skill.indexOf("1. **Reconnaissance**"), skill.indexOf("3. **Plan**"));
+  const accepted = reconnaissance.indexOf("accepted");
+  const grill = reconnaissance.indexOf("../grill-docs/SKILL.md");
+  assert.ok(accepted >= 0 && grill > accepted);
+  assert.match(reconnaissance, /already answered.*only.*new material gaps/is);
+  assert.match(reconnaissance, /no new material gaps.*plan-writer/is);
+  assert.match(skill, /3\. \*\*Plan\*\*.*4\. \*\*Record\*\*/s);
+});
+
+test("plan keeps knowledge ownership and record contract", () => {
+  const root = join(import.meta.dirname, "..");
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  assert.match(skill, /plan worker owns every glossary and ADR write/i);
+  assert.match(skill, /home\/knowledge\/<org>\/<project>\/context\.md/);
+  assert.match(skill, /<yokemate>\/context\.md/);
+  assert.match(skill, /grill-docs.*criteria.*permission/is);
+  assert.match(skill, /Never delegate.*(?:scout|writer).*documentation write/is);
+  const plan = skill.slice(skill.indexOf("3. **Plan**"), skill.indexOf("4. **Record**"));
+  assert.match(plan, /task.*final decisions.*term definitions.*resolved conflicts/is);
+  assert.match(plan, /exact paths and sections.*actually written.*assumptions/is);
+  assert.match(plan, /acceptedInputId.*immutable full scout bytes/is);
+  assert.match(plan, /verify.*decision content.*not only.*references/is);
+  assert.match(skill, /recordPlanCore\(\).*commitExact\(\).*plan and journal.*not arbitrary documentation/is);
+  assert.match(skill, /do not.*manual(?:ly)?.*(?:publish|sync)/is);
+  assert.match(skill, /`pnpm plan <KEY> <plan-path>`/);
+});
+
+test("plan agents preserve documentation handoff boundaries", () => {
+  const root = join(import.meta.dirname, "..");
+  const plan = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  const scout = fs.readFileSync(join(root, ".pi/agents/plan-scout.md"), "utf8");
+  const writer = fs.readFileSync(join(root, ".pi/agents/plan-writer.md"), "utf8");
+  assert.match(scout, /applicable glossary and ADRs.*exact paths and sections/is);
+  assert.match(scout, /definitions.*conflicts.*absence of documentation/is);
+  assert.match(scout, /facts.*past decisions.*proposals/is);
+  assert.match(scout, /read-only.*three.*do not create documentation/is);
+  assert.match(scout, /do not invent.*questions.*documentation/is);
+  const handoff = plan.slice(plan.indexOf("3. **Plan**"), plan.indexOf("4. **Record**"));
+  assert.match(handoff, /task.*final decisions.*exact paths and sections/is);
+  assert.match(handoff, /`acceptedInputId` separately.*immutable full scout bytes/is);
+  assert.match(writer, /final answers.*documented decisions/is);
+  assert.match(writer, /Goal.*Steps.*Acceptance.*Assumptions/is);
+  assert.match(writer, /references.*do not replace.*executable content/is);
+  assert.match(writer, /Do not add a `Decisions` section/);
+  assert.match(writer, /do not interview.*do not write glossary or ADR/is);
+  assert.match(writer, /write only the plan/i);
+  assert.match(writer, /break-glass audit lines/);
+  assert.match(writer, /one line containing the saved plan's exact absolute path/);
+});
+
 test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
