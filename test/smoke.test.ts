@@ -1392,6 +1392,29 @@ test("plan keeps knowledge ownership and record contract", () => {
   assert.match(skill, /`pnpm plan <KEY> <plan-path>`/);
 });
 
+test("plan agents preserve documentation handoff boundaries", () => {
+  const root = join(import.meta.dirname, "..");
+  const plan = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  const scout = fs.readFileSync(join(root, ".pi/agents/plan-scout.md"), "utf8");
+  const writer = fs.readFileSync(join(root, ".pi/agents/plan-writer.md"), "utf8");
+  assert.match(scout, /applicable glossary and ADRs.*exact paths and sections/is);
+  assert.match(scout, /definitions.*conflicts.*absence of documentation/is);
+  assert.match(scout, /facts.*past decisions.*proposals/is);
+  assert.match(scout, /read-only.*three.*do not create documentation/is);
+  assert.match(scout, /do not invent.*questions.*documentation/is);
+  const handoff = plan.slice(plan.indexOf("3. **Plan**"), plan.indexOf("4. **Record**"));
+  assert.match(handoff, /task.*final decisions.*exact paths and sections/is);
+  assert.match(handoff, /`acceptedInputId` separately.*immutable full scout bytes/is);
+  assert.match(writer, /final answers.*documented decisions/is);
+  assert.match(writer, /Goal.*Steps.*Acceptance.*Assumptions/is);
+  assert.match(writer, /references.*do not replace.*executable content/is);
+  assert.match(writer, /Do not add a `Decisions` section/);
+  assert.match(writer, /do not interview.*do not write glossary or ADR/is);
+  assert.match(writer, /write only the plan/i);
+  assert.match(writer, /break-glass audit lines/);
+  assert.match(writer, /one line containing the saved plan's exact absolute path/);
+});
+
 test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
