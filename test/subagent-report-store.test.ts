@@ -44,13 +44,16 @@ test("D02 diagnostic writes and updates project facts without raw or unknown nes
     const key = id("projection");
     const raw = "SAFE SENTINEL task prompt tool secret-like content";
     const extras = { requestedTask: raw, prompt: raw, toolArguments: { input: raw }, secret: raw, unknown: { nested: raw } };
-    const identity = { ownerRunId: "owner", ownerSessionId: "session", runId: "run", batchId: "batch", agent: "worker", taskHash: id(raw), ...extras };
+    const identity = { ownerRunId: "owner", ownerSessionId: "session", runId: "run", batchId: "batch", agent: "plan-writer", taskHash: id(raw), ticket: "YM-1", acceptedInputId: 1, ...extras };
+    const stream = { stdoutBytes: 12, stdoutHash: id("stdout"), events: { message_end: 1 }, parserErrors: 0, parserErrorCounters: { invalid_json: 0, invalid_event: 0, record_limit: 0, partial_record: 0 }, parsedBytes: 11, malformedBytes: 0, ignoredBytes: 0, framingBytes: 1, partialBytes: 0, partialHash: id(""), assistantMessageSeen: true, assistantMessageEndCount: 1, assistantTextBearingCount: 0, textDeltaEvents: 1, textDeltaBytes: 2, finalEventPresent: true, finalTextPresent: false, finalNonWhitespace: false, finalTextBytes: 0, finalTextHash: id(""), activeTools: 0, retry: false, compaction: false, summaryRetry: false, phase: "text" };
+    const writerResult = { state: "verified", source: "reconciled", binding: { ticket: "YM-1", path: "/safe/YM-1-plan.md", repositories: ["org/repo"], scopeHash: id("scope"), contentHash: id("content") }, artifactBytes: 42 };
     const metadata = { identity, taskHash: id(raw), actualTaskHash: id(raw), launch: { path: "/local/pi", hash: id("pi"), ...extras },
-      terminal: { processOutcome: "cancelled", exitCode: 143, signal: "SIGTERM", ...extras },
-      stderr: { bytes: 42, hash: id("stderr"), ...extras },
+      terminal: { processOutcome: "cancelled", exitCode: 143, signal: "SIGTERM", ...extras }, stream,
+      stderr: { class: "unknown", bytes: 42, hash: id("stderr"), ...extras },
+      payload: { outcome: "valid", bytes: 0, hash: id(""), retainedBytes: 19, retainedHash: id("/safe/YM-1-plan.md"), truncated: false }, writerResult,
       scoutCandidate: { id: id("candidate"), hash: id(raw), bytes: 42, failureHash: id("failure"), ...extras },
       deliveries: { [id("delivery")]: { state: "delivery_failed", envelopeHash: id("envelope"), ...extras } }, ...extras };
-    const facts = { identity, children: [{ identity, processOutcome: "cancelled", actualTaskHash: id(raw), metadata, ...extras }],
+    const facts = { identity, children: [{ identity, processOutcome: "cancelled", actualTaskHash: id(raw), payloadOutcome: "valid", planResult: writerResult, metadata, ...extras }],
       process: { ...metadata, exitCode: 143 }, terminal: { outcome: "blocked", summary: raw, reason: raw, verification: { state: "blocked", reason: raw }, ...extras },
       delivery: { deliveryId: id("delivery"), state: "delivery_failed", ...extras }, ...extras };
     assert.equal(store.writeReport(key, raw, facts).ok, true);
@@ -58,18 +61,28 @@ test("D02 diagnostic writes and updates project facts without raw or unknown nes
       assert.equal(store.updateDiagnostics(key, { ...facts, delivery: { ...facts.delivery, state } }).ok, true);
       const stored = store.readReport(key)!;
       assert.equal(stored.report.toString(), raw);
-      assert.doesNotMatch(JSON.stringify(stored.diagnostics), /SAFE SENTINEL|requestedTask|toolArguments|unknown|secret|prompt/);
+      assert.doesNotMatch(JSON.stringify(stored.diagnostics), /SAFE SENTINEL|requestedTask|toolArguments|\"unknown\":|secret|prompt/);
       const projected = stored.diagnostics.diagnostics as any;
       assert.equal(projected.children[0].identity.taskHash, id(raw));
       assert.equal(projected.children[0].metadata.launch.hash, id("pi"));
       assert.equal(projected.children[0].metadata.scoutCandidate.failureHash, id("failure"));
+      assert.equal(projected.children[0].planResult.source, "reconciled");
+      assert.equal(projected.children[0].metadata.writerResult.binding.contentHash, id("content"));
+      assert.equal(projected.children[0].metadata.stream.finalTextBytes, 0);
+      assert.equal(projected.children[0].metadata.payload.truncated, false);
       assert.equal(projected.process.exitCode, 143);
       assert.equal(projected.delivery.state, state);
       assert.equal(projected.terminal.outcome, "blocked");
     }
     const snapshots = new RunSnapshots(box.root);
     assert.equal(snapshots.write("owner", "run", metadata, true).state, "available");
-    assert.doesNotMatch(fs.readFileSync(path.join(snapshots.directory, "owner-run.json"), "utf8"), /SAFE SENTINEL|requestedTask|toolArguments|secret|prompt/);
+    const snapshot = fs.readFileSync(path.join(snapshots.directory, "owner-run.json"), "utf8");
+    assert.doesNotMatch(snapshot, /SAFE SENTINEL|requestedTask|toolArguments|secret|prompt/);
+    const projectedSnapshot = JSON.parse(snapshot) as any;
+    assert.equal(projectedSnapshot.writerResult.source, "reconciled");
+    assert.equal(projectedSnapshot.writerResult.contentHash, id("content"));
+    assert.equal(projectedSnapshot.stream.textDeltaBytes, 2);
+    assert.equal(projectedSnapshot.payload.truncated, false);
   } finally { box.cleanup(); }
 });
 

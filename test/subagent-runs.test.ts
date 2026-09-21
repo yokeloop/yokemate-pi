@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { boundBatchResult, ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
 import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
@@ -193,6 +193,61 @@ test("parser facts are byte-exact, cumulative and preserve authoritative final h
   completeWithoutLf.end();
   assert.equal(completeWithoutLf.metadata().assistantMessageSeen, false);
   assert.deepEqual(completeWithoutLf.metadata().lastParserError, { kind: "partial_record", offset: 0 });
+});
+
+test("YM-221 writer terminal contract preserves failure precedence and required payload budget", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const task = { agent: "plan-writer", task: "write", ticket: "YM-1", acceptedInputId: 1 };
+  const admitted = runs.admit("writer", [task], cwd, () => undefined);
+  const identity = admitted.children[0]!.identity;
+  const empty = resultEnvelope(identity, task.task, clean, " \r\n");
+  assert.equal(empty.payloadOutcome, "missing_final");
+  const nonzero = resultEnvelope(identity, task.task, { ...clean, exitCode: 7 }, "/tmp/existing-plan.md");
+  assert.equal(nonzero.payloadOutcome, "incomplete");
+  const parser = resultEnvelope(identity, task.task, { ...clean, protocolError: true }, "/tmp/existing-plan.md");
+  assert.equal(parser.payloadOutcome, "protocol_error");
+  const oversized = resultEnvelope(identity, task.task, clean, "x".repeat(PAYLOAD_LIMIT + 1));
+  assert.equal(oversized.payloadOutcome, "output_limit");
+  assert.equal(oversized.payload, "");
+  const required = { ...resultEnvelope(identity, task.task, clean, "/tmp/plan.md"), planResult: { state: "verified" as const, source: "final" as const, binding: { ticket: "YM-1", path: "/tmp/plan.md", repositories: ["org/repo"], scopeHash: "a".repeat(64), contentHash: "b".repeat(64) }, artifactBytes: 12 } };
+  const bounded = boundBatchResult(required, [identity]);
+  assert.equal(bounded.payloadOutcome, "valid");
+  assert.equal(bounded.payload, "/tmp/plan.md");
+  assert.equal(buildReportDisplay({ ...required, planResult: { ...required.planResult, source: "reconciled" } }, new Map(), 1).brief, "reconciled; review required");
+  const rejected = { ...required, payloadOutcome: "missing_final" as const, payload: "", planResult: { state: "rejected" as const, reason: "artifact_not_found" as const } };
+  assert.equal(buildReportDisplay(rejected, new Map(), 1).failureReason, "missing_final / artifact_not_found");
+  assert.equal(runs.settle(required), true);
+  assert.deepEqual(await runs.finalized(identity), required);
+  assert.equal(runs.settle({ ...required, payloadOutcome: "invalid_plan_result", payload: "" }), false);
+  assert.deepEqual(await runs.finalized(identity), required);
+});
+
+test("YM-221 bounded writer evidence", async () => {
+  const { JsonlObservation, sha256 } = await import("../src/subagent-runs.ts");
+  const observed = new JsonlObservation();
+  const records = [
+    "\r",
+    "{malformed}",
+    JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "é" } }),
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "observed" }], stopReason: "stop" } }),
+    JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "stop" } }),
+  ];
+  const wire = Buffer.from(records.join("\n") + "\n");
+  for (let offset = 0; offset < wire.length; offset += 3) observed.write(wire.subarray(offset, offset + 3));
+  observed.end();
+  const facts = observed.metadata();
+  assert.equal(facts.parsedBytes + facts.malformedBytes + facts.ignoredBytes + facts.framingBytes + facts.partialBytes, wire.length);
+  assert.equal(facts.ignoredBytes, 1);
+  assert.equal(facts.framingBytes, records.length);
+  assert.equal(facts.textDeltaEvents, 1);
+  assert.equal(facts.textDeltaBytes, Buffer.byteLength("é"));
+  assert.equal(facts.assistantMessageEndCount, 2);
+  assert.equal(facts.assistantTextBearingCount, 1);
+  assert.equal(facts.finalEventPresent, true);
+  assert.equal(facts.finalTextPresent, false);
+  assert.equal(facts.finalNonWhitespace, false);
+  assert.equal(facts.finalTextBytes, 0);
+  assert.equal(facts.finalTextHash, sha256(""));
 });
 
 test("patched producer summarizes only oversized agent_end messages and parser validates the summary", async () => {

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
+import type { PlanBinding, PlanWriterArtifactReason } from "./plan-binding.ts";
 
 export const PAYLOAD_LIMIT = 50 * 1024;
 export const sha256 = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
@@ -54,7 +55,10 @@ export type ArtifactReference =
   | { state: "blocked"; reason: string; path?: string; hash?: string; bytes?: number }
   | { state: "superseded"; path: string; hash: string; bytes: number; acceptanceId: number };
 export type ProcessOutcome = "exited" | "signaled" | "spawn_error" | "cancelled" | "not_started";
-export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
+export type PayloadOutcome = "pending" | "valid" | "missing_final" | "invalid_plan_result" | "invalid_reviewer_json" | "protocol_error" | "output_limit" | "incomplete";
+export type PlanResult =
+  | { state: "verified"; source: "final" | "reconciled"; binding: PlanBinding; artifactBytes: number }
+  | { state: "rejected"; reason: PlanWriterArtifactReason | "writer_dispatch_mismatch" | "writer_draft_conflict"; candidateCount?: number };
 export type ParserErrorKind = "invalid_json" | "invalid_event" | "record_limit" | "partial_record";
 export interface ParserErrorFact { kind: ParserErrorKind; offset: number }
 export interface StreamDiagnostics {
@@ -63,12 +67,24 @@ export interface StreamDiagnostics {
   events: Record<string, number>;
   parserErrors: number;
   parserErrorCounters: Record<ParserErrorKind, number>;
+  parsedBytes: number;
+  malformedBytes: number;
+  ignoredBytes: number;
+  framingBytes: number;
   firstParserError?: ParserErrorFact;
   lastParserError?: ParserErrorFact;
   partialBytes: number;
   partialHash: string;
   assistantMessageSeen: boolean;
+  assistantMessageEndCount: number;
+  assistantTextBearingCount: number;
+  textDeltaEvents: number;
+  textDeltaBytes: number;
+  finalEventPresent: boolean;
   finalTextPresent: boolean;
+  finalNonWhitespace: boolean;
+  finalTextBytes: number;
+  finalTextHash: string;
   activeTools: number;
   retry: boolean;
   compaction: boolean;
@@ -80,7 +96,7 @@ export interface StreamDiagnostics {
 }
 export interface ResultDiagnostics {
   stream: StreamDiagnostics;
-  stderr?: { bytes: number; hash: string };
+  stderr?: { class?: "none" | "unknown"; bytes: number; hash: string };
   final: { bytes: number; hash: string; previewBytes: number; previewHash: string; truncated: boolean };
   snapshotStorage?: { state: "available" | "unavailable"; code?: string };
 }
@@ -97,6 +113,7 @@ export interface ResultEnvelope {
   payload: string;
   outputLimit?: "batch_transport";
   reviewVerdict: "approved" | "changes_required" | null;
+  planResult?: PlanResult;
   artifact?: ArtifactReference;
   publication?: PublicationReference;
   diagnostics?: ResultDiagnostics;
@@ -178,7 +195,7 @@ export function resultEnvelope(identity: ChildIdentity, task: string, terminal: 
   const clean = terminal.processOutcome === "exited" && terminal.exitCode === 0 && terminal.signal === null && terminal.stopReason === "stop" && !terminal.incomplete;
   const reviewer = identity.agent === "task-reviewer";
   const verdict = reviewer ? reviewerVerdict(text) : null;
-  const overflow = reviewer && Buffer.byteLength(text) > PAYLOAD_LIMIT;
+  const overflow = (reviewer || identity.agent === "plan-writer") && Buffer.byteLength(text) > PAYLOAD_LIMIT;
   const payloadOutcome: PayloadOutcome = terminal.protocolError ? "protocol_error" : !clean ? "incomplete" : overflow ? "output_limit" : !text.trim() ? "missing_final" : reviewer && !verdict ? "invalid_reviewer_json" : "valid";
   const payload = overflow ? "" : boundedText(text);
   const supplied = copyDiagnostics(terminal.diagnostics);
@@ -472,6 +489,14 @@ export class JsonlObservation {
   private counts: Record<string, number> = {};
   private stdoutHash = createHash("sha256");
   private assistantSeen = false;
+  private parsedBytes = 0;
+  private malformedBytes = 0;
+  private ignoredBytes = 0;
+  private framingBytes = 0;
+  private assistantMessageEndCount = 0;
+  private assistantTextBearingCount = 0;
+  private textDeltaEvents = 0;
+  private textDeltaBytes = 0;
   stdoutBytes = 0;
   sessionId?: string;
   finalText = "";
@@ -519,6 +544,7 @@ export class JsonlObservation {
       this.consumeRecordBytes(chunk.subarray(start, end));
       if (newline < 0) break;
       this.finishRecord();
+      this.framingBytes++;
       this.offset += this.recordBytes + 1;
       this.resetRecord();
       start = newline + 1;
@@ -547,11 +573,14 @@ export class JsonlObservation {
     const joined = this.record.length ? Buffer.concat(this.record) : Buffer.alloc(0);
     const line = joined.length && joined[joined.length - 1] === 13 ? joined.subarray(0, -1) : joined;
     if (this.recordBytes - (joined.length !== line.length ? 1 : 0) > RECORD_LIMIT) this.error("record_limit");
-    if (this.recordLimited) return;
+    if (this.recordLimited) { this.malformedBytes += this.recordBytes; return; }
     let text: string;
     try { text = new TextDecoder("utf-8", { fatal: true }).decode(line); }
-    catch { this.error("invalid_utf8"); return; }
-    this.parse(text);
+    catch { this.error("invalid_utf8"); this.malformedBytes += this.recordBytes; return; }
+    const outcome = this.parse(text);
+    if (outcome === "parsed") this.parsedBytes += this.recordBytes;
+    else if (outcome === "ignored") this.ignoredBytes += this.recordBytes;
+    else this.malformedBytes += this.recordBytes;
   }
   private resetRecord(): void {
     this.record = [];
@@ -571,11 +600,11 @@ export class JsonlObservation {
       && Number.isSafeInteger(summary.bytes) && summary.bytes >= 0
       && typeof summary.sha256 === "string" && /^[a-f0-9]{64}$/.test(summary.sha256);
   }
-  private parse(line: string): void {
-    if (!line.trim()) return;
+  private parse(line: string): "parsed" | "malformed" | "ignored" {
+    if (!line.trim()) return "ignored";
     let event: any;
-    try { event = JSON.parse(line); } catch { this.error("invalid_json"); return; }
-    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !this.validAgentEndSummary(event)) { this.error("invalid_event"); return; }
+    try { event = JSON.parse(line); } catch { this.error("invalid_json"); return "malformed"; }
+    if (!event || typeof event !== "object" || Array.isArray(event) || typeof event.type !== "string" || !this.validAgentEndSummary(event)) { this.error("invalid_event"); return "malformed"; }
     const name = eventNames.has(event.type) ? event.type : "other";
     this.eventSequence++;
     if (this.agentSettled && event.type !== "agent_settled") {
@@ -588,11 +617,17 @@ export class JsonlObservation {
     if (event.type === "message_update") {
       const phase = String(event.assistantMessageEvent?.type).split("_")[0];
       if (phase === "text" || phase === "thinking" || phase === "toolcall") this.phase = phase;
+      if (event.assistantMessageEvent?.type === "text_delta" && typeof event.assistantMessageEvent.delta === "string") {
+        this.textDeltaEvents++;
+        this.textDeltaBytes += Buffer.byteLength(event.assistantMessageEvent.delta);
+      }
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
       this.assistantSeen = true;
+      this.assistantMessageEndCount++;
       const message = event.message;
       this.finalText = Array.isArray(message.content) ? message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("") : "";
+      if (Buffer.byteLength(this.finalText) > 0) this.assistantTextBearingCount++;
       this.stopReason = ["stop", "length", "toolUse", "error", "aborted", "pending", "deferred"].includes(message.stopReason) ? message.stopReason : undefined;
       this.model = typeof message.model === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.model) ? message.model : undefined;
       this.provider = typeof message.provider === "string" && /^[a-zA-Z0-9_.:/+-]{1,200}$/.test(message.provider) ? message.provider : undefined;
@@ -620,6 +655,7 @@ export class JsonlObservation {
       }
     }
     this.onEvent?.(event);
+    return "parsed";
   }
   evidence(): ScoutCompletenessEvidence {
     return Object.freeze({ stdoutBytes: this.stdoutBytes, eventCount: this.eventSequence, finalSequence: this.finalSequence, finalBytes: Buffer.byteLength(this.finalText), finalHash: sha256(this.finalText), sessionId: this.sessionId, stopReason: this.stopReason, errors: Object.freeze(this.errorHistory.map((entry) => Object.freeze({ ...entry }))), recordLimit: this.recordLimit, partialRecord: this.partialRecord, invalidUtf8: this.invalidUtf8, lostSource: this.lostSource, exhaustedEvidence: this.exhaustedEvidence, activeTools: this.tools.size, retry: this.retry, compaction: this.compaction, summaryRetry: this.summaryRetry, agentSettled: this.agentSettled, settledSequence: this.settledSequence, queueKnown: this.queueKnown, queueEmpty: this.queueEmpty });
@@ -631,12 +667,24 @@ export class JsonlObservation {
       events: { ...this.counts },
       parserErrors: this.errors,
       parserErrorCounters: { ...this.errorCounters },
+      parsedBytes: this.parsedBytes,
+      malformedBytes: this.malformedBytes,
+      ignoredBytes: this.ignoredBytes,
+      framingBytes: this.framingBytes,
       ...(this.firstError ? { firstParserError: { ...this.firstError } } : {}),
       ...(this.lastError ? { lastParserError: { ...this.lastError } } : {}),
       partialBytes: this.recordBytes,
       partialHash: this.recordHash.copy().digest("hex"),
       assistantMessageSeen: this.assistantSeen,
+      assistantMessageEndCount: this.assistantMessageEndCount,
+      assistantTextBearingCount: this.assistantTextBearingCount,
+      textDeltaEvents: this.textDeltaEvents,
+      textDeltaBytes: this.textDeltaBytes,
+      finalEventPresent: this.assistantMessageEndCount > 0,
       finalTextPresent: Buffer.byteLength(this.finalText) > 0,
+      finalNonWhitespace: this.finalText.trim().length > 0,
+      finalTextBytes: Buffer.byteLength(this.finalText),
+      finalTextHash: sha256(this.finalText),
       activeTools: this.tools.size,
       retry: this.retry,
       compaction: this.compaction,
@@ -677,7 +725,9 @@ export interface RunSnapshotV1 {
   hashes?: { task?: string; actualTask?: string; appendedPrompt?: string };
   resources?: Record<string, { path: string; hash: string }>;
   stream?: StreamDiagnostics;
-  stderr?: { bytes: number; hash: string };
+  stderr?: { class?: "none" | "unknown"; bytes: number; hash: string };
+  payload?: { outcome?: string; originalBytes?: number; originalHash?: string; deliveredBytes?: number; deliveredHash?: string; truncated?: boolean; outputLimit?: string };
+  writerResult?: { state?: string; source?: string; reason?: string; candidateCount?: number; path?: string; contentHash?: string; scopeHash?: string; artifactBytes?: number };
   artifact?: { state?: string; hash?: string; bytes?: number; acceptanceId?: number };
   publication?: { state?: string; revision?: string; publicationId?: number; error?: string };
   deliveries: Array<{ id: string; state: string; envelopeHash?: string; at?: string }>;
@@ -713,10 +763,16 @@ const allowlistedStream = (source: unknown): StreamDiagnostics | undefined => {
   const parserErrors = safeNumber(value.parserErrors);
   const partialBytes = safeNumber(value.partialBytes);
   const partialHash = safeString(value.partialHash, /^[a-f0-9]{64}$/);
-  if (stdoutBytes === undefined || !stdoutHash || parserErrors === undefined || partialBytes === undefined || !partialHash) return;
+  const parsedBytes = safeNumber(value.parsedBytes);
+  const malformedBytes = safeNumber(value.malformedBytes);
+  const ignoredBytes = safeNumber(value.ignoredBytes);
+  const framingBytes = safeNumber(value.framingBytes);
+  const finalTextBytes = safeNumber(value.finalTextBytes);
+  const finalTextHash = safeString(value.finalTextHash, /^[a-f0-9]{64}$/);
+  if ([stdoutBytes, parserErrors, partialBytes, parsedBytes, malformedBytes, ignoredBytes, framingBytes, finalTextBytes].some((item) => item === undefined) || !stdoutHash || !partialHash || !finalTextHash) return;
   const phase = ["text", "thinking", "toolcall", "unknown"].includes(String(value.phase)) ? value.phase as StreamDiagnostics["phase"] : "unknown";
   return {
-    stdoutBytes, stdoutHash, events, parserErrors,
+    stdoutBytes: stdoutBytes!, stdoutHash, events, parserErrors: parserErrors!,
     parserErrorCounters: {
       invalid_json: safeNumber(counters.invalid_json) ?? 0,
       invalid_event: safeNumber(counters.invalid_event) ?? 0,
@@ -725,9 +781,18 @@ const allowlistedStream = (source: unknown): StreamDiagnostics | undefined => {
     },
     ...(error(value.firstParserError) ? { firstParserError: error(value.firstParserError) } : {}),
     ...(error(value.lastParserError) ? { lastParserError: error(value.lastParserError) } : {}),
-    partialBytes, partialHash,
+    parsedBytes: parsedBytes!, malformedBytes: malformedBytes!, ignoredBytes: ignoredBytes!, framingBytes: framingBytes!,
+    partialBytes: partialBytes!, partialHash,
     assistantMessageSeen: value.assistantMessageSeen === true,
+    assistantMessageEndCount: safeNumber(value.assistantMessageEndCount) ?? 0,
+    assistantTextBearingCount: safeNumber(value.assistantTextBearingCount) ?? 0,
+    textDeltaEvents: safeNumber(value.textDeltaEvents) ?? 0,
+    textDeltaBytes: safeNumber(value.textDeltaBytes) ?? 0,
+    finalEventPresent: value.finalEventPresent === true,
     finalTextPresent: value.finalTextPresent === true,
+    finalNonWhitespace: value.finalNonWhitespace === true,
+    finalTextBytes: finalTextBytes!,
+    finalTextHash,
     activeTools: safeNumber(value.activeTools) ?? 0,
     retry: value.retry === true,
     compaction: value.compaction === true,
@@ -881,6 +946,9 @@ export class RunSnapshots {
     const runtime = metadata.runtime && typeof metadata.runtime === "object" ? metadata.runtime as Record<string, unknown> : {};
     const artifact = metadata.artifact && typeof metadata.artifact === "object" ? metadata.artifact as Record<string, unknown> : {};
     const publication = metadata.publication && typeof metadata.publication === "object" ? metadata.publication as Record<string, unknown> : {};
+    const payload = metadata.payload && typeof metadata.payload === "object" ? metadata.payload as Record<string, unknown> : {};
+    const writer = metadata.writerResult && typeof metadata.writerResult === "object" ? metadata.writerResult as Record<string, unknown> : {};
+    const writerBinding = writer.binding && typeof writer.binding === "object" ? writer.binding as Record<string, unknown> : {};
     const stream = allowlistedStream(metadata.stream);
     const artifactState = safeString(artifact.state, /^[a-z_]{1,40}$/);
     const artifactHash = safeString(artifact.hash, /^[a-f0-9]{64}$/);
@@ -902,7 +970,9 @@ export class RunSnapshots {
       hashes: { task: safeString(metadata.taskHash, /^[a-f0-9]{64}$/), actualTask: safeString(metadata.actualTaskHash, /^[a-f0-9]{64}$/), appendedPrompt: safeString(metadata.appendedPromptHash, /^[a-f0-9]{64}$/) },
       ...(Object.keys(resources).length ? { resources } : {}),
       ...(stream ? { stream } : {}),
-      ...(metadata.stderr && typeof metadata.stderr === "object" ? { stderr: { bytes: safeNumber((metadata.stderr as any).bytes) ?? 0, hash: safeString((metadata.stderr as any).hash, /^[a-f0-9]{64}$/) ?? sha256("") } } : {}),
+      ...(metadata.stderr && typeof metadata.stderr === "object" ? { stderr: { class: ["none", "unknown"].includes(String((metadata.stderr as any).class)) ? (metadata.stderr as any).class : "unknown", bytes: safeNumber((metadata.stderr as any).bytes) ?? 0, hash: safeString((metadata.stderr as any).hash, /^[a-f0-9]{64}$/) ?? sha256("") } } : {}),
+      ...(safeString(payload.outcome, /^[a-z_]{1,40}$/) ? { payload: { outcome: payload.outcome as string, originalBytes: safeNumber(payload.bytes), originalHash: safeString(payload.hash, /^[a-f0-9]{64}$/), deliveredBytes: safeNumber(payload.retainedBytes), deliveredHash: safeString(payload.retainedHash, /^[a-f0-9]{64}$/), truncated: payload.truncated === true, outputLimit: safeString(payload.outputLimit, /^[a-z_]{1,40}$/) } } : {}),
+      ...(["verified", "rejected"].includes(String(writer.state)) ? { writerResult: { state: writer.state as string, source: safeString(writer.source, /^(final|reconciled)$/), reason: safeString(writer.reason, /^[a-z_]{1,80}$/), candidateCount: safeNumber(writer.candidateCount), path: safeString(writerBinding.path, /^[^\x00-\x1f\x7f]{1,4096}$/), contentHash: safeString(writerBinding.contentHash, /^[a-f0-9]{64}$/), scopeHash: safeString(writerBinding.scopeHash, /^[a-f0-9]{64}$/), artifactBytes: safeNumber(writer.artifactBytes) } } : {}),
       ...(artifactState || artifactHash ? { artifact: { state: artifactState, hash: artifactHash, bytes: safeNumber(artifact.bytes), acceptanceId: safeNumber(artifact.acceptanceId) } } : {}),
       ...(publicationState || publicationRevision || publicationError ? { publication: { state: publicationState, revision: publicationRevision, publicationId: safeNumber(publication.publicationId), error: publicationError } } : {}),
       deliveries,
@@ -1078,6 +1148,20 @@ function batchPayloadQuota(identities: readonly ChildIdentity[]): number {
 export function boundBatchResult(result: ResultEnvelope, identities: readonly ChildIdentity[]): ResultEnvelope {
   const budget = resultWireCost(emptyBatchResult(result.identity)) + batchPayloadQuota(identities);
   if (resultWireCost(result) <= budget) return structuredClone(result);
+  if (result.identity.agent === "plan-writer") {
+    const limited: ResultEnvelope = {
+      ...result,
+      identity: copyIdentity(result.identity),
+      payloadOutcome: "output_limit",
+      payload: "",
+      outputLimit: "batch_transport",
+      reviewVerdict: null,
+      planResult: undefined,
+      ...(result.diagnostics ? { diagnostics: { ...copyDiagnostics(result.diagnostics)!, final: { ...result.diagnostics.final, previewBytes: 0, previewHash: sha256(""), truncated: true } } } : {}),
+    };
+    if (resultWireCost(limited) <= budget) return limited;
+    throw new Error("immutable required writer result exceeds JSONL transport budget");
+  }
   const characters = Array.from(result.payload);
   let low = 0;
   let high = characters.length;

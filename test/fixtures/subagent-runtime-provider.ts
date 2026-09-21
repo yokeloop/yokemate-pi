@@ -55,7 +55,7 @@ let cancelledRunId: string | undefined;
     const original = fs.renameSync;
     fs.renameSync = ((from: any, to: any) => { if (String(to).includes("subagent-reports")) throw Object.assign(new Error("private storage fault"), { code: "EIO" }); original(from, to); }) as any;
   }
-  if (scenario === "nonzero") pi.on("session_shutdown", () => { if (process.env.YOKEMATE_ROLE === "executor") process.exit(7); });
+  if (scenario === "nonzero" || scenario === "plan_writer_nonzero") pi.on("session_shutdown", () => { if (process.env.YOKEMATE_ROLE === "executor") process.exit(7); });
   let calledA = false;
   let calledB = false;
   let observedOldBatch = false;
@@ -102,10 +102,25 @@ let cancelledRunId: string | undefined;
             return;
           }
           await barrier(scenario ? "child-working" : text.includes("review-B") ? "B-working" : "A-working", { pid: process.pid });
-          message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           childTurns++;
+          if (scenario === "plan_writer_write_empty") {
+            if (childTurns === 1) {
+              message.stopReason = "toolUse";
+              message.content = [{ type: "toolCall", id: "write-plan", name: "write", arguments: { path: process.env.YM204_FIXTURE_PLAN_PATH, content: process.env.YM204_FIXTURE_PLAN_CONTENT } } as any];
+              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+            } else message.content = [];
+            stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+            stream.end();
+            return;
+          }
+          message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           if (scenario === "plan_scout" || scenario === "plan_scout_terminal" || scenario === "plan_scout_failed_send") message.content = [{ type: "text", text: `# Scout\n\n## Facts and sources\n${"evidence line\n".repeat(5000)}EVIDENCE-TAIL${scenario === "plan_scout_failed_send" ? "-FAILED-SEND" : ""}${process.env.WORKFLOW_SCOUT_REVISION ?? ""}\n\n## Assumptions\n- Fixture assumption.\n\n## Forks and recommendations\n- Fixture recommendation.\n` }];
-          if (scenario === "plan_writer") message.content = [{ type: "text", text: readFileSync(process.env.YM204_FIXTURE_READ_FILE!, "utf8") }];
+          if (scenario === "plan_writer" || scenario?.startsWith("plan_writer_")) message.content = [{ type: "text", text: readFileSync(process.env.YM204_FIXTURE_READ_FILE!, "utf8") }];
+          if (scenario === "plan_writer_error") message.stopReason = "error";
+          if (scenario === "plan_writer_aborted") message.stopReason = "aborted";
+          if (scenario === "plan_writer_length") message.stopReason = "length";
+          if (scenario === "plan_writer_protocol_invalid") fs.writeSync(1, "{private writer malformed}\n");
           if (scenario === "plan_scout_secret") message.content = [{ type: "text", text: `# Scout\n${"evidence line\n".repeat(5000)}\nconst token = "literal-secret-value"` }];
           if (scenario === "parallel_max" || scenario === "chain_max") message.content = [{ type: "text", text: JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: '"'.repeat(24000), fix: "fixture" }] }) }];
           if (scenario === "chain_long") message.content = [{ type: "text", text: text.includes("step-1") ? "x".repeat(60 * 1024) + "UNTRUNCATED-TAIL" : text.includes("UNTRUNCATED-TAIL") ? "tail received" : "tail missing" }];

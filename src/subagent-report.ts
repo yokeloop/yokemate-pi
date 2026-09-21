@@ -98,7 +98,9 @@ export function reportFailureReason(result: ResultEnvelope, facts: ReportDiagnos
   const parser = stream?.firstParserError ?? stream?.lastParserError;
   if (parser?.kind) return boundedScalars(`protocol_error: ${parser.kind}${Number.isSafeInteger(parser.offset) ? ` at byte ${parser.offset}` : ""}${stream?.parserErrors ? ` (${stream.parserErrors} parser errors)` : ""}`, 160, 512);
   if (result.payloadOutcome === "output_limit") return result.outputLimit ? `output limit: ${result.outputLimit}` : "output limit";
+  if (result.planResult?.state === "rejected") return `${result.payloadOutcome} / ${result.planResult.reason}`;
   if (result.payloadOutcome === "missing_final") return "missing final";
+  if (result.payloadOutcome === "invalid_plan_result") return "invalid plan result";
   if (result.payloadOutcome === "invalid_reviewer_json") return "invalid reviewer JSON";
   if (result.payloadOutcome === "protocol_error") return "protocol error";
   if (result.stopReason && result.stopReason !== "stop") return boundedScalars(`stop ${result.stopReason}`, 160, 512);
@@ -165,7 +167,7 @@ export function buildReportDisplay(
     kind: envelope.kind,
     ...(starts.length && terminalAt !== undefined ? { durationMs: Math.max(0, terminalAt - Math.min(...starts)) } : {}),
     ...(envelope.kind === "result" && firstAdmission ? { taskExcerpt: firstAdmission.taskExcerpt, ordinal: firstAdmission.ordinal } : {}),
-    ...(envelope.kind === "result" ? { brief: envelope.recovery ? `transport failed; recovery candidate ${envelope.recovery.candidateId}; publication ${envelope.publication?.state ?? "not-started"}` : reportBrief(envelope.payload) } : {}),
+    ...(envelope.kind === "result" ? { brief: envelope.recovery ? `transport failed; recovery candidate ${envelope.recovery.candidateId}; publication ${envelope.publication?.state ?? "not-started"}` : envelope.planResult?.state === "verified" && envelope.planResult.source === "reconciled" ? "reconciled; review required" : reportBrief(envelope.payload) } : {}),
     ...(firstFailure ? { failureReason: reportFailureReason(firstFailure, diagnostics.get(firstFailure.identity.runId)) } : {}),
     ...(diagnosticCode ? { diagnosticCode } : {}),
     ...(envelope.kind === "result" ? {} : { members }),
@@ -202,7 +204,12 @@ function isResultEnvelope(value: unknown): value is ResultEnvelope {
   if (!["exited", "signaled", "spawn_error", "cancelled", "not_started"].includes(String(value.processOutcome))) return false;
   if (value.exitCode !== null && typeof value.exitCode !== "number") return false;
   if (value.signal !== null && typeof value.signal !== "string") return false;
-  if (!["pending", "valid", "missing_final", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete"].includes(String(value.payloadOutcome))) return false;
+  if (!["pending", "valid", "missing_final", "invalid_plan_result", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete"].includes(String(value.payloadOutcome))) return false;
+  if (value.planResult !== undefined) {
+    if (!isRecord(value.planResult) || !["verified", "rejected"].includes(String(value.planResult.state))) return false;
+    if (value.planResult.state === "verified" && (!isRecord(value.planResult.binding) || !["final", "reconciled"].includes(String(value.planResult.source)) || typeof value.planResult.binding.path !== "string" || !/^[a-f0-9]{64}$/.test(String(value.planResult.binding.contentHash)))) return false;
+    if (value.planResult.state === "rejected" && typeof value.planResult.reason !== "string") return false;
+  }
   return typeof value.payload === "string" && (value.reviewVerdict === null || value.reviewVerdict === "approved" || value.reviewVerdict === "changes_required");
 }
 
@@ -277,6 +284,7 @@ function addResultBody(container: Container, result: ResultEnvelope, padding: nu
     container.addChild(new Text(theme.fg("dim", `parser: first ${first.kind} at byte ${first.offset} · last ${last.kind} at byte ${last.offset}${counters ? ` · ${counters}` : ""}`), padding, 0));
   }
   if (stream && (stream.activeTools || stream.retry || stream.compaction || stream.summaryRetry)) container.addChild(new Text(theme.fg("dim", `incomplete: tools=${stream.activeTools} · retry=${stream.retry} · compaction=${stream.compaction} · summaryRetry=${stream.summaryRetry}`), padding, 0));
+  if (result.planResult) container.addChild(new Text(theme.fg("dim", `writer: ${result.planResult.state}${result.planResult.state === "verified" ? ` · ${result.planResult.source}${result.planResult.source === "reconciled" ? "; review required" : ""}` : ` · ${result.planResult.reason}`}`), padding, 0));
   if (result.artifact) container.addChild(new Text(theme.fg("dim", `artifact: ${result.artifact.state}${result.artifact.state === "blocked" ? ` · ${result.artifact.reason}` : ""}`), padding, 0));
   if (result.publication) container.addChild(new Text(theme.fg("dim", `publication: ${result.publication.state}${result.publication.error ? ` · ${result.publication.error}` : ""}`), padding, 0));
   if (result.diagnostics?.snapshotStorage?.state === "unavailable") container.addChild(new Text(theme.fg("dim", `storage: unavailable · ${result.diagnostics.snapshotStorage.code ?? "unknown"}`), padding, 0));
