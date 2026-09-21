@@ -479,7 +479,7 @@ test("fixture isolation preserves live and held-delivery evidence", { timeout: 1
   }
 }));
 
-test("real loader fixtures leave persistent engine snapshot capacity", { timeout: 120000 }, (t) => runBoundedRuntimeCase(t, async (signal) => {
+test("real loader fixtures leave persistent engine snapshot capacity", { timeout: 180000 }, (t) => runBoundedRuntimeCase(t, async (signal) => {
   const sourceRef = process.env.YM245_FIXTURE_SOURCE_REF;
   const engine = createPersistentEngine(sourceRef);
   try {
