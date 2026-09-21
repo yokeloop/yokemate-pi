@@ -159,8 +159,14 @@ test("YM-221 writer scope, unsafe candidates and deterministic snapshot races fa
       mkdirSync(added);
       writeFileSync(join(added, "YM-9-added-plan.md"), original);
     } }), /ambiguous_artifact/);
-    rmSync(folder, { recursive: true });
     rmSync(join(scope.knowledgeRoot, "ai", "YM-9-added"), { recursive: true });
+    const replaced = `${file}.replaced`;
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope, { afterSnapshot: () => {
+      renameSync(file, replaced);
+      writeFileSync(file, original);
+    } }), /binding_changed/);
+    rmSync(replaced);
+    rmSync(folder, { recursive: true });
     const unsafe = join(scope.knowledgeRoot, "ai", "YM-9-unsafe");
     writeFileSync(unsafe, "not a directory");
     assert.throws(() => reconcilePlanWriterArtifact(root, scope), /not_regular/);

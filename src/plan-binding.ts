@@ -269,6 +269,10 @@ export function readPlanWriterSnapshot(root: string, scope: PlanWriterScope, req
   } finally { if (descriptor !== undefined) closeSync(descriptor); }
 }
 
+function statSignature(stat: BigIntStats): string {
+  return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].map(String).join(":");
+}
+
 function enumeratePlanWriterArtifacts(scope: PlanWriterScope): { candidates: Array<{ path?: string; reason?: PlanWriterArtifactReason }>; signature: string } {
   const ai = join(scope.knowledgeRoot, "ai");
   let entries: import("node:fs").Dirent[];
@@ -287,20 +291,27 @@ function enumeratePlanWriterArtifacts(scope: PlanWriterScope): { candidates: Arr
   const observed: string[] = [];
   for (const entry of entries.filter((item) => item.name.startsWith(`${scope.ticket}-`))) {
     const folder = join(ai, entry.name);
-    const kind = entry.isSymbolicLink() ? "symlink" : entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other";
-    observed.push(`${entry.name}\u0000${kind}`);
-    if (entry.isSymbolicLink()) { candidates.push({ reason: "symlink_component" }); continue; }
-    if (!entry.isDirectory()) { candidates.push({ reason: "not_regular" }); continue; }
+    let folderStat: BigIntStats;
+    try { folderStat = lstatSync(folder, { bigint: true }); }
+    catch { observed.push(`${entry.name}\u0000missing`); candidates.push({ reason: "artifact_unavailable" }); continue; }
+    const kind = folderStat.isSymbolicLink() ? "symlink" : folderStat.isDirectory() ? "directory" : folderStat.isFile() ? "file" : "other";
+    observed.push(`${entry.name}\u0000${kind}\u0000${statSignature(folderStat)}`);
+    if (folderStat.isSymbolicLink()) { candidates.push({ reason: "symlink_component" }); continue; }
+    if (!folderStat.isDirectory()) { candidates.push({ reason: "not_regular" }); continue; }
     let children: import("node:fs").Dirent[];
     try { children = readdirSync(folder, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name)); }
     catch { candidates.push({ reason: "artifact_unavailable" }); continue; }
     for (const child of children) if (child.name.startsWith(`${scope.ticket}-`) && child.name.endsWith("-plan.md")) {
-      const childKind = child.isSymbolicLink() ? "symlink" : child.isDirectory() ? "directory" : child.isFile() ? "file" : "other";
-      observed.push(`${entry.name}\u0000${child.name}\u0000${childKind}`);
-      candidates.push({ path: join(folder, child.name) });
+      const childPath = join(folder, child.name);
+      let childStat: BigIntStats;
+      try { childStat = lstatSync(childPath, { bigint: true }); }
+      catch { observed.push(`${entry.name}\u0000${child.name}\u0000missing`); candidates.push({ reason: "artifact_unavailable" }); continue; }
+      const childKind = childStat.isSymbolicLink() ? "symlink" : childStat.isDirectory() ? "directory" : childStat.isFile() ? "file" : "other";
+      observed.push(`${entry.name}\u0000${child.name}\u0000${childKind}\u0000${statSignature(childStat)}`);
+      candidates.push({ path: childPath });
     }
   }
-  return { candidates, signature: JSON.stringify([String(aiStat.dev), String(aiStat.ino), String(aiStat.mtimeNs), String(aiStat.ctimeNs), observed]) };
+  return { candidates, signature: JSON.stringify([statSignature(aiStat), observed]) };
 }
 
 export function reconcilePlanWriterArtifact(root: string, scope: PlanWriterScope, hooks: PlanWriterReadHooks = {}): CandidatePlanSnapshot {
