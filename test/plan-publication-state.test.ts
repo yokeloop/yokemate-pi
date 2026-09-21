@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db.ts";
-import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding } from "../src/plan-binding.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, readPlanWriterSnapshot, readRecordedPlanBinding, reconcilePlanWriterArtifact, resolvePlanWriterScope } from "../src/plan-binding.ts";
 import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationById, publicationFor, readPublicationArtifact, reserveCanonicalUrl, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
@@ -54,6 +55,125 @@ test("candidate and recorded readers share strict byte, path and section validat
     assert.throws(() => readCandidatePlanSnapshot(root, "YM-1", file), /regular|symlink/);
     db.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("YM-221 exact snapshot and reconciliation", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-snapshot-"));
+  try {
+    const db = openDb(join(root, "yokemate.db"));
+    db.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('org','repo','/clone','github','YM','test/model')").run();
+    db.close();
+    const scope = resolvePlanWriterScope(root, "YM-1");
+    assert.equal(scope.project, "org/repo");
+    const folder = join(scope.knowledgeRoot, "ai", "YM-1-exact result");
+    const file = join(folder, "YM-1-exact result-plan.md");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(file, plan());
+    const exact = readPlanWriterSnapshot(root, scope, file);
+    assert.equal(exact.contentHash, sha256(readFileSync(file)));
+    assert.equal(reconcilePlanWriterArtifact(root, scope).path, file);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "plan.md")), /invalid_plan_path/);
+    const secondFolder = join(scope.knowledgeRoot, "ai", "YM-1-second");
+    mkdirSync(secondFolder);
+    writeFileSync(join(secondFolder, "YM-1-second-plan.md"), plan("YM-2"));
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /ambiguous_artifact/);
+    rmSync(secondFolder, { recursive: true });
+    rmSync(file);
+    const outside = join(root, "outside.md");
+    writeFileSync(outside, plan());
+    symlinkSync(outside, file);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file), /symlink_component/);
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /symlink_component/);
+    rmSync(file);
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /artifact_not_found/);
+    const historical = join(folder, "plan.md");
+    writeFileSync(historical, plan());
+    assert.equal(readCandidatePlanSnapshot(root, "YM-1", historical).contentHash, sha256(readFileSync(historical)));
+    const state = openDb(join(root, "yokemate.db"));
+    state.prepare("DELETE FROM project").run();
+    state.close();
+    assert.throws(() => resolvePlanWriterScope(root, "YM-1"), /scope_not_found/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("YM-221 writer scope, unsafe candidates and deterministic snapshot races fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "writer-safety-"));
+  try {
+    const db = openDb(join(root, "yokemate.db"));
+    db.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('org','repo','/one','github','YM','test/model')").run();
+    db.close();
+    const scope = resolvePlanWriterScope(root, "YM-9");
+    assert.equal(scope.project, "org/repo");
+    const folder = join(scope.knowledgeRoot, "ai", "YM-9-race plan");
+    const file = join(folder, "YM-9-race plan-plan.md");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(file, plan("YM-9"));
+    assert.equal(readPlanWriterSnapshot(root, scope, file).contentHash, sha256(readFileSync(file)));
+    assert.throws(() => readPlanWriterSnapshot(root, scope, `${folder}/./YM-9-race plan-plan.md`), /invalid_plan_path/);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, `${folder}/../YM-9-race plan/YM-9-race plan-plan.md`), /invalid_plan_path/);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "YM-8-race plan-plan.md")), /invalid_plan_path/);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "YM-9-other-plan.md")), /invalid_plan_path/);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, join(root, "outside.md")), /outside_project/);
+
+    const original = readFileSync(file);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file, { beforeOpen: () => {
+      renameSync(file, `${file}.old`);
+      writeFileSync(file, original);
+    } }), /binding_changed/);
+    rmSync(`${file}.old`);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file, { afterRead: () => writeFileSync(file, `${plan("YM-9")}\n`) }), /binding_changed/);
+    writeFileSync(file, original);
+    const moved = `${folder}.old`;
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file, { beforeFinalStat: () => {
+      renameSync(folder, moved);
+      mkdirSync(folder);
+      writeFileSync(file, original);
+    } }), /binding_changed/);
+    rmSync(moved, { recursive: true });
+
+    rmSync(file);
+    execFileSync("mkfifo", [file]);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file), /not_regular/);
+    rmSync(file);
+    mkdirSync(file);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file), /not_regular/);
+    rmSync(file, { recursive: true });
+    writeFileSync(file, plan("YM-8"));
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /wrong_heading/);
+    const second = join(scope.knowledgeRoot, "ai", "YM-9-second");
+    mkdirSync(second);
+    writeFileSync(join(second, "YM-9-second-plan.md"), plan("YM-9"));
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /ambiguous_artifact/);
+    rmSync(folder, { recursive: true });
+    rmSync(second, { recursive: true });
+    const unsafe = join(scope.knowledgeRoot, "ai", "YM-9-unsafe");
+    writeFileSync(unsafe, "not a directory");
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope), /not_regular/);
+    rmSync(unsafe);
+
+    const many = openDb(join(root, "yokemate.db"));
+    many.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('other','repo','/three','github','YM','test/model')").run();
+    many.close();
+    assert.throws(() => resolvePlanWriterScope(root, "YM-9"), /ambiguous_scope/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+
+  const linkedRoot = mkdtempSync(join(tmpdir(), "writer-linked-"));
+  const backing = mkdtempSync(join(tmpdir(), "writer-backing-"));
+  try {
+    const db = openDb(join(linkedRoot, "yokemate.db"));
+    db.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('org','repo','/one','github','YM','test/model')").run();
+    db.close();
+    symlinkSync(backing, join(linkedRoot, "home"));
+    const scope = resolvePlanWriterScope(linkedRoot, "YM-9");
+    const folder = join(scope.knowledgeRoot, "ai", "YM-9-linked");
+    const file = join(folder, "YM-9-linked-plan.md");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(file, plan("YM-9"));
+    assert.throws(() => readPlanWriterSnapshot(linkedRoot, scope, file), /symlink_component/);
+  } finally {
+    rmSync(linkedRoot, { recursive: true, force: true });
+    rmSync(backing, { recursive: true, force: true });
+  }
 });
 
 test("canonical reservation prevents concurrent and crash-resume publication to another URL", async () => {

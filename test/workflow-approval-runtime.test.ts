@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +25,7 @@ async function waitForFile(path: string, timeout = 15000): Promise<void> {
   }
 }
 
-test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 300000 }, async () => {
+test("YM-221 write-empty-final-record owned and save-only; raw authority remains exact", { timeout: 300000 }, async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "workflow-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
   const env = { ...process.env };
@@ -69,7 +70,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
     writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
     writeFileSync(join(dir, ".pi", "agents", "plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nReturn complete scout Markdown.\n");
-    writeFileSync(join(dir, ".pi", "agents", "plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read\n---\nRead the accepted scout.\n");
+    writeFileSync(join(dir, ".pi", "agents", "plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read, write\n---\nRead the accepted scout.\n");
     const agentDir = join(dir, "agent");
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     symlinkSync(join(source, "test/fixtures/subagent-runtime-provider.ts"), join(agentDir, "extensions/provider.ts"));
@@ -81,7 +82,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     set(false);
     const folder = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work");
     mkdirSync(folder, { recursive: true });
-    const plan = join(folder, "plan.md");
+    const plan = join(folder, "YM-1-work-plan.md");
     const text = "# YM-1 — fixture\n\n## Goal\nExercise authority.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Work\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Production.\n\n## Acceptance\nThe fixture records the plan.\n";
     writeFileSync(plan, text);
     const clone = join(dir, "clone");
@@ -156,7 +157,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const launch = () => tool.execute("launch", { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
     const output = (result: Awaited<ReturnType<typeof launch>>) => result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
     const cancel = (runId: string) => tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-    const recordProcess = async (extraEnv: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", HERDR_PANE_ID: "main-pane", ...extraEnv } });
+    const recordProcess = async (extraEnv: NodeJS.ProcessEnv = {}) => promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "plan-ticket.ts"), "YM-1", plan, "--content-hash", createHash("sha256").update(readFileSync(plan)).digest("hex")], { cwd: dir, env: { PATH: process.env.PATH, WORKFLOW_COMMENTS: commentsFile, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "parent", HERDR_PANE_ID: "main-pane", ...extraEnv } });
     const record = async (extraEnv: NodeJS.ProcessEnv = {}) => (await recordProcess(extraEnv)).stdout;
     const reset = () => db.prepare("UPDATE work SET stage='planned' WHERE ticket='YM-1'").run();
     const triggerReview = async () => {
@@ -232,14 +233,14 @@ test("raw interactive authority flows through real plan CLI and parent control w
     delete process.env.YOKEMATE_PLAN_RUN_ID;
     const recoveredScout = await runScout("scout-recovery");
     assert.equal(recoveredScout.publication.state, "complete", JSON.stringify(recoveredScout.publication));
-    db.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
+    process.env.WORKFLOW_GH_FAIL = "1";
+    process.env.WORKFLOW_SCOUT_REVISION = "-unavailable";
     const warningsBeforeUnresolved = notifications.length;
     const unresolvedScout = await runScout("scout-unresolved");
     assert.equal(unresolvedScout.artifact.state, "accepted");
     assert.equal(unresolvedScout.publication.state, "pending");
-    assert.equal(unresolvedScout.publication.error, "target_unavailable");
-    assert.equal(unresolvedScout.publication.target, "unresolved/YM-1");
-    assert.match(notifications.slice(warningsBeforeUnresolved).join("\n"), /warning: scout publication → unresolved\/YM-1: target_unavailable/);
+    assert.equal(unresolvedScout.publication.error, "unavailable");
+    assert.match(notifications.slice(warningsBeforeUnresolved).join("\n"), /warning: scout publication → .*: unavailable/);
     delete process.env.YOKEMATE_RUN_ID;
     process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test/fixtures/subagent-json-relay.mjs");
     process.env.YOKEMATE_SUBAGENT_TEST_TARGET = workflowChild;
@@ -248,16 +249,17 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const unresolvedRecord = await recordProcess();
     assert.match(unresolvedRecord.stdout, /YM-1 → planned/);
     assert.match(unresolvedRecord.stdout, /plan-only; ready for \/do/);
-    assert.match(unresolvedRecord.stderr, /warning: scout publication → unresolved\/YM-1: target_unavailable/);
-    assert.match(unresolvedRecord.stderr, /warning: plan publication → unresolved\/YM-1: target_unavailable/);
+    assert.match(unresolvedRecord.stderr, /warning: scout publication → .*: unavailable/);
+    assert.match(unresolvedRecord.stderr, /warning: plan publication → .*: unavailable/);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, scoutPartCount);
     notifications.length = 0;
-    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','test/model')").run(clone);
+    delete process.env.WORKFLOW_GH_FAIL;
+    delete process.env.WORKFLOW_SCOUT_REVISION;
     await input("/plan YM-1");
     assert.match(await record(), /plan-only; ready for \/do/);
     const firstPublications = JSON.parse(readFileSync(commentsFile, "utf8")) as { body: string }[];
-    assert.equal(firstPublications.length, scoutPartCount + 1);
-    assert.ok(firstPublications.slice(0, scoutPartCount).every((comment) => /YM-1 · scout · revision/.test(comment.body)));
+    assert.equal(firstPublications.length, scoutPartCount * 2 + 1);
+    assert.ok(firstPublications.slice(0, -1).every((comment) => /YM-1 · scout · revision/.test(comment.body)));
     const planComment = firstPublications.at(-1)!;
     assert.match(planComment.body, /YM-1 · plan · revision/);
     assert.match(planComment.body, /record: planned \(successful local record\)/);
@@ -293,7 +295,7 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const planArtifact = readFileSync(planPublication.artifact_path);
     writeFileSync(planPublication.artifact_path, "tampered");
     const parentTarget = resolveCoordinatorParent(dir, { ...process.env, XDG_RUNTIME_DIR: runtime });
-    const artifactReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const artifactReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, contentHash: createHash("sha256").update(readFileSync(plan)).digest("hex"), recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
     assert.equal(artifactReply.state, "refused");
     assert.equal(artifactReply.reason, "artifact_invalid");
     writeFileSync(planPublication.artifact_path, planArtifact);
@@ -301,9 +303,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
     db.prepare("DELETE FROM plan_publication WHERE id=?").run(recorded.publication_id);
     const commentsBeforeTargetChange = (JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length;
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/other/repo.git"]);
-    const targetReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const targetReply = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, contentHash: createHash("sha256").update(readFileSync(plan)).digest("hex"), recordId: recorded.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
     assert.equal(targetReply.state, "accepted");
-    assert.deepEqual(targetReply.publications?.map((outcome) => [outcome.kind, outcome.state, outcome.error, outcome.publicationId]), [["scout", "pending", "target_changed", recoveredScout.publication.publicationId], ["plan", "pending", "target_changed", undefined]]);
+    assert.deepEqual(targetReply.publications?.map((outcome) => [outcome.kind, outcome.state, outcome.error, outcome.publicationId]), [["scout", "pending", "target_changed", unresolvedScout.publication.publicationId], ["plan", "pending", "target_changed", undefined]]);
     assert.equal((JSON.parse(readFileSync(commentsFile, "utf8")) as unknown[]).length, commentsBeforeTargetChange);
     assert.equal(db.prepare("SELECT COUNT(*) AS count FROM plan_publication WHERE kind='plan' AND target='github:other/repo#1'").get()?.count, 0);
     execFileSync("git", ["-C", clone, "remote", "set-url", "origin", "https://github.com/org/repo.git"]);
@@ -579,7 +581,9 @@ test("raw interactive authority flows through real plan CLI and parent control w
         const worker = await workerPromise;
         const workerMatch = worker.stdout.match(/PLAN_WORKER_RESULT (.+)$/m);
         assert.ok(workerMatch, worker.stdout + worker.stderr);
-        const workerResult = JSON.parse(workerMatch[1]!) as { foreign?: { state: string; reason?: string }; stdout: string; stderr: string };
+        const workerResult = JSON.parse(workerMatch[1]!) as { writer: any; foreign?: { state: string; reason?: string }; stdout: string; stderr: string };
+        assert.equal(workerResult.writer.planResult?.state, "verified", label);
+        assert.equal(workerResult.writer.planResult?.source, "reconciled", label);
         if (label === "plan-pending") {
           assert.equal(workerResult.foreign?.state, "refused");
           assert.match(workerResult.foreign?.reason ?? "", /identity|delivery|owner/);
@@ -623,14 +627,16 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const noIdWorker = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(source, "test", "fixtures", "workflow-plan-worker.mjs"), dir, plan, source, "-", "save-only-pane", "save-only-session"], { cwd: dir, env: { ...process.env, PI_SESSION_ID: "save-only-session" }, maxBuffer: 4 * 1024 * 1024 });
     const noIdMatch = noIdWorker.stdout.match(/PLAN_WORKER_RESULT (.+)$/m);
     assert.ok(noIdMatch, noIdWorker.stdout + noIdWorker.stderr);
-    const noIdResult = JSON.parse(noIdMatch[1]!) as { scout: any; stdout: string; stderr: string };
+    const noIdResult = JSON.parse(noIdMatch[1]!) as { scout: any; writer: any; stdout: string; stderr: string };
+    assert.equal(noIdResult.writer.planResult?.state, "verified");
+    assert.equal(noIdResult.writer.planResult?.source, "reconciled");
     assert.equal(noIdResult.scout.artifact.state, "accepted", JSON.stringify(noIdResult.scout.artifact));
     assert.equal(noIdResult.scout.publication.state, "pending");
     assert.match(noIdResult.stdout, /YM-1 → planned/);
     assert.match(noIdResult.stdout, /plan-only; ready for \/do; automatic handoff unavailable/);
     assert.doesNotMatch(noIdResult.stdout, /background run/);
     const saveOnlyRecord = db.prepare("SELECT id FROM plan_record WHERE ticket='YM-1' AND successful_record=1 ORDER BY id DESC LIMIT 1").get() as { id: number };
-    const reconciliation = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, recordId: saveOnlyRecord.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
+    const reconciliation = await requestPlanControl(dir, "plan-recorded", { ticket: "YM-1", path: plan, contentHash: createHash("sha256").update(readFileSync(plan)).digest("hex"), recordId: saveOnlyRecord.id }, currentControlOrigin(dir, "parent"), parentTarget, { ...process.env, XDG_RUNTIME_DIR: runtime });
     assert.equal(reconciliation.state, "accepted", reconciliation.reason ?? "save-only reconciliation refused");
     assert.equal(reconciliation.handoff, "unavailable");
     assert.equal(reconciliation.runId, undefined);

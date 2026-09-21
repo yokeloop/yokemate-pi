@@ -102,8 +102,19 @@ let cancelledRunId: string | undefined;
             return;
           }
           await barrier(scenario ? "child-working" : text.includes("review-B") ? "B-working" : "A-working", { pid: process.pid });
-          message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           childTurns++;
+          if (scenario === "plan_writer_write_empty") {
+            if (childTurns === 1) {
+              message.stopReason = "toolUse";
+              message.content = [{ type: "toolCall", id: "write-plan", name: "write", arguments: { path: process.env.YM204_FIXTURE_PLAN_PATH, content: process.env.YM204_FIXTURE_PLAN_CONTENT } } as any];
+              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+            } else message.content = [];
+            stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+            stream.end();
+            return;
+          }
+          message.content = [{ type: "text", text: '{"status":"approved",' }, { type: "text", text: '"findings":[]}' }];
           if (scenario === "plan_scout" || scenario === "plan_scout_terminal" || scenario === "plan_scout_failed_send") message.content = [{ type: "text", text: `# Scout\n\n## Facts and sources\n${"evidence line\n".repeat(5000)}EVIDENCE-TAIL${scenario === "plan_scout_failed_send" ? "-FAILED-SEND" : ""}${process.env.WORKFLOW_SCOUT_REVISION ?? ""}\n\n## Assumptions\n- Fixture assumption.\n\n## Forks and recommendations\n- Fixture recommendation.\n` }];
           if (scenario === "plan_writer") message.content = [{ type: "text", text: readFileSync(process.env.YM204_FIXTURE_READ_FILE!, "utf8") }];
           if (scenario === "plan_scout_secret") message.content = [{ type: "text", text: `# Scout\n${"evidence line\n".repeat(5000)}\nconst token = "literal-secret-value"` }];

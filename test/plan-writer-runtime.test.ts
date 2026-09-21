@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer, type Socket } from "node:net";
-import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -17,10 +17,16 @@ import { recordWriterDraft, writerDraftFor, type WriterDraftRow } from "../src/w
 const source = join(import.meta.dirname, "..");
 
 const cases = [
+  { name: "YM-221 write-empty-final-record ordinary", final: (path: string) => path, valid: true, writeEmpty: true },
+  { name: "YM-221 empty-no-artifact", final: (path: string) => path, valid: false, empty: true, expected: "missing_final", reason: "artifact_not_found" },
+  { name: "YM-221 multiple-artifacts", final: (path: string) => path, valid: false, empty: true, multiple: true, expected: "invalid_plan_result", reason: "ambiguous_artifact" },
   { name: "observed canary path", final: (path: string) => `[k7x2] ${path}`, valid: true },
   { name: "bare path", final: (path: string) => path, valid: true },
   { name: "bare path with spaces", final: (path: string) => path, valid: true, spaced: true },
   { name: "decorated path with spaces", final: (path: string) => `[k7x2] ${path}`, valid: true, spaced: true },
+  { name: "bare path with outer whitespace", final: (path: string) => `  ${path}  `, valid: true, spaced: true },
+  { name: "decorated path with LF", final: (path: string) => `[k7x2] ${path}\n`, valid: true, spaced: true },
+  { name: "decorated path with CRLF", final: (path: string) => `\r\n[k7x2] ${path}\r\n`, valid: true, spaced: true },
   { name: "two paths", final: (path: string) => `${path} ${path}`, valid: false },
   { name: "two lines", final: (path: string) => `[k7x2] ${path}\n${path}`, valid: false },
   { name: "prose prefix", final: (path: string) => `Saved plan: ${path}`, valid: false },
@@ -39,7 +45,7 @@ const cases = [
   { name: "foreign accepted input", final: (path: string) => `[k7x2] ${path}`, valid: false, fault: "input" },
 ];
 
-for (const scenario of cases) test(`production writer settle and record: ${scenario.name}`, { timeout: 30000 }, async () => {
+for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scenario.name : `production writer settle and record: ${scenario.name}`}`, { timeout: 30000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "plan-writer-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "plan-writer-socket-"));
   const priorEnv = { ...process.env };
@@ -67,7 +73,7 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
     symlinkSync(join(source, "node_modules"), join(root, "node_modules"));
     mkdirSync(join(root, ".pi/agents"), { recursive: true });
     writeFileSync(join(root, ".pi/agents/plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nInvestigate.\n");
-    writeFileSync(join(root, ".pi/agents/plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read\n---\nWrite a plan.\n");
+    writeFileSync(join(root, ".pi/agents/plan-writer.md"), "---\nname: plan-writer\ndescription: fixture writer\ntools: read, write\n---\nWrite a plan.\n");
     writeFileSync(join(root, ".pi/settings.json"), "{}");
     writeFileSync(join(root, ".env.local"), "");
     const clone = join(root, "clone");
@@ -112,29 +118,39 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
     assert.equal(sourceResult.artifact.state, "accepted");
     assert.equal(sourceResult.publication.state, "pending");
     const scout = { id: sourceResult.artifact.acceptanceId };
-    const folder = join(root, "home/knowledge/org/repo/ai/YM-1");
+    const slug = scenario.spaced ? "work with spaces" : "work";
+    let folder = join(root, "home/knowledge/org/repo/ai", `YM-1-${slug}`);
     mkdirSync(folder, { recursive: true });
-    let planPath = join(folder, scenario.spaced ? "plan with spaces.md" : "plan.md");
+    let planPath = join(folder, `YM-1-${slug}-plan.md`);
     const planText = `# ${scenario.fault === "ticket" ? "YM-2" : "YM-1"} — fixture\n\n## Goal\nExercise writer result.\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Work\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Production.\n\n## Acceptance\nThe fixture records the plan.\n`;
-    writeFileSync(planPath, planText);
+    if (!scenario.writeEmpty && !scenario.empty || scenario.multiple) writeFileSync(planPath, planText);
+    if (scenario.multiple) {
+      const extra = join(root, "home/knowledge/org/repo/ai/YM-1-extra");
+      mkdirSync(extra);
+      writeFileSync(join(extra, "YM-1-extra-plan.md"), planText);
+    }
     if (scenario.fault === "outside") {
       planPath = join(root, "outside.md");
       writeFileSync(planPath, planText);
     } else if (scenario.fault === "symlink") {
-      symlinkSync(planPath, join(folder, "link.md"));
-      planPath = join(folder, "link.md");
+      const target = join(root, "symlink-target.md");
+      writeFileSync(target, planText);
+      rmSync(planPath);
+      symlinkSync(target, planPath);
     } else if (scenario.fault === "escape") {
       const outside = join(root, "outside");
       mkdirSync(outside);
-      writeFileSync(join(outside, "plan.md"), planText);
-      symlinkSync(outside, join(folder, "escape"));
-      planPath = join(folder, "escape/plan.md");
+      writeFileSync(join(outside, `YM-1-${slug}-plan.md`), planText);
+      rmSync(folder, { recursive: true });
+      symlinkSync(outside, folder);
     }
     const final = scenario.final(planPath);
     const resultFile = join(root, "writer-final.txt");
     writeFileSync(resultFile, final);
-    process.env.YM204_FIXTURE_SCENARIO = "plan_writer";
+    process.env.YM204_FIXTURE_SCENARIO = scenario.writeEmpty ? "plan_writer_write_empty" : scenario.empty ? "missing" : "plan_writer";
     process.env.YM204_FIXTURE_READ_FILE = resultFile;
+    process.env.YM204_FIXTURE_PLAN_PATH = planPath;
+    process.env.YM204_FIXTURE_PLAN_CONTENT = planText;
     beforeFinal = () => {
       const state = openDb(join(root, "yokemate.db"));
       try {
@@ -160,8 +176,17 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
     beforeFinal = undefined;
     assert.equal(result.processOutcome, "exited");
     assert.equal(result.exitCode, 0);
-    assert.equal(result.payloadOutcome, scenario.valid ? "valid" : "protocol_error");
-    assert.equal(result.payload, scenario.valid ? final : "");
+    assert.equal(result.payloadOutcome, scenario.valid ? "valid" : scenario.expected ?? "invalid_plan_result");
+    assert.equal(result.payload, scenario.valid ? scenario.writeEmpty ? planPath : final : "");
+    if (scenario.reason) {
+      assert.equal(result.planResult?.state, "rejected");
+      assert.equal((result.planResult as any).reason, scenario.reason);
+    }
+    if (scenario.writeEmpty) {
+      assert.equal(result.planResult?.state, "verified");
+      assert.equal(result.planResult?.source, "reconciled");
+      assert.equal(readFileSync(planPath, "utf8"), planText);
+    }
     const state = openDb(join(root, "yokemate.db"));
     const dispatch = state.prepare("SELECT * FROM workflow_writer_dispatch").get() as any;
     const draft = writerDraftFor(state, sha256(planText));
@@ -172,7 +197,11 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
       assert.equal(draft?.writer_task_hash, result.identity.taskHash);
       assert.equal(draft?.writer_actual_task_hash, result.actualTaskHash);
       assert.equal(draft?.accepted_input_id, scout.id);
-      const recorded = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(root, "src/plan-ticket.ts"), "YM-1", planPath], { cwd: root, env: { ...process.env, PI_SESSION_ID: "plan-session" } });
+      const recordsBefore = state.prepare("SELECT COUNT(*) AS count FROM plan_record").get()!.count;
+      await assert.rejects(promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(root, "src/plan-ticket.ts"), "YM-1", planPath], { cwd: root, env: { ...process.env, PI_SESSION_ID: "plan-session" } }), (error: any) => /--content-hash/.test(error.stderr));
+      await assert.rejects(promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(root, "src/plan-ticket.ts"), "YM-1", planPath, "--content-hash", "0".repeat(64)], { cwd: root, env: { ...process.env, PI_SESSION_ID: "plan-session" } }), (error: any) => /binding_changed/.test(error.stderr));
+      assert.equal(state.prepare("SELECT COUNT(*) AS count FROM plan_record").get()!.count, recordsBefore);
+      const recorded = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(root, "src/plan-ticket.ts"), "YM-1", planPath, "--content-hash", sha256(planText)], { cwd: root, env: { ...process.env, PI_SESSION_ID: "plan-session" } });
       assert.match(recorded.stdout, /plan-only; ready for \/do/);
       assert.equal(readRecordedPlanBinding(root, "YM-1").contentHash, sha256(planText));
       assert.equal(state.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get()?.stage, "planned");
@@ -184,12 +213,11 @@ for (const scenario of cases) test(`production writer settle and record: ${scena
     assert.notEqual(dispatch.task_hash, dispatch.actual_task_hash);
     state.prepare("DELETE FROM project WHERE tracker_key='YM'").run();
     process.env.YM204_FIXTURE_SCENARIO = "plan_scout";
-    report = new Promise<ResultEnvelope>((resolve) => { resolveReport = resolve; });
-    const repeated = await tool.execute("writer-repeat", { agent: "plan-writer", task: "Write again from the same current source.", ticket: "YM-1" }, undefined, () => undefined, ctx);
-    assert.match(JSON.stringify(repeated), /Detached, not terminal/);
-    await report;
-    assert.equal(state.prepare("SELECT COUNT(*) AS count FROM workflow_writer_dispatch WHERE accepted_input_id=?").get(String(scout.id))!.count, 2);
-    assert.equal(state.prepare("SELECT COUNT(*) AS count FROM workflow_writer_dispatch").get()!.count, 2);
+    await assert.rejects(() => tool.execute("writer-repeat", { agent: "plan-writer", task: "Write again from the same current source.", ticket: "YM-1" }, undefined, () => undefined, ctx), /scope_not_found/);
+    await assert.rejects(() => tool.execute("writer-repeat-parallel", { tasks: [{ agent: "plan-writer", task: "Write in parallel from the same current source.", ticket: "YM-1" }] }, undefined, () => undefined, ctx), /scope_not_found/);
+    await assert.rejects(() => tool.execute("writer-repeat-chain", { chain: [{ agent: "plan-writer", task: "Write in chain from the same current source.", ticket: "YM-1" }] }, undefined, () => undefined, ctx), /scope_not_found/);
+    assert.equal(state.prepare("SELECT COUNT(*) AS count FROM workflow_writer_dispatch WHERE accepted_input_id=?").get(String(scout.id))!.count, 1);
+    assert.equal(state.prepare("SELECT COUNT(*) AS count FROM workflow_writer_dispatch").get()!.count, 1);
     state.close();
   } finally {
     await shutdown?.();
