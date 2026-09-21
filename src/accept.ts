@@ -13,10 +13,35 @@ import { openDb } from "./db.ts";
 import { syncPush } from "./git-sync.ts";
 import { logMove } from "./move-log.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
-import { applyMove, type MoveEnv } from "./transitions.ts";
+import { applyMove, type From, type MoveEnv } from "./transitions.ts";
+import { assertPlanBinding, readCandidatePlanSnapshot, type PlanBinding } from "./plan-binding.ts";
+import { currentControlOrigin, requestReviewRecordWithStatus, resolveCoordinatorParent } from "./coordinator-control.ts";
 
 export interface AcceptOptions {
-  reworkPlan?: string; // path to the rework plan → remarks path
+  reworkPlan?: string;
+}
+
+export interface ReviewReworkRecord { outcome: "rework"; folder: string | null; binding: PlanBinding; previous: From; repeat: boolean }
+
+export function recordReviewRework(db: DatabaseSync, root: string, ticket: string, candidatePath: string, env: MoveEnv, previousBinding?: PlanBinding): ReviewReworkRecord {
+  const snapshot = readCandidatePlanSnapshot(root, ticket, candidatePath);
+  const settings = readRuntimeSettings(root);
+  let folder: string | null = null;
+  const expected = previousBinding ? "planned" : "review";
+  const out = applyMove(db, "accept-rework", env, ticket, (prev) => {
+    const row = db.prepare("SELECT folder, plan FROM work WHERE ticket = ?").get(ticket) as { folder: string | null; plan: string | null } | undefined;
+    folder = row?.folder ?? null;
+    if (prev === "planned") {
+      if (!previousBinding || !row?.plan) throw new Error(`${ticket}: planned rework retry is not owned by this review run`);
+      const recorded = readCandidatePlanSnapshot(root, ticket, row.plan);
+      assertPlanBinding(previousBinding, recorded);
+      assertPlanBinding(previousBinding, snapshot);
+    }
+    assertPlanBinding(snapshot, readCandidatePlanSnapshot(root, ticket, snapshot.path));
+    db.prepare("UPDATE work SET stage = 'planned', plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(snapshot.path, ticket);
+  }, { expected, settings });
+  if (!out.ok) throw new Error(out.refuse);
+  return { outcome: "rework", folder, binding: snapshot, previous: out.prev, repeat: out.repeat };
 }
 
 export function accept(
@@ -82,6 +107,22 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       i++;
     } else {
       console.error(`unknown argument ${argv[i]} — known: --rework <plan-path>`);
+      process.exit(1);
+    }
+  }
+  if (reworkPlan && process.env.YOKEMATE_MODE === "review") {
+    try {
+      const runId = process.env.YOKEMATE_REVIEW_RUN_ID;
+      if (!runId) throw new Error("stamped review rework has no parent-owned review run");
+      const parent = resolveCoordinatorParent(ROOT);
+      const reply = await requestReviewRecordWithStatus(ROOT, { ticket, runId, path: resolve(reworkPlan) }, currentControlOrigin(ROOT), parent);
+      if (reply.state !== "accepted" || !reply.rework) throw new Error(reply.reason ?? "review rework handoff was refused");
+      const outcome = reply.rework;
+      console.log(JSON.stringify(outcome));
+      if (outcome.state !== "started") process.exitCode = 1;
+      process.exit();
+    } catch (error) {
+      console.error((error as Error).message);
       process.exit(1);
     }
   }

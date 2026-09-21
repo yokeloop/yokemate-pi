@@ -8,12 +8,13 @@ import { openDb } from "./db.ts";
 import { findRunningAgent, formatHerdrError, herdr, herdrRaw, startAgent } from "./herdr.ts";
 import { poolModel } from "./pool.ts";
 import { modelForOrg, modelForTicket } from "./project-model.ts";
-import { currentControlOrigin, requestPlanControl, requestPlanLaunch, processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { currentControlOrigin, requestPlanControl, requestPlanLaunch, requestReviewControl, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 import { researchAgentArgs, resolveResearchLaunch } from "./research-launch.ts";
 import { checkModel, piList } from "./pi-model.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 import type { Mode as ModelMode } from "./mode-guard.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 function incompleteTerminalCapture(error: unknown): boolean {
   const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
@@ -224,6 +225,8 @@ if (import.meta.filename === process.argv[1]) {
   }
 
   if (mode === "ship") {
+    assertMandatoryBoundary("workflow.target-identity", ticket.split("+").every((key) => /^[A-Z][A-Z0-9]*-\d+$/.test(key)), "invalid ship target identity");
+    assertMandatoryBoundary("workflow.explicit-ship", argv[0] === "ship", "ship requires the explicit typed launcher");
     let shipModel: string | undefined;
     const modelIndex = tail.indexOf("--model");
     if (modelIndex >= 0) {
@@ -233,7 +236,7 @@ if (import.meta.filename === process.argv[1]) {
     const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required to route ship to its live coordinator parent");
     try {
       const parent = resolveCoordinatorParent(ROOT);
-      const reply = await requestCoordinator(ROOT, { mode: "ship", tickets: ticket.split("+"), model: shipModel, note: tail.join(" ") || undefined }, { sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? fail("cannot read CLI process starttime"), cwd: ROOT, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
+      const reply = await requestCoordinator(ROOT, { mode: "ship", tickets: ticket.split("+"), model: shipModel, note: tail.join(" ") || undefined }, currentControlOrigin(ROOT, sessionId), parent);
       if (reply.state !== "accepted" || !reply.runId) fail(reply.reason ?? "ship coordinator launch was not accepted");
       for (const result of reply.results ?? []) console.log(result.state === "accepted" ? `${result.key} → reserved background run ${result.keyRunId}` : `refused ${result.key}: ${result.reason}`);
       if (!reply.results?.length) console.log(`${ticket} → background run ${reply.runId}`);
@@ -323,13 +326,20 @@ if (import.meta.filename === process.argv[1]) {
       }
 
       let planRunId: string | undefined;
-      if (mode === "plan" && ticket) {
-        try {
-          const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
-          if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
-          planRunId = reply.runId;
-          env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
-        } catch (error) { console.error(`${ticket}: no automatic do handoff: ${(error as Error).message}`); }
+      let reviewRunId: string | undefined;
+      let reviewRuntimeId: string | undefined;
+      if (mode === "plan" && ticket && process.env.PI_SESSION_ID !== undefined) {
+        const reply = await requestPlanControl(ROOT, "register-plan", { ticket }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+        if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "plan registration refused");
+        planRunId = reply.runId;
+        env.push(`YOKEMATE_PLAN_RUN_ID=${planRunId}`);
+      }
+      if (mode === "review" && ticket && process.env.PI_SESSION_ID) {
+        reviewRuntimeId = randomUUID();
+        const reply = await requestReviewControl(ROOT, "register-review", { ticket, workerRuntimeId: reviewRuntimeId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+        if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "review registration refused");
+        reviewRunId = reply.runId;
+        env.push(`YOKEMATE_REVIEW_RUN_ID=${reviewRunId}`, `YOKEMATE_REVIEW_RUNTIME_ID=${reviewRuntimeId}`);
       }
       const opened = openModeSurface(surface, parentPane, parentWorkspace, cwd, label, env);
       const { paneId } = opened;
@@ -337,6 +347,10 @@ if (import.meta.filename === process.argv[1]) {
         if (planRunId) {
           const reply = await requestPlanControl(ROOT, "bind-plan", { ticket, runId: planRunId, pane: paneId }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
           if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
+        }
+        if (reviewRunId) {
+          const reply = await requestReviewControl(ROOT, "bind-review", { ticket, runId: reviewRunId, pane: paneId, surface, ...(opened.tabId ? { tabId: opened.tabId } : {}) }, currentControlOrigin(ROOT), resolveCoordinatorParent(ROOT));
+          if (reply.state !== "accepted") throw new Error(reply.reason ?? "review surface binding refused");
         }
         startAgent(agentName, paneId, label, ["--model", model, "--skill", join(ROOT, ".pi", "skills")]);
         herdr(["agent", "prompt", agentName, prompt]);

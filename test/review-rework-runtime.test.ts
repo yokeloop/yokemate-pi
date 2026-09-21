@@ -1,0 +1,325 @@
+import assert from "node:assert/strict";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { test } from "node:test";
+import { DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { currentControlOrigin, processStarttime, requestReviewControl, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { openDb } from "../src/db.ts";
+import { socketDir } from "../src/inbox.ts";
+
+const source = join(import.meta.dirname, "..");
+const planText = (ticket: string, goal: string) => `# ${ticket} — rework\n\n## Goal\n${goal}\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Fix the agreed remark.\n\n## Assumptions\n- Existing stand.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nThe agreed remark is fixed.\n`;
+
+async function loadExtension(root: string, agentDir: string, appendEntry: (type: string, data: unknown) => void = () => undefined) {
+  const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager: SettingsManager.create(root, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [join(root, ".pi", "extensions", "subagent", "index.ts")] });
+  await loader.reload();
+  const loaded = loader.getExtensions();
+  assert.deepEqual(loaded.errors, []);
+  loaded.runtime.appendEntry = appendEntry;
+  loaded.runtime.sendMessage = () => undefined;
+  return loaded.extensions[0]!;
+}
+
+async function runCase(workflowApproval: boolean, entry: "node" | "package") {
+  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "review-rework-runtime-"));
+  const runtime = mkdtempSync(join(tmpdir(), "ym-review-rework-"));
+  const savedEnv = { ...process.env };
+  const savedArgv = process.argv[1];
+  let mainShutdown: (() => Promise<void>) | undefined;
+  let workerShutdown: (() => Promise<void>) | undefined;
+  try {
+    cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
+    cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    cpSync(join(source, ".pi", "agents", "do"), join(dir, ".pi", "agents", "do"), { recursive: true });
+    cpSync(join(source, "package.json"), join(dir, "package.json"));
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
+    mkdirSync(join(dir, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "fixture");
+    writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ guardPolicy: { workflowApproval, guards: { duplicateDo: false, duplicateMode: false } } }));
+    writeFileSync(join(dir, ".env.local"), "");
+    const oldPlanDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-old");
+    const reworkDir = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-rework");
+    mkdirSync(oldPlanDir, { recursive: true });
+    mkdirSync(reworkDir, { recursive: true });
+    const oldPlan = join(oldPlanDir, "plan.md");
+    const reworkPlan = join(reworkDir, "plan.md");
+    writeFileSync(oldPlan, planText("YM-1", "Exercise the original implementation."));
+    writeFileSync(reworkPlan, planText("YM-1", "Apply the accepted review rework."));
+    const clone = join(dir, "clone");
+    mkdirSync(clone);
+    execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe" });
+    const db = openDb(join(dir, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model,mode_models) VALUES ('org','repo',?,'github','YM','test/model',?)").run(clone, JSON.stringify({ review: "test/review", do: "test/model" }));
+    db.prepare("INSERT INTO work (ticket,url,stage,folder,plan) VALUES ('YM-1','u','review',?,?)").run(join(dir, "work", "YM-1"), oldPlan);
+    const work = db.prepare("SELECT id FROM work WHERE ticket='YM-1'").get() as { id: number };
+    db.prepare("INSERT INTO part (work_id,repo,role,branch,pr) VALUES (?, 'org/repo','app','YM-1','https://example/pr')").run(work.id);
+    db.close();
+    const shim = join(dir, "shim");
+    const closeLog = join(dir, "close.jsonl");
+    mkdirSync(shim);
+    writeFileSync(closeLog, "");
+    writeFileSync(join(shim, "herdr"), `#!${process.execPath}\nimport fs from "node:fs"; const args=process.argv.slice(2); fs.appendFileSync(process.env.REVIEW_CLOSE_LOG,JSON.stringify(args)+"\\n"); console.log(JSON.stringify({result:{}}));\n`, { mode: 0o755 });
+    const agentDir = join(dir, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    Object.assign(process.env, { XDG_RUNTIME_DIR: runtime, PATH: `${shim}:${savedEnv.PATH ?? ""}`, REVIEW_CLOSE_LOG: closeLog, HERDR_PANE_ID: "main-pane", PI_SESSION_ID: "parent-session", PI_CODING_AGENT_DIR: agentDir });
+    if (workflowApproval) delete process.env.WORKFLOW_FAST_TERMINAL;
+    else process.env.WORKFLOW_FAST_TERMINAL = "1";
+    for (const key of ["YOKEMATE_MODE", "YOKEMATE_ROLE", "YOKEMATE_TICKET", "YOKEMATE_REVIEW_RUN_ID", "YOKEMATE_REVIEW_RUNTIME_ID", "YOKEMATE_PARENT_PANE"]) delete process.env[key];
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
+    process.argv[1] = join(source, "test", "fixtures", "workflow-rpc-child.mjs");
+    const runtimeDir = socketDir(process.env, process.getuid!());
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "main-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "parent-session", parentPane: null, cwd: dir, mode: "main", ticket: null }));
+    writeFileSync(join(runtimeDir, "review-pane.json"), JSON.stringify({ pid: process.pid, starttime: processStarttime(process.pid), sessionId: "review-session", parentPane: "main-pane", cwd: dir, mode: "review", ticket: "YM-1" }));
+    const notifications: string[] = [];
+    let confirms = 0;
+    const verdict = "План доработки согласован. На доработку.";
+    const quoteReply = (text: string, stopReason = "stop") => ({ stopReason, content: [{ type: "text", text }] });
+    const approvedReply = async (raw: string) => quoteReply(JSON.stringify({ kind: "rework", evidence: [{ text: raw === verdict || raw === "🚀 е\u0301: На доработку." ? "На доработку." : raw }] }));
+    let completeReview = approvedReply;
+    let modelCalls = 0;
+    let configuredAuth = true;
+    const modelRegistry = {
+      getAll: () => [{ provider: "test", id: "review", name: "review" }, { provider: "test", id: "model", name: "model" }],
+      hasConfiguredAuth: () => configuredAuth,
+      complete: async (_model: unknown, context: { systemPrompt: string; messages: { content: string }[] }) => {
+        modelCalls++;
+        assert.match(context.systemPrompt, /Do not calculate or return offsets/);
+        assert.match(context.systemPrompt, /Questions, quotations, negations, conditions/);
+        const raw = JSON.parse(context.messages[0]!.content).raw as string;
+        return completeReview(raw);
+      },
+    };
+    const ui = { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } };
+    const mainCtx = { cwd: dir, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "parent-session" }, model: { provider: "test", id: "review" }, modelRegistry, ui } as unknown as ExtensionContext;
+    const main = await loadExtension(dir, agentDir);
+    for (const handler of main.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, mainCtx);
+    mainShutdown = async () => { for (const handler of main.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, mainCtx); };
+    const parent = resolveCoordinatorParent(dir, process.env);
+    const registered = await requestReviewControl(dir, "register-review", { ticket: "YM-1", workerRuntimeId: "review-runtime" }, currentControlOrigin(dir, "parent-session"), parent, process.env);
+    assert.equal(registered.state, "accepted", registered.reason ?? "review registration refused");
+    const reviewRunId = registered.runId!;
+    const bound = await requestReviewControl(dir, "bind-review", { ticket: "YM-1", runId: reviewRunId, pane: "review-pane", surface: "tab", tabId: "review-tab" }, currentControlOrigin(dir, "parent-session"), parent, process.env);
+    assert.equal(bound.state, "accepted", bound.reason ?? "review binding refused");
+    Object.assign(process.env, { YOKEMATE_MODE: "review", YOKEMATE_ROLE: "coordinator", YOKEMATE_TICKET: "YM-1", YOKEMATE_REVIEW_RUN_ID: reviewRunId, YOKEMATE_REVIEW_RUNTIME_ID: "review-runtime", YOKEMATE_PARENT_PANE: "main-pane", HERDR_PANE_ID: "review-pane", PI_SESSION_ID: "review-session" });
+    const workerCtx = { ...mainCtx, mode: "tui", sessionManager: { getSessionId: () => "review-session" } } as unknown as ExtensionContext;
+    const diagnosticSession = SessionManager.create(dir, join(dir, "diagnostic-sessions"));
+    diagnosticSession.appendMessage({ role: "assistant", content: [], api: "openai-responses", provider: "test", model: "review", stopReason: "stop", timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    let diagnosticFailure = false;
+    const worker = await loadExtension(dir, agentDir, (type, data) => {
+      if (diagnosticFailure) throw new Error("PRIVATE_DIAGNOSTIC_ERROR");
+      diagnosticSession.appendCustomEntry(type, data);
+    });
+    const diagnosticEntries = () => (readFileSync(diagnosticSession.getSessionFile()!, "utf8").trim().split("\n").map((line) => JSON.parse(line)) as { customType?: string; data?: any }[]).filter((entry) => entry.customType === "yokemate-review-extraction").map((entry) => entry.data);
+    const terminal = () => diagnosticEntries().filter((entry) => entry.phase === "terminal").at(-1);
+    const input = async (text: string) => {
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, workerCtx);
+    };
+    for (const handler of worker.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, workerCtx);
+    workerShutdown = async () => { for (const handler of worker.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, workerCtx); };
+    const command = entry === "package" ? "pnpm" : process.execPath;
+    const args = entry === "package" ? ["accept", "YM-1", "--rework", reworkPlan] : ["--experimental-strip-types", "--no-warnings", "src/accept.ts", "YM-1", "--rework", reworkPlan];
+    const accept = () => promisify(execFile)(command, args, { cwd: dir, env: { ...process.env }, timeout: 30000 });
+    const parseOutput = (stdout: unknown, stderr: unknown = "") => {
+      for (const line of `${String(stdout ?? "")}\n${String(stderr ?? "")}`.trim().split("\n").reverse()) {
+        try { return JSON.parse(line); } catch {}
+      }
+      throw new Error(`no JSON outcome in accept output: ${String(stdout)} ${String(stderr)}`);
+    };
+    for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "extension", text: "Итог: отправляй на доработку" } as never, workerCtx);
+    await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
+    for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "Итог: отправляй на доработку" } as never, { ...workerCtx, mode: "rpc" } as ExtensionContext);
+    await assert.rejects(accept, (error: any) => /approval is missing|stale/.test(String(error.stderr)));
+    assert.equal(modelCalls, 0);
+    const noHandoff = async () => {
+      await assert.rejects(accept, (error: any) => /approval is missing|stale|revoked/.test(String(error.stderr)));
+      const state = openDb(join(dir, "yokemate.db"));
+      try { assert.deepEqual({ ...state.prepare("SELECT stage, plan FROM work WHERE ticket='YM-1'").get() }, { stage: "review", plan: oldPlan }); }
+      finally { state.close(); }
+      assert.equal(readFileSync(closeLog, "utf8"), "");
+    };
+    completeReview = async () => quoteReply('{"kind":"rework","evidence":[{"start":26,"end":39,"text":"На доработку."}]}');
+    await input(verdict);
+    await noHandoff();
+    assert.equal(terminal()?.reasonCode, "invalid_evidence");
+    if (!workflowApproval) {
+      const sentinel = "PRIVATE_REVIEW_SENTINEL";
+      for (const [raw, response, reasonCode] of [
+        [verdict, '{"kind":"rework","evidence":[{"text":"На доработку!"}]}', "invalid_evidence"],
+        [verdict, '{"kind":"rework"}', "invalid_evidence"],
+        [verdict, '{"kind":"rework","evidence":[{"text":""}]}', "invalid_evidence"],
+        [verdict, '{"kind":"rework","evidence":[]}', "invalid_evidence"],
+        [`${verdict} На доработку.`, '{"kind":"rework","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [verdict, JSON.stringify({ kind: "rework", evidence: Array(9).fill({ text: "На доработку." }) }), "invalid_evidence"],
+        [verdict, '{"kind":"approve","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [verdict, JSON.stringify({ kind: "none", extra: { nested: sentinel } }), "invalid_evidence"],
+        [`${verdict} YM-2`, '{"kind":"rework","evidence":[{"text":"На доработку."}]}', "invalid_evidence"],
+        [sentinel, `not JSON ${sentinel}`, "invalid_json"],
+        ["Отправить на доработку?", '{"kind":"none"}', "none"],
+        ["Не отправляй на доработку.", '{"kind":"none"}', "none"],
+        ["Если тесты пройдут, отправь на доработку.", '{"kind":"none"}', "none"],
+        ["Согласен только с заменой Guest на Visitor.", '{"kind":"none"}', "none"],
+        ["Он сказал: «На доработку.»", '{"kind":"none"}', "none"],
+      ]) {
+        completeReview = async () => quoteReply(response!);
+        await input(raw!);
+        await noHandoff();
+        assert.equal(terminal().reasonCode, reasonCode);
+        assert.equal(terminal().responseHash, createHash("sha256").update(response!).digest("hex"));
+        assert.equal(terminal().responseBytes, Buffer.byteLength(response!));
+      }
+      completeReview = async () => { throw new Error(`provider ${sentinel}`); };
+      await input(sentinel);
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "model_error");
+      for (const stop of ["length", "error", "aborted", "toolUse", sentinel]) {
+        completeReview = async () => ({ ...quoteReply(sentinel, stop), errorMessage: sentinel, extra: { nested: sentinel } });
+        await input(sentinel);
+        await noHandoff();
+        assert.equal(terminal().reasonCode, "unclean_response");
+        assert.equal(terminal().stopReason, stop === sentinel ? "unknown" : stop);
+      }
+      completeReview = async () => ({ stopReason: "stop", content: [{ type: "toolCall", text: sentinel }] });
+      await input(sentinel);
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "unclean_response");
+      configuredAuth = false;
+      const callsBeforeAuth = modelCalls;
+      await input(verdict);
+      await noHandoff();
+      assert.equal(modelCalls, callsBeforeAuth);
+      assert.equal(terminal().reasonCode, "auth_unavailable");
+      configuredAuth = true;
+      completeReview = approvedReply;
+      await input("🚀 е\u0301: На доработку.");
+      assert.equal(terminal().reasonCode, "rework");
+      completeReview = async () => quoteReply('{"kind":"revoke","evidence":[{"text":"стоп"}]}');
+      await input("стоп");
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "revoke");
+      let release!: (value: Awaited<ReturnType<typeof approvedReply>>) => void;
+      for (const kind of ["none", "revoke"]) {
+        let entered!: () => void;
+        const waiting = new Promise<void>((resolve) => { entered = resolve; });
+        completeReview = () => { entered(); return new Promise((resolve) => { release = resolve; }); };
+        const stale = input(verdict);
+        await waiting;
+        completeReview = async () => quoteReply(JSON.stringify(kind === "none" ? { kind } : { kind, evidence: [{ text: "стоп" }] }));
+        await input(kind === "none" ? "Ещё вопрос?" : "стоп");
+        release(await approvedReply(verdict));
+        await stale;
+        await noHandoff();
+        assert.equal(terminal().reasonCode, "extraction_control_refused");
+        assert.equal(terminal().validation, "accepted");
+        assert.equal(terminal().extractionControl, "refused");
+        assert.equal(terminal().outcome, "refused");
+      }
+      const runtimeId = process.env.YOKEMATE_REVIEW_RUNTIME_ID;
+      process.env.YOKEMATE_REVIEW_RUNTIME_ID = "foreign-runtime";
+      const callsBeforeForeign = modelCalls;
+      await input(verdict);
+      assert.equal(modelCalls, callsBeforeForeign);
+      assert.equal(terminal().reasonCode, "input_control_refused");
+      process.env.YOKEMATE_REVIEW_RUNTIME_ID = runtimeId;
+      await noHandoff();
+      const timeoutStarted = Date.now();
+      completeReview = () => new Promise((resolve) => { release = resolve; });
+      await input(sentinel);
+      assert.ok(Date.now() - timeoutStarted >= 15000);
+      assert.equal(terminal().reasonCode, "timeout");
+      release(await approvedReply(sentinel));
+      await noHandoff();
+      assert.equal(terminal().reasonCode, "timeout");
+      const entriesBeforeFailure = diagnosticEntries().length;
+      diagnosticFailure = true;
+      completeReview = async () => quoteReply(`malformed ${sentinel}`);
+      await input(sentinel);
+      await noHandoff();
+      diagnosticFailure = false;
+      assert.equal(diagnosticEntries().length, entriesBeforeFailure);
+      const entries = diagnosticEntries();
+      const allowed = ["version", "phase", "reviewRunId", "serial", "revision", "inputHash", "provider", "model", "outcome", "reasonCode", "stopReason", "elapsedMs", "responseHash", "responseBytes", "validation", "inputControl", "extractionControl"].sort();
+      for (const diagnostic of entries) {
+        assert.deepEqual(Object.keys(diagnostic).sort(), allowed);
+        assert.equal(diagnostic.provider, "test");
+        assert.equal(diagnostic.model, "review");
+        assert.match(diagnostic.inputHash, /^[a-f0-9]{64}$/);
+        assert.ok(Number.isFinite(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
+        assert.ok(JSON.stringify(diagnostic).length < 2048);
+      }
+      assert.equal(entries.filter((entry) => entry.phase === "start").length, entries.filter((entry) => entry.phase === "terminal").length);
+      const persisted = readFileSync(diagnosticSession.getSessionFile()!, "utf8");
+      for (const privateText of [sentinel, verdict, "На доработку.", planText("YM-1", "Apply the accepted review rework.")]) assert.equal(persisted.includes(privateText), false);
+      assert.equal(notifications.join("\n").includes(sentinel), false);
+    }
+    completeReview = approvedReply;
+    if (workflowApproval) {
+      const failedDb = openDb(join(dir, "yokemate.db"));
+      failedDb.prepare("UPDATE project SET mode_models=? WHERE tracker_key='YM'").run(JSON.stringify({ review: "test/review", do: "missing/model" }));
+      failedDb.close();
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "Итог: отправляй на доработку" } as never, workerCtx);
+      let failed: any;
+      try { await accept(); assert.fail("missing do model must refuse startup"); } catch (error) { failed = error; }
+      const failure = parseOutput(failed.stdout, failed.stderr) as { state: string; recorded: boolean; reason: string; stage: string; plan: string; contentHash: string };
+      assert.equal(failure.state, "refused");
+      assert.equal(failure.recorded, true);
+      assert.equal(failure.stage, "planned");
+      assert.equal(failure.plan, reworkPlan);
+      assert.match(failure.reason, /missing\/model/);
+      assert.equal(readFileSync(closeLog, "utf8"), "");
+      const repairedDb = openDb(join(dir, "yokemate.db"));
+      repairedDb.prepare("UPDATE project SET mode_models=? WHERE tracker_key='YM'").run(JSON.stringify({ review: "test/review", do: "test/model" }));
+      repairedDb.close();
+      let repeated: any;
+      try { await accept(); assert.fail("old verdict must not retry"); } catch (error) { repeated = error; }
+      assert.deepEqual(parseOutput(repeated.stdout, repeated.stderr), failure);
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "После исправления снова отправляй на доработку" } as never, workerCtx);
+    } else {
+      for (const handler of worker.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "План доработки согласован. На доработку." } as never, workerCtx);
+    }
+    const approved = terminal();
+    assert.equal(approved.reasonCode, "rework");
+    assert.equal(approved.outcome, "accepted");
+    assert.equal(approved.validation, "accepted");
+    assert.equal(approved.inputControl, "accepted");
+    assert.equal(approved.extractionControl, "accepted");
+    assert.ok(Number.isSafeInteger(approved.serial) && approved.serial > 0);
+    assert.ok(Number.isSafeInteger(approved.revision) && approved.revision >= 0);
+    if (!workflowApproval) assert.equal(approved.inputHash, createHash("sha256").update(verdict).digest("hex"));
+    const result = await accept();
+    const outcome = parseOutput(result.stdout, result.stderr) as { state: string; recorded: boolean; runId: string; model: string; plan: string; contentHash: string; close: { state: string } };
+    assert.equal(outcome.state, "started");
+    assert.equal(outcome.recorded, true);
+    assert.equal(outcome.plan, reworkPlan);
+    assert.equal(outcome.model, "test/model");
+    assert.equal(outcome.close.state, "closed");
+    const current = openDb(join(dir, "yokemate.db"));
+    assert.equal(current.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get()!.stage, "running");
+    assert.equal(current.prepare("SELECT plan FROM work WHERE ticket='YM-1'").get()!.plan, reworkPlan);
+    assert.equal(current.prepare("SELECT COUNT(*) AS count FROM part WHERE work_id=?").get(work.id)!.count, 1);
+    current.close();
+    assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-runs"), "utf8").trim(), outcome.runId);
+    if (!workflowApproval) assert.equal(readFileSync(join(dir, "work", "YM-1", "fixture-fast-terminals"), "utf8").trim(), outcome.runId);
+    assert.deepEqual(readFileSync(closeLog, "utf8").trim().split("\n").map((line) => JSON.parse(line)), [["tab", "close", "review-tab"]]);
+    assert.equal(confirms, 0);
+    assert.match(notifications.join("\n"), new RegExp(`YM-1: rework .* \\(${outcome.contentHash}\\) recorded; do ${outcome.runId} started with test/model`));
+  } finally {
+    await workerShutdown?.();
+    await mainShutdown?.();
+    process.argv[1] = savedArgv;
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+}
+
+test("owned review verdict records, starts and closes for both workflowApproval values", { timeout: 120000 }, async () => {
+  await runCase(false, "node");
+  await runCase(true, "package");
+});

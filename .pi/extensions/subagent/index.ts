@@ -13,11 +13,13 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { readCandidatePlanSnapshot, readRecordedPlanBinding, assertPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
-import { DoAuthorityStore, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION } from "../../../src/workflow-approval.ts";
+import { readCandidatePlanSnapshot, readRecordedPlanBinding, readWorkflowBindingSnapshot, assertPlanBinding, toPlanBinding, type PlanBinding } from "../../../src/plan-binding.ts";
+import { DoAuthorityStore, isWorkflowCandidate, PendingWorkflowExtraction, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION, type ApprovalParent, type InputGeneration, type WorkflowCancellationReason, type WorkflowExtractionTerminal } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { boundBatchResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { boundBatchResult, cancellationResult, type CancellationResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
+import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,7 +33,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Container, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Container, getKeybindings, Markdown, Spacer, Text, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import { buildCoordinatorDisplay, buildReportDisplay, reportTaskExcerpt, subagentReportRenderer, type ReportAdmissionDisplay, type ReportDiagnosticFacts, type SubagentReportDisplayV1 } from "../../../src/subagent-report.ts";
 import { coordinatorArtifactId, SubagentReportStore } from "../../../src/subagent-report-store.ts";
 import { Type } from "typebox";
@@ -42,13 +44,18 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { currentControlOrigin, requestPlanControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { type PlanCompletionContext, currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
 import { ListRunRegistry, type KeyRunContext } from "../../../src/list-run.ts";
 import { launchPlanKey } from "../../../src/plan-launch.ts";
 import { herdrAsync } from "../../../src/herdr.ts";
+import { closeModeSurface } from "../../../src/mode-surface.ts";
+import { observeProcessIdentity, ReviewReworkStore, REVIEW_REWORK_EXTRACTION_INSTRUCTION, adaptReviewReworkQuotes, validateReviewReworkExtraction, type ReviewHandoffOutcome } from "../../../src/review-rework.ts";
+import { recordReviewRework } from "../../../src/accept.ts";
+import { logMove } from "../../../src/move-log.ts";
+import { syncPush } from "../../../src/git-sync.ts";
 import { openDb } from "../../../src/db.ts";
 import { dataRoot } from "../../../src/data-root.ts";
 import { modelForTicket } from "../../../src/project-model.ts";
@@ -57,18 +64,31 @@ import { recordPlan as recordPlanFile, type PlanRecordResult } from "../../../sr
 import { coordinatorMerge, type CoordinatorMergeRequest } from "../../../src/coordinator-merge.ts";
 import { finalizeShip } from "../../../src/ship-finalize.ts";
 import { PublicationTargetFailure, publicationTargetLabel, resolvePublicationTarget } from "../../../src/plan-publication-target.ts";
-import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationRow } from "../../../src/plan-publication-state.ts";
+import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptRecoveredPublication, acceptScoutArtifact, markPublicationResult, planRecordById, publicationAcceptanceById, publicationById, readPublicationArtifact, recordPublicationBlock, revokePendingPlanRecords, reserveCanonicalUrl, writePublicationArtifact, type ArtifactMetadata, type PublicationError, type PublicationOutcome, type PublicationProvenance, type PublicationRow } from "../../../src/plan-publication-state.ts";
 import { assertPublishable, normalizeScoutMarkdown, publishDocument, PublicationFailure } from "../../../src/plan-publication.ts";
 import { PlanPublicationMcp } from "../../../src/plan-publication-mcp.ts";
 import { githubPublicationAdapter } from "../../../src/github.ts";
+import { installWorkflowIngress, WorkflowIngressWitnessStore, type WorkflowIngressWitness } from "../../../src/workflow-ingress.ts";
+import { BreakGlassPermitStore, parseBreakGlass, previewScoutAcceptance, resolveScoutAcceptance, type BreakGlassPreview, type PlanSnapshotIdentity } from "../../../src/workflow-break-glass.ts";
+import { assertMandatoryBoundary } from "../../../src/workflow-boundaries.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
 // нет, и убить их некому, кроме конца сессии.
 const detached = new Set<ChildProcess>();
-const cancellationByProcess = new Map<ChildProcess, (initiator: string) => void>();
-const childCompletions = new Map<ChildProcess, Promise<void>>();
+interface OrdinaryProcess {
+	identity: ChildIdentity;
+	process: ChildProcess;
+	pid: number;
+	starttime: string;
+	closed: boolean;
+	termSent: boolean;
+	killSent: boolean;
+	killTimer?: NodeJS.Timeout;
+}
+const ordinaryProcesses = new Map<string, OrdinaryProcess>();
+let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -78,11 +98,10 @@ let activeUnits = 0;
 // (задачи сверх maxConcurrency) и следующий шаг цепочки поднимаются позже — в
 // те миллисекунды, что pi ещё дочитывает ввод, — и осиротели бы. Флаг
 // закрывает очередь; turn_start снимает его, если сессия вернулась.
-let shuttingDown = false;
-
 // Батч закрывает расширение: сколько поднято и сколько осело, знает только
 // оно. Счёт, отданный модели, врёт молча — таб уйдёт дальше на неполном наборе.
 const batches = new Set<string>();
+const batchModes = new Map<string, "single" | "parallel" | "chain">();
 
 // Отвязанный вызов сворачивает тул-колл, и в ленте не остаётся ничего живого:
 // кто сейчас работает, видно только отсюда — строкой над редактором.
@@ -93,6 +112,9 @@ let widgetTimer: NodeJS.Timeout | undefined;
 // ctx протухает вместе с сессией, поэтому рисуем всегда по свежему: тому, что
 // пришёл в execute текущего вызова или в turn_start, а не захваченному.
 let latestCtx: ExtensionContext | undefined;
+const scoutCandidateIds = new Map<string, string>();
+const scoutCandidateGenerations = new Map<string, number>();
+const verifiedWriterDrafts = new Map<string, { acceptedInputId: number; planningIdentity: string; runId: string }>();
 
 // Ряд показывает всех детей, только пока влезает целиком: не влез — TruncatedText
 // срезает хвост, и вторая половина детей пропадает вместе с именами (на 40 колонках
@@ -287,6 +309,8 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	cleanupError?: string;
+	cleanupPath?: string;
 	step?: number;
 }
 
@@ -351,30 +375,52 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
+class PromptCleanupFailure extends Error {
+	readonly dir: string;
+	readonly writeFailure: ReturnType<typeof errorMetadata>;
+	readonly cleanupFailure: ReturnType<typeof errorMetadata>;
+	constructor(dir: string, writeError: unknown, cleanupError: unknown) {
+		super("temporary prompt write and cleanup failed");
+		this.dir = dir;
+		this.writeFailure = errorMetadata(writeError);
+		this.cleanupFailure = errorMetadata(cleanupError);
+	}
+}
+
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
 	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
+	try {
+		await withFileMutationQueue(filePath, async () => {
+			await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
+		});
+		return { dir: tmpDir, filePath };
+	} catch (error) {
+		try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); }
+		catch (cleanupError) { throw new PromptCleanupFailure(tmpDir, error, cleanupError); }
+		throw error;
+	}
 }
 
+let pinnedPiCli: string | undefined;
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+	if (!pinnedPiCli) {
+		const packageRoot = fs.realpathSync(path.join(ENGINE_ROOT, "node_modules", "@earendil-works", "pi-coding-agent"));
+		const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+		if (manifest.version !== "0.85.1") throw new Error("pinned Pi 0.85.1 is unavailable");
+		const contract = fs.readFileSync(path.join(packageRoot, "dist", "modes", "json-event.js"), "utf8");
+		if (!contract.includes("YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1")) throw new Error("pinned Pi JSON contract patch is unavailable");
+		pinnedPiCli = fs.realpathSync(path.join(packageRoot, "dist", "cli.js"));
 	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
+	const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+	if (relay && process.env.NODE_TEST_CONTEXT) {
+		const canonicalRelay = fs.realpathSync(relay);
+		const fixtureRoot = fs.realpathSync(path.join(ENGINE_ROOT, "test", "fixtures"));
+		if (path.dirname(canonicalRelay) !== fixtureRoot || path.basename(canonicalRelay) !== "subagent-json-relay.mjs") throw new Error("invalid test JSON relay");
+		return { command: process.execPath, args: [canonicalRelay, pinnedPiCli, ...args] };
 	}
-
-	return { command: "pi", args };
+	return { command: process.execPath, args: [pinnedPiCli, ...args] };
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -397,6 +443,7 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onSpawn: ((proc: ChildProcess) => void) | undefined,
 	identity: ChildIdentity,
+	lifecycle: ChildRuns,
 	diagnostic: { metadata: Record<string, unknown>; save(completed: boolean): void },
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
@@ -416,7 +463,7 @@ async function runSingleAgent(
 	}
 
 	const coordinatorChild = process.env.YOKEMATE_ROLE === "coordinator";
-	const args: string[] = ["--mode", "json", "-p", ...(coordinatorChild ? ["--session-dir", path.join(process.cwd(), "sessions")] : ["--no-session"]), "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
+	const args: string[] = ["--mode", "json", "-p", ...(coordinatorChild ? process.env.PI_CODING_AGENT_SESSION_DIR ? [] : ["--session-dir", path.join(process.cwd(), "sessions")] : ["--no-session"]), "--extension", path.join(ENGINE_ROOT, "src", "guards.ts")];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
@@ -452,10 +499,18 @@ async function runSingleAgent(
 	};
 
 	try {
+		if (!lifecycle.canSpawn(identity)) {
+			currentResult.envelope = lifecycle.claimNoSpawn(identity);
+			return currentResult;
+		}
 		if (agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
+			if (!lifecycle.canSpawn(identity)) {
+				currentResult.envelope = lifecycle.claimNoSpawn(identity);
+				return currentResult;
+			}
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
@@ -490,55 +545,92 @@ async function runSingleAgent(
 				emitUpdate();
 			}
 		});
-		const refreshObservation = () => {
-			diagnostic.metadata.stream = observation.metadata();
+		const refreshObservation = (stream = observation.metadata()) => {
+			diagnostic.metadata.stream = stream;
 			diagnostic.metadata.stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
 			diagnostic.metadata.sessionId = observation.sessionId;
 			diagnostic.metadata.effective = { model: observation.model ?? "unknown", provider: observation.provider ?? "unknown", thinking: "unknown" };
 		};
-		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" | "cancelled" }>((resolve) => {
+		let lastProgressSnapshot = 0;
+		let priorParserErrors = 0;
+		let priorPhase: string = "unknown";
+		const checkpointProgress = () => {
+			const stream = observation.metadata();
+			const now = Date.now();
+			const firstFault = priorParserErrors === 0 && stream.parserErrors > 0;
+			const phaseChanged = stream.phase !== priorPhase;
+			priorParserErrors = stream.parserErrors;
+			priorPhase = stream.phase;
+			if (!firstFault && !phaseChanged && now - lastProgressSnapshot < 1000) return;
+			lastProgressSnapshot = now;
+			refreshObservation(stream);
+			diagnostic.save(false);
+		};
+		if (!lifecycle.canSpawn(identity)) {
+			currentResult.envelope = lifecycle.claimNoSpawn(identity);
+			return currentResult;
+		}
+		const terminal = await new Promise<{ exitCode: number | null; signal: string | null; processOutcome: "exited" | "signaled" | "spawn_error" }>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const child = research ? researchChildLaunch(research, identity.cwd, [research.root, ...(research.projectPath ? [research.projectPath] : [])]) : undefined;
-			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, ...(child?.env ?? {}) };
+			const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_ROLE: "executor", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.ownerRunId, YOKEMATE_SUBAGENT_JSON_CONTRACT: "1", ...(child?.env ?? {}) };
 			delete env.HERDR_PANE_ID;
 			delete env.YOKEMATE_PARENT_PANE;
 			let spawnError: Error | undefined;
-			let cancelled = false;
-			let killTimer: NodeJS.Timeout | undefined;
 			const proc = spawn(invocation.command, invocation.args, { cwd: child?.cwd ?? identity.cwd, env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+			const starttime = proc.pid ? processStarttime(proc.pid) : undefined;
 			diagnostic.metadata.pid = proc.pid;
-			diagnostic.metadata.starttime = proc.pid ? processStarttime(proc.pid) : undefined;
+			diagnostic.metadata.starttime = starttime;
 			diagnostic.metadata.spawnAt = new Date().toISOString();
-			cancellationByProcess.set(proc, (initiator) => {
-				cancelled = true;
-				if (diagnostic.metadata.cancellationInitiator === "unknown") diagnostic.metadata.cancellationInitiator = initiator;
-				refreshObservation();
-				diagnostic.save(false);
-			});
+			if (proc.pid && starttime && lifecycle.attachProcess(identity, proc.pid, starttime)) ordinaryProcesses.set(identity.runId, { identity, process: proc, pid: proc.pid, starttime, closed: false, termSent: false, killSent: false });
 			diagnostic.save(false);
 			onSpawn?.(proc);
-			const abort = () => {
-				cancellationByProcess.get(proc)?.("tool_abort_signal");
-				proc.kill("SIGTERM");
-				killTimer = setTimeout(() => { if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL"); }, 5000);
-			};
-			proc.stdout.on("data", (data: Buffer) => observation.write(data));
+			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId); };
+			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
 			proc.once("close", (exitCode, signalName) => {
-				clearTimeout(killTimer);
+				const owned = ordinaryProcesses.get(identity.runId);
+				if (owned) {
+					owned.closed = true;
+					clearTimeout(owned.killTimer);
+				}
 				signal?.removeEventListener("abort", abort);
 				observation.end();
-				cancellationByProcess.delete(proc);
 				diagnostic.metadata.closeAt = new Date().toISOString();
-				resolve({ exitCode, signal: signalName, processOutcome: cancelled ? "cancelled" : spawnError ? "spawn_error" : signalName ? "signaled" : "exited" });
+				const processOutcome = spawnError ? "spawn_error" : signalName ? "signaled" : "exited";
+				lifecycle.claimTerminal(identity, task, { exitCode, signal: signalName, processOutcome, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream: observation.metadata(), stderr: { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") }, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
+				resolve({ exitCode, signal: signalName, processOutcome });
 			});
 			if (signal?.aborted) abort();
 			else signal?.addEventListener("abort", abort, { once: true });
 		});
 		currentResult.exitCode = terminal.exitCode;
-		currentResult.envelope = resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete }, observation.finalText);
-		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid") {
+		refreshObservation();
+		const stream = observation.metadata();
+		const stderr = { bytes: stderrBytes, hash: stderrHash.copy().digest("hex") };
+		currentResult.envelope = lifecycle.claimed(identity) ?? resultEnvelope(identity, task, { ...terminal, stopReason: observation.stopReason, protocolError: observation.protocolError, incomplete: observation.incomplete, diagnostics: { stream, stderr, final: { bytes: 0, hash: sha256(""), previewBytes: 0, previewHash: sha256(""), truncated: false } } }, observation.finalText);
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "protocol_error" && currentResult.envelope.processOutcome !== "cancelled" && process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID) {
+			try {
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const planningIdentity = process.env.YOKEMATE_PLAN_RUN_ID;
+				const generation = (scoutCandidateGenerations.get(planningIdentity) ?? 0) + 1;
+				scoutCandidateGenerations.set(planningIdentity, generation);
+				const captured = captureScoutCandidate({ root: ENGINE_ROOT, identity, envelope: currentResult.envelope, finalText: observation.finalText, childSessionId: observation.sessionId, evidence: observation.evidence(), planningIdentity, generation, parentRuntimeId: parent.runtimeId, parentSessionId: parent.sessionId });
+				if (captured.state === "captured") {
+					const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					let candidateId: string;
+					try { candidateId = persistScoutCandidate(state, ENGINE_ROOT, captured.candidate).id; }
+					finally { state.close(); }
+					const registration = await requestPlanControl(ENGINE_ROOT, "register-scout-candidate", { ticket: identity.ticket, runId: planningIdentity, candidateId, failureHash: captured.candidate.failedEnvelopeHash, generation }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), parent);
+					if (registration.state !== "accepted") throw new Error(registration.reason ?? "candidate lineage registration refused");
+					scoutCandidateIds.set(identity.runId, candidateId);
+					currentResult.envelope.recovery = { sourceTransport: "failed", state: "candidate", candidateId, failureHash: captured.candidate.failedEnvelopeHash, payloadHash: captured.candidate.contentHash, bytes: captured.candidate.bytes };
+					diagnostic.metadata.scoutCandidate = { id: candidateId, hash: captured.candidate.contentHash, bytes: captured.candidate.bytes, failureHash: captured.candidate.failedEnvelopeHash };
+				} else diagnostic.metadata.scoutCandidate = { refusal: captured.reason };
+			} catch (error) { diagnostic.metadata.scoutCandidate = { refusal: "audit-unavailable", error: errorMetadata(error) }; }
+		}
+		if (identity.agent === "plan-scout" && identity.ticket && currentResult.envelope.payloadOutcome === "valid" && currentResult.envelope.processOutcome !== "cancelled") {
 			const bytes = normalizeScoutMarkdown(observation.finalText);
 			try {
 				assertPublishable(bytes);
@@ -551,24 +643,25 @@ async function runSingleAgent(
 			}
 		}
 		refreshObservation();
-		diagnostic.metadata.terminal = { ...terminal, stopReason: observation.stopReason };
+		diagnostic.metadata.terminal = { processOutcome: currentResult.envelope.processOutcome, exitCode: currentResult.envelope.exitCode, signal: currentResult.envelope.signal, stopReason: observation.stopReason };
+		diagnostic.metadata.actualTaskHash = currentResult.envelope.actualTaskHash;
 		diagnostic.metadata.usage = { ...currentResult.usage };
 		diagnostic.metadata.payload = { outcome: currentResult.envelope.payloadOutcome, bytes: Buffer.byteLength(observation.finalText), hash: sha256(observation.finalText), retainedBytes: Buffer.byteLength(currentResult.envelope.payload), retainedHash: sha256(currentResult.envelope.payload), truncated: currentResult.envelope.payload !== observation.finalText, verdict: currentResult.envelope.reviewVerdict };
+		diagnostic.metadata.artifact = currentResult.envelope.artifact;
 		diagnostic.save(true);
+		const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+		if (snapshotStorage && currentResult.envelope.diagnostics) currentResult.envelope.diagnostics.snapshotStorage = { ...snapshotStorage };
 		return currentResult;
 	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
+		if (tmpPromptDir) {
+			try { fs.rmSync(tmpPromptDir, { recursive: true, force: true }); }
+			catch (error) {
+				currentResult.cleanupError = "temporary prompt cleanup could not be verified";
+				currentResult.cleanupPath = tmpPromptDir;
+				diagnostic.metadata.cleanupError = { reason: currentResult.cleanupError, path: tmpPromptDir, cleanupFailure: errorMetadata(error) };
+				diagnostic.save(true);
 			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+		}
 	}
 }
 
@@ -579,6 +672,8 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -587,6 +682,8 @@ const ChainItem = Type.Object({
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -605,8 +702,10 @@ const CoordinatorRequestSchema = Type.Object({
 
 const SubagentParams = Type.Object({
 	review: Type.Optional(ReviewRevisionSchema),
+	acceptedInputId: Type.Optional(Type.Integer({ minimum: 1, description: "Accepted scout input binding for a plan writer" })),
+	writerRevisionOf: Type.Optional(Type.String({ description: "Verified prior plan draft hash for an explicit revision" })),
 	coordinator: Type.Optional(CoordinatorRequestSchema),
-	cancelRun: Type.Optional(Type.String()),
+	cancelRun: Type.Optional(Type.String({ description: "Exact ordinary ACK, coordinator, list, or list-key run UUID to cancel", pattern: "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[1-5][a-fA-F0-9]{3}-[89aAbB][a-fA-F0-9]{3}-[a-fA-F0-9]{12}$" })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	ticket: Type.Optional(Type.String({ description: "Explicit ticket binding for a plan scout" })),
@@ -623,6 +722,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerMessageRenderer("subagent-report", subagentReportRenderer);
 	const reportStore = new SubagentReportStore(path.join(ENGINE_ROOT, ".pi", "subagent-reports"));
 	let runs: ChildRuns | undefined;
+	let shuttingDown = false;
+	let sessionGeneration = 0;
+	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
+	let nextScoutSequence = 0;
+	const scoutSequenceByRunId = new Map<string, number>();
 	const publicationMcp = new PlanPublicationMcp(pi, ENGINE_ROOT);
 	const publicationTail = new Map<string, Promise<unknown>>();
 	const localPublicationErrors = new Set<PublicationError>(["artifact_invalid", "unsafe_document", "binding_changed"]);
@@ -675,17 +779,43 @@ export default function (pi: ExtensionAPI) {
 					publication = publicationById(binding, publication.id)!;
 				} finally { binding.close(); }
 				canonicalUrl = resolved.canonicalUrl;
+				if (publication.source_kind === "engineer-accepted-input") {
+					const audit = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					try {
+						const incident = publication.incident_id ? incidentById(audit, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(audit, incident, { kind: "effect-start", code: `publish-${publication.kind}`, payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: "started" });
+					} finally { audit.close(); }
+				}
 				const knowledgePath = publication.plan_path ? path.relative(ENGINE_ROOT, publication.plan_path) : undefined;
 				const result = await publishDocument(publication, bytes, resolved.adapter, { canonicalUrl: resolved.canonicalUrl, knowledgePath, verifyBinding: verifyPublicationBinding });
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-				try { markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl }); }
+				try {
+					update.exec("BEGIN IMMEDIATE");
+					markPublicationResult(update, publication.id, { complete: result.complete, error: result.error, canonicalUrl: resolved.canonicalUrl });
+					if (publication.source_kind === "engineer-accepted-input") {
+						const incident = publication.incident_id ? incidentById(update, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(update, incident, { kind: "outcome", code: result.error ?? (result.complete ? "complete" : "partial"), payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: result.complete ? "complete" : "partial" });
+					}
+					update.exec("COMMIT");
+				} catch (error) { try { update.exec("ROLLBACK"); } catch {} throw error; }
 				finally { update.close(); }
 				return { ...result, target: resolved.canonicalUrl };
 			} catch (error) {
 				const code = error instanceof PublicationFailure ? error.code : "unavailable";
 				if (localPublicationErrors.has(code)) throw error;
 				const update = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-				try { markPublicationResult(update, publication.id, { complete: false, error: code, canonicalUrl }); }
+				try {
+					update.exec("BEGIN IMMEDIATE");
+					markPublicationResult(update, publication.id, { complete: false, error: code, canonicalUrl });
+					if (publication.source_kind === "engineer-accepted-input") {
+						const incident = publication.incident_id ? incidentById(update, publication.incident_id) : undefined;
+						if (!incident) throw new PublicationFailure("artifact_invalid");
+						appendIncidentEvent(update, incident, { kind: "outcome", code, payloadHash: publication.payload_hash ?? undefined, failureHash: publication.failure_hash ?? undefined, planHash: publication.kind === "plan" ? publication.content_hash : undefined, effect: `publish-${publication.kind}`, outcome: "failed" });
+					}
+					update.exec("COMMIT");
+				} catch (auditError) { try { update.exec("ROLLBACK"); } catch {} throw auditError; }
 				finally { update.close(); }
 				return { complete: false, error: code, parts: 0, revision: publication.content_hash, target: canonicalUrl ?? safeTarget(publication.ticket) };
 			}
@@ -697,7 +827,7 @@ export default function (pi: ExtensionAPI) {
 	const attemptArtifactPublication = async (input: {
 		kind: "scout" | "plan"; ticket: string; artifact: ArtifactMetadata; runId: string; publicationId?: number;
 		child?: ChildIdentity; planPath?: string; scopeHash?: string; attach(db: DatabaseSync, row: PublicationRow): void;
-		verifyBinding?: () => void | Promise<void>;
+		verifyBinding?: () => void | Promise<void>; provenance?: PublicationProvenance; acceptanceId?: number;
 	}): Promise<PublicationOutcome> => {
 		const local = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		let row: PublicationRow | undefined;
@@ -719,13 +849,16 @@ export default function (pi: ExtensionAPI) {
 				markPublicationResult(local, row.id, { complete: false, error: "target_changed" });
 				return { kind: input.kind, state: "pending", target: row.canonical_url ?? publicationTargetLabel(local, input.ticket), revision: row.content_hash, publicationId: row.id, error: "target_changed" };
 			}
-			if (!row) row = acceptPublication(local, ENGINE_ROOT, { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash });
+			if (!row) {
+				const identity = { target: target.target, targetHash: target.targetHash, ticket: input.ticket, kind: input.kind, bytes, runId: input.runId, child: input.child, planPath: input.planPath, scopeHash: input.scopeHash };
+				row = input.provenance?.source_kind === "engineer-accepted-input" ? acceptRecoveredPublication(local, ENGINE_ROOT, identity, input.acceptanceId!) : acceptPublication(local, ENGINE_ROOT, identity);
+			}
 			input.attach(local, row);
 		} finally { local.close(); }
 		const result = await publishAccepted(row!.id, input.verifyBinding);
 		return { kind: input.kind, state: result.complete ? "complete" : "pending", target: result.target, revision: result.revision, publicationId: row!.id, ...(result.error ? { error: result.error } : {}) };
 	};
-	let snapshots: RunSnapshots | undefined;
+	const snapshots = new RunSnapshots(ENGINE_ROOT);
 	const diagnostics = new Map<string, { metadata: Record<string, unknown>; save(completed: boolean): void }>();
 	const reportAdmissions = new Map<string, ReportAdmissionDisplay>();
 	const reportSettledAt = new Map<string, number>();
@@ -733,6 +866,7 @@ export default function (pi: ExtensionAPI) {
 	const reportArchives = new Map<string, { facts: Record<string, unknown> }>();
 	const coordinatorAdmissions = new Map<string, { startedAt: number; taskExcerpt: string }>();
 	const sentBatches = new Set<string>();
+	const settlingRuns = new Set<string>();
 	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
 	const diagnosticFacts = (runId: string): ReportDiagnosticFacts => {
 		const metadata = diagnostics.get(runId)?.metadata ?? {};
@@ -776,6 +910,7 @@ export default function (pi: ExtensionAPI) {
 				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
 				if (details?.deliveryId !== delivery.deliveryId || details.envelopeHash !== delivery.envelopeHash) continue;
 				delivery.state = "observed";
+				delivery.observedAt = new Date().toISOString();
 				for (const runId of delivery.runIds) {
 					const diagnostic = diagnostics.get(runId);
 					if (diagnostic) {
@@ -798,6 +933,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => emitChildState());
 	const coordinators = new CoordinatorRegistry();
 	const listRuns = new ListRunRegistry();
+	const authorityByCycle = new Map<string, DoAuthorityStore>();
 	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => {
 		const deliveryId = createHash("sha256").update(`${message.customType}\u0000${JSON.stringify(message.details)}`).digest("hex");
 		const delivery = listDeliveries.get(deliveryId) ?? { state: "pending" as const, customType: message.customType, content: message.content };
@@ -827,25 +963,94 @@ export default function (pi: ExtensionAPI) {
 		listRuns.flushAggregate(listRunId);
 	};
 	listRuns.onTerminal((run, entry) => {
+		if (run.identity.mode === "do") {
+			authorityByCycle.get(entry.keyRunId)?.finish(entry.keyRunId);
+			authorityByCycle.delete(entry.keyRunId);
+		}
 		if (entry.immediate?.state === "accepted" && !listRuns.wasLifetimeReleased(entry.keyRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
-		if (entry.terminal?.outcome === "cancelled" && typeof entry.immediate?.facts?.agentName === "string") void herdrAsync(["agent", "stop", entry.immediate.facts.agentName]).catch(() => {});
 		deliverListMessage(run.identity.listRunId, { customType: "yokemate-list-key", content: `[${run.identity.mode} ${entry.key} ${entry.keyRunId}] ${entry.terminal?.outcome}: ${entry.terminal?.reason ?? "complete"}`, display: true, details: { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, key: entry.key, terminal: entry.terminal } });
 	});
 	listRuns.onAggregate((aggregate) => deliverListMessage(aggregate.listRunId, { customType: "yokemate-list-aggregate", content: `[${aggregate.mode} list ${aggregate.listRunId}] ${aggregate.results.map((result) => `${result.key}:${result.terminal?.outcome ?? "refused"}`).join(", ")}`, display: true, details: aggregate }));
 	const recordingPlans = new Set<string>();
+	const stoppedPlanRuns = new Set<string>();
 	const lockedRecordingPlans = new Set<string>();
 	const recorderControllers = new Map<string, AbortController>();
-	const cancelledRecordingPlans = new Set<string>();
+	const recorderCompletions = new Map<string, Promise<void>>();
+	const recorderFences = new PlanRecorderFences();
 	const shipPermits = new ShipPermitStore();
+	const workflowIngress = new WorkflowIngressWitnessStore();
+	const breakGlassPermits = new BreakGlassPermitStore();
+	let ingressWitness: WorkflowIngressWitness | undefined;
+	let uninstallIngress: (() => void) | undefined;
 	let authority: DoAuthorityStore | undefined;
+	const reviewReworks = new Map<string, { store: ReviewReworkStore; stopObserver: () => void }>();
+	let workflowExtraction: PendingWorkflowExtraction | undefined;
+	let removeTerminalInputListener: (() => void) | undefined;
+	const observedTurnSignals = new WeakSet<AbortSignal>();
+	const warnedWorkflowExtractions = new WeakSet<PendingWorkflowExtraction>();
+	interface WorkflowGenerationCapture { parent: ApprovalParent; store: DoAuthorityStore; generation: InputGeneration; operation?: PendingWorkflowExtraction }
+	type WorkflowConsumerMetadata = { requestId?: string; toolCallId?: string; listRunId?: string; keyRunId?: string };
+	type PlanRecordCompletion = { runId?: string; reason: string; facts: Record<string, unknown>; publications: PublicationOutcome[]; handoff: "plan-only" | "unavailable" | "started" | "refused" };
+	const planRunGenerations = new Map<string, WorkflowGenerationCapture>();
+	const planRunMetadata = new Map<string, WorkflowConsumerMetadata>();
+	const planRecordGenerations = new Map<number, WorkflowGenerationCapture>();
+	const planRecordCompletions = new Map<number, Promise<PlanRecordCompletion>>();
+	const captureWorkflowGeneration = (): WorkflowGenerationCapture | undefined => {
+		if (!authority || !controlIdentity) return;
+		const generation = authority.generation();
+		const operation = workflowExtraction?.matches(controlIdentity, authority, generation) ? workflowExtraction : undefined;
+		return { parent: { ...controlIdentity }, store: authority, generation, operation };
+	};
+	const safeWorkflowId = (value: unknown): string | undefined => {
+		if (typeof value !== "string") return;
+		return /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : createHash("sha256").update(value).digest("hex");
+	};
+	const appendWorkflowEntry = (type: "yokemate-workflow-extraction" | "yokemate-workflow-consumer", data: Record<string, unknown>): void => {
+		try { pi.appendEntry(type, data); } catch {}
+	};
+	const assertWorkflowCapture = (capture: WorkflowGenerationCapture): void => {
+		if (!authority || !controlIdentity || capture.store !== authority || capture.parent.sessionId !== controlIdentity.sessionId || capture.parent.runtimeId !== controlIdentity.runtimeId) throw new Error("stale do approval input generation");
+		authority.assertGeneration(capture.generation);
+	};
+	const awaitWorkflowGeneration = async (capture: WorkflowGenerationCapture | undefined, ctx: ExtensionContext, consumer: Record<string, unknown>, blocking = true): Promise<WorkflowExtractionTerminal | undefined> => {
+		if (!capture?.operation) return;
+		appendWorkflowEntry("yokemate-workflow-consumer", { phase: "wait", parentSessionId: capture.parent.sessionId, parentRuntimeId: capture.parent.runtimeId, serial: capture.generation.serial, revision: capture.generation.revision, inputHash: capture.generation.inputHash, decisionCode: "pending", ...consumer });
+		const terminal = await capture.operation.wait();
+		assertWorkflowCapture(capture);
+		appendWorkflowEntry("yokemate-workflow-consumer", { phase: "decision", parentSessionId: capture.parent.sessionId, parentRuntimeId: capture.parent.runtimeId, serial: capture.generation.serial, revision: capture.generation.revision, inputHash: capture.generation.inputHash, outcome: terminal.outcome, decisionCode: terminal.outcome, elapsedMs: terminal.elapsedMs, ...consumer });
+		if (blocking && ["timeout", "model_error", "invalid"].includes(terminal.outcome)) {
+			if (!warnedWorkflowExtractions.has(capture.operation)) {
+				warnedWorkflowExtractions.add(capture.operation);
+				ctx.ui.notify(`workflow extraction unavailable: outcome=${terminal.outcome}, elapsedMs=${terminal.elapsedMs}; no inferred workflow approval`, "warning");
+			}
+			throw new Error(`workflow extraction unavailable: outcome=${terminal.outcome}; no inferred workflow approval`);
+		}
+		return terminal;
+	};
 	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
 		if (coordinatorUnits.delete(runId)) activeUnits -= 1;
-		authority?.finish(runId);
+		authorityByCycle.get(runId)?.finish(runId);
+		authorityByCycle.delete(runId);
 	};
 	let controlServer: import("node:net").Server | undefined;
 	let controlIdentity: { sessionId: string; runtimeId: string } | undefined;
+	const auditRecoveryPreviews = (previews: readonly BreakGlassPreview[], outcome: "refusal" | "revoke" | "expiry"): void => {
+		if (!previews.length || !controlIdentity) return;
+		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			for (const preview of previews) {
+				appendRecoveryAttempt(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputGeneration: preview.inputGeneration, inputHash: preview.inputHash, scopeHash: preview.scopeHash, targetHash: preview.targetHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, payloadHash: preview.candidateHash, failureHash: preview.failureHash, reason: preview.reason, outcome });
+				appendRecoveryDecision(db, { candidateId: preview.candidateId, ticket: preview.ticket, action: preview.action, inputHash: preview.inputHash, sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, code: `${outcome}-permit`, blockers: [`${outcome}-permit`], reason: preview.reason, outcome });
+			}
+			db.exec("COMMIT");
+		} catch (error) {
+			try { db.exec("ROLLBACK"); } catch {}
+			throw error;
+		} finally { db.close(); }
+	};
 	let uiTail: Promise<void> = Promise.resolve();
 	const uiAbortByRun = new Map<string, AbortController>();
 	const suppressedCancellationReports = new Set<string>();
@@ -874,30 +1079,92 @@ export default function (pi: ExtensionAPI) {
 		void operation.then(() => cancellingCoordinators.delete(runId), () => cancellingCoordinators.delete(runId));
 		return operation;
 	};
-	const fenceListRuns = async (reason: string) => {
-		await Promise.all([...listRuns.activeEntries()].map(async (entry) => {
-			if (recordingPlans.has(entry.keyRunId)) {
-				cancelledRecordingPlans.add(entry.keyRunId);
-				recorderControllers.get(entry.keyRunId)?.abort();
-				return;
-			}
-			const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
-			listRuns.cancel(entry.keyRunId, reason);
-			if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
-			if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
-		}));
+	const revokeReviewRun = async (reviewRunId: string, reason: string, stopObserver = true) => {
+		const review = reviewReworks.get(reviewRunId);
+		if (!review) return;
+		for (const runId of review.store.revoke()) {
+			listRuns.cancel(runId, reason);
+			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run", true).catch(() => {});
+		}
+		if (stopObserver) review.stopObserver();
 	};
-	const revokeAuthority = async () => {
+	const upgradeRecordingFence = (runId: string): boolean => {
+		if (!recordingPlans.has(runId)) return false;
+		recorderFences.fence(runId, true);
+		recorderControllers.get(runId)?.abort();
+		return true;
+	};
+	const fenceTargetedWorkflow = (tickets: readonly string[], explicitRunIds: readonly string[], reason: string, store = authority) => {
+		const runIds = new Set(explicitRunIds);
+		for (const ticket of new Set(tickets)) for (const runId of store?.revoke(ticket) ?? []) runIds.add(runId);
+		let cancelled = false;
+		const immediateRunIds: string[] = [];
+		for (const runId of runIds) {
+			planRunGenerations.delete(runId);
+			planRunMetadata.delete(runId);
+			if (recordingPlans.has(runId)) {
+				recorderFences.fence(runId, true);
+				recorderControllers.get(runId)?.abort();
+				cancelled = true;
+				continue;
+			}
+			immediateRunIds.push(runId);
+		}
+		cancelled = listRuns.cancelMany(immediateRunIds, reason) || cancelled;
+		const coordinatorRunIds = immediateRunIds.filter((runId) => Boolean(coordinators.get(runId)));
+		return { runIds, coordinatorRunIds, cancelled: cancelled || coordinatorRunIds.length > 0 };
+	};
+	const fenceListRuns = async (reason: string) => {
+		for (const runId of recordingPlans) upgradeRecordingFence(runId);
+		const entries = [...listRuns.activeEntries()];
+		const cancellations: string[] = [];
+		const coordinatorStops: string[] = [];
+		const agentStops: string[] = [];
+		for (const entry of entries) {
+			if (recordingPlans.has(entry.keyRunId)) {
+				recorderFences.fence(entry.keyRunId, true);
+				recorderControllers.get(entry.keyRunId)?.abort();
+				continue;
+			}
+			cancellations.push(entry.keyRunId);
+			if (coordinators.get(entry.keyRunId)) coordinatorStops.push(entry.keyRunId);
+			if (typeof entry.immediate?.facts?.agentName === "string") agentStops.push(entry.immediate.facts.agentName);
+		}
+		listRuns.cancelMany(cancellations, reason);
+		await Promise.all([
+			...coordinatorStops.map((runId) => cancelCoordinator(runId, "parent_cancel_run", true)),
+			...agentStops.map((agentName) => herdrAsync(["agent", "stop", agentName]).catch(() => {})),
+		]);
+	};
+	const revokeAuthority = async (reason: WorkflowCancellationReason = "parent_cancel") => {
 		shipPermits.invalidate();
+		workflowExtraction?.cancel(reason);
+		const stopped = authority?.revoke() ?? [];
+		for (const runId of stopped) authorityByCycle.delete(runId);
+		auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
+		workflowIngress.revoke();
+		ingressWitness = undefined;
+		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent runtime changed")));
 		await fenceListRuns("parent runtime changed");
-		for (const runId of authority?.revoke() ?? []) {
+		for (const runId of stopped) {
 			if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run");
 			else listRuns.cancel(runId, "parent runtime changed");
 		}
 	};
-	pi.on("session_before_switch", revokeAuthority);
-	pi.on("session_before_fork", revokeAuthority);
-	pi.on("session_before_tree", revokeAuthority);
+	const endOwnedReview = async (reason: string) => {
+		if (process.env.YOKEMATE_MODE !== "review" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_REVIEW_RUN_ID || !process.env.PI_SESSION_ID) return;
+		const reply = await requestReviewControl(ENGINE_ROOT, "review-ended", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID, reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
+		if (reply.state !== "accepted") throw new Error(reply.reason ?? "review authority fencing was refused");
+	};
+	const fenceOwnedAuthority = async (reason: WorkflowCancellationReason) => {
+		const revoked = revokeAuthority(reason);
+		try { await endOwnedReview("review runtime changed"); }
+		catch (error) { latestCtx?.ui.notify(`review runtime change blocked: ${(error as Error).message}`, "error"); throw error; }
+		await revoked;
+	};
+	pi.on("session_before_switch", () => fenceOwnedAuthority("session_switch"));
+	pi.on("session_before_fork", () => fenceOwnedAuthority("session_fork"));
+	pi.on("session_before_tree", () => fenceOwnedAuthority("session_tree"));
 	let ownedReadyRunId: string | undefined;
 	let finishingCoordinatorRunId: string | undefined;
 	const sendCoordinatorTerminal = (run: CoordinatorRun, outcome: "done" | "blocked", summary: string, reason: string | undefined, verification: unknown, rpcDiagnostic?: Record<string, unknown>, awaitLateDiagnostics = false): void => {
@@ -912,7 +1179,124 @@ export default function (pi: ExtensionAPI) {
 		if (!awaitLateDiagnostics) reportArchives.delete(artifactId);
 		pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { runId: run.identity.runId, mode: run.identity.mode, tickets: run.request.tickets, outcome, verification, display } }, { deliverAs: "followUp", triggerTurn: true });
 	};
+	const startWorkflowExtraction = (raw: string, ctx: ExtensionContext, parent: ApprovalParent, store: DoAuthorityStore, generation: InputGeneration): void => {
+		const operation = new PendingWorkflowExtraction(parent, store, generation);
+		workflowExtraction = operation;
+		appendWorkflowEntry("yokemate-workflow-extraction", { phase: "start", parentSessionId: parent.sessionId, parentRuntimeId: parent.runtimeId, serial: generation.serial, revision: generation.revision, inputHash: generation.inputHash, startedAt: new Date(operation.startedAtWall).toISOString(), provider: ctx.model?.provider, model: ctx.model?.id, bindingCount: 0, bindingBytes: 0 });
+		void operation.wait().then((terminal) => appendWorkflowEntry("yokemate-workflow-extraction", { phase: "terminal", parentSessionId: parent.sessionId, parentRuntimeId: parent.runtimeId, serial: generation.serial, revision: generation.revision, inputHash: generation.inputHash, ...terminal }));
+		setImmediate(() => operation.start(async (signal) => {
+			const model = ctx.model;
+			const provider = model?.provider;
+			const modelId = model?.id;
+			if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) return { outcome: "model_error", provider, model: modelId };
+			let bindings: PlanBinding[];
+			try { bindings = await readWorkflowBindingSnapshot(ENGINE_ROOT, signal); }
+			catch { return { outcome: signal.aborted ? "none" : "model_error", provider, model: modelId }; }
+			if (!operation.isCurrent(parent, store, generation)) return { outcome: "none", provider, model: modelId };
+			const bindingCount = bindings.length;
+			const bindingBytes = Buffer.byteLength(JSON.stringify(bindings), "utf8");
+			let message: Awaited<ReturnType<typeof ctx.modelRegistry.complete>>;
+			try {
+				message = await ctx.modelRegistry.complete(model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw, bindings }), timestamp: Date.now() }] }, { signal, maxTokens: 1024 });
+			} catch { return { outcome: signal.aborted ? "none" : "model_error", provider, model: modelId, bindingCount, bindingBytes }; }
+			if (!operation.isCurrent(parent, store, generation)) return { outcome: "none", provider, model: modelId, bindingCount, bindingBytes };
+			if (message.stopReason === "error" || message.stopReason === "aborted") return { outcome: "model_error", provider, model: modelId, bindingCount, bindingBytes };
+			if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+			const response = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+			if (Buffer.byteLength(response, "utf8") > 16 * 1024) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+			let extraction;
+			try { extraction = validateExtraction(JSON.parse(response), raw, bindings); }
+			catch { return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes }; }
+			if (extraction.kind === "none") return { outcome: "none", provider, model: modelId, bindingCount, bindingBytes };
+			if (extraction.kind === "advance-plan-do") return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => store.approve("advance-plan-do", extraction.ticket, undefined, generation) };
+			if (extraction.kind === "approve-ready-do") {
+				let current: PlanBinding;
+				try {
+					current = readRecordedPlanBinding(ENGINE_ROOT, extraction.ticket);
+					const snapshotted = bindings.find((binding) => binding.ticket === extraction.ticket);
+					if (!snapshotted) return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes };
+					assertPlanBinding(snapshotted, current);
+				} catch { return { outcome: "invalid", provider, model: modelId, bindingCount, bindingBytes }; }
+				return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => store.approve("post-plan-approval", extraction.ticket, current, generation) };
+			}
+			return { outcome: "approval", action: extraction.kind, provider, model: modelId, bindingCount, bindingBytes, effect: () => {
+				const fenced = fenceTargetedWorkflow([extraction.ticket], [], "workflow revoked", store);
+				setImmediate(() => { void Promise.all(fenced.coordinatorRunIds.map((runId) => cancelCoordinator(runId, "parent_cancel_run"))).catch(() => {}); });
+			} };
+		}));
+	};
 	pi.on("input", async (event, ctx) => {
+		if (event.source === "interactive" && ctx.mode === "tui" && process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_ROLE === "coordinator" && process.env.YOKEMATE_TICKET && process.env.YOKEMATE_REVIEW_RUN_ID) {
+			const ticket = process.env.YOKEMATE_TICKET;
+			const runId = process.env.YOKEMATE_REVIEW_RUN_ID;
+			const origin = currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId());
+			let controller: AbortController | undefined;
+			let timer: NodeJS.Timeout | undefined;
+			const model = ctx.model;
+			const startedAt = performance.now();
+			const inputHash = sha256(event.text);
+			let serial: number | null = null;
+			let revision: number | null = null;
+			let stopReason = "unknown";
+			let responseHash: string | null = null;
+			let responseBytes = 0;
+			let validation: "not_run" | "rejected" | "accepted" = "not_run";
+			let inputControl: "not_run" | "error" | "refused" | "accepted" = "not_run";
+			let extractionControl: "not_run" | "error" | "refused" | "accepted" = "not_run";
+			let outcome: "refused" | "accepted" = "refused";
+			let reasonCode: "settings_error" | "input_control_error" | "input_control_refused" | "auth_unavailable" | "model_error" | "timeout" | "unclean_response" | "invalid_json" | "invalid_evidence" | "extraction_control_error" | "extraction_control_refused" | "none" | "rework" | "revoke" = "settings_error";
+			const persist = (phase: "start" | "terminal") => {
+				try {
+					pi.appendEntry("yokemate-review-extraction", { version: 1, phase, reviewRunId: safeWorkflowId(runId), serial, revision, inputHash, provider: safeWorkflowId(model?.provider) ?? "unknown", model: safeWorkflowId(model?.id) ?? "unknown", outcome: phase === "start" ? "pending" : outcome, reasonCode: phase === "start" ? "pending" : reasonCode, stopReason, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), responseHash, responseBytes, validation, inputControl, extractionControl });
+				} catch {}
+			};
+			persist("start");
+			try {
+				readRuntimeSettings(ENGINE_ROOT);
+				reasonCode = "input_control_error";
+				inputControl = "error";
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const begun = await requestReviewControl(ENGINE_ROOT, "review-input", { ticket, runId, raw: event.text }, origin, parent);
+				reasonCode = "input_control_refused";
+				inputControl = "refused";
+				if (begun.state !== "accepted" || typeof begun.generation !== "object" || !begun.generation) throw new Error(reasonCode);
+				inputControl = "accepted";
+				serial = Number.isSafeInteger(begun.generation.serial) && begun.generation.serial >= 0 ? begun.generation.serial : null;
+				revision = Number.isSafeInteger(begun.generation.revision) && begun.generation.revision >= 0 ? begun.generation.revision : null;
+				reasonCode = "auth_unavailable";
+				if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error(reasonCode);
+				controller = new AbortController();
+				reasonCode = "model_error";
+				const message = await Promise.race([
+					ctx.modelRegistry.complete(model, { systemPrompt: REVIEW_REWORK_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 512 }),
+					new Promise<never>((_, reject) => { timer = setTimeout(() => { reasonCode = "timeout"; controller!.abort(); reject(new Error(reasonCode)); }, 15_000); }),
+				]);
+				clearTimeout(timer);
+				reasonCode = "unclean_response";
+				stopReason = ["stop", "length", "toolUse", "error", "aborted"].includes(message.stopReason) ? message.stopReason : "unknown";
+				const response = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+				responseHash = sha256(response);
+				responseBytes = Buffer.byteLength(response);
+				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error(reasonCode);
+				validation = "rejected";
+				reasonCode = "invalid_json";
+				const value: unknown = JSON.parse(response);
+				reasonCode = "invalid_evidence";
+				const extraction = adaptReviewReworkQuotes(value, event.text, ticket);
+				validation = "accepted";
+				reasonCode = "extraction_control_error";
+				extractionControl = "error";
+				const extracted = await requestReviewControl(ENGINE_ROOT, "review-extraction", { ticket, runId, generation: begun.generation, extraction }, origin, parent);
+				reasonCode = "extraction_control_refused";
+				extractionControl = "refused";
+				if (extracted.state !== "accepted") throw new Error(reasonCode);
+				extractionControl = "accepted";
+				outcome = "accepted";
+				reasonCode = extraction.kind;
+			} catch { ctx.ui.notify(`review verdict extraction unavailable: reason=${reasonCode}; no inferred rework approval`, "warning"); }
+			finally { clearTimeout(timer); controller?.abort(); persist("terminal"); }
+			return;
+		}
 		if (event.source !== "interactive" || ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const text = event.text.trim();
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -920,10 +1304,12 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("workflow approval unavailable: no verified main parent runtime", "error");
 			return { action: "handled" as const };
 		}
-		const generation = authority.beginInput(event.text);
+		workflowExtraction?.cancel("new_input");
+		const witnessed = ingressWitness && !ingressWitness.consumed && ingressWitness.sessionId === sessionId && ingressWitness.runtimeId === controlIdentity.runtimeId && ingressWitness.raw === event.text ? ingressWitness : undefined;
+		const generation = witnessed ? authority.generation() : authority.beginInput(event.text);
+		if (!witnessed) { auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke"); workflowIngress.revoke(); ingressWitness = undefined; }
 		shipPermits.invalidate();
 		try {
-			readRuntimeSettings(ENGINE_ROOT);
 			const ship = text.match(/^\/ship\s+(.+)$/);
 			if (ship) {
 				const tickets = ship[1]!.split(/\s+/).filter((word) => /^[A-Z][A-Z0-9]*-\d+$/.test(word));
@@ -960,46 +1346,33 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (text.startsWith("/")) return;
-			if (!ctx.model || !ctx.modelRegistry.hasConfiguredAuth(ctx.model)) throw new Error("workflow extraction requires a configured model and external authentication");
-			const bindings: PlanBinding[] = [];
-			if (fs.existsSync(path.join(ENGINE_ROOT, "yokemate.db"))) {
-				const db = new DatabaseSync(path.join(ENGINE_ROOT, "yokemate.db"), { readOnly: true });
-				try {
-					for (const row of db.prepare("SELECT ticket FROM work WHERE plan IS NOT NULL ORDER BY ticket").all()) {
-						try { bindings.push(readRecordedPlanBinding(ENGINE_ROOT, String(row.ticket))); } catch {}
-					}
-				} finally { db.close(); }
+			if (!isWorkflowCandidate(event.text)) {
+				const skippedAt = new Date().toISOString();
+				const skippedParent = { ...controlIdentity };
+				const skippedGeneration = { ...generation };
+				setImmediate(() => appendWorkflowEntry("yokemate-workflow-extraction", { phase: "terminal", parentSessionId: skippedParent.sessionId, parentRuntimeId: skippedParent.runtimeId, serial: skippedGeneration.serial, revision: skippedGeneration.revision, inputHash: skippedGeneration.inputHash, startedAt: skippedAt, finishedAt: skippedAt, elapsedMs: 0, outcome: "none", action: "skipped", bindingCount: 0, bindingBytes: 0 }));
+				return;
 			}
-			const controller = new AbortController();
-			let timer: NodeJS.Timeout | undefined;
-			try {
-				const message = await Promise.race([
-					ctx.modelRegistry.complete(ctx.model, { systemPrompt: WORKFLOW_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, bindings }), timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 1024 }),
-					new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("workflow extraction timed out")); }, 15000); }),
-				]);
-				authority.assertGeneration(generation);
-				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("workflow extraction did not return a clean no-tools result");
-				const extraction = validateExtraction(JSON.parse(message.content.filter((part) => part.type === "text").map((part) => part.text).join("")), event.text, bindings);
-				if (extraction.kind === "revoke") {
-					for (const runId of authority.revoke(extraction.ticket)) await cancelCoordinator(runId, "parent_cancel_run");
-				} else if (extraction.kind === "advance-plan-do") authority.approve("advance-plan-do", extraction.ticket, undefined, generation);
-				else if (extraction.kind === "approve-ready-do") {
-					const binding = readRecordedPlanBinding(ENGINE_ROOT, extraction.ticket);
-					if (binding.contentHash !== extraction.binding) throw new Error("workflow extraction ready binding changed");
-					authority.approve("post-plan-approval", extraction.ticket, binding, generation);
-				}
-			} finally { clearTimeout(timer); controller.abort(); }
+			startWorkflowExtraction(event.text, ctx, controlIdentity, authority, generation);
 		} catch (error) {
 			ctx.ui.notify((error as Error).message, "error");
 			return { action: "handled" as const };
 		}
 	});
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT), lane?: { context: KeyRunContext; doBinding?: PlanBinding }) => {
+	const workflowConsumerFacts = (kind: string, metadata: WorkflowConsumerMetadata, ticket?: string): Record<string, unknown> => ({ consumerKind: kind, ...(ticket ? { ticket } : {}), ...(safeWorkflowId(metadata.requestId) ? { requestId: safeWorkflowId(metadata.requestId) } : {}), ...(safeWorkflowId(metadata.toolCallId) ? { toolCallId: safeWorkflowId(metadata.toolCallId) } : {}), ...(safeWorkflowId(metadata.listRunId) ? { listRunId: safeWorkflowId(metadata.listRunId) } : {}), ...(safeWorkflowId(metadata.keyRunId) ? { keyRunId: safeWorkflowId(metadata.keyRunId) } : {}) });
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings | undefined, lane?: { context: KeyRunContext; doBinding?: PlanBinding; review?: { store: ReviewReworkStore; operationId: string } }, metadata: WorkflowConsumerMetadata = {}) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-		const checks = coordinatorChecks(settings);
 		validateCoordinatorRequest(request);
+		let checks = coordinatorChecks(settings ?? readRuntimeSettings(ENGINE_ROOT));
 		const refusal = checks.checkCaller(origin, request);
 		if (refusal) throw new Error(refusal);
+		const workflowCapture = request.mode === "do" && !lane ? captureWorkflowGeneration() : undefined;
+		if (request.mode === "do" && !lane) await awaitWorkflowGeneration(workflowCapture, ctx, workflowConsumerFacts("do", metadata, request.tickets[0]));
+		if (workflowCapture) assertWorkflowCapture(workflowCapture);
+		settings = lane?.context.settings ?? readRuntimeSettings(ENGINE_ROOT);
+		checks = coordinatorChecks(settings);
+		const currentRefusal = checks.checkCaller(origin, request);
+		if (currentRefusal) throw new Error(currentRefusal);
 		if (request.mode === "ship" && !lane) {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
@@ -1024,9 +1397,15 @@ export default function (pi: ExtensionAPI) {
 			if (!run) throw new Error("coordinator reservation failed");
 			const ownedRun = run;
 			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: reportTaskExcerpt(request.tickets.join("+")) });
-			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
+			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => {
+				if (lane?.review) lane.review.store.finish(ownedRun.identity.runId);
+				return lane ? lane.context.terminal({ outcome, reason, facts }) : (releaseCoordinatorUnit(ownedRun.identity.runId), true);
+			};
 			if (!lane) coordinatorUnits.add(ownedRun.identity.runId);
-			if (doBinding && !lane) authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
+			if (doBinding && !lane) {
+				authority!.consume(request.tickets[0]!, doBinding, controlIdentity!, ownedRun.identity.runId);
+				authorityByCycle.set(ownedRun.identity.runId, authority!);
+			}
 			let cleanup: Promise<void> | undefined;
 			cleanupReservation = (reason) => cleanup ??= (async () => {
 				uiAbortByRun.get(ownedRun.identity.runId)?.abort();
@@ -1044,7 +1423,12 @@ export default function (pi: ExtensionAPI) {
 			})();
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin, settings) : await prepareShip(root, request);
 			if (ownedRun.state === "blocked") throw new Error("coordinator was cancelled during preparation");
-			if (doBinding) { authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!)); prepared.doBinding = doBinding; }
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+				prepared.doBinding = doBinding;
+			}
 			ownedRun.identity.model = prepared.model;
 			ownedRun.identity.cwd = prepared.cwd;
 			ownedRun.identity.project = prepared.parts.map((part) => part.repo);
@@ -1068,11 +1452,15 @@ export default function (pi: ExtensionAPI) {
 			};
 			const resolvedModel = resolveCoordinatorModel(prepared.model, ctx.modelRegistry);
 			if (resolvedModel.warning) ctx.ui.notify(resolvedModel.warning, "warning");
-			if (request.mode === "do") markDoRunning(root, prepared, origin);
+			if (request.mode === "do") markDoRunning(root, prepared, origin, settings);
 			rpc = startCoordinatorRpc(prepared, ownedRun.identity, resolvedModel.expected, { onEvent: (event) => {
 				if (rpc && !terminalReported) {
 					try {
-						if (doBinding && (event.type === "agent_settled" || event.type === "tool_execution_start")) authority!.checkCycle(ownedRun.identity.runId, readRecordedPlanBinding(root, request.tickets[0]!));
+						if (doBinding && (event.type === "agent_settled" || event.type === "tool_execution_start")) {
+							const current = readRecordedPlanBinding(root, request.tickets[0]!);
+							if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+							else authority!.checkCycle(ownedRun.identity.runId, current);
+						}
 						continueOwnedCoordinator(rpc, event, (reason) => reportBlocked?.(reason));
 					}
 					catch (error) { reportBlocked?.((error as Error).message); }
@@ -1140,6 +1528,11 @@ export default function (pi: ExtensionAPI) {
 			}, onBlocked: reportBlocked });
 			rpcByRun.set(ownedRun.identity.runId, rpc);
 			await rpc.ready;
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+			}
 			coordinators.attachProcess(ownedRun.identity.runId, rpc.process);
 			const { mode, tickets } = prepared;
 			const plan = mode === "do" ? prepared.plans[tickets[0]!] : undefined;
@@ -1148,7 +1541,16 @@ export default function (pi: ExtensionAPI) {
 			const excerpt = heading.startsWith(prefix) ? heading.slice(prefix.length) : heading;
 			const admissionDisplay = coordinatorAdmissions.get(ownedRun.identity.runId);
 			if (admissionDisplay) admissionDisplay.taskExcerpt = reportTaskExcerpt(excerpt || tickets.join("+"));
-			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt });
+			if (doBinding) {
+				const current = readRecordedPlanBinding(root, request.tickets[0]!);
+				if (lane?.review) lane.review.store.checkCycle(ownedRun.identity.runId, current);
+				else authority!.checkCycle(ownedRun.identity.runId, current);
+			}
+			const work = await rpc.request({ id: `${ownedRun.identity.runId}:work`, type: "prompt", message: prepared.prompt }, (response) => {
+				if (response.success !== true || !lane) return;
+				if (lane.review) lane.review.store.startCycle(ownedRun.identity.runId);
+				if (!lane.context.startup({ state: "started", runId: ownedRun.identity.runId, facts: { model: prepared.model, cwd: prepared.cwd } })) throw new Error("coordinator startup acknowledgement lost its retained claim");
+			});
 			if (work.success !== true) throw new Error(`coordinator work prompt was refused: ${String(work.error ?? "unknown error")}`);
 			if (ownedRun.state === "active") trackRunning(rpc.process, `${mode} ${tickets.join("+")}`, excerpt);
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
@@ -1158,12 +1560,20 @@ export default function (pi: ExtensionAPI) {
 			throw error;
 		}
 	};
-	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings = readRuntimeSettings(ENGINE_ROOT)) => {
+	const startCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string }, settings: RuntimeSettings | undefined, metadata: WorkflowConsumerMetadata = {}, workflowCaptureOverride?: WorkflowGenerationCapture, review?: { store: ReviewReworkStore; operationId: string; binding: PlanBinding }) => {
 		if (!request || !["do", "ship"].includes(request.mode) || !Array.isArray(request.tickets) || !request.tickets.length) throw new Error("coordinator request needs ordered tickets");
 		if (new Set(request.tickets).size !== request.tickets.length) throw new Error("ticket list contains duplicates");
-		const checks = coordinatorChecks(settings);
+		if (request.tickets.every((ticket) => !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket))) throw new Error(`invalid ticket key ${JSON.stringify(request.tickets[0])}`);
+		let checks = coordinatorChecks(settings ?? readRuntimeSettings(ENGINE_ROOT));
 		const caller = checks.checkCaller(origin, request);
 		if (caller) throw new Error(caller);
+		const workflowCapture = request.mode === "do" && !review ? workflowCaptureOverride ?? captureWorkflowGeneration() : undefined;
+		if (request.mode === "do" && !review) await awaitWorkflowGeneration(workflowCapture, ctx, workflowConsumerFacts("do-list", metadata));
+		if (workflowCapture) assertWorkflowCapture(workflowCapture);
+		settings = readRuntimeSettings(ENGINE_ROOT);
+		checks = coordinatorChecks(settings);
+		const currentCaller = checks.checkCaller(origin, request);
+		if (currentCaller) throw new Error(currentCaller);
 		if (request.mode === "ship") {
 			if (!shipPermits.consume(request.tickets, origin.sessionId ?? "main")) throw new Error("ship requires the current interactive /ship command in the main chat");
 			if (checks.needsShipConfirmation(origin) && (!ctx.hasUI || !(await ctx.ui.confirm("Ship merges", "Confirm this run is on the engineer's word.")))) throw new Error("ship confirmation declined");
@@ -1173,16 +1583,27 @@ export default function (pi: ExtensionAPI) {
 		for (const ticket of request.tickets) {
 			if (!/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) { rejection.set(ticket, `invalid ticket key ${JSON.stringify(ticket)}`); continue; }
 			if (request.mode === "do") try {
-				if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
 				const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 				if (request.plan && fs.realpathSync(path.resolve(origin.cwd ?? ENGINE_ROOT, request.plan)) !== binding.path) throw new Error("do approval --plan differs from the recorded binding");
-				authority.check(ticket, binding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+				if (review) {
+					if (request.tickets.length !== 1 || review.store.owner.ticket !== ticket) throw new Error("review rework handoff ticket mismatch");
+					assertPlanBinding(review.binding, binding);
+				} else {
+					if (!authority || !controlIdentity) throw new Error("initial do requires a current interactive approval in its live parent");
+					authority.check(ticket, binding, { ...controlIdentity, sessionId: origin.sessionId ?? "" });
+				}
 				bindings.set(ticket, binding);
 			} catch (error) { rejection.set(ticket, (error as Error).message); }
 		}
-		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
+		const run = listRuns.admit({ mode: request.mode, keys: request.tickets, parentSessionId: origin.sessionId ?? "main", parentRuntimeId: controlIdentity?.runtimeId ?? "main", settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: review ? true : checks.rejectDuplicate(request.mode), rejectKey: (key) => rejection.get(key) });
 		const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
-		if (request.mode === "do") for (const entry of accepted) authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+		if (request.mode === "do") for (const entry of accepted) {
+			if (review) review.store.consume(review.operationId, entry.keyRunId, bindings.get(entry.key)!);
+			else {
+				authority!.consume(entry.key, bindings.get(entry.key)!, controlIdentity!, entry.keyRunId);
+				authorityByCycle.set(entry.keyRunId, authority!);
+			}
+		}
 		listUnits += accepted.length;
 		activeUnits += accepted.length;
 		deferredListDeliveries.add(run.identity.listRunId);
@@ -1191,7 +1612,7 @@ export default function (pi: ExtensionAPI) {
 			listRuns.start(run.identity.listRunId, async (lane) => {
 				lane.signal.addEventListener("abort", () => { void cancelCoordinator(lane.keyRunId, "parent_cancel_run", true).catch(() => {}); }, { once: true });
 				const part = { ...request, tickets: [lane.key] };
-				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key) });
+				const result = await startOneCoordinator(part, ctx, origin, settings, { context: lane, doBinding: bindings.get(lane.key), ...(review ? { review: { store: review.store, operationId: review.operationId } } : {}) }, { ...metadata, listRunId: lane.listRunId, keyRunId: lane.keyRunId });
 				lane.active({ identity: result.details.identity, model: result.details.identity?.model, cwd: result.details.identity?.cwd });
 			});
 		});
@@ -1199,22 +1620,57 @@ export default function (pi: ExtensionAPI) {
 		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
+		sessionGeneration += 1;
 		latestCtx = ctx;
 		publicationMcp.setContext(ctx);
-		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID && process.env.YOKEMATE_TICKET) {
+		if (process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_REVIEW_RUN_ID && process.env.YOKEMATE_TICKET) {
 			try {
+				const reply = await requestReviewControl(ENGINE_ROOT, "review-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_REVIEW_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+				if (reply.state !== "accepted") throw new Error(reply.reason ?? "review worker registration refused");
+			} catch (error) { ctx.ui.notify(`automatic rework handoff unavailable: ${(error as Error).message}`, "warning"); }
+		}
+		if (process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_PLAN_RUN_ID !== undefined && process.env.YOKEMATE_TICKET) {
+			try {
+				if (!process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("empty plan run id");
 				const reply = await requestPlanControl(ENGINE_ROOT, "plan-started", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan worker registration refused");
-			} catch (error) { ctx.ui.notify(`no automatic do handoff: ${(error as Error).message}`, "warning"); }
+			} catch (error) { ctx.ui.notify(`plan registration refused: ${(error as Error).message}`, "warning"); }
 		}
 		if (process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE) return;
 		const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
-		await revokeAuthority();
+		await revokeAuthority("session_reload");
+		workflowExtraction = undefined;
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
+		reviewReworks.clear();
 		if (controlServer) await new Promise<void>((resolve) => controlServer!.close(() => resolve()));
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
-		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin) => {
+		uninstallIngress?.();
+		uninstallIngress = undefined;
+		if (ctx.mode === "tui" && typeof ctx.ui.getEditorComponent === "function" && typeof ctx.ui.setEditorComponent === "function") {
+			uninstallIngress = installWorkflowIngress(ctx.ui, (raw) => {
+				workflowExtraction?.cancel("new_input");
+				auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
+				shipPermits.invalidate();
+				ingressWitness = workflowIngress.submit(raw, sessionId, runtimeId);
+				authority?.beginInput(raw);
+			});
+		}
+		if (ctx.mode === "tui" && typeof ctx.ui.onTerminalInput === "function") removeTerminalInputListener = ctx.ui.onTerminalInput((data) => {
+			const keybindings = getKeybindings();
+			if (!keybindings.matches(data, "app.interrupt") && !keybindings.matches(data, "app.clear")) return;
+			workflowExtraction?.cancel("interrupt");
+			authority?.invalidateUnconsumed();
+			shipPermits.invalidate();
+			return undefined;
+		});
+		planRunGenerations.clear();
+		planRunMetadata.clear();
+		planRecordGenerations.clear();
+		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin, planRunId?: string) => {
 			const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
 			assertPublishable(snapshot.bytes);
 			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
@@ -1222,12 +1678,22 @@ export default function (pi: ExtensionAPI) {
 				const scout = publicationAcceptanceById(db, acceptanceId);
 				if (!scout || scout.ticket !== ticket || scout.owner_session_id !== origin.sessionId) throw new Error("plan preparation requires its current accepted scout");
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
+				let writer: { runId: string; taskHash: string; actualTaskHash: string } | undefined;
+				if (scout.source_kind === "engineer-accepted-input") {
+					const draft = writerDraftFor(db, snapshot.contentHash);
+					if (!draft || draft.accepted_input_id !== scout.id || draft.planning_identity !== scout.continuation_id || draft.plan_path !== snapshot.path || draft.bytes !== snapshot.bytes.length) throw new Error("recovery plan is not the correlated writer draft");
+					const markers = ["BREAK-GLASS: engineer-accepted-input", `incident: ${scout.incident_id}`, `source-run: ${scout.source_run_id}`, `source-hash: ${scout.content_hash}`, `reason: ${scout.incident_reason}`, "skipped: failed-transport-envelope"];
+					if (markers.some((marker) => !snapshot.text.includes(marker))) throw new Error("recovery plan assumptions do not match incident provenance");
+					writer = { runId: draft.writer_run_id, taskHash: draft.writer_task_hash, actualTaskHash: draft.writer_actual_task_hash };
+				}
 				const snapshotPath = writePublicationArtifact(ENGINE_ROOT, ticket, "plan", snapshot.contentHash, snapshot.bytes);
-				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}) });
-				return { binding: snapshot as PlanBinding, record, snapshotPath, scout };
+				const record = acceptPlanRecord(db, { ticket, planPath: snapshot.path, contentHash: snapshot.contentHash, scopeHash: snapshot.scopeHash, artifactPath: snapshotPath, bytes: snapshot.bytes.length, scoutAcceptance: scout.id, ...(scout.publication_id ? { scoutPublication: scout.publication_id } : {}), ...(writer ? { writer } : {}) });
+				const capture = planRunId ? planRunGenerations.get(planRunId) : !origin.mode && origin.sessionId === sessionId ? captureWorkflowGeneration() : undefined;
+				if (capture && !record.successful_record && !planRecordCompletions.has(record.id) && !planRecordGenerations.has(record.id)) planRecordGenerations.set(record.id, capture);
+				return { binding: toPlanBinding(snapshot), record, snapshotPath, scout };
 			} finally { db.close(); }
 		};
-		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding): Promise<PublicationOutcome[]> => {
+		const publishRecordedArtifacts = async (recordId: number, binding: PlanBinding, continuation?: () => void): Promise<PublicationOutcome[]> => {
 			const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 			let record;
 			let scout;
@@ -1239,35 +1705,70 @@ export default function (pi: ExtensionAPI) {
 				if (!scout || scout.ticket !== binding.ticket) throw new PublicationFailure("artifact_invalid");
 				assertPublishable(readPublicationArtifact(ENGINE_ROOT, scout));
 			} finally { db.close(); }
-			const verify = () => { try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); } catch { throw new PublicationFailure("binding_changed"); } };
+			const verify = () => {
+				continuation?.();
+				try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, binding.ticket)); }
+				catch { throw new PublicationFailure("binding_changed"); }
+			};
 			const child: ChildIdentity = { ownerRunId: scout.owner_run_id, ownerSessionId: scout.owner_session_id, batchId: scout.batch_id, runId: scout.run_id, agent: "plan-scout", taskHash: scout.task_hash, cwd: ENGINE_ROOT, ticket: binding.ticket };
-			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			continuation?.();
+			const scoutOutcome = await attemptArtifactPublication({ kind: "scout", ticket: binding.ticket, artifact: scout, runId: scout.run_id, publicationId: scout.publication_id ?? undefined, child, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); }, verifyBinding: verify });
+			continuation?.();
 			const planOutcome: PublicationOutcome = scoutOutcome.error === "target_changed"
 				? { kind: "plan", state: "pending", target: scoutOutcome.target, revision: record.content_hash, ...(record.publication_id ? { publicationId: record.publication_id } : {}), error: "target_changed" }
-				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}) }); }, verifyBinding: verify });
+				: await attemptArtifactPublication({ kind: "plan", ticket: binding.ticket, artifact: record, runId: `record-${record.id}`, publicationId: record.publication_id ?? undefined, planPath: binding.path, scopeHash: binding.scopeHash, provenance: scout, acceptanceId: scout.id, attach: (state, row) => { acceptPlanRecord(state, { ticket: binding.ticket, planPath: binding.path, contentHash: binding.contentHash, scopeHash: binding.scopeHash, artifactPath: record.artifact_path, bytes: record.bytes, scoutAcceptance: scout.id, publicationId: row.id, ...(scoutOutcome.publicationId ? { scoutPublication: scoutOutcome.publicationId } : {}), ...(record.writer_run_id && record.writer_task_hash && record.writer_actual_task_hash ? { writer: { runId: record.writer_run_id, taskHash: record.writer_task_hash, actualTaskHash: record.writer_actual_task_hash } } : {}) }); }, verifyBinding: verify });
+			continuation?.();
 			return [scoutOutcome, planOutcome];
 		};
-		const completePlanRecord = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], planRunId?: string, record?: PlanRecordResult) => {
-			const settings = readRuntimeSettings(ENGINE_ROOT);
+		const completePlanRecordOnce = async (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, context: PlanCompletionContext, verifyCompletion: (binding: PlanBinding) => void, record?: PlanRecordResult): Promise<PlanRecordCompletion> => {
 			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
 			if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("plan handoff path does not match the current recorded binding");
+			const planRunId = context.kind === "registered" ? context.runId : undefined;
 			const found = planRunId ? listRuns.get(planRunId) : undefined;
-			if (planRunId && (!found || !("run" in found) || ["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state))) throw new Error("plan run is no longer active");
+			const recovery = planRunId ? listRuns.recovery(planRunId) : undefined;
+			if (context.kind === "registered" && context.listRunId && (!found || !("run" in found) || (["refused", "recorded", "done", "blocked", "cancelled"].includes(found.entry.state) && !(found.entry.state === "blocked" && recovery?.state === "active")))) throw new Error("plan run is no longer active");
+			const capture = context.kind === "save-only" ? undefined : planRecordGenerations.get(recordId) ?? (planRunId ? planRunGenerations.get(planRunId) : undefined);
 			const sync = record ? { localSync: record.localSync, push: record.push } : undefined;
-			if (planRunId && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
+			if (planRunId && !recovery && listRuns.releaseLifetime(planRunId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
 			let runId: string | undefined;
-			let reason = "plan-only; ready for /do; a new interactive approval is required";
-			let handoff: "plan-only" | "started" | "refused" = "plan-only";
-			if (!planRunId || !cancelledRecordingPlans.has(planRunId)) {
-				const advance = authority!.record(binding, settings.policy.workflowApproval);
-				if (advance) {
+			let reason = context.kind === "save-only" ? "plan-only; ready for /do; automatic handoff unavailable" : "plan-only; ready for /do; a new interactive approval is required";
+			let handoff: "plan-only" | "unavailable" | "started" | "refused" = context.kind === "save-only" ? "unavailable" : "plan-only";
+			const provenanceDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+			let recovered = false;
+			let recoveryStatus: Record<string, unknown> | undefined;
+			try {
+				const recorded = planRecordById(provenanceDb, recordId);
+				recovered = recorded?.source_kind === "engineer-accepted-input";
+				if (recovered && recorded) {
+					assertMandatoryBoundary("workflow.audit", Number.isSafeInteger(recorded.scout_acceptance), "recovered plan record has no accepted input");
+					const accepted = publicationAcceptanceById(provenanceDb, recorded.scout_acceptance!);
+					recoveryStatus = { sourceTransport: "failed", recovery: "engineer-accepted-input", candidateId: recorded.candidate_id, incidentId: recorded.incident_id, acceptedInputId: recorded.scout_acceptance, localRecord: "planned", remotePublication: publications.map((outcome) => ({ kind: outcome.kind, state: outcome.state, target: outcome.target, error: outcome.error })), sourceRunId: accepted?.source_run_id };
+				}
+			} finally { provenanceDb.close(); }
+			if (recovered) authority!.revoke(ticket);
+			let terminal: WorkflowExtractionTerminal | undefined;
+			let captureCurrent = false;
+			if (capture && !recovered) try {
+				terminal = await awaitWorkflowGeneration(capture, ctx, workflowConsumerFacts("plan-record", planRunId ? planRunMetadata.get(planRunId) ?? { keyRunId: planRunId } : {}, ticket), false);
+				assertWorkflowCapture(capture);
+				captureCurrent = true;
+			} catch { reason = "plan-only; workflow approval became stale; use a new /do"; }
+			verifyCompletion(binding);
+			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
+			const settings = readRuntimeSettings(ENGINE_ROOT);
+			if (terminal && ["timeout", "model_error", "invalid"].includes(terminal.outcome)) reason = `plan-only; workflow extraction unavailable: outcome=${terminal.outcome}; use a new /do`;
+			else if (terminal?.outcome === "none") reason = "plan-only; no inferred workflow approval; use a new /do";
+			if (context.kind !== "save-only" && !recovered && (!planRunId || !recorderFences.active(planRunId)) && capture && captureCurrent && terminal?.outcome === "approval" && terminal.action === "advance-plan-do") {
+				const advance = capture.store.record(binding, settings.policy.workflowApproval);
+				if (settings.policy.workflowApproval) reason = "plan-only; ready for /do; workflowApproval requires a new interactive approval";
+				else if (advance) {
 					try {
 						const modelDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 						try {
 							const model = modelForTicket(modelDb, ticket, "do") ?? poolModel(dataRoot(ENGINE_ROOT), "do");
 							resolveCoordinatorModel(model, ctx.modelRegistry);
 						} finally { modelDb.close(); }
-						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings);
+						const result = await startCoordinator({ mode: "do", tickets: [ticket] }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, { keyRunId: planRunId }, capture);
 						if (result.details.listRunId) setImmediate(() => flushListDelivery(result.details.listRunId));
 						if (("isError" in result && result.isError) || !result.details.runId) throw new Error(result.content.map((part) => part.text).join("\n"));
 						runId = result.details.runId;
@@ -1275,43 +1776,173 @@ export default function (pi: ExtensionAPI) {
 						handoff = "started";
 					} catch (error) { reason = (error as Error).message; handoff = "refused"; }
 				}
-			} else reason = "plan recorded after cancellation; automatic do handoff revoked";
-			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, handoff: { state: handoff, runId, reason } };
-			if (planRunId && found && "run" in found && !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts })) throw new Error("plan run lost its terminal claim");
+			} else if (recovered) reason = "engineer-accepted-input recorded plan-only; a fresh /do approval is required";
+			else if (planRunId && recorderFences.active(planRunId)) reason = "plan recorded after cancellation; automatic do handoff revoked";
+			const facts = { plan: binding.path, contentHash: binding.contentHash, sync, publications, ...(recoveryStatus ? { recovery: recoveryStatus } : {}), handoff: { state: handoff, runId, reason } };
+			if (planRunId && found && "run" in found) {
+				const settled = recovery ? listRuns.settleRecovery(planRunId, { outcome: "recorded", facts }) : listRuns.settle(found.run.identity.listRunId, planRunId, { outcome: "recorded", facts });
+				if (!settled) throw new Error("plan run lost its terminal claim");
+			}
+			planRecordGenerations.delete(recordId);
+			if (planRunId) {
+				planRunGenerations.delete(planRunId);
+				planRunMetadata.delete(planRunId);
+			}
 			return { runId, reason, facts, publications, handoff };
+		};
+		const completePlanRecord = (ticket: string, recordedPath: string, binding: PlanBinding, publications: PublicationOutcome[], recordId: number, context: PlanCompletionContext, verifyCompletion: (binding: PlanBinding) => void, record?: PlanRecordResult): Promise<PlanRecordCompletion> => {
+			verifyCompletion(binding);
+			assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
+			const existing = planRecordCompletions.get(recordId);
+			if (existing) return existing.then((outcome) => {
+				verifyCompletion(binding);
+				assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket));
+				return { ...outcome, publications, facts: { ...outcome.facts, publications } };
+			});
+			const completion = completePlanRecordOnce(ticket, recordedPath, binding, publications, recordId, context, verifyCompletion, record);
+			planRecordCompletions.set(recordId, completion);
+			void completion.catch(() => { if (planRecordCompletions.get(recordId) === completion) planRecordCompletions.delete(recordId); });
+			return completion;
 		};
 		try {
 			controlServer = bindCoordinatorControl(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), {
-				publishPlanScout: async (ticket, acceptanceId, origin) => {
+				reviewStarted: async (ticket, reviewRunId, reviewOrigin, surface) => {
+					if (!controlIdentity || !reviewOrigin.runtimeId) throw new Error("review parent identity is unavailable");
+					const existing = reviewReworks.get(reviewRunId);
+					if (existing) {
+						const worker = existing.store.owner.worker;
+						if (worker.sessionId !== reviewOrigin.sessionId || worker.runtimeId !== reviewOrigin.runtimeId || worker.pid !== reviewOrigin.pid || worker.starttime !== reviewOrigin.starttime) throw new Error("review run cannot be revived by a new worker identity");
+						return;
+					}
+					const store = new ReviewReworkStore({ parent: controlIdentity, reviewRunId, ticket, worker: { sessionId: reviewOrigin.sessionId, runtimeId: reviewOrigin.runtimeId, pid: reviewOrigin.pid, starttime: reviewOrigin.starttime }, surface });
+					const stopObserver = observeProcessIdentity(reviewOrigin.pid, reviewOrigin.starttime, () => { void revokeReviewRun(reviewRunId, "review worker process ended before do startup"); });
+					reviewReworks.set(reviewRunId, { store, stopObserver });
+				},
+				reviewInput: async (ticket, reviewRunId, raw) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					const generation = review.store.beginInput(raw);
+					for (const runId of review.store.cancelPreStartCycles()) {
+						listRuns.cancel(runId, "review verdict was superseded by fresh input");
+						if (coordinators.get(runId)) await cancelCoordinator(runId, "parent_cancel_run", true).catch(() => {});
+					}
+					return generation;
+				},
+				reviewExtraction: async (ticket, reviewRunId, extraction, generation) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					const checked = validateReviewReworkExtraction(extraction, review.store.rawInput(generation), ticket);
+					if (checked.kind === "rework") review.store.approveRework(generation);
+					else if (checked.kind === "revoke") await revokeReviewRun(reviewRunId, "review verdict revoked before do startup", false);
+				},
+				reviewRecord: async (ticket, reviewRunId, candidatePath) => {
+					const review = reviewReworks.get(reviewRunId);
+					if (!review || review.store.owner.ticket !== ticket) throw new Error("review rework store is unavailable");
+					const generation = review.store.generation();
+					return review.store.claimHandoff(generation, candidatePath, async (operationId) => {
+						const snapshot = readCandidatePlanSnapshot(ENGINE_ROOT, ticket, candidatePath);
+						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						let recorded;
+						try {
+							const stage = (db.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage;
+							if (stage !== "review" && stage !== "planned") throw new Error(`${ticket} is at ${stage ?? "absent"}; review rework records only review or its owned planned retry`);
+							const previousBinding = stage === "planned" ? review.store.plannedRetryBinding(operationId) : undefined;
+							if (stage === "planned" && !previousBinding) throw new Error(`${ticket}: planned rework retry is not owned by this review run`);
+							recorded = recordReviewRework(db, ENGINE_ROOT, ticket, snapshot.path, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: ticket, YOKEMATE_ROLE: "coordinator" }, previousBinding);
+						} finally { db.close(); }
+						review.store.bindRecorded(operationId, recorded.binding);
+						const currentStage = () => {
+							const stageDb = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+							try { return String((stageDb.prepare("SELECT stage FROM work WHERE ticket = ?").get(ticket) as { stage?: string } | undefined)?.stage ?? "absent"); }
+							finally { stageDb.close(); }
+						};
+						let details: { runId?: string; listRunId?: string } = {};
+						try {
+							if (!recorded.repeat) {
+								logMove(dataRoot(ENGINE_ROOT), ticket, "на доработку", path.basename(recorded.binding.path, ".md"));
+								syncPush(dataRoot(ENGINE_ROOT), `${ticket} на доработку`);
+							}
+							const settings = readRuntimeSettings(ENGINE_ROOT);
+							const startedAt = Date.now();
+							const launched = await startCoordinator({ mode: "do", tickets: [ticket], plan: recorded.binding.path }, ctx, { sessionId, cwd: ENGINE_ROOT }, settings, {}, undefined, { store: review.store, operationId, binding: recorded.binding });
+							details = launched.details as { runId?: string; listRunId?: string };
+							if (("isError" in launched && launched.isError) || !details.runId) throw new Error(launched.content.map((part) => part.text).join("\n") || "review do admission refused");
+							if (details.listRunId) setImmediate(() => flushListDelivery(details.listRunId!));
+							const remaining = Math.max(1, 120_000 - (Date.now() - startedAt));
+							let timer: NodeJS.Timeout | undefined;
+							let startup;
+							try {
+								startup = await Promise.race([
+									listRuns.waitForStartup(details.runId),
+									new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("review do startup timed out after 120000ms")), remaining); }),
+								]);
+							} catch (error) {
+								listRuns.cancel(details.runId, (error as Error).message);
+								if (coordinators.get(details.runId)) await cancelCoordinator(details.runId, "parent_cancel_run", true).catch(() => {});
+								throw error;
+							} finally { clearTimeout(timer); }
+							const model = typeof startup.facts?.model === "string" ? startup.facts.model : undefined;
+							if (startup.state !== "started") {
+								review.store.finish(details.runId);
+								return { state: startup.state === "cancelled" ? "cancelled" : "refused", recorded: true, runId: details.runId, ...(model ? { model } : {}), reason: startup.reason, stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash } as ReviewHandoffOutcome;
+							}
+							review.stopObserver();
+							const close = await closeModeSurface({ ...review.store.owner.surface, cleanup() {} });
+							const outcome: ReviewHandoffOutcome = { state: "started", recorded: true, runId: details.runId, ...(model ? { model } : {}), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash, close };
+							const started = `${ticket}: rework ${recorded.binding.path} (${recorded.binding.contentHash}) recorded; do ${details.runId} started${model ? ` with ${model}` : ""}`;
+							ctx.ui.notify(close.state === "closed" ? started : `${started}; review close failed: ${close.reason}`, close.state === "closed" ? "info" : "warning");
+							return outcome;
+						} catch (error) {
+							const outcome: ReviewHandoffOutcome = { state: "refused", recorded: true, ...(details.runId ? { runId: details.runId } : {}), reason: error instanceof Error ? error.message : String(error), stage: currentStage(), plan: recorded.binding.path, contentHash: recorded.binding.contentHash };
+							ctx.ui.notify(`${ticket}: rework recorded at ${recorded.binding.path} (${recorded.binding.contentHash}), but do startup failed at ${outcome.stage}: ${outcome.reason}`, "warning");
+							return outcome;
+						}
+					});
+				},
+				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),
+				reviewEnded: async (_ticket, reviewRunId, reason) => { await revokeReviewRun(reviewRunId, reason); },
+				publishPlanScout: async (ticket, acceptanceId, child, origin) => {
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let acceptance;
 					try {
 						acceptance = publicationAcceptanceById(db, acceptanceId);
-						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_session_id !== origin.sessionId || !acceptance.owner_run_id || !acceptance.batch_id || !acceptance.task_hash) throw new Error("accepted scout identity does not match its live plan worker");
+						if (!acceptance || acceptance.ticket !== ticket || acceptance.owner_run_id !== child.ownerRunId || acceptance.owner_session_id !== child.ownerSessionId || acceptance.batch_id !== child.batchId || acceptance.run_id !== child.runId || acceptance.task_hash !== child.taskHash || child.agent !== "plan-scout" || child.ticket !== ticket || path.resolve(child.cwd) !== path.resolve(ENGINE_ROOT) || child.ownerSessionId !== origin.sessionId) throw new Error("accepted scout identity does not match its delivery");
 						assertPublishable(readPublicationArtifact(ENGINE_ROOT, acceptance));
 					} finally { db.close(); }
-					const child: ChildIdentity = { ownerRunId: acceptance.owner_run_id, ownerSessionId: acceptance.owner_session_id, batchId: acceptance.batch_id, runId: acceptance.run_id, agent: "plan-scout", taskHash: acceptance.task_hash, cwd: ENGINE_ROOT, ticket };
-					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
+					const outcome = await attemptArtifactPublication({ kind: "scout", ticket, artifact: acceptance, runId: acceptance.run_id, publicationId: acceptance.publication_id ?? undefined, child, provenance: acceptance, acceptanceId: acceptance.id, attach: (state, row) => { acceptPublicationDelivery(state, row.id, child); } });
 					return { reason: outcome.state === "complete" ? "scout publication complete" : outcome.error ?? "unavailable", publication: outcome.state, target: outcome.target, revision: outcome.revision, publicationId: outcome.publicationId };
 				},
-				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin) => {
-					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin);
-					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
-					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
+				planRegistered: (_ticket, planRunId, _origin, dispatch) => {
+					const capture = captureWorkflowGeneration();
+					if (capture && !planRunGenerations.has(planRunId)) planRunGenerations.set(planRunId, capture);
+					planRunMetadata.set(planRunId, { ...dispatch, keyRunId: planRunId });
 				},
-				planRecorded: async (ticket, recordedPath, recordIdOrOrigin, originOrRunId) => {
-					if (typeof recordIdOrOrigin !== "number") throw new Error("legacy plan record needs a local record id");
+				preparePlanPublication: async (ticket, candidatePath, contentHash, acceptanceId, origin, context) => {
+					const prepared = prepareLocalPlanRecord(ticket, candidatePath, acceptanceId, origin, context.kind === "registered" ? context.runId : undefined);
+					if (prepared.binding.contentHash !== contentHash) throw new Error("binding_changed");
+					return { reason: "local plan record prepared", recordId: prepared.record.id, snapshotPath: prepared.snapshotPath, scoutAcceptance: prepared.scout.id, revision: prepared.binding.contentHash, binding: prepared.binding, ...(prepared.record.publication_id ? { publicationId: prepared.record.publication_id } : {}), ...(prepared.record.scout_publication ? { scoutPublication: prepared.record.scout_publication } : {}) };
+				},
+				planRecorded: async (ticket, recordedPath, recordId, _origin, context, verifyCompletion, prior) => {
 					const binding = readRecordedPlanBinding(ENGINE_ROOT, ticket);
 					if (fs.realpathSync(recordedPath) !== binding.path) throw new Error("binding_changed");
-					const publications = await publishRecordedArtifacts(recordIdOrOrigin, binding);
+					const continuation = () => verifyCompletion(binding);
+					continuation();
+					const publications = await publishRecordedArtifacts(recordId, binding, continuation);
 					try { assertPlanBinding(binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 					catch { throw new Error("binding_changed"); }
-					return completePlanRecord(ticket, recordedPath, binding, publications, typeof originOrRunId === "string" ? originOrRunId : undefined);
+					verifyCompletion(binding);
+					if (prior) return { ...prior, publications, ...(prior.facts ? { facts: { ...prior.facts, publications } } : {}) };
+					return completePlanRecord(ticket, recordedPath, binding, publications, recordId, context, verifyCompletion);
 				},
-				launchPlan: async (request, controlOrigin) => {
+				launchPlan: async (request, controlOrigin, dispatch) => {
+					const launchCapture = captureWorkflowGeneration();
 					const settings = readRuntimeSettings(ENGINE_ROOT);
 					const run = listRuns.admit({ mode: "plan", keys: request.targets.map((target) => target.ticket), parentSessionId: sessionId, parentRuntimeId: runtimeId, settings, externalActiveUnits: activeUnits - listUnits, rejectDuplicate: settings.policy.guards.duplicateMode, rejectKey: (key) => /^[A-Z][A-Z0-9]*-\d+$/.test(key) ? undefined : `invalid ticket key ${JSON.stringify(key)}` });
 					const accepted = run.entries.filter((entry) => entry.immediate?.state === "accepted");
+					for (const entry of accepted) {
+						if (launchCapture) planRunGenerations.set(entry.keyRunId, launchCapture);
+						planRunMetadata.set(entry.keyRunId, { ...dispatch, listRunId: run.identity.listRunId, keyRunId: entry.keyRunId });
+					}
 					listUnits += accepted.length;
 					activeUnits += accepted.length;
 					setImmediate(() => {
@@ -1322,41 +1953,58 @@ export default function (pi: ExtensionAPI) {
 							try { model = request.model ?? modelForTicket(db, key.key, "plan") ?? poolModel(dataRoot(ENGINE_ROOT), "plan"); }
 							finally { db.close(); }
 							const facts = await launchPlanKey(ENGINE_ROOT, request, target, key.keyRunId, model, async (pane) => {
-								const reply = await requestPlanControl(ENGINE_ROOT, "bind-plan", { ticket: key.key, runId: key.keyRunId, pane }, { sessionId: controlOrigin.sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ENGINE_ROOT }, controlIdentity!);
+								const reply = await requestPlanControl(ENGINE_ROOT, "bind-plan", { ticket: key.key, runId: key.keyRunId, pane }, currentControlOrigin(ctx.cwd, controlOrigin.sessionId), controlIdentity!);
 								if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan pane binding refused");
 							});
 							key.active({ ...facts });
-							void herdrAsync(["agent", "wait", facts.agentName, "--until", "done", "--until", "blocked", "--until", "unknown"]).then(async () => {
-								try {
-									const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: key.key, runId: key.keyRunId, outcome: "cancelled", reason: "plan worker process or pane ended before a terminal record" }, currentControlOrigin(ENGINE_ROOT, sessionId), controlIdentity!);
-									if (reply.state !== "accepted" && !/no longer active/.test(reply.reason ?? "")) throw new Error(reply.reason ?? "plan lifecycle settlement refused");
-								} catch (error) { try { ctx.ui.notify(`plan lifecycle: ${(error as Error).message}`, "warning"); } catch {} }
-							}).catch((error) => { try { ctx.ui.notify(`plan lifecycle watch failed: ${(error as Error).message}`, "warning"); } catch {} });
 						});
 						listRuns.publishImmediate(run.identity.listRunId);
 					});
 					return { listRunId: run.identity.listRunId, results: run.entries.map((entry) => ({ key: entry.key, keyRunId: entry.keyRunId, state: entry.immediate!.state, reservation: entry.immediate?.reservation, reason: entry.immediate?.reason })) };
 				},
-				planFinished: async (_ticket, planRunId, outcome, reason) => {
+				planFinished: async (_ticket, context, outcome, reason) => {
+					if (context.kind !== "registered") return;
+					const planRunId = context.runId;
+					planRunGenerations.delete(planRunId);
+					planRunMetadata.delete(planRunId);
+					if (recordingPlans.has(planRunId)) {
+						recorderFences.fence(planRunId, false);
+						recorderControllers.get(planRunId)?.abort();
+					}
+					if (!context.listRunId) return;
 					const found = listRuns.get(planRunId);
-					if (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+					if (!found || !("run" in found)) throw new Error("plan run is no longer active");
+					if (!listRuns.settle(found.run.identity.listRunId, planRunId, { outcome, reason })) throw new Error("plan run is no longer active");
+					planRunGenerations.delete(planRunId);
+					planRunMetadata.delete(planRunId);
 				},
-				recordPlan: async (ticket, planPath, origin, planRunId, acceptanceId) => {
+				recordPlan: async (ticket, planPath, origin, context, acceptanceId, verifyCompletion) => {
+					if (context.kind !== "registered") throw new Error("owned plan record requires a registered run");
+					const planRunId = context.runId;
 					const controller = new AbortController();
+					const generation = sessionGeneration;
+					let resolveCompletion!: () => void;
+					const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+					recorderCompletions.set(planRunId, completion);
 					recordingPlans.add(planRunId);
 					recorderControllers.set(planRunId, controller);
 					let locallyRecorded = false;
 					try {
-						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin);
+						const prepared = prepareLocalPlanRecord(ticket, planPath, acceptanceId, origin, planRunId);
 						const result = await recordPlanFile(ENGINE_ROOT, ticket, planPath, process.env, { expectedBinding: prepared.binding, recordId: prepared.record.id, signal: controller.signal, onLocked: () => lockedRecordingPlans.add(planRunId) });
 						locallyRecorded = true;
+						const continuation = () => {
+							if (recorderFences.active(planRunId) || generation !== sessionGeneration) throw new Error("plan recorder cancelled before publication and handoff");
+						};
+						continuation();
 						if (result.localSync.state === "deferred" || result.localSync.state === "error") ctx.ui.notify(`git-sync: ${result.localSync.reason}`, "warning");
 						const pushed = result.push;
 						if (pushed?.state === "deferred" || pushed?.state === "error") ctx.ui.notify(`git-sync: ${pushed.reason}`, "warning");
-						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding);
+						const publications = await publishRecordedArtifacts(prepared.record.id, prepared.binding, continuation);
 						try { assertPlanBinding(prepared.binding, readRecordedPlanBinding(ENGINE_ROOT, ticket)); }
 						catch { throw new PublicationFailure("binding_changed"); }
-						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, planRunId, result);
+						verifyCompletion(prepared.binding);
+						return await completePlanRecord(ticket, result.plan, prepared.binding, publications, prepared.record.id, context, verifyCompletion, result);
 					} catch (error) {
 						if (controller.signal.aborted && !lockedRecordingPlans.has(planRunId)) {
 							const found = listRuns.get(planRunId);
@@ -1371,16 +2019,20 @@ export default function (pi: ExtensionAPI) {
 						recordingPlans.delete(planRunId);
 						lockedRecordingPlans.delete(planRunId);
 						recorderControllers.delete(planRunId);
-						if (cancelledRecordingPlans.delete(planRunId)) {
+						const fence = recorderFences.consume(planRunId);
+						if (fence.fenced) {
 							const found = listRuns.get(planRunId);
 							const agentName = found && "run" in found && typeof found.entry.immediate?.facts?.agentName === "string" ? found.entry.immediate.facts.agentName : undefined;
-							if (agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
+							listRuns.cancel(planRunId, "plan recorder cancelled before publication and handoff");
+							if (fence.stopAgent && agentName) void herdrAsync(["agent", "stop", agentName]).catch(() => {});
 						}
+						resolveCompletion();
+						recorderCompletions.delete(planRunId);
 					}
 				},
-				launch: async (request, controlOrigin) => {
+				launch: async (request, controlOrigin, dispatch) => {
 					const origin = { YOKEMATE_MODE: controlOrigin.mode, YOKEMATE_TICKET: controlOrigin.ticket, YOKEMATE_ROLE: controlOrigin.role as "coordinator" | "executor" | undefined, sessionId: controlOrigin.sessionId, cwd: controlOrigin.cwd };
-					const result = await startCoordinator(request, ctx, origin);
+					const result = await startCoordinator(request, ctx, origin, undefined, dispatch);
 					const details = result.details as { runId?: string; listRunId?: string; results?: import("../../../src/coordinator-control.ts").ControlResult[] };
 					return { ...details, afterAck: () => details.listRunId && flushListDelivery(details.listRunId) };
 				},
@@ -1392,21 +2044,38 @@ export default function (pi: ExtensionAPI) {
 				},
 				cancel: async (runId, _origin) => {
 					const target = listRuns.get(runId);
-					let cancelled = false;
-					const entries = target ? "run" in target ? [target.entry] : target.entries : [];
-					for (const entry of entries) {
-						if (recordingPlans.has(entry.keyRunId)) {
-							cancelledRecordingPlans.add(entry.keyRunId);
-							recorderControllers.get(entry.keyRunId)?.abort();
-							for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
-							cancelled = true;
-						} else {
-							cancelled = listRuns.cancel(entry.keyRunId) || cancelled;
-							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
-						}
+					const direct = coordinators.get(runId);
+					if (target || direct) {
+						workflowExtraction?.cancel("parent_cancel");
+						shipPermits.invalidate();
 					}
-					if (!target && coordinators.get(runId)) { await cancelCoordinator(runId, "parent_control_cancel", cancelled); cancelled = true; }
-					if (!cancelled) throw new Error(`unknown coordinator run ${runId}`);
+					if (target) {
+						const entries = "run" in target ? [target.entry] : target.entries;
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
+						const active = entries.filter((entry) => (!["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state) || listRuns.recovery(entry.keyRunId)?.state === "active"));
+						if (!active.length) return cancellationResult(runId, "list", recording.length ? "cancellation_requested" : "already_terminal", recording.length === 0);
+						let pending = recording.length > 0;
+						const fenced = fenceTargetedWorkflow(entries.map((entry) => entry.key), active.map((entry) => entry.keyRunId), "parent control cancel");
+						await Promise.all(fenced.coordinatorRunIds.map((id) => cancelCoordinator(id, "parent_control_cancel", true)));
+						for (const entry of active) {
+							if (upgradeRecordingFence(entry.keyRunId)) {
+								for (const coordinatorRunId of authority?.revoke(entry.key) ?? []) await cancelCoordinator(coordinatorRunId, "parent_cancel_run");
+								pending = true;
+								continue;
+							}
+							const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
+							listRuns.cancel(entry.keyRunId);
+							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_control_cancel", true);
+							if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
+						}
+						return cancellationResult(runId, "list", pending ? "cancellation_requested" : "cancelled", !pending);
+					}
+					const coordinator = coordinators.get(runId);
+					if (!coordinator) return cancellationResult(runId, "unknown", "unknown", false);
+					if (["done", "blocked"].includes(coordinator.state)) return cancellationResult(runId, "coordinator", "already_terminal", true);
+					const fenced = fenceTargetedWorkflow([coordinator.identity.ticket], [runId], "parent control cancel");
+					await Promise.all(fenced.coordinatorRunIds.map((id) => cancelCoordinator(id, "parent_control_cancel")));
+					return cancellationResult(runId, "coordinator", "cancelled", true);
 				},
 				merge: async (runId, request, mergeOrigin) => {
 					const run = coordinators.get(runId);
@@ -1429,6 +2098,86 @@ export default function (pi: ExtensionAPI) {
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
+	pi.registerCommand("break-glass", {
+		description: "Accept one exact failed plan-scout transport input through an audited incident.",
+		handler: async (args, ctx) => {
+			let state: DatabaseSync | undefined;
+			let preview: BreakGlassPreview | undefined;
+			let decision: { candidateId: string; ticket: string; reason: string; inputHash: string } | undefined;
+			try {
+				const sessionId = ctx.sessionManager.getSessionId();
+				if (ctx.mode !== "tui" || process.env.YOKEMATE_MODE || process.env.YOKEMATE_ROLE || !controlIdentity || controlIdentity.sessionId !== sessionId || !ingressWitness) throw new Error("break-glass requires a fresh typed submit in verified MAIN TUI");
+				const raw = `/break-glass${args ? ` ${args}` : ""}`;
+				if (ingressWitness.raw !== raw || ingressWitness.runtimeId !== controlIdentity.runtimeId) throw new Error("break-glass requires the current exact typed submit");
+				const command = parseBreakGlass(raw);
+				decision = { candidateId: command.candidateId, ticket: command.ticket, reason: command.reason, inputHash: ingressWitness.hash };
+				state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				const candidate = state.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
+				if (!candidate || candidate.ticket !== command.ticket) throw new Error("unknown recovery candidate");
+				const parent = resolveCoordinatorParent(ENGINE_ROOT);
+				const mainOrigin = currentControlOrigin(ENGINE_ROOT, sessionId);
+				const live = await requestPlanControl(ENGINE_ROOT, "read-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId }, mainOrigin, parent);
+				if (live.state !== "accepted" || live.failureHash !== candidate.failed_envelope_hash) throw new Error(live.reason ?? "recovery lineage is not live");
+				const snapshot = (): { scopeHash: string; targetHash: string; plan: PlanSnapshotIdentity } => {
+					const target = resolvePublicationTarget(state!, command.ticket);
+					const recorded = state!.prepare("SELECT plan FROM work WHERE ticket=?").get(command.ticket) as { plan?: string | null } | undefined;
+					if (recorded?.plan) {
+						const binding = readRecordedPlanBinding(ENGINE_ROOT, command.ticket);
+						return { scopeHash: binding.scopeHash, targetHash: target.targetHash, plan: { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) } };
+					}
+					const absent = sha256(JSON.stringify([command.ticket, target.targetHash, candidate.content_hash, "plan-absent"]));
+					return { scopeHash: absent, targetHash: target.targetHash, plan: { state: "absent", hash: sha256("absent"), scopeHash: absent, pathHash: sha256("absent") } };
+				};
+				const initial = snapshot();
+				preview = previewScoutAcceptance({ db: state, root: ENGINE_ROOT, command, witness: ingressWitness, planningRunId: candidate.planning_identity, liveFailureHash: candidate.failed_envelope_hash, ...initial, store: breakGlassPermits });
+				const currentPreview = preview;
+				const recheck = async (): Promise<Omit<BreakGlassPreview, "permitId" | "createdAt" | "expiresAt">> => {
+					const currentLive = await requestPlanControl(ENGINE_ROOT, "read-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId }, mainOrigin, parent);
+					if (currentLive.state !== "accepted" || currentLive.failureHash !== currentPreview.failureHash) throw new Error(currentLive.reason ?? "recovery lineage changed");
+					const currentCandidate = state!.prepare("SELECT * FROM plan_scout_candidate WHERE id=?").get(command.candidateId) as any;
+					if (!currentCandidate || currentCandidate.content_hash !== currentPreview.candidateHash || currentCandidate.bytes !== currentPreview.candidateBytes || currentCandidate.failed_envelope_hash !== currentPreview.failureHash) throw new Error("recovery candidate changed");
+					const current = snapshot();
+					const { permitId: _permitId, createdAt: _createdAt, expiresAt: _expiresAt, ...expected } = currentPreview;
+					return { ...expected, ...current, plan: { ...current.plan }, bypassed: [...expected.bypassed] as ["plan.scout.transport-input"], preserved: [...expected.preserved], blockers: [] };
+				};
+				const accepted = await resolveScoutAcceptance({
+					db: state, root: ENGINE_ROOT, store: breakGlassPermits, preview: currentPreview, witness: ingressWitness, sourceUid: process.getuid!(),
+					confirm: async (value) => ctx.hasUI && await ctx.ui.confirm("Audited break-glass", `${value.ticket} accepts candidate ${value.candidateId}\nsource-run: ${value.sourceRunId}\nbytes: ${value.candidateBytes}\npayload-hash: ${value.candidateHash}\nfailure-category: failed-transport-envelope\nfailure-hash: ${value.failureHash}\nreason: ${value.reason}\nstatus: pending engineer confirmation\nresult: plan-only; /do still needs fresh approval`, { timeout: Math.max(1, value.expiresAt - Date.now()) }),
+					recheck,
+					continueLineage: async () => {
+						const continued = await requestPlanControl(ENGINE_ROOT, "continue-scout-candidate", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash }, mainOrigin, parent);
+						if (continued.state !== "accepted" || !continued.planningIdentity || typeof continued.generation !== "number" || !continued.generation) throw new Error(continued.reason ?? "recovery continuation refused");
+						const recovery = listRuns.admitRecovery(candidate.planning_identity, continued.generation);
+						if (recovery.recoveryRunId !== continued.planningIdentity) throw new Error("recovery list identity changed");
+						return { planningIdentity: continued.planningIdentity, generation: continued.generation };
+					},
+				});
+				const bound = await requestPlanControl(ENGINE_ROOT, "bind-recovered-scout", { ticket: command.ticket, runId: candidate.planning_identity, candidateId: command.candidateId, failureHash: candidate.failed_envelope_hash, acceptanceId: accepted.acceptance.id }, mainOrigin, parent);
+				if (bound.state !== "accepted") throw new Error(bound.reason ?? "recovered scout binding refused");
+				workflowIngress.consume(ingressWitness.id, sessionId, controlIdentity.runtimeId, raw);
+				ingressWitness = undefined;
+				ctx.ui.notify(`${command.ticket}: incident ${accepted.incidentId}; accepted-input ${accepted.acceptance.id}; source-run ${candidate.run_id}; failure failed-transport-envelope ${candidate.failed_envelope_hash}; status accepted as ${accepted.planningIdentity}; result remains plan-only`, "warning");
+			} catch (error) {
+				const message = (error as Error).message;
+				const outcome = /expired/i.test(message) ? "expiry" : "refusal";
+				try {
+					auditRecoveryPreviews(breakGlassPermits.revoke(), outcome);
+					if (decision && controlIdentity) {
+						const audit = state ?? openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						const code = /unknown recovery candidate|candidate.*(?:changed|stale)/i.test(message) ? "candidate-unavailable"
+							: /lineage|live/i.test(message) ? "lineage-unavailable"
+							: /target|plan|scope|binding/i.test(message) ? "snapshot-invalid"
+							: /declined/i.test(message) ? "engineer-declined"
+							: outcome === "expiry" ? "permit-expired" : "recovery-refused";
+						appendRecoveryDecision(audit, { ...decision, action: "accept-plan-scout-input", sourceUid: process.getuid!(), sourceSessionId: controlIdentity.sessionId, sourceRuntimeId: controlIdentity.runtimeId, code, blockers: [code], outcome, reason: decision.reason });
+						if (!state) audit.close();
+					}
+				} catch (auditError) { ctx.ui.notify(`break-glass audit failed: ${(auditError as Error).message}`, "error"); }
+				ctx.ui.notify(`break-glass refused: ${message}`, "error");
+			} finally { state?.close(); }
+		},
+	});
+
 	pi.registerCommand("yokemate-coordinator-ready", {
 		description: "Initialize an owned coordinator RPC runtime.",
 		handler: async (args, ctx) => {
@@ -1441,9 +2190,6 @@ export default function (pi: ExtensionAPI) {
 				if (payload.prepared?.doBinding) {
 					assertPlanBinding(payload.prepared.doBinding, readRecordedPlanBinding(ENGINE_ROOT, payload.prepared.doBinding.ticket));
 					ownedBinding = payload.prepared.doBinding;
-				}
-				if (payload.prepared?.plan) {
-					try { snapshots = new RunSnapshots(payload.prepared.diagnosticRoot ?? ENGINE_ROOT, payload.prepared.plan); } catch { console.error("[subagent] diagnostic initialization failed"); }
 				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
 				emitChildState();
@@ -1480,21 +2226,57 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerCommand("yokemate-child-cancel", {
 		description: "Record an owned parent cancellation before teardown.",
-		handler: async (args) => {
+		handler: async (args, ctx) => {
 			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
 			if (payload.runId !== ownedReadyRunId || !["parent_rpc_stop", "parent_control_cancel", "parent_cancel_run", "parent_session_shutdown"].includes(payload.reason)) throw new Error("invalid owned child cancellation");
-			for (const mark of cancellationByProcess.values()) mark(payload.reason);
+			const sessionId = ctx.sessionManager.getSessionId();
+			await Promise.all((runs?.active() ?? []).map((child) => requestOrdinaryCancellation(child.identity.runId, payload.reason, payload.runId, sessionId)));
 		},
 	});
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		shuttingDown = true;
-		await fenceListRuns("parent session shutdown");
+		const revoked = revokeAuthority(event.reason === "reload" ? "session_reload" : event.reason === "fork" ? "session_fork" : "session_shutdown");
+		workflowExtraction = undefined;
+		removeTerminalInputListener?.();
+		removeTerminalInputListener = undefined;
+		sessionGeneration += 1;
+		const sessionId = latestCtx?.sessionManager?.getSessionId?.();
+		const ordinaryStops = sessionId && runs ? runs.shutdownActive().map((child) => requestOrdinaryCancellation(child.identity.runId, "session_shutdown", runs!.ownerRunId, sessionId)) : [];
+		uninstallIngress?.();
+		uninstallIngress = undefined;
+		auditRecoveryPreviews(breakGlassPermits.revoke(), "revoke");
+		workflowIngress.revoke();
+		ingressWitness = undefined;
+		try { await endOwnedReview("review session shutdown"); }
+		catch (error) { latestCtx?.ui.notify(`review shutdown fencing failed: ${(error as Error).message}`, "error"); }
+		await Promise.all([...reviewReworks.keys()].map((runId) => revokeReviewRun(runId, "parent session shutdown")));
+		for (const { delivery, envelope } of deliveries.values()) {
+			if (!["pending", "enqueued"].includes(delivery.state)) continue;
+			delivery.state = "delivery_unknown";
+			delivery.code = "parent_shutdown";
+			delivery.failedAt = new Date().toISOString();
+			for (const runId of delivery.runIds) {
+				const diagnostic = diagnostics.get(runId);
+				if (!diagnostic) continue;
+				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, failedAt: delivery.failedAt, code: delivery.code };
+				diagnostic.metadata.deliveries = states;
+				diagnostic.save(true);
+			}
+			const retained = reportArchives.get(delivery.deliveryId);
+			if (retained) retained.facts = archiveFacts(envelope, delivery);
+			updateReportArchive(delivery.deliveryId);
+		}
+		emitChildState();
+		await revoked;
+		await Promise.all([...recorderCompletions.values()]);
 		authority?.revoke();
 		authority = undefined;
 		shipPermits.invalidate();
 		controlServer?.close();
 		controlServer = undefined;
 		controlIdentity = undefined;
+		reviewReworks.clear();
 		await publicationMcp.shutdown();
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
@@ -1503,26 +2285,38 @@ export default function (pi: ExtensionAPI) {
 		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
 		coordinatorChildren.clear();
-		await Promise.all([...detached].map(async (proc) => {
-			const completion = childCompletions.get(proc);
-			cancellationByProcess.get(proc)?.("session_shutdown");
-			const timer = setTimeout(() => { if (cancellationByProcess.has(proc)) { try { proc.kill("SIGKILL"); } catch {} } }, 5000);
-			try {
-				try { proc.kill("SIGTERM"); } catch {}
-				await completion;
-			} finally { clearTimeout(timer); }
-		}));
+		await Promise.all(ordinaryStops);
+		await Promise.all([...batchCompletions.values()].map((completion) => completion.promise));
+		await Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity)));
 		await Promise.all(coordinatorStops);
 		detached.clear();
+		ordinaryProcesses.clear();
 		batches.clear();
+		batchModes.clear();
+		batchCompletions.clear();
+		sentBatches.clear();
+		deliveries.clear();
+		diagnostics.clear();
+		recorderFences.clear();
+		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
 		renderRunningWidget();
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
-		shuttingDown = false;
 		latestCtx = ctx;
+		const signal = ctx.signal;
+		const capture = captureWorkflowGeneration();
+		if (signal && capture && !observedTurnSignals.has(signal)) {
+			observedTurnSignals.add(signal);
+			signal.addEventListener("abort", () => {
+				if (!capture.operation?.matches(capture.parent, capture.store)) return;
+				capture.operation.cancel("interrupt");
+				if (authority === capture.store) capture.store.invalidateUnconsumed();
+				shipPermits.invalidate();
+			}, { once: true });
+		}
 		renderRunningWidget();
 	});
 
@@ -1530,6 +2324,25 @@ export default function (pi: ExtensionAPI) {
 		const delivery = deliveryFor(envelope);
 		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope });
 		return deliveries.get(delivery.deliveryId)!;
+	};
+	const failDelivery = (deliveryId: string, code: string): void => {
+		const entry = deliveries.get(deliveryId);
+		if (!entry || entry.delivery.state === "observed" || ["delivery_failed", "delivery_unknown"].includes(entry.delivery.state)) return;
+		entry.delivery.state = "delivery_failed";
+		entry.delivery.code = code;
+		entry.delivery.failedAt = new Date().toISOString();
+		for (const runId of entry.delivery.runIds) {
+			const diagnostic = diagnostics.get(runId);
+			if (!diagnostic) continue;
+			const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+			states[deliveryId] = { state: entry.delivery.state, envelopeHash: entry.delivery.envelopeHash, failedAt: entry.delivery.failedAt, code };
+			diagnostic.metadata.deliveries = states;
+			diagnostic.save(true);
+		}
+		const retained = reportArchives.get(deliveryId);
+		if (retained) retained.facts = archiveFacts(entry.envelope, entry.delivery);
+		updateReportArchive(deliveryId);
+		emitChildState();
 	};
 	const sendReport = (envelope: ReportEnvelope): void => {
 		const { delivery } = registerDelivery(envelope);
@@ -1545,9 +2358,9 @@ export default function (pi: ExtensionAPI) {
 		emitChildState();
 		if (shuttingDown) delivery.state = "delivery_unknown";
 		else try {
-			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true });
+			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true, yokemateSendId: delivery.deliveryId, onYokemateSendError: (sendId) => failDelivery(sendId, "send_rejected") });
 			if (delivery.state === "pending") delivery.state = "enqueued";
-		} catch { delivery.state = "delivery_failed"; }
+		} catch { failDelivery(delivery.deliveryId, "send_throw"); }
 		for (const runId of delivery.runIds) {
 			const diagnostic = diagnostics.get(runId);
 			if (diagnostic) {
@@ -1568,11 +2381,13 @@ export default function (pi: ExtensionAPI) {
 		sentBatches.add(batchId);
 		sendReport(batch);
 		batches.delete(batchId);
+		batchModes.delete(batchId);
 		for (const result of batch.results) {
 			reportAdmissions.delete(result.identity.runId);
 			reportSettledAt.delete(result.identity.runId);
 		}
 		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
+		runs?.compactBatch(batchId);
 	};
 	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "target_unavailable", "target_changed", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
 	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
@@ -1590,7 +2405,7 @@ export default function (pi: ExtensionAPI) {
 	const requestScoutControl = (result: ResultEnvelope, operation: "publish-plan-scout" | "reject-plan-scout", payload: { acceptanceId?: number }) => requestPlanControl(
 		ENGINE_ROOT,
 		operation,
-		{ ticket: result.identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, ...payload },
+		{ ticket: result.identity.ticket!, ...(process.env.YOKEMATE_PLAN_RUN_ID !== undefined ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), child: result.identity, scoutSequence: scoutSequenceByRunId.get(result.identity.runId), ...payload },
 		currentControlOrigin(ENGINE_ROOT, result.identity.ownerSessionId),
 		resolveCoordinatorParent(ENGINE_ROOT),
 	);
@@ -1602,11 +2417,58 @@ export default function (pi: ExtensionAPI) {
 		} catch { safe = "unavailable"; }
 		persistScoutBlock(result, safe);
 	};
+	const assertPlanWriterAdmission = (identity: ChildIdentity): void => {
+		if (identity.agent !== "plan-writer" || !identity.ticket || !runs) return;
+		const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		try {
+			const accepted = identity.acceptedInputId ? publicationAcceptanceById(state, identity.acceptedInputId) : undefined;
+			if (accepted?.source_kind === "engineer-accepted-input") {
+				if (accepted.ticket !== identity.ticket || accepted.owner_session_id !== identity.ownerSessionId || !accepted.continuation_id || !accepted.incident_id) throw new Error("plan-writer recovery source is foreign");
+				assertPublishable(readPublicationArtifact(ENGINE_ROOT, accepted));
+				return;
+			}
+		} finally { state.close(); }
+		const scout = runs.assertPlanWriterAdmission(identity);
+		const reference = scout.artifact;
+		if (!reference || reference.state !== "accepted") throw new Error(`plan-writer requires the current accepted scout for ${identity.ticket}`);
+		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+		try {
+			const acceptance = publicationAcceptanceById(db, reference.acceptanceId);
+			if (!acceptance || acceptance.ticket !== identity.ticket || acceptance.owner_run_id !== scout.identity.ownerRunId || acceptance.owner_session_id !== scout.identity.ownerSessionId || acceptance.batch_id !== scout.identity.batchId || acceptance.run_id !== scout.identity.runId || acceptance.task_hash !== scout.identity.taskHash || acceptance.content_hash !== reference.hash || acceptance.artifact_path !== reference.path || acceptance.bytes !== reference.bytes) throw new Error(`plan-writer scout binding is invalid for ${identity.ticket}`);
+			const bytes = readPublicationArtifact(ENGINE_ROOT, acceptance);
+			if (bytes.length !== reference.bytes || sha256(bytes) !== reference.hash) throw new Error(`plan-writer scout artifact changed for ${identity.ticket}`);
+		} finally { db.close(); }
+	};
 	const settleResult = async (result: ResultEnvelope, report: boolean) => {
-		if (!runs?.settle(result)) return;
+		if (!runs || runs.children.get(result.identity.runId)?.result || settlingRuns.has(result.identity.runId)) return;
+		settlingRuns.add(result.identity.runId);
+		try {
+		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash !== result.identity.taskHash) {
+			try {
+				const target = /^(?:\[k7x2\] )?(\/[^\x00-\x1f\x7f]+)$/.exec(result.payload.trim());
+				if (!target) throw new Error("writer result must contain one absolute path with only the optional [k7x2] prefix");
+				const draft = readCandidatePlanSnapshot(ENGINE_ROOT, result.identity.ticket, target[1]!);
+				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const dispatch = state.prepare("SELECT planning_identity FROM workflow_writer_dispatch WHERE writer_run_id=? AND accepted_input_id=? AND actual_task_hash=?").get(result.identity.runId, String(result.identity.acceptedInputId), result.actualTaskHash) as { planning_identity?: string } | undefined;
+					if (!dispatch?.planning_identity) throw new Error("writer dispatch correlation is missing");
+					recordWriterDraft(state, { content_hash: draft.contentHash, accepted_input_id: result.identity.acceptedInputId, planning_identity: dispatch.planning_identity, writer_run_id: result.identity.runId, writer_task_hash: result.identity.taskHash, writer_actual_task_hash: result.actualTaskHash, plan_path: draft.path, bytes: draft.bytes.length, result_hash: sha256(result.payload) });
+					verifiedWriterDrafts.set(draft.contentHash, { acceptedInputId: result.identity.acceptedInputId, planningIdentity: dispatch.planning_identity, runId: result.identity.runId });
+				} finally { state.close(); }
+			} catch (error) {
+				result.payloadOutcome = "protocol_error";
+				result.payload = "";
+				const diagnostic = diagnostics.get(result.identity.runId);
+				if (diagnostic) diagnostic.metadata.writerDraft = { refusal: "invalid-or-uncorrelated-draft", error: errorMetadata(error) };
+			}
+		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
-			if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
+			if (!runs.isCurrentScout(result.identity) || stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID ?? "") || result.processOutcome === "cancelled") {
+				persistScoutBlock(result, "artifact_invalid");
+			} else if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
+				const candidateId = scoutCandidateIds.get(result.identity.runId);
+				if (candidateId) try { latestCtx?.ui.notify(`plan scout transport failed; audited recovery candidate ${candidateId}`, "warning"); } catch {}
 			} else {
 				let acceptanceId: number | undefined;
 				try {
@@ -1617,7 +2479,7 @@ export default function (pi: ExtensionAPI) {
 					try { acceptanceId = acceptScoutArtifact(db, ENGINE_ROOT, result.identity, bytes).id; }
 					finally { db.close(); }
 					const reply = await requestScoutControl(result, "publish-plan-scout", { acceptanceId });
-					if (reply.state !== "accepted" || !reply.artifactAcceptance) throw new Error("parent control refused");
+					if (reply.state !== "accepted" || !reply.artifactAcceptance) throw new Error(reply.reason ?? "parent control refused");
 					result.artifact = reply.artifactAcceptance === "accepted"
 						? { ...reference, state: "accepted", acceptanceId }
 						: { ...reference, state: "superseded", acceptanceId };
@@ -1628,7 +2490,23 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-		reportSettledAt.set(result.identity.runId, Date.now());
+		const settledAt = Date.now();
+		const diagnostic = diagnostics.get(result.identity.runId);
+		if (diagnostic) {
+			diagnostic.metadata.settledAt = new Date(settledAt).toISOString();
+			diagnostic.metadata.closeAt ??= new Date(settledAt).toISOString();
+			diagnostic.metadata.terminal ??= { processOutcome: result.processOutcome, exitCode: result.exitCode, signal: result.signal, stopReason: result.stopReason };
+			diagnostic.metadata.artifact = result.artifact;
+			diagnostic.metadata.publication = result.publication;
+			const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
+			diagnostic.metadata.payload = { ...originalPayload, outcome: result.payloadOutcome, retainedBytes: Buffer.byteLength(result.payload), retainedHash: sha256(result.payload), truncated: result.diagnostics?.final.truncated ?? false, verdict: result.reviewVerdict, outputLimit: result.outputLimit };
+			diagnostic.save(true);
+			const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
+			if (snapshotStorage && result.diagnostics) result.diagnostics.snapshotStorage = { ...snapshotStorage };
+		}
+		result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
+		if (!runs.settle(result)) return;
+		reportSettledAt.set(result.identity.runId, settledAt);
 		if (report) registerDelivery(result);
 		const batch = runs.batch(result.identity.batchId);
 		if (batch) {
@@ -1636,6 +2514,51 @@ export default function (pi: ExtensionAPI) {
 			if (!report) registerDelivery({ ...batch, kind: "chain" });
 		}
 		if (report) sendReport(result);
+		} finally { settlingRuns.delete(result.identity.runId); }
+	};
+
+	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId) => {
+		if (!runs) return cancellationResult(runId, "unknown", "unknown", false);
+		if (runs.children.has(runId) && !runs.owns(runId, ownerRunId, ownerSessionId)) return cancellationResult(runId, "ordinary", "not_owned", false, "ordinary run belongs to another owner");
+		const request = runs.requestCancel(runId, initiator);
+		if (request.result.targetKind === "unknown") return request.result;
+		if (request.first) {
+			const diagnostic = diagnostics.get(runId);
+			if (diagnostic) {
+				diagnostic.metadata.cancellationInitiator = initiator;
+				diagnostic.save(false);
+			}
+		}
+		const identity = runs.children.get(runId)?.identity;
+		const claimed = identity ? runs.claimed(identity) : undefined;
+		if (identity && claimed && request.first) {
+			runs.completeCleanup(identity);
+			void settleResult(claimed, batchModes.get(identity.batchId) !== "chain").then(() => settleBatch(identity.batchId));
+		}
+		if (request.shouldSignal) {
+			const owned = ordinaryProcesses.get(runId);
+			const attached = identity ? runs.process(identity) : undefined;
+			const verified = !!owned && !!attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !runs.claimed(owned.identity) && !owned.termSent;
+			if (!verified) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			let sent = false;
+			try { sent = owned.process.kill("SIGTERM"); } catch {}
+			if (!sent) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			owned.termSent = true;
+			owned.killTimer = setTimeout(() => {
+				const current = ordinaryProcesses.get(runId);
+				if (current !== owned || current.closed || current.killSent || runs?.claimed(current.identity)) return;
+				if (processStarttime(current.pid) !== current.starttime || current.process.pid !== current.pid) {
+					runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+					return;
+				}
+				let killed = false;
+				try { killed = current.process.kill("SIGKILL"); } catch {}
+				if (killed) current.killSent = true;
+				else runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			}, 5000);
+			owned.killTimer.unref();
+		}
+		return request.waitForCleanup ? await request.completion : request.result;
 	};
 
 	pi.registerTool({
@@ -1643,13 +2566,21 @@ export default function (pi: ExtensionAPI) {
 		label: "Plan finish",
 		description: "Finish the owned plan run as blocked or cancelled.",
 		parameters: Type.Object({ outcome: StringEnum(["blocked", "cancelled"] as const), reason: Type.String() }),
-		async execute(_id, params): Promise<any> {
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
 			if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_TICKET || !process.env.YOKEMATE_PLAN_RUN_ID) return { content: [{ type: "text", text: "plan_finish is available only to an owned plan worker" }], isError: true };
+			const planRunId = process.env.YOKEMATE_PLAN_RUN_ID;
+			stoppedPlanRuns.add(planRunId);
+			const sessionId = ctx.sessionManager.getSessionId();
+			const cancellations = Promise.all((runs?.active() ?? []).map((child) => requestOrdinaryCancellation(child.identity.runId, "plan_finish", planRunId, sessionId)));
 			try {
-				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: process.env.YOKEMATE_PLAN_RUN_ID, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT), resolveCoordinatorParent(ENGINE_ROOT));
+				const reply = await requestPlanControl(ENGINE_ROOT, "plan-finished", { ticket: process.env.YOKEMATE_TICKET, runId: planRunId, outcome: params.outcome, reason: params.reason }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
 				if (reply.state !== "accepted") throw new Error(reply.reason ?? "plan finish refused");
-				return { content: [{ type: "text", text: `${params.outcome} recorded` }] };
-			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+				const physical = await cancellations;
+				return { content: [{ type: "text", text: `${params.outcome} recorded; ${JSON.stringify(physical)}` }], details: { planRunId, cancellations: physical } };
+			} catch (error) {
+				const physical = await cancellations;
+				return { content: [{ type: "text", text: `${(error as Error).message}; ${JSON.stringify(physical)}` }], details: { planRunId, cancellations: physical }, isError: true };
+			}
 		},
 	});
 
@@ -1718,26 +2649,68 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Delegate tasks to specialized subagents with isolated context, or cancel one exact owned run UUID.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder), cancel (cancelRun only).",
 			`Agents come from the nearest ${CONFIG_DIR_NAME}/agents — the yokemate root in the main chat, work/<TICKET>/${CONFIG_DIR_NAME}/agents in the task tab.`,
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
+			const admittedGeneration = sessionGeneration;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
+			if (!params.cancelRun && shuttingDown) return { content: [{ type: "text", text: "parent session is shutting down; only cancellation remains available" }], isError: true };
+			if (!params.cancelRun && process.env.YOKEMATE_PLAN_RUN_ID && stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID)) return { content: [{ type: "text", text: "plan run is stopped; only cancellation and conversation remain available" }], isError: true };
 			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-			const sessionId = (ctx as any).sessionManager?.getSessionId?.() ?? "main";
+			const currentSessionId = ctx.sessionManager?.getSessionId?.();
+			const sessionId = currentSessionId ?? `unavailable:${process.pid}`;
 			if (params.cancelRun) {
+				if (!currentSessionId) return { content: [{ type: "text", text: "cancellation requires the current session identity" }], isError: true };
+				const mixed = [params.coordinator, params.agent, params.task, params.ticket, params.tasks, params.chain, params.review, params.cwd].some((value) => value !== undefined);
+				if (mixed) return { content: [{ type: "text", text: "cancelRun cannot be combined with launch parameters" }], isError: true };
+				if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(params.cancelRun)) return { content: [{ type: "text", text: "cancelRun must be an exact UUID" }], isError: true };
+				const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
+				const resultResponse = (result: CancellationResult, text = JSON.stringify(result)) => ({ content: [{ type: "text" as const, text }], details: result, ...(["unknown", "not_owned"].includes(result.status) ? { isError: true } : {}) });
 				try {
-					if (coordinators.get(params.cancelRun)) {
-						const cancelled = listRuns.cancel(params.cancelRun);
-						const run = await cancelCoordinator(params.cancelRun, "parent_cancel_run", cancelled);
-						return { content: [{ type: "text", text: `${run.identity.runId} cancelled` }] };
+					if (runs?.children.has(params.cancelRun)) return resultResponse(await requestOrdinaryCancellation(params.cancelRun, "tool_cancel", ownerRunId, sessionId));
+					const coordinator = coordinators.get(params.cancelRun);
+					if (coordinator) {
+						if (coordinator.identity.parentSessionId !== sessionId) return resultResponse(cancellationResult(params.cancelRun, "coordinator", "not_owned", false, "coordinator run belongs to another owner"));
+						if (["done", "blocked"].includes(coordinator.state)) return resultResponse(cancellationResult(params.cancelRun, "coordinator", "already_terminal", true), `${params.cancelRun} cancelled`);
+						workflowExtraction?.cancel("parent_cancel");
+						shipPermits.invalidate();
+						const fenced = fenceTargetedWorkflow([coordinator.identity.ticket], [params.cancelRun], "parent cancel");
+						await Promise.all(fenced.coordinatorRunIds.map((id) => cancelCoordinator(id, "parent_cancel_run", Boolean(listRuns.get(id)))));
+						return resultResponse(cancellationResult(params.cancelRun, "coordinator", "cancelled", true), `${params.cancelRun} cancelled`);
 					}
-					if (listRuns.cancel(params.cancelRun)) return { content: [{ type: "text", text: `${params.cancelRun} cancelled` }] };
-					throw new Error(`unknown coordinator run ${params.cancelRun}`);
+					const list = listRuns.get(params.cancelRun);
+					if (list) {
+						const owned = "run" in list ? list.run.identity.parentSessionId === sessionId : list.identity.parentSessionId === sessionId;
+						if (!owned) return resultResponse(cancellationResult(params.cancelRun, "list", "not_owned", false, "list run belongs to another owner"));
+						const entries = "run" in list ? [list.entry] : list.entries;
+						const recording = entries.filter((entry) => upgradeRecordingFence(entry.keyRunId));
+						if (!recording.length && entries.every((entry) => ["refused", "recorded", "done", "blocked", "cancelled"].includes(entry.state))) return resultResponse(cancellationResult(params.cancelRun, "list", "already_terminal", true));
+						workflowExtraction?.cancel("parent_cancel");
+						shipPermits.invalidate();
+						const fenced = fenceTargetedWorkflow(entries.map((entry) => entry.key), entries.map((entry) => entry.keyRunId), "parent cancel");
+						await Promise.all(fenced.coordinatorRunIds.map((id) => cancelCoordinator(id, "parent_cancel_run", true)));
+						for (const entry of entries) {
+							if (recording.some((candidate) => candidate.keyRunId === entry.keyRunId)) { listRuns.cancel(entry.keyRunId); continue; }
+							const agentName = typeof entry.immediate?.facts?.agentName === "string" ? entry.immediate.facts.agentName : undefined;
+							listRuns.cancel(entry.keyRunId);
+							if (coordinators.get(entry.keyRunId)) await cancelCoordinator(entry.keyRunId, "parent_cancel_run", true);
+							if (agentName) await herdrAsync(["agent", "stop", agentName]).catch(() => {});
+						}
+						const outcome = cancellationResult(params.cancelRun, "list", recording.length ? "cancellation_requested" : "cancelled", recording.length === 0);
+						return resultResponse(outcome, recording.length ? JSON.stringify(outcome) : `${params.cancelRun} cancelled`);
+					}
+					if (process.env.YOKEMATE_MODE) {
+						const parent = resolveCoordinatorParent(root);
+						const reply = await requestCoordinatorCancel(root, params.cancelRun, currentControlOrigin(root, sessionId), parent);
+						if (reply.state === "accepted" && reply.cancellation) return resultResponse(reply.cancellation, reply.cancellation.status === "cancelled" ? `${params.cancelRun} cancelled` : JSON.stringify(reply.cancellation));
+						if (reply.state === "refused") return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false, reply.reason ?? "parent cancellation refused"));
+					}
+					return resultResponse(cancellationResult(params.cancelRun, "unknown", "unknown", false));
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
 			}
 			if (ownedBinding) {
@@ -1756,15 +2729,11 @@ export default function (pi: ExtensionAPI) {
 				try {
 					if (process.env.YOKEMATE_MODE) {
 						const parent = resolveCoordinatorParent(root);
-						const reply = await requestCoordinator(root, params.coordinator as CoordinatorRequest, {
-							sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd,
-							pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE,
-							mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE,
-						}, parent);
+						const reply = await requestCoordinator(root, params.coordinator as CoordinatorRequest, currentControlOrigin(ctx.cwd, sessionId), parent);
 						if (reply.state !== "accepted" || !reply.runId) throw new Error(reply.reason ?? "coordinator launch was not accepted");
 						return { content: reply.results?.map((result) => ({ type: "text" as const, text: result.state === "accepted" ? `accepted ${result.keyRunId}, key ${result.key}, reserved` : `refused ${result.key}: ${result.reason}` })) ?? [{ type: "text" as const, text: `accepted ${reply.runId}` }], details: { runId: reply.runId, listRunId: reply.listRunId, identity: reply.identity, results: reply.results } };
 					}
-					const result = await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings);
+					const result = await startCoordinator(params.coordinator as CoordinatorRequest, ctx, origin, settings, { toolCallId });
 					if (result.details.listRunId) flushListDelivery(result.details.listRunId);
 					return result;
 				} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
@@ -1795,23 +2764,81 @@ export default function (pi: ExtensionAPI) {
 			const ownerRunId = process.env.YOKEMATE_RUN_ID ?? sessionId;
 			if (!runs) runs = new ChildRuns(ownerRunId, sessionId, process.env.YOKEMATE_MODE === "plan" ? process.env.YOKEMATE_TICKET : undefined);
 			if (runs.ownerRunId !== ownerRunId || runs.ownerSessionId !== sessionId) throw new Error("subagent owner changed");
+			const admitPlanWriter = async (identity: ChildIdentity, requestedTask: string, expandedTask: string, claim: boolean): Promise<string> => {
+				if (identity.agent !== "plan-writer") return expandedTask;
+				if (!identity.ticket || !identity.acceptedInputId) throw new Error("plan-writer requires its current accepted scout");
+				assertPlanWriterAdmission(identity);
+				if (!identity.writerRevisionOf && requestedTask.includes("{previous}")) throw new Error("initial plan-writer input cannot come from {previous}");
+				assertMandatoryBoundary("workflow.external-auth", !!ctx.model && ctx.modelRegistry.hasConfiguredAuth(ctx.model), "plan-writer requires configured external authentication");
+				const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const accepted = publicationAcceptanceById(state, identity.acceptedInputId);
+					if (!accepted || accepted.ticket !== identity.ticket) throw new Error("plan-writer accepted input is missing or foreign");
+					const exact = readPublicationArtifact(ENGINE_ROOT, accepted);
+					assertPublishable(exact);
+					let planningIdentity = identity.writerRevisionOf ? verifiedWriterDrafts.get(identity.writerRevisionOf)?.planningIdentity ?? identity.runId : identity.runId;
+					let incident;
+					let provenance = "normal-transport";
+					let markerInstructions = "";
+					if (accepted.source_kind === "engineer-accepted-input") {
+						if (process.env.YOKEMATE_MODE !== "plan" || !process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("plan-writer requires its owned live plan worker");
+						if (!accepted.incident_id || !accepted.candidate_id || !accepted.failure_hash || !accepted.continuation_id || !accepted.continuation_generation) throw new Error("plan-writer recovery provenance is incomplete");
+						const candidate = state.prepare("SELECT planning_identity FROM plan_scout_candidate WHERE id=?").get(accepted.candidate_id) as { planning_identity?: string } | undefined;
+						if (!candidate?.planning_identity || candidate.planning_identity !== process.env.YOKEMATE_PLAN_RUN_ID) throw new Error("plan-writer recovery lineage is foreign");
+						const reply = await requestPlanControl(ENGINE_ROOT, "admit-plan-writer", { ticket: identity.ticket, runId: candidate.planning_identity, candidateId: accepted.candidate_id, failureHash: accepted.failure_hash, generation: accepted.continuation_generation, writerRunId: identity.runId, acceptanceId: accepted.id }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						if (reply.state !== "accepted" || reply.planningIdentity !== accepted.continuation_id) throw new Error(reply.reason ?? "plan-writer recovery admission refused");
+						planningIdentity = accepted.continuation_id;
+						incident = incidentById(state, accepted.incident_id);
+						if (!incident) throw new Error("plan-writer incident is missing");
+						const target = resolvePublicationTarget(state, identity.ticket);
+						if (target.targetHash !== incident.target_hash) throw new Error("plan-writer recovery target changed");
+						const recorded = state.prepare("SELECT plan FROM work WHERE ticket=?").get(identity.ticket) as { plan?: string | null } | undefined;
+						const plan = recorded?.plan ? (() => { const binding = readRecordedPlanBinding(ENGINE_ROOT, identity.ticket!); return { state: "recorded", hash: binding.contentHash, scopeHash: binding.scopeHash, pathHash: sha256(binding.path) }; })() : (() => { const scopeHash = sha256(JSON.stringify([identity.ticket, target.targetHash, accepted.content_hash, "plan-absent"])); return { state: "absent", hash: sha256("absent"), scopeHash, pathHash: sha256("absent") }; })();
+						if (incident.scope_hash !== plan.scopeHash || incident.plan_state !== plan.state || incident.plan_hash !== plan.hash || incident.plan_scope_hash !== plan.scopeHash || incident.plan_path_hash !== plan.pathHash) throw new Error("plan-writer recovery plan or scope changed");
+						provenance = `engineer-accepted-input incident=${accepted.incident_id} candidate=${accepted.candidate_id} source-run=${accepted.source_run_id} failure=${accepted.failure_hash} skipped=${accepted.skipped_json} preserved=${accepted.preserved_json} plan-only=true`;
+						markerInstructions = `\n\nThe plan's Assumptions section must preserve these exact audit lines:\nBREAK-GLASS: engineer-accepted-input\nincident: ${accepted.incident_id}\nsource-run: ${accepted.source_run_id}\nsource-hash: ${accepted.content_hash}\nreason: ${accepted.incident_reason}\nskipped: failed-transport-envelope`;
+					} else if (accepted.source_kind !== "normal-transport" || accepted.owner_session_id !== sessionId) throw new Error("plan-writer normal source is not owned by this plan worker");
+					if (identity.writerRevisionOf) {
+						const draft = verifiedWriterDrafts.get(identity.writerRevisionOf);
+						if (!draft || draft.acceptedInputId !== accepted.id || draft.planningIdentity !== planningIdentity) throw new Error("plan-writer revision draft is unknown or foreign");
+					}
+					const source = new TextDecoder("utf-8", { fatal: true }).decode(exact);
+					const injected = `${expandedTask}${markerInstructions}\n\nAccepted scout input (${provenance}; hash=${accepted.content_hash}; bytes=${accepted.bytes}):\n\n${source}`;
+					if (claim) claimWriterDispatch(state, incident, { acceptedInputId: String(accepted.id), planningIdentity, kind: identity.writerRevisionOf ? "revision" : "initial", revisionOf: identity.writerRevisionOf, writerRunId: identity.runId, taskHash: identity.taskHash, actualTaskHash: sha256(injected) });
+					return injected;
+				} finally { state.close(); }
+			};
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
-				let completeChild: (() => void) | undefined;
-				let envelope: ResultEnvelope;
+				let envelope: ResultEnvelope | undefined;
 				let output = "";
+				let cleanupError: string | undefined;
+				let cleanupPath: string | undefined;
 				try {
-					if (shuttingDown) return { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output };
-					runs!.start(identity);
+					runs!.resolveTask(identity, task);
+					if (shuttingDown) {
+						envelope = runs!.claimNoSpawn(identity);
+						if (!envelope) throw new Error("subagent run cannot be fenced during shutdown");
+						return { envelope, output };
+					}
+					if (!runs!.start(identity)) {
+						envelope = runs!.claimed(identity) ?? runs!.claimNoSpawn(identity);
+						if (!envelope) throw new Error("subagent run cannot start");
+						return { envelope, output };
+					}
+					assertPlanWriterAdmission(identity);
+					task = await admitPlanWriter(identity, diagnostics.get(identity.runId)?.metadata.requestedTask as string ?? task, task, true);
+					runs!.resolveTask(identity, task);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
 						child = proc;
-						childCompletions.set(proc, new Promise<void>((resolve) => { completeChild = resolve; }));
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
-					}, identity, diagnostics.get(identity.runId)!);
+					}, identity, runs!, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
-					envelope = boundBatchResult(result.envelope ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), runs!.batches.get(identity.batchId)!);
+					cleanupError = result.cleanupError;
+					cleanupPath = result.cleanupPath;
+					envelope = result.envelope ?? runs!.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
 					const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
@@ -1820,42 +2847,96 @@ export default function (pi: ExtensionAPI) {
 					diagnostic.metadata.payload = { ...originalPayload, outcome: envelope.payloadOutcome, retainedBytes, retainedHash, truncated: originalPayload === undefined ? false : originalPayload.bytes !== retainedBytes || originalPayload.hash !== retainedHash, verdict: envelope.reviewVerdict, outputLimit: envelope.outputLimit };
 					diagnostic.save(true);
 				} catch (error) {
+					if (error instanceof PromptCleanupFailure) {
+						cleanupError = "temporary prompt cleanup could not be verified";
+						cleanupPath = error.dir;
+					}
 					const diagnostic = diagnostics.get(identity.runId);
-					if (diagnostic) { diagnostic.metadata.spawnError = errorMetadata(error); diagnostic.save(true); }
-					envelope = resultEnvelope(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "");
+					if (diagnostic) {
+						diagnostic.metadata.spawnError = errorMetadata(error);
+						if (error instanceof PromptCleanupFailure) diagnostic.metadata.cleanupError = { reason: cleanupError, path: error.dir, writeFailure: error.writeFailure, cleanupFailure: error.cleanupFailure };
+						diagnostic.save(true);
+					}
+					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
+					if (!envelope) throw error;
 				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
-					if (child) childCompletions.delete(child);
-					completeChild?.();
+					ordinaryProcesses.delete(identity.runId);
+					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupPath ? `${cleanupError}: ${cleanupPath}` : cleanupError);
+					else runs!.completeCleanup(identity);
 				}
-				return { envelope, output };
+				return { envelope: envelope!, output };
 			};
-			const launch = (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string } }[]) => {
+			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
+				tasks = await Promise.all(tasks.map(async (task) => {
+					if (task.agent !== "plan-writer" || task.acceptedInputId) return task;
+					const ticket = task.ticket ?? process.env.YOKEMATE_TICKET;
+					const current = ticket ? runs!.currentScout(ticket) : undefined;
+					if (current?.artifact?.state === "accepted") return { ...task, ticket, acceptedInputId: current.artifact.acceptanceId };
+					const runId = process.env.YOKEMATE_PLAN_RUN_ID;
+					if (!ticket || !runId || process.env.YOKEMATE_MODE !== "plan") return task;
+					const input = await requestPlanControl(ENGINE_ROOT, "read-plan-writer-input", { ticket, runId }, currentControlOrigin(ENGINE_ROOT, sessionId), resolveCoordinatorParent(ENGINE_ROOT));
+					if (input.state !== "accepted" || !input.acceptanceId) throw new Error(input.reason ?? "plan writer accepted input is unavailable");
+					return { ...task, ticket, acceptedInputId: input.acceptanceId };
+				}));
+				if (shuttingDown || sessionGeneration !== admittedGeneration) throw new Error("parent session changed before subagent admission");
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
-				const ack = runs!.admit(toolCallId, tasks, ctx.cwd);
+				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission);
+				for (const [index, child] of ack.children.entries()) await admitPlanWriter(child.identity, tasks[index]!.task, tasks[index]!.task, false);
+				if (mode === "chain") for (const child of ack.children.slice(1)) runs!.defer(child.identity);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
+					if (identity.agent === "plan-scout") scoutSequenceByRunId.set(identity.runId, 2 * ++nextScoutSequence);
 					reportAdmissions.set(identity.runId, { startedAt: admittedAt, taskExcerpt: reportTaskExcerpt(tasks[index]!.task), ordinal: index + 1 });
-					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, cancellationInitiator: "unknown", deliveries: {} };
-					const diagnostic = { metadata, save: (completed: boolean) => { snapshots?.write(identity.ownerRunId, identity.runId, metadata, completed); } };
+					const metadata: Record<string, unknown> = { identity, admissionAt: new Date(admittedAt).toISOString(), ownerPid: process.pid, ownerStarttime: processStarttime(process.pid), runtime: { node: process.version, pi: "0.85.1", contract: 1 }, extension: fileProvenance(new URL(import.meta.url).pathname), guard: fileProvenance(path.join(root, "src/guards.ts")), taskHash: identity.taskHash, requestedTask: tasks[index]!.task, cancellationInitiator: "unknown", deliveries: {} };
+					const diagnostic = { metadata, save: (completed: boolean) => {
+						const status = snapshots.write(identity.ownerRunId, identity.runId, metadata, completed);
+						metadata.snapshotStorage = status;
+					} };
 					diagnostics.set(identity.runId, diagnostic);
 					diagnostic.save(false);
 				}
+				const admissionFence = process.env.YOKEMATE_MODE === "plan"
+					? Promise.all(ack.children.filter(({ identity }) => identity.agent === "plan-scout" && identity.ticket).map(async ({ identity }) => {
+						const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+						try { revokePendingPlanRecords(db, identity.ticket!); } finally { db.close(); }
+						const reply = await requestPlanControl(ENGINE_ROOT, "reject-plan-scout", { ticket: identity.ticket!, runId: process.env.YOKEMATE_PLAN_RUN_ID, child: identity, scoutSequence: scoutSequenceByRunId.get(identity.runId)! - 1 }, currentControlOrigin(ENGINE_ROOT, identity.ownerSessionId), resolveCoordinatorParent(ENGINE_ROOT));
+						if (reply.state !== "accepted") throw new Error(reply.reason ?? "current scout admission was not fenced");
+					}))
+					: Promise.resolve([]);
 				activeUnits += units;
 				batches.add(toolCallId);
+				batchModes.set(toolCallId, mode);
+				let resolveCompletion!: () => void;
+				const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+				batchCompletions.set(toolCallId, { promise: completion, resolve: resolveCompletion });
 				emitChildState();
 				const execute = async () => {
 					try {
+						try { await admissionFence; }
+						catch {
+							for (const { identity } of ack.children) await settleResult(resultEnvelope(identity, tasks[ack.children.findIndex((child) => child.identity.runId === identity.runId)]!.task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), mode !== "chain");
+							if (mode === "chain") sendReport(runs!.batch(toolCallId, "chain")!);
+							settleBatch(toolCallId);
+							return;
+						}
 						if (mode === "chain") {
 							let previous = "";
 							let failed = false;
 							for (let i = 0; i < tasks.length; i++) {
 								const identity = ack.children[i]!.identity;
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
-								const { envelope: result, output } = failed ? { envelope: resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), output: "" } : await runDetachedAgent(mode, identity, task, i + 1);
+								let terminal: { envelope: ResultEnvelope; output: string };
+								if (failed) {
+									runs!.resolveTask(identity, task);
+									const envelope = runs!.claimNoSpawn(identity)!;
+									runs!.completeCleanup(identity);
+									terminal = { envelope, output: "" };
+								} else terminal = await runDetachedAgent(mode, identity, task, i + 1);
+								const { envelope: result, output } = terminal;
 								await settleResult(result, false);
 								failed ||= failedEnvelope(result);
 								previous = output;
@@ -1868,7 +2949,11 @@ export default function (pi: ExtensionAPI) {
 							});
 						}
 						settleBatch(toolCallId);
-					} finally { activeUnits -= units; }
+					} finally {
+						activeUnits -= units;
+						batchCompletions.get(toolCallId)?.resolve();
+						batchCompletions.delete(toolCallId);
+					}
 				};
 				void execute().catch(() => console.error("[subagent] detached dispatch failed"));
 				return { content: [{ type: "text", text: `Detached, not terminal: ${JSON.stringify(ack)}` }], details: { ...makeDetails(mode)([]), ...ack, display: { version: 1, members: ack.children.map(({ identity }) => ({ taskExcerpt: reportAdmissions.get(identity.runId)?.taskExcerpt ?? "" })) } } };
@@ -1920,7 +3005,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain?.length) return launch("chain", params.chain);
 			if (params.tasks?.length) return launch("parallel", params.tasks);
-			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, ticket: params.ticket, review: params.review }]);
+			if (params.agent && params.task) return launch("single", [{ agent: params.agent, task: params.task, cwd: params.cwd, ticket: params.ticket, review: params.review, acceptedInputId: params.acceptedInputId, writerRevisionOf: params.writerRevisionOf }]);
 
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
@@ -1931,6 +3016,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			if (args.cancelRun) return new Text(theme.fg("toolTitle", theme.bold("subagent cancel ")) + theme.fg("accent", args.cancelRun), 0, 0);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +

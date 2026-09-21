@@ -25,7 +25,10 @@ export function recipeFor(worktree: string): Recipe | { blocker: string } {
   const found = RECIPES.filter((recipe) => existsSync(join(worktree, recipe.lockfile)));
   if (found.length > 1) return { blocker: `several lockfiles (${found.map((recipe) => recipe.lockfile).join(", ")})` };
   if (found.length === 0) return { blocker: "no lockfile — a project without a locked dependency graph cannot be made ready" };
-  return found[0]!;
+  const recipe = found[0]!;
+  if (recipe.manager === "pnpm" && !existsSync(join(worktree, "pnpm-workspace.yaml")))
+    return { ...recipe, command: ["pnpm", "install", "--ignore-workspace", "--frozen-lockfile", "--prod=false"] };
+  return recipe;
 }
 
 function git(cwd: string, ...args: string[]): string {

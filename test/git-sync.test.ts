@@ -374,6 +374,32 @@ test("plan commit excludes foreign staged files and duplicate record does not re
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 });
 
+test("large candidate snapshot is compacted before locked recorder spawn", async () => {
+  const tmp = makeTmp();
+  try {
+    const { a } = setupPair(tmp);
+    const engine = join(tmp, "engine");
+    mkdirSync(join(engine, ".pi"), { recursive: true });
+    writeFileSync(join(engine, ".pi", "settings.json"), "{}");
+    execFileSync("mv", [a, join(engine, "home")]);
+    const home = join(engine, "home");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    mkdirSync(join(plan, ".."), { recursive: true });
+    const largePlan = planText("YM-1").replace("1. Record it.", `1. Record it.\n${"- Preserve this detailed requirement.\n".repeat(1_500)}`);
+    writeFileSync(plan, largePlan);
+    const db = openDb(join(engine, "yokemate.db"));
+    db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
+    db.close();
+    const prepared = prepareRecord(engine, "YM-1", plan);
+    assert.ok(prepared.binding.bytes.length > 50_000);
+    const recorded = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId });
+    assert.equal(recorded.recorded, true);
+    const state = openDb(join(engine, "yokemate.db"));
+    assert.equal((state.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get() as { stage: string }).stage, "planned");
+    state.close();
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
 test("a cancelled plan recorder waiting for the canonical lock makes no mutation", async () => {
   const tmp = makeTmp();
   let holder: ReturnType<typeof spawn> | undefined;

@@ -13,6 +13,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { Stage } from "./db.ts";
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type Via = "stage" | "plan" | "spawn" | "record-report" | "accept" | "accept-rework" | "adopt";
 
@@ -80,6 +81,7 @@ export function checkMove(
   current: From,
   opts: { allowFresh?: boolean; expected?: From; settings?: RuntimeSettings } = {},
 ): Verdict {
+  assertMandatoryBoundary("workflow.target-identity", /^[A-Z][A-Z0-9]*-\d+$/.test(ticket), "invalid transition ticket identity");
   const rule = RULES[via];
   const { policy } = opts.settings ?? readRuntimeSettings();
   if (opts.expected !== undefined && current !== opts.expected)

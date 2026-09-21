@@ -11,7 +11,7 @@
 // guard must not paralyze the work it protects (same policy as bash-guard).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
@@ -19,6 +19,7 @@ import { RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRu
 import { stopVerdict } from "./report-guard.ts";
 import { buildDigest } from "./warmup.ts";
 import { classifyResearchCall, researchIdentity } from "./research-guard.ts";
+import { assertMandatoryBoundary, WorkflowBoundaryError } from "./workflow-boundaries.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 
@@ -89,13 +90,19 @@ export default function guards(pi: ExtensionAPI) {
     }
     try {
       const settings = readRuntimeSettings(ROOT);
+      if (process.env.YOKEMATE_MODE === "do" && event.toolName === "bash")
+        assertMandatoryBoundary("workflow.assigned-scope", typeof ctx.cwd === "string" && isAbsolute(ctx.cwd), "package operation needs an absolute host cwd; use cd '<assigned worktree>' && npm test");
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
       if (!call) return undefined;
+      const callCwd = resolve(ctx.cwd);
+      assertMandatoryBoundary("workflow.assigned-scope", callCwd === ROOT || callCwd.startsWith(ROOT + sep), "tool call cwd is outside the yokemate scope");
       const v = judge(process.env.YOKEMATE_MODE, call.name, call.input, {
         root: ROOT,
         dataRoot: dataRootOf(ROOT),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
+        cwd: ctx.cwd,
+        project: process.env.YOKEMATE_PROJECT,
       }, settings);
       if (!v) return undefined;
       if (v.decision === "deny") return { block: true, reason: v.reason };
@@ -104,7 +111,7 @@ export default function guards(pi: ExtensionAPI) {
       const ok = ctx.hasUI ? await ctx.ui.confirm("Ship merges", v.reason) : false;
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
-      if (e instanceof RuntimeSettingsError) return { block: true, reason: e.message };
+      if (e instanceof RuntimeSettingsError || e instanceof WorkflowBoundaryError) return { block: true, reason: e.message };
       if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }

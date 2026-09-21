@@ -28,6 +28,20 @@ test("identities distinguish same-name siblings and batches; duplicate and forei
   assert.deepEqual(runs.active().map((child) => child.identity.batchId), ["B"]);
 });
 
+test("settlement and batch snapshots are immutable from caller mutation", () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("immutable", [{ agent: "worker", task: "task" }], cwd).children[0]!.identity;
+  const result = resultEnvelope(identity, "task", clean, "original");
+  assert.equal(runs.settle(result), true);
+  result.payload = "mutated";
+  (result.identity as { agent: string }).agent = "changed";
+  const first = runs.batch("immutable")!;
+  assert.equal(first.results[0]!.payload, "original");
+  assert.equal(first.results[0]!.identity.agent, "worker");
+  first.results[0]!.payload = "batch mutation";
+  assert.equal(runs.batch("immutable")!.results[0]!.payload, "original");
+});
+
 test("plan scouts require an explicit or stamped ticket and keep it in correlation identity", () => {
   assert.throws(() => new ChildRuns("owner", "session").admit("missing", [{ agent: "plan-scout", task: "scout" }], cwd), /ticket binding/);
   const stamped = new ChildRuns("owner", "session", "YM-1");
@@ -36,6 +50,37 @@ test("plan scouts require an explicit or stamped ticket and keep it in correlati
   assert.throws(() => stamped.admit("foreign", [{ agent: "plan-scout", task: "scout", ticket: "YM-2" }], cwd), /differs/);
   const problem = new ChildRuns("owner", "session").admit("problem", [{ agent: "plan-scout", task: "scout", ticket: "YM-3" }], cwd);
   assert.equal(problem.children[0]!.identity.ticket, "YM-3");
+});
+
+test("current accepted scout gates plan writers and a newer scout revokes prior permission", () => {
+  const runs = new ChildRuns("owner", "session", "YM-1");
+  assert.throws(() => new ChildRuns("owner", "session").admit("writer-unbound", [{ agent: "plan-writer", task: "write" }], cwd), /ticket binding/);
+  assert.throws(() => runs.admit("writer-early", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
+  const first = runs.admit("scout-one", [{ agent: "plan-scout", task: "scout one" }], cwd).children[0]!.identity;
+  const accepted = resultEnvelope(first, "scout one", clean, "# Scout");
+  accepted.artifact = { state: "accepted", path: "/artifact", hash: "a".repeat(64), bytes: 7, acceptanceId: 1 };
+  assert.equal(runs.settle(accepted), true);
+  assert.equal(runs.admit("writer-one", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd).children[0]!.identity.ticket, "YM-1");
+  const newer = runs.admit("scout-two", [{ agent: "plan-scout", task: "scout two" }], cwd).children[0]!.identity;
+  assert.throws(() => runs.admit("writer-revoked", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
+  assert.equal(runs.settle(resultEnvelope(newer, "scout two", { ...clean, protocolError: true }, "beautiful final")), true);
+  assert.throws(() => runs.admit("writer-after-fault", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /current accepted scout/);
+});
+
+test("plan writers require an explicit accepted scout binding and preserve it in child identity", () => {
+  const runs = new ChildRuns("owner", "session", "YM-1");
+  assert.throws(() => runs.admit("missing-input", [{ agent: "plan-writer", task: "write" }], cwd), /acceptedInputId/);
+  assert.throws(() => new ChildRuns("owner", "session").admit("missing-ticket", [{ agent: "plan-writer", task: "write", acceptedInputId: 1 }], cwd), /explicit ticket/);
+  const scout = runs.admit("scout", [{ agent: "plan-scout", task: "investigate" }], cwd).children[0]!.identity;
+  const accepted = resultEnvelope(scout, "investigate", clean, "# Scout");
+  accepted.artifact = { state: "accepted", path: "/artifact", hash: "a".repeat(64), bytes: 7, acceptanceId: 7 };
+  assert.equal(runs.settle(accepted), true);
+  assert.throws(() => runs.admit("wrong-input", [{ agent: "plan-writer", task: "write", acceptedInputId: 8 }], cwd), /current accepted scout/);
+  const identity = runs.admit("writer", [{ agent: "plan-writer", task: "write", ticket: "YM-1", acceptedInputId: 7 }], cwd).children[0]!.identity;
+  assert.equal(identity.ticket, "YM-1");
+  assert.equal(identity.acceptedInputId, 7);
+  assert.throws(() => runs.admit("foreign", [{ agent: "plan-writer", task: "write", ticket: "YM-2", acceptedInputId: 8 }], cwd), /differs/);
+  assert.throws(() => runs.admit("bad-revision", [{ agent: "plan-writer", task: "revise", ticket: "YM-1", acceptedInputId: 7, writerRevisionOf: "short" }], cwd), /full draft hash/);
 });
 
 test("review revisions are validated before admission and template hashes survive chain substitution", () => {
@@ -98,6 +143,93 @@ test("JSONL framing reports malformed, unfinished and overflow records without r
   }
 });
 
+test("parser facts are byte-exact, cumulative and preserve authoritative final hashes", async () => {
+  const { JsonlObservation, sha256 } = await import("../src/subagent-runs.ts");
+  const record = (bytes: number) => {
+    const prefix = '{"type":"future_event","pad":"';
+    const suffix = '"}';
+    return Buffer.from(prefix + "x".repeat(bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)) + suffix);
+  };
+  const exact = new JsonlObservation();
+  const exactWire = Buffer.concat([record(1024 * 1024), Buffer.from("\r\n")]);
+  for (let offset = 0; offset < exactWire.length; offset += 8191) exact.write(exactWire.subarray(offset, offset + 8191));
+  exact.end();
+  assert.equal(exact.protocolError, false);
+  assert.equal(exact.metadata().events.other, 1);
+  assert.equal(exact.metadata().stdoutBytes, exactWire.length);
+  assert.equal(exact.metadata().stdoutHash, sha256(exactWire));
+
+  const tooLarge = new JsonlObservation();
+  tooLarge.write(Buffer.concat([record(1024 * 1024 + 1), Buffer.from("\n")]))
+  tooLarge.end();
+  assert.deepEqual(tooLarge.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+  assert.equal(tooLarge.metadata().parserErrorCounters.record_limit, 1);
+
+  const overflowEof = new JsonlObservation();
+  overflowEof.write(record(1024 * 1024 + 2));
+  overflowEof.end();
+  overflowEof.end();
+  assert.deepEqual(overflowEof.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+  assert.deepEqual(overflowEof.metadata().lastParserError, { kind: "partial_record", offset: 0 });
+  assert.deepEqual(overflowEof.metadata().parserErrorCounters, { invalid_json: 0, invalid_event: 0, record_limit: 1, partial_record: 1 });
+
+  const mixed = new JsonlObservation();
+  const finalText = "é日🙂tail";
+  const final = Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: finalText }], stopReason: "stop" } }) + "\n");
+  const wire = Buffer.concat([Buffer.from("junk\n{}\n{\"type\":\"future\"}\n"), final]);
+  for (const byte of wire) mixed.write(Buffer.from([byte]));
+  mixed.end();
+  assert.equal(mixed.finalText, finalText);
+  assert.equal(mixed.metadata().assistantMessageSeen, true);
+  assert.equal(mixed.metadata().finalTextPresent, true);
+  assert.equal(mixed.metadata().events.other, 1);
+  assert.deepEqual(mixed.metadata().parserErrorCounters, { invalid_json: 1, invalid_event: 1, record_limit: 0, partial_record: 0 });
+  assert.deepEqual(mixed.metadata().firstParserError, { kind: "invalid_json", offset: 0 });
+  assert.deepEqual(mixed.metadata().lastParserError, { kind: "invalid_event", offset: 5 });
+  assert.equal(mixed.metadata().stdoutHash, sha256(wire));
+
+  const completeWithoutLf = new JsonlObservation();
+  completeWithoutLf.write(final.subarray(0, -1));
+  completeWithoutLf.end();
+  assert.equal(completeWithoutLf.metadata().assistantMessageSeen, false);
+  assert.deepEqual(completeWithoutLf.metadata().lastParserError, { kind: "partial_record", offset: 0 });
+});
+
+test("patched producer summarizes only oversized agent_end messages and parser validates the summary", async () => {
+  const { JsonlObservation, sha256 } = await import("../src/subagent-runs.ts");
+  const { toJsonEvent, YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/json-event.js");
+  assert.equal(YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION, 1);
+  const small = { type: "agent_end", messages: [{ role: "user", content: "small" }], willRetry: false } as any;
+  const smallCopy = structuredClone(small);
+  assert.equal(toJsonEvent(small, { yokemateSubagentJsonContract: 1 }), small);
+  assert.equal(JSON.stringify(toJsonEvent(small, { yokemateSubagentJsonContract: 1 })), JSON.stringify(small));
+  assert.deepEqual(small, smallCopy);
+
+  const messages = [{ role: "user", content: "é".repeat(600_000) }, { role: "assistant", content: "tail" }];
+  const large = { type: "agent_end", messages, willRetry: true } as any;
+  const summarized = toJsonEvent(large, { yokemateSubagentJsonContract: 1 }) as any;
+  const serializedMessages = JSON.stringify(messages);
+  assert.equal(summarized.messages, undefined);
+  assert.deepEqual(summarized.messagesSummary, { version: 1, count: 2, bytes: Buffer.byteLength(serializedMessages), sha256: sha256(serializedMessages) });
+  assert.equal(summarized.willRetry, true);
+  assert.equal(large.messages, messages);
+
+  const valid = new JsonlObservation();
+  valid.write(Buffer.from(JSON.stringify(summarized) + "\n"));
+  valid.end();
+  assert.equal(valid.protocolError, false);
+  for (const bad of [
+    { ...summarized, messages: [{ role: "user", content: "small" }] },
+    { ...summarized, messagesSummary: { ...summarized.messagesSummary, version: 2 } },
+    { ...summarized, messagesSummary: { ...summarized.messagesSummary, sha256: "A".repeat(64) } },
+  ]) {
+    const observed = new JsonlObservation();
+    observed.write(Buffer.from(JSON.stringify(bad) + "\n"));
+    observed.end();
+    assert.deepEqual(observed.metadata().lastParserError, { kind: "invalid_event", offset: 0 });
+  }
+});
+
 test("tool and retry remain incomplete until their actual end events", async () => {
   const { JsonlObservation } = await import("../src/subagent-runs.ts");
   const observed = new JsonlObservation();
@@ -112,37 +244,49 @@ test("tool and retry remain incomplete until their actual end events", async () 
   assert.doesNotMatch(JSON.stringify(observed.metadata()), /private/);
 });
 
-test("metadata snapshots are private, bounded, retain active runs and survive write/rename/prune faults", async () => {
+test("ordinary snapshots are private, bounded, locked and protect active delivery lifecycles", async () => {
   const fs = (await import("node:fs")).default;
   const path = await import("node:path");
   const { tmpdir } = await import("node:os");
-  const { RunSnapshots, errorMetadata } = await import("../src/subagent-runs.ts");
-  const root = fs.mkdtempSync(path.join(tmpdir(), "ym204-snapshots-"));
-  const folder = path.join(root, "home/knowledge/org/repo/ai/task");
-  fs.mkdirSync(folder, { recursive: true });
-  const plan = path.join(folder, "plan.md");
-  fs.writeFileSync(plan, "plan");
-  const dir = path.join(folder, "reviewer-runs");
+  const { JsonlObservation, RunSnapshots } = await import("../src/subagent-runs.ts");
+  const root = fs.mkdtempSync(path.join(tmpdir(), "ym226-snapshots-"));
+  const activeRoot = path.join(root, "active");
   try {
-    const snapshots = new RunSnapshots(root, plan);
-    assert.equal(snapshots.write("owner", "active", { error: errorMetadata(new Error("private credentials")) }, false), true);
-    for (let i = 0; i < 24; i++) assert.equal(snapshots.write("owner", `run-${i}`, {}, true), true);
-    assert.equal(fs.readdirSync(dir).length, 21);
+    const snapshots = new RunSnapshots(activeRoot);
+    const identity = { ownerSessionId: "session", batchId: "batch", agent: "worker", taskHash: "a".repeat(64) };
+    const observed = new JsonlObservation();
+    observed.write(Buffer.from(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } }) + "\n"));
+    const stream = { ...observed.metadata(), privateNested: "private sentinel" };
+    assert.deepEqual(snapshots.write("owner", "active", { identity, ownerPid: process.pid, runtime: { node: process.version, pi: "0.85.1", contract: 1, privateNested: "private sentinel" }, artifact: { state: "accepted", hash: "b".repeat(64), bytes: 4, acceptanceId: 7, path: "private sentinel" }, publication: { state: "pending", revision: "c".repeat(64), publicationId: 9, error: "target_unavailable", target: "private sentinel" }, stream, rawPrompt: "private sentinel", deliveries: {} }, false), { state: "available" });
+    const dir = path.join(activeRoot, "sessions/subagent-runs");
     const active = fs.readFileSync(path.join(dir, "owner-active.json"), "utf8");
-    assert.doesNotMatch(active, /private credentials/);
+    const activeSnapshot = JSON.parse(active);
+    assert.deepEqual(activeSnapshot.artifact, { state: "accepted", hash: "b".repeat(64), bytes: 4, acceptanceId: 7 });
+    assert.deepEqual(activeSnapshot.publication, { state: "pending", revision: "c".repeat(64), publicationId: 9, error: "target_unavailable" });
+    assert.deepEqual(activeSnapshot.runtime, { node: process.version, pi: "0.85.1", contract: 1 });
+    assert.doesNotMatch(active, /private sentinel|rawPrompt|privateNested/);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(path.join(dir, "owner-active.json")).mode & 0o777, 0o600);
-    for (const method of ["writeFileSync", "renameSync", "unlinkSync"] as const) {
-      const writer = new RunSnapshots(root, plan);
-      assert.equal(writer.write("owner", `fill-${method}`, {}, true), true);
-      const original = fs[method];
-      (fs as any)[method] = () => { throw new Error("injected private failure"); };
-      try { assert.equal(writer.write("owner", `fault-${method}`, {}, true), false); }
-      finally { (fs as any)[method] = original; }
+    for (let i = 0; i < 39; i++) assert.equal(snapshots.write("owner", `active-${i}`, { identity, deliveries: {} }, false).state, "available");
+    assert.deepEqual(snapshots.write("owner", "protected-overflow", { identity, deliveries: {} }, false), { state: "unavailable", code: "storage_limit" });
+    assert.equal(fs.readdirSync(dir).filter((name: string) => name.endsWith(".json")).length, 40);
+
+    const completedRoot = path.join(root, "completed");
+    const completed = new RunSnapshots(completedRoot);
+    for (let i = 0; i < 24; i++) {
+      const delivery = "b".repeat(62) + i.toString(16).padStart(2, "0");
+      const status = completed.write("owner", `run-${i}`, { identity, closeAt: new Date().toISOString(), terminal: { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, deliveries: { [delivery]: { state: "observed", envelopeHash: "c".repeat(64), observedAt: new Date().toISOString() } }, arbitrary: "private sentinel" }, true);
+      assert.equal(status.state, "available");
     }
-    assert.equal(fs.existsSync(path.join(dir, "owner-active.json")), true);
-    assert.throws(() => new RunSnapshots(root, path.join(root, "plan.md")), /invalid reviewer/);
-    const limit = new RunSnapshots(root, plan);
-    assert.equal(limit.write("owner", "oversize", { tooLarge: "x".repeat(PAYLOAD_LIMIT) }, true), false);
+    const completedDir = path.join(completedRoot, "sessions/subagent-runs");
+    assert.equal(fs.readdirSync(completedDir).filter((name: string) => name.endsWith(".json")).length, 20);
+    assert.doesNotMatch(fs.readFileSync(path.join(completedDir, fs.readdirSync(completedDir).find((name: string) => name.endsWith(".json"))!), "utf8"), /private sentinel/);
+
+    const liveLockRoot = path.join(root, "live-lock");
+    const liveLock = new RunSnapshots(liveLockRoot, { pid: 42, processStarttime: () => "live" });
+    fs.mkdirSync(liveLock.directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(liveLock.directory, ".lock"), JSON.stringify({ pid: 41, starttime: "live" }), { mode: 0o600 });
+    assert.deepEqual(liveLock.write("owner", "blocked", { identity }, false), { state: "unavailable", code: "storage_busy" });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -171,6 +315,130 @@ test("result, chain and follow-up batch canonical contracts remain distinct and 
   assert.equal(reportContent(followUp, followUpDelivery), `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: followUpDelivery.deliveryId, envelopeHash: followUpDelivery.envelopeHash, envelope: followUp })}`);
 });
 
+test("ordinary lifecycle reserves before dispatch and cancellation keeps the first terminal claim", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("cancel", [{ agent: "worker", task: "work" }, { agent: "worker", task: "queued" }], cwd);
+  const active = ack.children[0]!.identity;
+  const queued = ack.children[1]!.identity;
+  assert.deepEqual(runs.active().map((child) => child.identity.runId), [active.runId, queued.runId]);
+  assert.equal(runs.start(active), true);
+  assert.equal(runs.attachProcess(active, process.pid, "start"), true);
+  const first = runs.requestCancel(active.runId, "tool_cancel");
+  const repeat = runs.requestCancel(active.runId, "later_cancel");
+  assert.equal(first.first, true);
+  assert.equal(first.shouldSignal, true);
+  assert.equal(repeat.first, false);
+  assert.equal(repeat.result.cancellationInitiator, "tool_cancel");
+  const claimed = runs.claimTerminal(active, "work", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "late clean output")!;
+  assert.equal(claimed.claimed, true);
+  assert.equal(claimed.result.processOutcome, "cancelled");
+  assert.equal(claimed.result.exitCode, 0);
+  assert.equal(claimed.result.cancellationInitiator, "tool_cancel");
+  assert.equal(claimed.result.payloadOutcome, "incomplete");
+  assert.equal(runs.claimTerminal(active, "work", { processOutcome: "signaled", exitCode: null, signal: "SIGKILL", protocolError: true }, "bad")!.claimed, false);
+  runs.completeCleanup(active);
+  assert.equal((await first.completion).status, "cancelled");
+  assert.equal(runs.settle(claimed.result), true);
+  assert.equal(runs.requestCancel(active.runId, "third").result.status, "already_terminal");
+
+  const queuedCancel = runs.requestCancel(queued.runId, "parent_cancel");
+  assert.equal(queuedCancel.result.status, "cancellation_requested");
+  assert.equal(runs.claimed(queued)?.processOutcome, "cancelled");
+  runs.completeCleanup(queued);
+  assert.equal((await queuedCancel.completion).terminal, true);
+  assert.equal(runs.settle(runs.claimed(queued)!), true);
+  assert.deepEqual(runs.batch("cancel")?.results.map((result) => result.identity.runId), [active.runId, queued.runId]);
+  assert.deepEqual(runs.active(), []);
+});
+
+test("unconfirmed process identity releases cancellation wait and compact repeats retain only terminal facts", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("mismatch", [{ agent: "worker", task: "sensitive prompt" }], cwd).children[0]!.identity;
+  assert.equal(runs.start(identity), true);
+  assert.equal(runs.attachProcess(identity, process.pid, "stale-starttime"), true);
+  const requested = runs.requestCancel(identity.runId, "tool_cancel");
+  const unconfirmed = runs.markCancellationUnconfirmed(identity.runId, "process identity could not be verified for cancellation");
+  assert.equal(unconfirmed.status, "cancellation_requested");
+  assert.equal(unconfirmed.terminal, false);
+  assert.match(unconfirmed.reason ?? "", /could not be verified/);
+  assert.deepEqual(await requested.completion, unconfirmed);
+  assert.equal(runs.requestCancel(identity.runId, "repeat").result.status, "cancellation_requested");
+  const terminal = runs.claimTerminal(identity, "sensitive prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  assert.equal(runs.completeCleanup(identity), true);
+  assert.equal(runs.settle(terminal), true);
+  assert.ok(runs.batch("mismatch"));
+  assert.equal(runs.compactBatch("mismatch"), true);
+  assert.equal(runs.batches.has("mismatch"), false);
+  const retained = runs.children.get(identity.runId)! as any;
+  assert.equal(retained.templateTask, undefined);
+  assert.equal(retained.resolvedTask, undefined);
+  assert.equal(retained.cleanupPromise, undefined);
+  const terminalRepeat = runs.requestCancel(identity.runId, "after-terminal").result;
+  assert.equal(terminalRepeat.status, "already_terminal");
+  assert.equal(terminalRepeat.cancellationInitiator, "tool_cancel");
+
+  const cleanupRuns = new ChildRuns("owner", "session");
+  const cleanupIdentity = cleanupRuns.admit("cleanup", [{ agent: "worker", task: "prompt" }], cwd).children[0]!.identity;
+  cleanupRuns.start(cleanupIdentity);
+  const cleanupTerminal = cleanupRuns.claimTerminal(cleanupIdentity, "prompt", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "done")!.result;
+  const pendingCleanupCancellation = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel");
+  assert.equal(pendingCleanupCancellation.result.status, "cancellation_requested");
+  assert.equal(pendingCleanupCancellation.waitForCleanup, true);
+  cleanupRuns.markCancellationUnconfirmed(cleanupIdentity.runId, "temporary prompt cleanup could not be verified");
+  const failedCleanupCancellation = await pendingCleanupCancellation.completion;
+  assert.equal(failedCleanupCancellation.status, "cancellation_requested");
+  assert.equal(failedCleanupCancellation.cancellationInitiator, undefined);
+  assert.match(failedCleanupCancellation.reason ?? "", /cleanup could not be verified/);
+  cleanupRuns.settle(cleanupTerminal);
+  cleanupRuns.compactBatch("cleanup");
+  const cleanupRepeat = cleanupRuns.requestCancel(cleanupIdentity.runId, "late-cancel").result;
+  assert.equal(cleanupRepeat.status, "cancellation_requested");
+  assert.equal(cleanupRepeat.cancellationInitiator, undefined);
+  assert.match(cleanupRepeat.reason ?? "", /cleanup could not be verified/);
+});
+
+test("bulk shutdown excludes deferred chain remainder from explicit cancellation", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("shutdown-chain", [{ agent: "worker", task: "first" }, { agent: "worker", task: "after {previous}" }], cwd);
+  const first = ack.children[0]!.identity;
+  const remainder = ack.children[1]!.identity;
+  runs.defer(remainder);
+  runs.start(first);
+  assert.deepEqual(runs.shutdownActive().map((child) => child.identity.runId), [first.runId]);
+  runs.requestCancel(first.runId, "session_shutdown");
+  runs.resolveTask(remainder, "after cancelled predecessor");
+  const result = runs.claimNoSpawn(remainder)!;
+  assert.equal(result.processOutcome, "not_started");
+  assert.equal(result.cancellationInitiator, undefined);
+});
+
+test("deferred chain cancellation waits for the actual resolved task and protocol errors win payload classification", async () => {
+  const runs = new ChildRuns("owner", "session");
+  const identity = runs.admit("chain-cancel", [{ agent: "worker", task: "after {previous}" }], cwd).children[0]!.identity;
+  assert.equal(runs.defer(identity), true);
+  const request = runs.requestCancel(identity.runId, "tool_cancel");
+  assert.equal(request.waitForCleanup, false);
+  assert.equal(request.result.status, "cancellation_requested");
+  assert.equal(runs.claimed(identity), undefined);
+  const resolved = "after actual predecessor output";
+  assert.equal(runs.resolveTask(identity, resolved), true);
+  const result = runs.claimNoSpawn(identity)!;
+  assert.equal(result.actualTaskHash, (await import("../src/subagent-runs.ts")).sha256(resolved));
+  assert.notEqual(result.actualTaskHash, identity.taskHash);
+  runs.completeCleanup(identity);
+  assert.equal(runs.settle(result), true);
+
+  const protocolRuns = new ChildRuns("owner", "session");
+  const protocolIdentity = protocolRuns.admit("protocol", [{ agent: "worker", task: "work" }], cwd).children[0]!.identity;
+  protocolRuns.start(protocolIdentity);
+  const cancel = protocolRuns.requestCancel(protocolIdentity.runId, "shutdown");
+  const protocol = protocolRuns.claimTerminal(protocolIdentity, "work", { processOutcome: "signaled", exitCode: null, signal: "SIGTERM", protocolError: true }, "late")!.result;
+  assert.equal(protocol.processOutcome, "cancelled");
+  assert.equal(protocol.payloadOutcome, "protocol_error");
+  protocolRuns.completeCleanup(protocolIdentity);
+  assert.equal((await cancel.completion).status, "cancelled");
+});
+
 test("aggregate framing budgets account for escaped content and details without changing settled envelopes", async () => {
   const { boundBatchResult, deliveryFor, reportContent, JsonlObservation } = await import("../src/subagent-runs.ts");
   for (const character of ["x", '"']) {
@@ -179,7 +447,8 @@ test("aggregate framing budgets account for escaped content and details without 
     const payload = JSON.stringify({ status: "approved", findings: [{ severity: "advice", lens: 1, file: "fixture.ts", line: 1, problem: "fixture", evidence: character.repeat(character === "x" ? 48000 : 24000), fix: "fixture" }] });
     assert.ok(Buffer.byteLength(payload) < PAYLOAD_LIMIT);
     const results = ack.children.map(({ identity }) => boundBatchResult(resultEnvelope(identity, task.task, clean, payload), ack.children.map((child) => child.identity)));
-    assert.ok(results.every((result) => result.payloadOutcome === (character === "x" ? "valid" : "output_limit")));
+    assert.ok(results.every((result) => result.payloadOutcome === "valid"));
+    if (character === '"') assert.ok(results.every((result) => Buffer.byteLength(result.payload) < Buffer.byteLength(payload)));
     for (const result of results) assert.equal(runs.settle(result), true);
     const envelope = runs.batch("maximum")!;
     assert.deepEqual(envelope.results, results);
@@ -195,6 +464,9 @@ test("aggregate framing budgets account for escaped content and details without 
   }
   const runs = new ChildRuns("owner", "session");
   assert.throws(() => runs.admit("oversized-identities", Array.from({ length: 2000 }, () => ({ agent: "worker", task: "task" })), cwd), /batch identity exceeds JSONL transport budget/);
+  const one = new ChildRuns("owner", "session").admit("immutable-overflow", [{ agent: "worker", task: "task" }], cwd);
+  const immutableOverflow = { ...resultEnvelope(one.children[0]!.identity, "task", clean, "done"), artifact: { state: "verified" as const, path: `/private/${"x".repeat(600000)}`, hash: "a".repeat(64), bytes: 4 } };
+  assert.throws(() => boundBatchResult(immutableOverflow, one.children.map((child) => child.identity)), /immutable subagent result exceeds JSONL transport budget/);
   assert.equal(runs.children.size, 0);
   assert.equal(runs.batches.size, 0);
 });

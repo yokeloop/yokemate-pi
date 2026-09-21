@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { subagentConcurrency, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export type ListMode = "plan" | "do" | "ship";
 export type KeyRunState = "reserved" | "starting" | "active" | "refused" | "recorded" | "done" | "blocked" | "cancelled";
 export interface ListRunIdentity { readonly listRunId: string; readonly parentSessionId: string; readonly parentRuntimeId: string; readonly mode: ListMode; readonly keys: readonly string[] }
 export interface ListImmediate { state: "accepted" | "refused"; reservation?: "queued" | "ready"; reason?: string; facts?: Record<string, unknown> }
 export interface ListTerminal { outcome: "recorded" | "done" | "blocked" | "cancelled"; reason?: string; facts?: Record<string, unknown> }
-export interface KeyRunEntry { readonly keyRunId: string; readonly key: string; readonly index: number; state: KeyRunState; immediate?: ListImmediate; terminal?: ListTerminal }
+export interface ListStartup { state: "started" | "refused" | "failed" | "cancelled"; reason?: string; runId?: string; facts?: Record<string, unknown> }
+export interface KeyRunEntry { readonly keyRunId: string; readonly key: string; readonly index: number; state: KeyRunState; immediate?: ListImmediate; startup?: ListStartup; terminal?: ListTerminal }
 export interface ListRun { readonly identity: ListRunIdentity; readonly settings: RuntimeSettings; readonly entries: KeyRunEntry[]; immediatePublished: boolean; aggregatePublished: boolean }
 export interface ListAggregate { listRunId: string; mode: ListMode; results: readonly { keyRunId: string; key: string; index: number; immediate: ListImmediate; terminal?: ListTerminal }[] }
 export interface ListAdmission {
@@ -19,7 +21,8 @@ export interface ListAdmission {
   rejectKey?(key: string, index: number): string | undefined;
   rejectDuplicate?: boolean;
 }
-export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
+export interface KeyRunContext { listRunId: string; keyRunId: string; parentRunId: string; key: string; index: number; mode: ListMode; settings: RuntimeSettings; signal: AbortSignal; startup(value: ListStartup): boolean; active(facts?: Record<string, unknown>): boolean; terminal(value: ListTerminal): boolean }
+export interface RecoveryRun { readonly keyRunId: string; readonly generation: number; readonly recoveryRunId: string; state: "active" | "recorded" | "cancelled"; terminal?: ListTerminal }
 
 type Listener = (run: ListRun, entry: KeyRunEntry) => void;
 
@@ -33,17 +36,21 @@ export class ListRunRegistry {
   private readonly starts = new Map<string, (context: KeyRunContext) => Promise<ListTerminal | void>>();
   private readonly buffered = new Map<string, ListTerminal>();
   private readonly released = new Set<string>();
+  private readonly recoveries = new Map<string, RecoveryRun>();
   private readonly immediateListeners = new Set<Listener>();
   private readonly terminalListeners = new Set<Listener>();
   private readonly aggregateListeners = new Set<(aggregate: ListAggregate) => void>();
+  private readonly startupWaiters = new Map<string, Set<(startup: ListStartup) => void>>();
   private running = 0;
+  private pumpSuspended = 0;
 
   onImmediate(listener: Listener): () => void { this.immediateListeners.add(listener); return () => this.immediateListeners.delete(listener); }
   onTerminal(listener: Listener): () => void { this.terminalListeners.add(listener); return () => this.terminalListeners.delete(listener); }
   onAggregate(listener: (aggregate: ListAggregate) => void): () => void { this.aggregateListeners.add(listener); return () => this.aggregateListeners.delete(listener); }
 
   admit(input: ListAdmission): ListRun {
-    if (!input.keys.length) throw new Error(`${input.mode} list needs at least one key`);
+    assertMandatoryBoundary("workflow.live-owner", !!input.parentSessionId && !!input.parentRuntimeId, "list run requires a live parent owner");
+    assertMandatoryBoundary("workflow.assigned-scope", input.keys.length > 0, `${input.mode} list needs at least one key`);
     const identities = input.keys.map((key, index) => ({ keyRunId: randomUUID(), key, index }));
     const identity: ListRunIdentity = Object.freeze({ listRunId: randomUUID(), parentSessionId: input.parentSessionId, parentRuntimeId: input.parentRuntimeId, mode: input.mode, keys: Object.freeze([...input.keys]) });
     const run: ListRun = { identity, settings: input.settings, entries: identities.map((entry) => ({ ...entry, state: "reserved" })), immediatePublished: false, aggregatePublished: false };
@@ -69,6 +76,7 @@ export class ListRunRegistry {
       if (reason) {
         entry.state = "refused";
         entry.immediate = { state: "refused", reason };
+        entry.startup = { state: "refused", reason };
         entry.terminal = { outcome: "blocked", reason };
       } else {
         entry.immediate = { state: "accepted", reservation: accepted < subagentConcurrency(input.settings, input.keys.length) ? "ready" : "queued" };
@@ -106,10 +114,52 @@ export class ListRunRegistry {
 
   wasLifetimeReleased(keyRunId: string): boolean { return this.released.has(keyRunId); }
 
+  admitRecovery(keyRunId: string, generation: number): RecoveryRun {
+    const found = this.find(keyRunId);
+    if (!found || found.entry.state !== "blocked" || !Number.isSafeInteger(generation) || generation < 1) throw new Error("only a blocked plan run can admit recovery");
+    const existing = this.recoveries.get(keyRunId);
+    if (existing) {
+      if (existing.generation !== generation) throw new Error("recovery generation changed");
+      return existing;
+    }
+    const recovery: RecoveryRun = { keyRunId, generation, recoveryRunId: `${keyRunId}:${generation}`, state: "active" };
+    this.recoveries.set(keyRunId, recovery);
+    return recovery;
+  }
+
+  recovery(keyRunId: string): RecoveryRun | undefined { return this.recoveries.get(keyRunId); }
+
+  settleRecovery(keyRunId: string, terminal: ListTerminal): boolean {
+    const recovery = this.recoveries.get(keyRunId);
+    if (!recovery || recovery.state !== "active" || terminal.outcome !== "recorded") return false;
+    recovery.state = "recorded";
+    recovery.terminal = { ...terminal, facts: terminal.facts && { ...terminal.facts } };
+    return true;
+  }
+
   start(listRunId: string, start: (context: KeyRunContext) => Promise<ListTerminal | void>): void {
     const run = this.requiredList(listRunId);
     for (const entry of run.entries) if (entry.immediate?.state === "accepted" && !terminalState(entry.state)) this.starts.set(entry.keyRunId, start);
     this.pump();
+  }
+
+  settleStartup(keyRunId: string, startup: ListStartup): boolean {
+    const found = this.find(keyRunId);
+    if (!found || found.entry.startup) return false;
+    found.entry.startup = { ...startup, ...(startup.facts ? { facts: { ...startup.facts } } : {}) };
+    const waiters = this.startupWaiters.get(keyRunId);
+    if (waiters) {
+      this.startupWaiters.delete(keyRunId);
+      for (const resolvePromise of waiters) resolvePromise(found.entry.startup);
+    }
+    return true;
+  }
+
+  waitForStartup(keyRunId: string): Promise<ListStartup> {
+    const found = this.find(keyRunId);
+    if (!found) return Promise.reject(new Error(`unknown key run ${keyRunId}`));
+    if (found.entry.startup) return Promise.resolve(found.entry.startup);
+    return new Promise((resolvePromise) => (this.startupWaiters.get(keyRunId) ?? this.startupWaiters.set(keyRunId, new Set()).get(keyRunId)!).add(resolvePromise));
   }
 
   markActive(keyRunId: string, facts?: Record<string, unknown>): boolean {
@@ -121,6 +171,7 @@ export class ListRunRegistry {
   }
 
   settle(listRunId: string, keyRunId: string, terminal: ListTerminal): boolean {
+    assertMandatoryBoundary("workflow.terminal-lineage", !!listRunId && !!keyRunId, "terminal lineage is incomplete");
     const run = this.lists.get(listRunId);
     const entry = run?.entries.find((candidate) => candidate.keyRunId === keyRunId);
     if (!run || !entry || terminalState(entry.state)) return false;
@@ -130,13 +181,34 @@ export class ListRunRegistry {
 
   cancel(id: string, reason = "cancelled"): boolean {
     const list = this.lists.get(id);
-    if (list) {
-      let changed = false;
-      for (const entry of list.entries) changed = this.cancelEntry(list, entry, reason) || changed;
-      return changed;
+    if (list) return this.cancelMany(list.entries.map((entry) => entry.keyRunId), reason);
+    return this.cancelMany([id], reason);
+  }
+
+  cancelMany(ids: readonly string[], reason = "cancelled"): boolean {
+    const targets = [...new Set(ids)].map((id) => this.find(id)).filter((found): found is { run: ListRun; entry: KeyRunEntry } => Boolean(found && !terminalState(found.entry.state)));
+    let recoveryChanged = false;
+    for (const id of new Set(ids)) recoveryChanged = this.cancelRecovery(id, reason) || recoveryChanged;
+    if (!targets.length) return recoveryChanged;
+    this.pumpSuspended++;
+    try {
+      for (const { entry } of targets) this.starts.delete(entry.keyRunId);
+      for (const { entry } of targets) this.controllers.get(entry.keyRunId)?.abort(reason);
+      for (const { entry } of targets) this.settleStartup(entry.keyRunId, { state: "cancelled", reason });
+      for (const { run, entry } of targets) this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "cancelled", reason });
+      return true;
+    } finally {
+      this.pumpSuspended--;
+      this.pump();
     }
-    const found = this.find(id);
-    return found ? this.cancelEntry(found.run, found.entry, reason) : false;
+  }
+
+  cancelRecovery(keyRunId: string, reason = "cancelled"): boolean {
+    const recovery = this.recoveries.get(keyRunId);
+    if (!recovery || recovery.state !== "active") return false;
+    recovery.state = "cancelled";
+    recovery.terminal = { outcome: "cancelled", reason };
+    return true;
   }
 
   get(id: string): ListRun | { run: ListRun; entry: KeyRunEntry } | undefined { return this.lists.get(id) ?? this.find(id); }
@@ -149,6 +221,7 @@ export class ListRunRegistry {
   }
 
   private pump(): void {
+    if (this.pumpSuspended) return;
     for (const run of this.lists.values()) {
       if (!run.immediatePublished) continue;
       const limit = subagentConcurrency(run.settings, run.entries.length);
@@ -161,7 +234,7 @@ export class ListRunRegistry {
         this.controllers.set(entry.keyRunId, controller);
         entry.state = "starting";
         this.running++;
-        const context: KeyRunContext = { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, parentRunId: run.identity.listRunId, key: entry.key, index: entry.index, mode: run.identity.mode, settings: run.settings, signal: controller.signal, active: (facts) => this.markActive(entry.keyRunId, facts), terminal: (terminal) => this.settle(run.identity.listRunId, entry.keyRunId, terminal) };
+        const context: KeyRunContext = { listRunId: run.identity.listRunId, keyRunId: entry.keyRunId, parentRunId: run.identity.listRunId, key: entry.key, index: entry.index, mode: run.identity.mode, settings: run.settings, signal: controller.signal, startup: (startup) => this.settleStartup(entry.keyRunId, startup), active: (facts) => this.markActive(entry.keyRunId, facts), terminal: (terminal) => this.settle(run.identity.listRunId, entry.keyRunId, terminal) };
         void start(context).then((terminal) => { if (terminal) this.settle(run.identity.listRunId, entry.keyRunId, terminal); }).catch((error) => this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "blocked", reason: error instanceof Error ? error.message : String(error) }));
       }
     }
@@ -172,19 +245,13 @@ export class ListRunRegistry {
     const occupied = (entry.state === "starting" || entry.state === "active") && !this.released.has(entry.keyRunId);
     entry.state = terminalToState(terminal.outcome);
     entry.terminal = { ...terminal, facts: terminal.facts && { ...terminal.facts } };
+    if (!entry.startup) this.settleStartup(entry.keyRunId, terminal.outcome === "cancelled" ? { state: "cancelled", reason: terminal.reason } : { state: "failed", reason: terminal.reason ?? "coordinator ended before startup acknowledgement" });
     this.controllers.delete(entry.keyRunId);
     if (occupied) this.running = Math.max(0, this.running - 1);
     for (const listener of this.terminalListeners) listener(run, entry);
     this.publishAggregate(run);
     this.pump();
     return true;
-  }
-
-  private cancelEntry(run: ListRun, entry: KeyRunEntry, reason: string): boolean {
-    if (terminalState(entry.state)) return false;
-    this.controllers.get(entry.keyRunId)?.abort(reason);
-    this.starts.delete(entry.keyRunId);
-    return this.settle(run.identity.listRunId, entry.keyRunId, { outcome: "cancelled", reason });
   }
 
   private publishAggregate(run: ListRun): void {

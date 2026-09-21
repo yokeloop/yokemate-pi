@@ -117,6 +117,74 @@ function migratePlanArtifacts(db: DatabaseSync): void {
   }
 }
 
+function addColumn(db: DatabaseSync, table: string, definition: string): void {
+  const name = definition.trim().split(/\s+/, 1)[0]!;
+  if (!columns(db, table).has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+}
+
+function migratePublicationProvenance(db: DatabaseSync): void {
+  if (columns(db, "plan_publication").has("provenance_key")) return;
+  db.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE");
+  try {
+    db.exec(`
+      CREATE TABLE plan_publication_next (
+        id INTEGER PRIMARY KEY, target TEXT NOT NULL, target_hash TEXT NOT NULL, canonical_url TEXT,
+        ticket TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('scout','plan')), content_hash TEXT NOT NULL,
+        provenance_key TEXT NOT NULL, artifact_path TEXT NOT NULL, bytes INTEGER NOT NULL, run_id TEXT NOT NULL,
+        owner_run_id TEXT, owner_session_id TEXT, batch_id TEXT, task_hash TEXT, plan_path TEXT, scope_hash TEXT,
+        scout_publication INTEGER REFERENCES plan_publication_next(id), successful_record INTEGER NOT NULL DEFAULT 0 CHECK (successful_record IN (0,1)),
+        complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0,1)), error_code TEXT,
+        side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (target,ticket,kind,content_hash,provenance_key)
+      );
+      INSERT INTO plan_publication_next
+        (id,target,target_hash,canonical_url,ticket,kind,content_hash,provenance_key,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,scout_publication,successful_record,complete,error_code,side_effects_started,created_at,updated_at)
+      SELECT id,target,target_hash,canonical_url,ticket,kind,content_hash,'normal',artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,scout_publication,successful_record,complete,error_code,side_effects_started,created_at,updated_at
+      FROM plan_publication;
+      DROP TABLE plan_publication;
+      ALTER TABLE plan_publication_next RENAME TO plan_publication;
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  } finally { db.exec("PRAGMA foreign_keys = ON"); }
+}
+
+function migrateIncidentColumns(db: DatabaseSync): void {
+  addColumn(db, "plan_publication", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
+  addColumn(db, "plan_publication", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_publication", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
+  addColumn(db, "plan_publication", "source_run_id TEXT");
+  addColumn(db, "plan_publication", "failure_hash TEXT");
+  addColumn(db, "plan_publication", "payload_hash TEXT");
+  addColumn(db, "plan_publication", "skipped_json TEXT");
+  addColumn(db, "plan_publication", "preserved_json TEXT");
+  addColumn(db, "plan_publication", "incident_reason TEXT");
+  addColumn(db, "plan_publication_acceptance", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
+  addColumn(db, "plan_publication_acceptance", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_publication_acceptance", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
+  addColumn(db, "plan_publication_acceptance", "source_run_id TEXT");
+  addColumn(db, "plan_publication_acceptance", "failure_hash TEXT");
+  addColumn(db, "plan_publication_acceptance", "payload_hash TEXT");
+  addColumn(db, "plan_publication_acceptance", "skipped_json TEXT");
+  addColumn(db, "plan_publication_acceptance", "preserved_json TEXT");
+  addColumn(db, "plan_publication_acceptance", "incident_reason TEXT");
+  addColumn(db, "plan_publication_acceptance", "continuation_id TEXT");
+  addColumn(db, "plan_publication_acceptance", "continuation_generation INTEGER");
+  addColumn(db, "plan_record", "source_kind TEXT NOT NULL DEFAULT 'normal-transport'");
+  addColumn(db, "plan_record", "incident_id TEXT REFERENCES workflow_incident(id)");
+  addColumn(db, "plan_record", "candidate_id TEXT REFERENCES plan_scout_candidate(id)");
+  addColumn(db, "plan_record", "writer_run_id TEXT");
+  addColumn(db, "plan_record", "writer_task_hash TEXT");
+  addColumn(db, "plan_record", "writer_actual_task_hash TEXT");
+  addColumn(db, "workflow_incident", "plan_state TEXT NOT NULL DEFAULT 'absent'");
+  addColumn(db, "workflow_incident", "plan_hash TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "workflow_incident", "plan_scope_hash TEXT NOT NULL DEFAULT ''");
+  addColumn(db, "workflow_incident", "plan_path_hash TEXT NOT NULL DEFAULT ''");
+}
+
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
@@ -176,6 +244,7 @@ export function openDb(path: string): DatabaseSync {
       ticket             TEXT NOT NULL,
       kind               TEXT NOT NULL CHECK (kind IN ('scout','plan')),
       content_hash       TEXT NOT NULL,
+      provenance_key     TEXT NOT NULL DEFAULT 'normal',
       artifact_path      TEXT NOT NULL,
       bytes              INTEGER NOT NULL,
       run_id             TEXT NOT NULL,
@@ -192,7 +261,7 @@ export function openDb(path: string): DatabaseSync {
       side_effects_started INTEGER NOT NULL DEFAULT 0 CHECK (side_effects_started IN (0,1)),
       created_at         TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (target, ticket, kind, content_hash)
+      UNIQUE (target, ticket, kind, content_hash, provenance_key)
     );
 
     CREATE TABLE IF NOT EXISTS plan_publication_acceptance (
@@ -237,8 +306,172 @@ export function openDb(path: string): DatabaseSync {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (ticket, run_id, reason)
     );
+
+    CREATE TABLE IF NOT EXISTS plan_scout_candidate (
+      id TEXT PRIMARY KEY,
+      ticket TEXT NOT NULL,
+      planning_identity TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      parent_runtime_id TEXT NOT NULL,
+      parent_session_id TEXT NOT NULL,
+      owner_run_id TEXT NOT NULL,
+      owner_session_id TEXT NOT NULL,
+      batch_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      task_hash TEXT NOT NULL,
+      actual_task_hash TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      child_session_id TEXT NOT NULL,
+      artifact_path TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      failed_envelope_hash TEXT NOT NULL,
+      terminal_json TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (owner_run_id,owner_session_id,batch_id,run_id,task_hash,failed_envelope_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_recovery_decision (
+      id TEXT PRIMARY KEY,
+      candidate_id TEXT,
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      source_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      blockers_json TEXT,
+      reason TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_recovery_attempt (
+      id TEXT PRIMARY KEY,
+      candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      input_generation INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      scope_hash TEXT NOT NULL,
+      target_hash TEXT NOT NULL,
+      source_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      failure_hash TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_incident (
+      id TEXT PRIMARY KEY,
+      candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      planning_identity TEXT NOT NULL,
+      input_generation INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      scope_hash TEXT NOT NULL,
+      target_hash TEXT NOT NULL,
+      plan_state TEXT NOT NULL,
+      plan_hash TEXT NOT NULL,
+      plan_scope_hash TEXT NOT NULL,
+      plan_path_hash TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      source_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (candidate_id,action)
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_incident_event (
+      id INTEGER PRIMARY KEY,
+      incident_id TEXT NOT NULL REFERENCES workflow_incident(id),
+      kind TEXT NOT NULL CHECK (kind IN ('grant','refusal','revoke','expiry','consume','dispatch','effect-start','outcome')),
+      code TEXT NOT NULL,
+      actor_uid INTEGER NOT NULL,
+      source_session_id TEXT NOT NULL,
+      source_runtime_id TEXT NOT NULL,
+      candidate_id TEXT NOT NULL,
+      input_generation INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      ticket TEXT NOT NULL,
+      action TEXT NOT NULL,
+      scope_hash TEXT NOT NULL,
+      target_hash TEXT NOT NULL,
+      continuation_id TEXT,
+      writer_id TEXT,
+      payload_hash TEXT,
+      failure_hash TEXT,
+      plan_hash TEXT,
+      reason TEXT,
+      bypassed_json TEXT,
+      preserved_json TEXT,
+      blockers_json TEXT,
+      effect TEXT,
+      outcome TEXT,
+      error_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_incident_claim (
+      candidate_id TEXT NOT NULL REFERENCES plan_scout_candidate(id),
+      action TEXT NOT NULL,
+      incident_id TEXT NOT NULL REFERENCES workflow_incident(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (candidate_id,action)
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_writer_dispatch (
+      id TEXT PRIMARY KEY,
+      accepted_input_id TEXT NOT NULL,
+      planning_identity TEXT NOT NULL,
+      dispatch_kind TEXT NOT NULL CHECK (dispatch_kind IN ('initial','revision')),
+      revision_of TEXT NOT NULL DEFAULT '',
+      writer_run_id TEXT NOT NULL,
+      task_hash TEXT NOT NULL,
+      actual_task_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (accepted_input_id,planning_identity,dispatch_kind,revision_of)
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_writer_draft (
+      content_hash TEXT PRIMARY KEY,
+      accepted_input_id INTEGER NOT NULL REFERENCES plan_publication_acceptance(id),
+      planning_identity TEXT NOT NULL,
+      writer_run_id TEXT NOT NULL,
+      writer_task_hash TEXT NOT NULL,
+      writer_actual_task_hash TEXT NOT NULL,
+      plan_path TEXT NOT NULL,
+      bytes INTEGER NOT NULL,
+      result_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (accepted_input_id,planning_identity,writer_run_id)
+    );
+
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_decision_no_update BEFORE UPDATE ON workflow_recovery_decision BEGIN SELECT RAISE(ABORT,'workflow recovery decisions are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_decision_no_delete BEFORE DELETE ON workflow_recovery_decision BEGIN SELECT RAISE(ABORT,'workflow recovery decisions are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS plan_scout_candidate_no_update BEFORE UPDATE ON plan_scout_candidate BEGIN SELECT RAISE(ABORT,'plan scout candidates are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS plan_scout_candidate_no_delete BEFORE DELETE ON plan_scout_candidate BEGIN SELECT RAISE(ABORT,'plan scout candidates are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_no_update BEFORE UPDATE ON workflow_incident BEGIN SELECT RAISE(ABORT,'workflow incidents are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_no_delete BEFORE DELETE ON workflow_incident BEGIN SELECT RAISE(ABORT,'workflow incidents are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_claim_no_update BEFORE UPDATE ON workflow_incident_claim BEGIN SELECT RAISE(ABORT,'workflow incident claims are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_claim_no_delete BEFORE DELETE ON workflow_incident_claim BEGIN SELECT RAISE(ABORT,'workflow incident claims are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_writer_dispatch_no_update BEFORE UPDATE ON workflow_writer_dispatch BEGIN SELECT RAISE(ABORT,'workflow writer dispatches are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_writer_dispatch_no_delete BEFORE DELETE ON workflow_writer_dispatch BEGIN SELECT RAISE(ABORT,'workflow writer dispatches are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_update BEFORE UPDATE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_delete BEFORE DELETE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_update BEFORE UPDATE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_delete BEFORE DELETE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
   `);
   migratePlanArtifacts(db);
+  migratePublicationProvenance(db);
+  migrateIncidentColumns(db);
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.
   const have = new Set(

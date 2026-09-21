@@ -234,6 +234,29 @@ test("acceptance keeps the folder in both outcomes", async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test("owned review rework records an exact plan and preserves the stand", async () => {
+  const { recordReviewRework } = await import("../src/accept.ts");
+  const root = join(process.env.TMPDIR ?? "/tmp", `yokemate-test-review-record-${process.pid}`);
+  const folder = join(root, "home", "knowledge", "org", "repo", "ai", "ACME-9-rework");
+  fs.mkdirSync(folder, { recursive: true });
+  const plan = join(folder, "ACME-9-rework-plan.md");
+  fs.writeFileSync(plan, "# ACME-9 — rework\n\n## Goal\nFix review remarks.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fix behavior.\n\n## Assumptions\n- Existing stand.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nThe remark is fixed.\n");
+  const db = openDb(join(root, "yokemate.db"));
+  try {
+    db.prepare("INSERT INTO work (ticket,url,stage,folder) VALUES ('ACME-9','u','review','/stand')").run();
+    const work = db.prepare("SELECT id FROM work WHERE ticket='ACME-9'").get() as { id: number };
+    db.prepare("INSERT INTO part (work_id,repo,role,branch,pr) VALUES (?, 'org/repo','app','ACME-9','https://example/pr')").run(work.id);
+    const recorded = recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" });
+    assert.equal(recorded.binding.path, plan);
+    assert.equal(db.prepare("SELECT stage FROM work WHERE ticket='ACME-9'").get()!.stage, "planned");
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM part WHERE work_id=?").get(work.id)!.count, 1);
+    assert.throws(() => recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }), /changed from review to planned/);
+    assert.throws(() => recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, { ...recorded.binding, contentHash: "foreign" }), /content hash/);
+    const repeated = recordReviewRework(db, root, "ACME-9", plan, { YOKEMATE_MODE: "review", YOKEMATE_TICKET: "ACME-9", YOKEMATE_ROLE: "coordinator" }, recorded.binding);
+    assert.equal(repeated.repeat, true);
+  } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("accept refuses malformed settings before reading or changing the work row", async () => {
   const { accept } = await import("../src/accept.ts");
   const root = join(process.env.TMPDIR ?? "/tmp", `yokemate-test-accept-settings-${process.pid}`);
@@ -773,6 +796,25 @@ test("ship prompt preserves single and batch arguments through where", async () 
     decide({ YOKEMATE_MODE: "ship", YOKEMATE_TICKET: "YM-199" }, "ship", "YM-199", policyOff),
     { kind: "run" },
   );
+});
+
+test("review prompt preserves tab, split and literal arguments through where", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const root = join(import.meta.dirname, "..");
+  const promptTemplates = await import(new URL("./core/prompt-templates.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
+  const templates = promptTemplates.loadPromptTemplates({ cwd: root, agentDir: join(root, ".pi"), promptPaths: [join(root, ".pi", "prompts", "review.md")], includeDefaults: false });
+  for (const [input, launch] of [
+    ["/review YM-1", "pnpm review YM-1"],
+    ["/review --split YM-1", "pnpm review --split YM-1"],
+    ["/review YM-1 -- --split", "pnpm review YM-1 -- --split"],
+  ]) {
+    const expanded = promptTemplates.expandPromptTemplate(input, templates);
+    assert.ok(expanded.includes(`run \`${launch}\``));
+    assert.match(expanded, /pnpm where review <ticket>/);
+    const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "src/mode-guard.ts", "review", "YM-1"], { cwd: root, env: { PATH: process.env.PATH ?? "", YOKEMATE_MODE: "", YOKEMATE_TICKET: "" }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "launch");
+  }
 });
 
 test("plan prompt preserves several keys", async () => {

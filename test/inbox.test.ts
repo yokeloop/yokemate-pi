@@ -66,9 +66,9 @@ test("deliver answers ENOENT on a dead address and times out on a mute listener"
   }
 });
 
-const SIDECAR = { mode: "main", ticket: null, cwd: "/root", pid: 42 };
+const SIDECAR = { mode: "main", ticket: null, cwd: "/root", pid: 42, starttime: "fixture", sessionId: "session", parentPane: null };
 
-test("bindInbox takes a report, acks it and leaves a four-field sidecar", async () => {
+test("bindInbox takes a report, acks it and leaves an identity sidecar", async () => {
   const tmp = makeTmp();
   try {
     const got: Report[] = [];
@@ -77,7 +77,7 @@ test("bindInbox takes a report, acks it and leaves a four-field sidecar", async 
       assert.deepEqual(await deliver(inbox.sock, REPORT), { ok: true });
       assert.deepEqual(got, [REPORT]);
       const side = JSON.parse(readFileSync(sidecarPath(tmp, "wT:p1"), "utf8"));
-      assert.deepEqual(Object.keys(side).sort(), ["cwd", "mode", "pid", "ticket"]);
+      assert.deepEqual(Object.keys(side).sort(), ["cwd", "mode", "parentPane", "pid", "sessionId", "starttime", "ticket"]);
       assert.deepEqual(side, SIDECAR);
     } finally {
       closeInbox(tmp, inbox);
@@ -197,7 +197,7 @@ test("отчёт не уходит в главный чат чужого кор�
     const alien = await bindInbox(
       dir,
       "wA:p1",
-      { mode: "main", ticket: null, cwd: "/elsewhere", pid: 1 },
+      { ...SIDECAR, cwd: "/elsewhere", pid: 1 },
       (r) => got.push(r),
     );
     try {
@@ -226,7 +226,7 @@ test("мёртвая пара чужого корня подметается, д
     const mine = await bindInbox(
       dir,
       "wB:p1",
-      { mode: "main", ticket: null, cwd: "/root", pid: 2 },
+      { ...SIDECAR, pid: 2 },
       (r) => got.push(r),
     );
     try {
@@ -252,7 +252,7 @@ test("при двух главных чатах своего корня отчё
   try {
     mkdirSync(dir, { recursive: true });
     const got: Report[] = [];
-    const side = { mode: "main", ticket: null, cwd: "/root", pid: 1 };
+    const side = { ...SIDECAR, pid: 1 };
     const one = await bindInbox(dir, "wA:p1", side, (r) => got.push(r));
     const two = await bindInbox(dir, "wB:p1", side, (r) => got.push(r));
     try {

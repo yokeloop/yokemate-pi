@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createServer, type Socket } from "node:net";
 import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { reportContent, sha256, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
@@ -28,13 +29,18 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
   const previousMode = process.env.YOKEMATE_MODE;
   const previousRole = process.env.YOKEMATE_ROLE;
   const previousRunId = process.env.YOKEMATE_RUN_ID;
+  const previousRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const previousTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
   let shutdown: (() => Promise<void>) | undefined;
   try {
     delete process.env.YOKEMATE_MODE;
     delete process.env.YOKEMATE_ROLE;
     process.env.YOKEMATE_COORDINATOR_REPORT_SCENARIO = scenario;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = coordinatorChild;
     cpSync(join(root, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(root, ".pi/extensions/subagent"), join(dir, ".pi/extensions/subagent"), { recursive: true });
+    symlinkSync(join(root, "node_modules"), join(dir, "node_modules"));
     mkdirSync(join(dir, ".pi/agents/do"), { recursive: true });
     mkdirSync(join(dir, "home/knowledge/org/repo/ai/YM-1-work"), { recursive: true });
     writeFileSync(join(dir, ".pi/settings.json"), "{}");
@@ -59,7 +65,6 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     for (const handler of loadedExtension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of loadedExtension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     for (const handler of loadedExtension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "/do YM-1" } as never, { ...ctx, mode: "tui" });
-    process.argv[1] = coordinatorChild;
     const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent");
     assert.ok(tool);
     const accepted = await tool.definition.execute(`coordinator-${scenario}`, { coordinator: { mode: "do", tickets: ["YM-1"] } }, undefined, () => undefined, ctx);
@@ -80,7 +85,8 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     const terminalReports = () => sent.filter((entry) => entry.message.customType === "subagent-report");
     await waitFor(() => terminalReports().length === 1);
     const terminal = terminalReports()[0]!;
-    assert.deepEqual(terminal.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.equal(terminal.options.deliverAs, "followUp");
+    assert.equal(terminal.options.triggerTurn, true);
     assert.equal(terminal.message.customType, "subagent-report");
     assert.equal(terminal.message.display, true);
     assert.equal(terminal.message.details.mode, "do");
@@ -106,9 +112,133 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
     if (previousMode === undefined) delete process.env.YOKEMATE_MODE; else process.env.YOKEMATE_MODE = previousMode;
     if (previousRole === undefined) delete process.env.YOKEMATE_ROLE; else process.env.YOKEMATE_ROLE = previousRole;
     if (previousRunId === undefined) delete process.env.YOKEMATE_RUN_ID; else process.env.YOKEMATE_RUN_ID = previousRunId;
+    if (previousRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = previousRelay;
+    if (previousTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = previousTarget;
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closing the runtime", { timeout: 30000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ym228-cancel-"));
+  const socketPath = join(dir, "cancel.sock");
+  const agentDir = join(dir, "agent");
+  const promptTmp = join(dir, "tmp");
+  mkdirSync(promptTmp);
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = promptTmp;
+  const previousArgv = process.argv[1];
+  const previousSocket = process.env.RUNTIME_SETTINGS_TEST_SOCKET;
+  const previousMode = process.env.SUBAGENT_CANCEL_MODE;
+  const previousRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const previousTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
+  const previousOwner = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE, YOKEMATE_RUN_ID: process.env.YOKEMATE_RUN_ID, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_PLAN_RUN_ID: process.env.YOKEMATE_PLAN_RUN_ID, PI_SESSION_ID: process.env.PI_SESSION_ID };
+  const sockets = new Set<Socket>();
+  const events: any[] = [];
+  const waiters: Array<() => void> = [];
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        events.push({ ...JSON.parse(buffer.slice(0, newline)), socket });
+        buffer = buffer.slice(newline + 1);
+        for (const wake of waiters.splice(0)) wake();
+      }
+    });
+  });
+  const waitEvent = async (predicate: (event: any) => boolean) => {
+    while (!events.some(predicate)) await new Promise<void>((resolve) => waiters.push(resolve));
+    return events.find(predicate)!;
+  };
+  try {
+    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: cancellation fixture\n---\nReturn only after release.\n");
+    process.env.RUNTIME_SETTINGS_TEST_SOCKET = socketPath;
+    process.env.SUBAGENT_CANCEL_MODE = "term";
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
+    delete process.env.YOKEMATE_RUN_ID;
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    const states: any[] = [];
+    const reports: any[] = [];
+    loaded.runtime.appendEntry = (_type, data) => { states.push(data); };
+    loaded.runtime.sendMessage = (message) => { if ((message as any).customType === "subagent-report") reports.push(message); };
+    const tool = loaded.extensions[0]!.tools.get("subagent")!.definition;
+    const widgets: unknown[] = [];
+    const ctx = { cwd: dir, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "cancel-owner" }, ui: { setWidget: (_key: string, value: unknown) => widgets.push(value) } } as unknown as ExtensionContext;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test/fixtures/runtime-settings-child.mjs");
+    const promptsBefore = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-")));
+    const launched = await tool.execute("cancel-term", { agent: "worker", task: "held TERM child" }, undefined, () => undefined, ctx);
+    const runId = (launched.details as any).children[0].identity.runId;
+    const child = await waitEvent((event) => event.task?.includes("held TERM child"));
+    const foreign = await tool.execute("foreign", { cancelRun: runId }, undefined, () => undefined, { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext);
+    assert.equal((foreign.details as any).status, "not_owned");
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+    const cancelling = tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
+    await waitEvent((event) => event.pid === child.pid && event.phase === "term");
+    assert.notEqual(widgets.at(-1), undefined);
+    const cancelled = await cancelling;
+    assert.equal((cancelled.details as any).status, "cancelled");
+    assert.equal((cancelled.details as any).targetKind, "ordinary");
+    assert.equal((cancelled.details as any).processOutcome, "cancelled");
+    assert.equal((cancelled.details as any).exitCode, 0);
+    assert.equal((cancelled.details as any).signal, null);
+    assert.equal((cancelled.details as any).cancellationInitiator, "tool_cancel");
+    assert.throws(() => process.kill(child.pid, 0));
+    await waitFor(() => reports.filter((message) => message.details?.envelope?.identity?.runId === runId || message.details?.envelope?.results?.some((result: any) => result.identity.runId === runId)).length === 2);
+    assert.equal(reports.find((message) => message.details?.envelope?.identity?.runId === runId).details.envelope.processOutcome, "cancelled");
+    assert.equal((await tool.execute("repeat", { cancelRun: runId }, undefined, () => undefined, ctx) as any).details.status, "already_terminal");
+    assert.equal((await tool.execute("unknown", { cancelRun: "11111111-1111-4111-8111-111111111111" }, undefined, () => undefined, ctx) as any).details.status, "unknown");
+    const mixed = await tool.execute("mixed", { cancelRun: "11111111-1111-4111-8111-111111111111", agent: "worker", task: "must not launch" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in mixed && mixed.isError, true);
+    assert.match((mixed.content[0] as any).text, /cannot be combined/);
+    await waitFor(() => widgets.at(-1) === undefined);
+    assert.deepEqual(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-") && !promptsBefore.has(name)), []);
+
+    process.env.SUBAGENT_CANCEL_MODE = "kill";
+    const killLaunch = await tool.execute("cancel-kill", { agent: "worker", task: "held KILL child" }, undefined, () => undefined, ctx);
+    const killRunId = (killLaunch.details as any).children[0].identity.runId;
+    const killChild = await waitEvent((event) => event.task?.includes("held KILL child"));
+    const killed = await tool.execute("kill", { cancelRun: killRunId }, undefined, () => undefined, ctx);
+    assert.ok(events.some((event) => event.pid === killChild.pid && event.phase === "term-ignored"));
+    assert.equal((killed.details as any).status, "cancelled");
+    assert.equal((killed.details as any).signal, "SIGKILL");
+    assert.equal((killed.details as any).exitCode, null);
+    assert.throws(() => process.kill(killChild.pid, 0));
+    assert.ok(states.some((state) => state.children?.some((entry: any) => entry.identity.runId === killRunId)));
+    assert.ok(states.some((state) => state.children?.length === 0));
+
+    Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_PLAN_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_TICKET: "YM-1" });
+    delete process.env.PI_SESSION_ID;
+    const planFinish = loaded.extensions[0]!.tools.get("plan_finish")!.definition;
+    const stopped = await planFinish.execute("finish", { outcome: "cancelled", reason: "fixture stop" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in stopped && stopped.isError, true);
+    assert.doesNotMatch((stopped.content[0] as any).text, /PI_SESSION_ID/);
+    const fenced = await tool.execute("after-stop", { agent: "worker", task: "must stay conversational" }, undefined, () => undefined, ctx);
+    assert.equal("isError" in fenced && fenced.isError, true);
+    assert.match((fenced.content[0] as any).text, /plan run is stopped/);
+  } finally {
+    process.argv[1] = previousArgv;
+    if (previousSocket === undefined) delete process.env.RUNTIME_SETTINGS_TEST_SOCKET; else process.env.RUNTIME_SETTINGS_TEST_SOCKET = previousSocket;
+    if (previousMode === undefined) delete process.env.SUBAGENT_CANCEL_MODE; else process.env.SUBAGENT_CANCEL_MODE = previousMode;
+    if (previousRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = previousRelay;
+    if (previousTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = previousTarget;
+    for (const [key, value] of Object.entries(previousOwner)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    if (previousTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmpdir;
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("real loader sends one compact parent terminal for every coordinator terminal path", async () => {
   const verified = await coordinatorTerminalScenario("verified");
@@ -117,11 +247,54 @@ test("real loader sends one compact parent terminal for every coordinator termin
   assert.equal(new Set([verified.details.runId, blocked.details.runId, local.details.runId]).size, 3);
 });
 
+test("D01 ordinary descendants inherit isolation and retain default session behavior", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isolation-loader-"));
+  const originalCwd = process.cwd();
+  const keys = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "YOKEMATE_ROLE", "YM217_REPORT_SCENARIO", "YOKEMATE_SUBAGENT_TEST_RELAY", "YOKEMATE_SUBAGENT_TEST_TARGET"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const sent: any[] = [];
+  try {
+    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
+    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: isolation fixture\n---\nReturn output.\n");
+    const agentDir = join(dir, "isolated agent");
+    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
+    await loader.reload();
+    const loaded = loader.getExtensions();
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = () => undefined;
+    loaded.runtime.sendMessage = ((message: any) => { sent.push(message); }) as any;
+    const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent")!;
+    const ctx = { cwd: dir, mode: "rpc", hasUI: false, ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "isolation-session" } } as unknown as ExtensionContext;
+    process.chdir(dir);
+    Object.assign(process.env, { PI_CODING_AGENT_DIR: agentDir, YM217_REPORT_SCENARIO: "isolation", YOKEMATE_SUBAGENT_TEST_RELAY: join(root, "test/fixtures/subagent-json-relay.mjs"), YOKEMATE_SUBAGENT_TEST_TARGET: child });
+    for (const coordinator of [false, true]) for (const isolated of [false, true]) {
+      if (coordinator) process.env.YOKEMATE_ROLE = "coordinator"; else delete process.env.YOKEMATE_ROLE;
+      if (isolated) process.env.PI_CODING_AGENT_SESSION_DIR = join(dir, "isolated sessions"); else delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      const before = sent.length;
+      await tool.definition.execute(`isolation-${coordinator}-${isolated}`, { agent: "worker", task: "inspect safe fixture configuration" }, undefined, () => undefined, ctx);
+      await waitFor(() => sent.length === before + 2);
+      const observed = JSON.parse(sent[before].details.envelope.payload);
+      assert.equal(observed.agentDir, agentDir);
+      assert.equal(observed.sessionDir, isolated ? join(dir, "isolated sessions") : undefined);
+      assert.equal(observed.role, "executor");
+      assert.equal(observed.args.includes("--no-session"), !coordinator);
+      assert.equal(observed.args.includes("--session-dir"), coordinator && !isolated);
+      if (coordinator && !isolated) assert.equal(observed.args[observed.args.indexOf("--session-dir") + 1], join(dir, "sessions"));
+    }
+  } finally {
+    process.chdir(originalCwd);
+    for (const [key, val] of Object.entries(previous)) if (val === undefined) delete process.env[key]; else process.env[key] = val;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("real loader keeps canonical reports byte-equivalent while renderer collapses and expands", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ym217-loader-"));
   const agentDir = join(dir, "agent");
   const originalArgv = process.argv[1];
   const originalCwd = process.cwd();
+  const originalRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
+  const originalTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
   const sent: { message: any; options: any }[] = [];
   let providerTurns = 0;
   try {
@@ -147,7 +320,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.ok(tool);
     const ctx = { cwd: dir, mode: "rpc", hasUI: false, model: undefined, thinkingLevel: "off", ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "loader-session" } } as unknown as ExtensionContext;
     process.chdir(dir);
-    process.argv[1] = child;
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = child;
     const ack = await tool.definition.execute("loader-batch", { agent: "worker", task: "produce multiline canonical output" }, undefined, () => undefined, ctx);
     assert.match((ack.content[0] as any).text, /^Detached, not terminal: /);
     const parsedAck = JSON.parse((ack.content[0] as any).text.slice("Detached, not terminal: ".length));
@@ -155,10 +329,7 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.equal((ack.details as any).display.members[0].taskExcerpt, "produce multiline canoni");
     await waitFor(() => sent.length === 2);
     assert.equal(sent.length, 2);
-    assert.deepEqual(sent.map((entry) => entry.options), [
-      { deliverAs: "followUp", triggerTurn: true },
-      { deliverAs: "followUp", triggerTurn: true },
-    ]);
+    assert.ok(sent.every((entry) => entry.options.deliverAs === "followUp" && entry.options.triggerTurn === true && typeof entry.options.yokemateSendId === "string" && typeof entry.options.onYokemateSendError === "function"));
     const assertCanonicalReports = (entries: typeof sent) => {
       for (const { message, options } of entries) {
         const envelope = message.details.envelope as ReportEnvelope;
@@ -168,10 +339,15 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
         assert.equal(message.customType, "subagent-report");
         assert.equal(message.display, true);
         assert.equal(message.details.display.version, 1);
-        assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+        assert.equal(options.deliverAs, "followUp");
+        assert.equal(options.triggerTurn, true);
+        assert.equal(options.yokemateSendId, delivery.deliveryId);
+        assert.equal(typeof options.onYokemateSendError, "function");
         assert.equal(readFileSync(message.details.display.archive.reportPath, "utf8"), message.content);
         assert.equal(message.details.display.archive.reportBytes, Buffer.byteLength(message.content));
         assert.equal(message.details.display.archive.reportHash, sha256(message.content));
+        const diagnostics = readFileSync(message.details.display.archive.diagnosticsPath, "utf8");
+        assert.doesNotMatch(diagnostics, /requestedTask|produce multiline canonical output|parallel one|parallel two|chain one|after \{previous\}/);
         const llm = convertToLlm([{ role: "custom", timestamp: 0, ...message }]);
         assert.equal((llm[0]!.content[0] as any).text, message.content);
       }
@@ -250,6 +426,8 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
   } finally {
     process.argv[1] = originalArgv;
     process.chdir(originalCwd);
+    if (originalRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = originalRelay;
+    if (originalTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = originalTarget;
     rmSync(dir, { recursive: true, force: true });
   }
 });

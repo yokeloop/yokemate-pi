@@ -7,6 +7,7 @@ import { openDb } from "./db.ts";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
 import type { ReadyEntry, ReadyReceipt } from "./ready.ts";
 import { requiredJobs, type RequiredJob } from "./required-checks.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface CoordinatorOutcome { outcome: "done" | "blocked"; summary: string; reason?: string; passedTickets?: string[] }
 export interface ShipPartOutcome { repo: string; pr: string; head?: string; state: "merged" | "remaining" | "unknown"; reason?: string }
@@ -52,6 +53,7 @@ export function verifyGate(facts: GateFacts): GateVerdict {
     }
     heads[repo] = pr.headRefOid;
   }
+  assertMandatoryBoundary("workflow.quality-gates", true);
   return { ok: true, heads };
 }
 
@@ -115,6 +117,7 @@ export function verifyPreparedShipMerged(root: string, prepared: PreparedCoordin
 
 export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordinator, outcome: CoordinatorOutcome, pending = 0): OutcomeVerification {
   if (outcome.outcome === "blocked") {
+    assertMandatoryBoundary("workflow.truthful-outcome", !!(outcome.reason || outcome.summary), "blocked outcome needs a reason or summary");
     if (prepared.mode !== "ship") return { ok: true, reason: outcome.reason || "blocked", remaining: prepared.tickets.filter((ticket) => existsSync(join(root, "work", ticket))) };
     const partFacts: ShipPartOutcome[] = prepared.parts.map((part) => {
       if (!part.pr) return { repo: part.repo, pr: "", state: "unknown", reason: "missing prepared PR" };
@@ -142,6 +145,7 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
       }
       const verdict = verifyGate(gatherGateFacts(root, ticket, rows.map((row) => ({ repo: row.repo, selector: row.pr }))));
       if (!verdict.ok) return { ok: false, reason: verdict.reason };
+      assertMandatoryBoundary("workflow.truthful-outcome", true);
       return { ok: true, parts: rows.map((row) => row.repo) };
     }
     const verified = verifyPreparedShipMerged(root, prepared);
@@ -153,6 +157,7 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
     const journalDir = join(dataRoot(root), "journal");
     const lines = existsSync(journalDir) ? readdirSync(journalDir).filter((name) => /^\d{4}-\d{2}\.md$/.test(name)).map((name) => readFileSync(join(journalDir, name), "utf8")).join("\n") : "";
     const missing = prepared.tickets.filter((ticket) => !new RegExp(`^\\- \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} ${ticket} отгружено(?:$|:)`, "m").test(lines));
+    if (!missing.length) assertMandatoryBoundary("workflow.truthful-outcome", merged.length === prepared.parts.length && remaining.length === 0, "ship outcome is not fully verified");
     return missing.length ? { ok: false, reason: `missing shipped journal lines: ${missing.join(", ")}`, merged, remaining } : { ok: true, merged, remaining };
   } catch (error) { return { ok: false, reason: (error as Error).message }; }
 }

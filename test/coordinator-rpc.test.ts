@@ -111,6 +111,23 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
   assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
 });
 
+test("request response hook runs before later events from the same JSONL chunk", async () => {
+  const order: string[] = [];
+  const rpc = startCoordinatorRpc(prepared, identity, expected, {
+    onEvent(event) { if (event.type === "terminal_probe") order.push("terminal"); },
+  }, {
+    invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture, "same-chunk-work-terminal"] },
+    readyTimeoutMs: 1000,
+    stopGraceMs: 100,
+  });
+  try {
+    await rpc.ready;
+    const response = await rpc.request({ id: "run-1:work", type: "prompt", message: "work" }, () => order.push("ack"));
+    assert.equal(response.success, true);
+    assert.deepEqual(order, ["ack", "terminal"]);
+  } finally { await rpc.stop(); }
+});
+
 test("RPC stop absorbs expected EPIPE and resolves", async () => {
   let stdinClosed!: () => void;
   const closed = new Promise<void>((resolve) => { stdinClosed = resolve; });
@@ -186,7 +203,24 @@ test("RPC ignores delayed UI replies after stop begins", async (t) => {
   }
 });
 
-test("coordinator invocation keeps a session under the task folder", () => {
+test("D01 coordinator honors explicitly isolated session storage", () => {
+  const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+  try {
+    process.env.PI_CODING_AGENT_SESSION_DIR = "/isolated sessions";
+    const args = coordinatorInvocationArgs(prepared);
+    assert.equal(args.includes("--session-dir"), false);
+    assert.equal(args.includes("--no-session"), false);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR; else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+  }
+});
+
+test("coordinator invocation keeps a session under the task folder when storage is unset", (t) => {
+  const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR; else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+  });
+  delete process.env.PI_CODING_AGENT_SESSION_DIR;
   const args = coordinatorInvocationArgs({ mode: "do", model: "test/model", cwd: "/tasks/YM-1", skillsPath: "/skills", resourcesPath: "/resources" });
   assert.ok(!args.includes("--no-session"));
   assert.equal(args[args.indexOf("--session-dir") + 1], "/tasks/YM-1/sessions");
@@ -213,7 +247,7 @@ test("owned state requires matching transport identity, launch admission and del
   tracker.toolEnd("A", ack, false);
   assert.equal(tracker.canFinish("blocked", "child still active"), false);
   const delivery = deliveryFor(result);
-  assert.equal(tracker.accept({ ...initial, sequence: 3, deliveries: [delivery] }), true);
+  assert.equal(tracker.accept({ ...initial, sequence: 3, deliveries: [{ ...delivery, state: "delivery_failed" }] }), true);
   assert.equal(tracker.settled(), "wait");
   tracker.recordDeliveryError();
   assert.equal(tracker.canFinish("done"), false);
@@ -250,7 +284,7 @@ test("an observed delivery retires its asynchronous error before a later healthy
   const terminal = { processOutcome: "exited" as const, exitCode: 0, signal: null, stopReason: "stop" };
   const deliveryA = deliveryFor(resultEnvelope(a.children[0]!.identity, "A", terminal, "A"));
   const deliveryB = deliveryFor(resultEnvelope(b.children[0]!.identity, "B", terminal, "B"));
-  tracker.accept({ ...initial, sequence: 2, children: b.children, deliveries: [deliveryA] });
+  tracker.accept({ ...initial, sequence: 2, children: b.children, deliveries: [{ ...deliveryA, state: "delivery_failed" }] });
   tracker.recordDeliveryError();
   tracker.accept({ ...initial, sequence: 3, children: b.children, deliveries: [{ ...deliveryA, state: "observed" }] });
   tracker.accept({ ...initial, sequence: 4, deliveries: [{ ...deliveryA, state: "observed" }, deliveryB] });
@@ -281,18 +315,18 @@ test("blocked teardown after unexpected exit preserves the completed parent snap
     await rpc.request({ type: "prompt", message: "work" });
     await complete;
     await rpc.stop();
-    const file = join(folder, "reviewer-runs/run-1-run-1.json");
+    const file = join(root, "sessions/subagent-runs/run-1-run-1.json");
     const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
-    assert.equal(snapshot.completed, true);
-    assert.equal(snapshot.exitCode, 9);
-    assert.equal(snapshot.cancellationInitiator, "unknown");
+    assert.equal(snapshot.lifecycle.processClosed, true);
+    assert.equal(snapshot.process.exitCode, 9);
+    assert.equal(snapshot.process.cancellationInitiator, "unknown");
     assert.ok(diagnostics.some((entry) => entry.completed));
     const terminalDiagnostic = rpc.diagnosticSnapshot();
     assert.equal(terminalDiagnostic.exitCode, 9);
     assert.equal((terminalDiagnostic.stderr as any).bytes, Buffer.byteLength("private coordinator sentinel"));
     assert.doesNotMatch(JSON.stringify(terminalDiagnostic), /private coordinator sentinel/);
-    const snapshots = new RunSnapshots(root, plan);
-    for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, {}, true);
+    const snapshots = new RunSnapshots(root);
+    for (let i = 0; i < 21; i++) snapshots.write("rotate", `run-${i}`, { closeAt: new Date().toISOString(), terminal: { processOutcome: "exited", exitCode: 0, signal: null }, noDeliveriesExpected: true }, true);
     assert.equal(fs.existsSync(file), false);
   } finally { await rpc?.stop(); fs.rmSync(root, { recursive: true, force: true }); }
 });
