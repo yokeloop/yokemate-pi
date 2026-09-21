@@ -25,7 +25,7 @@ async function waitForFile(path: string, timeout = 15000): Promise<void> {
   }
 }
 
-test("YM-221 write-empty-final-record owned and save-only; raw authority remains exact", { timeout: 300000 }, async () => {
+test("raw interactive authority flows through real plan CLI and parent control without a second do confirm", { timeout: 300000 }, async () => {
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "workflow-runtime-"));
   const runtime = mkdtempSync(join(tmpdir(), "ym-authority-"));
   const env = { ...process.env };
