@@ -1359,6 +1359,39 @@ test("grill-docs instruction contract", () => {
   assert.doesNotMatch(skill, /AskUserQuestion|question quota|mandatory ADR/i);
 });
 
+test("plan applies grill-docs in Interview and Questions", () => {
+  const root = join(import.meta.dirname, "..");
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  const interview = skill.slice(skill.indexOf("### Interview"), skill.indexOf("### The cut"));
+  assert.match(interview, /read `\.\.\/grill-docs\/SKILL\.md` relative to this skill directory/i);
+  assert.match(interview, /apply it before.*four fields/is);
+  const reconnaissance = skill.slice(skill.indexOf("1. **Reconnaissance**"), skill.indexOf("3. **Plan**"));
+  const accepted = reconnaissance.indexOf("accepted");
+  const grill = reconnaissance.indexOf("../grill-docs/SKILL.md");
+  assert.ok(accepted >= 0 && grill > accepted);
+  assert.match(reconnaissance, /already answered.*only.*new material gaps/is);
+  assert.match(reconnaissance, /no new material gaps.*plan-writer/is);
+  assert.match(skill, /3\. \*\*Plan\*\*.*4\. \*\*Record\*\*/s);
+});
+
+test("plan keeps knowledge ownership and record contract", () => {
+  const root = join(import.meta.dirname, "..");
+  const skill = fs.readFileSync(join(root, ".pi/skills/plan/SKILL.md"), "utf8");
+  assert.match(skill, /plan worker owns every glossary and ADR write/i);
+  assert.match(skill, /home\/knowledge\/<org>\/<project>\/context\.md/);
+  assert.match(skill, /<yokemate>\/context\.md/);
+  assert.match(skill, /grill-docs.*criteria.*permission/is);
+  assert.match(skill, /Never delegate.*(?:scout|writer).*documentation write/is);
+  const plan = skill.slice(skill.indexOf("3. **Plan**"), skill.indexOf("4. **Record**"));
+  assert.match(plan, /task.*final decisions.*term definitions.*resolved conflicts/is);
+  assert.match(plan, /exact paths and sections.*actually written.*assumptions/is);
+  assert.match(plan, /acceptedInputId.*immutable full scout bytes/is);
+  assert.match(plan, /verify.*decision content.*not only.*references/is);
+  assert.match(skill, /recordPlanCore\(\).*commitExact\(\).*plan and journal.*not arbitrary documentation/is);
+  assert.match(skill, /do not.*manual(?:ly)?.*(?:publish|sync)/is);
+  assert.match(skill, /`pnpm plan <KEY> <plan-path>`/);
+});
+
 test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
