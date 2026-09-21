@@ -1389,7 +1389,7 @@ test("plan keeps knowledge ownership and record contract", () => {
   assert.match(plan, /verify.*decision content.*not only.*references/is);
   assert.match(skill, /recordPlanCore\(\).*commitExact\(\).*plan and journal.*not arbitrary documentation/is);
   assert.match(skill, /do not.*manual(?:ly)?.*(?:publish|sync)/is);
-  assert.match(skill, /`pnpm plan <KEY> <plan-path>`/);
+  assert.match(skill, /`pnpm plan <KEY> <plan-path> --content-hash <reviewed-sha256>`/);
 });
 
 test("plan agents preserve documentation handoff boundaries", () => {
