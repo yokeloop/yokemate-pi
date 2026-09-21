@@ -8,7 +8,7 @@ import { readRuntimeSettings } from "./guard-policy.ts";
 import { logMoveDetailed } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type MoveEnv } from "./transitions.ts";
-import { assertPlanBinding, readCandidatePlanSnapshot, readRecordedPlanBinding, toPlanBinding, type PlanBinding } from "./plan-binding.ts";
+import { assertPlanBinding, readPlanWriterSnapshot, readRecordedPlanBinding, toPlanBinding, type PlanBinding, type PlanWriterScope } from "./plan-binding.ts";
 import { assertPublishable } from "./plan-publication.ts";
 import { markSideEffectsStarted, markSuccessfulRecord, planRecordById, publicationAcceptanceById, readPublicationArtifact } from "./plan-publication-state.ts";
 import { appendIncidentEvent, incidentById, writerDraftFor } from "./workflow-incident-state.ts";
@@ -17,12 +17,13 @@ import { sha256 } from "./subagent-runs.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface PlanRecordResult { ticket: string; plan: string; repeat: boolean; recorded: true; journal?: string; localSync: ExactSyncResult; push?: ExactSyncResult }
-export interface RecordPlanOptions { expectedBinding: PlanBinding; recordId: number; signal?: AbortSignal; onLocked?(): void }
+export interface RecordPlanOptions { expectedBinding: PlanBinding; expectedContentHash: string; requestedPath: string; scope: PlanWriterScope; recordId: number; signal?: AbortSignal; onLocked?(): void }
 
 export function recordLockPath(root: string): string { return gitMutationLockPath(root); }
 
-function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBinding, recordId: number) {
-  const candidate = readCandidatePlanSnapshot(root, ticket, expectedBinding.path);
+function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBinding, expectedContentHash: string, requestedPath: string, scope: PlanWriterScope, recordId: number) {
+  if (!/^[a-f0-9]{64}$/.test(expectedContentHash) || expectedContentHash !== expectedBinding.contentHash || scope.ticket !== ticket) throw new Error("binding_changed");
+  const candidate = readPlanWriterSnapshot(root, scope, requestedPath);
   assertPlanBinding(expectedBinding, candidate);
   assertPublishable(candidate.bytes);
   const db = openDb(join(root, "yokemate.db"));
@@ -55,9 +56,9 @@ function verifyLocalRecord(root: string, ticket: string, expectedBinding: PlanBi
   }
 }
 
-export function recordPlanCore(root: string, ticket: string, expectedBinding: PlanBinding, recordId: number, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
+export function recordPlanCore(root: string, ticket: string, expectedBinding: PlanBinding, expectedContentHash: string, requestedPath: string, scope: PlanWriterScope, recordId: number, env: MoveEnv = process.env as MoveEnv): PlanRecordResult {
   const data = dataRoot(root);
-  const { db, candidate, record, scout, incident } = verifyLocalRecord(root, ticket, expectedBinding, recordId);
+  const { db, candidate, record, scout, incident } = verifyLocalRecord(root, ticket, expectedBinding, expectedContentHash, requestedPath, scope, recordId);
   const plan = candidate.path;
   const dataRelative = relative(data, plan);
   if (dataRelative.startsWith("..") || isAbsolute(dataRelative)) { db.close(); throw new Error(`plan is outside the data root: ${plan}`); }
@@ -115,8 +116,8 @@ function runRecorder(root: string, lock: string, payload: string, env: NodeJS.Pr
 }
 
 export async function recordPlan(root: string, ticket: string, planPath: string, env: NodeJS.ProcessEnv = process.env, options: RecordPlanOptions): Promise<PlanRecordResult> {
-  if (resolve(planPath) !== resolve(options.expectedBinding.path) || options.expectedBinding.ticket !== ticket) throw new Error("binding_changed");
-  const payload = Buffer.from(JSON.stringify({ root, ticket, expectedBinding: toPlanBinding(options.expectedBinding), recordId: options.recordId })).toString("base64");
+  if (planPath !== options.requestedPath || resolve(planPath) !== resolve(options.expectedBinding.path) || options.expectedBinding.ticket !== ticket || options.expectedContentHash !== options.expectedBinding.contentHash || options.scope.ticket !== ticket) throw new Error("binding_changed");
+  const payload = Buffer.from(JSON.stringify({ root, ticket, expectedBinding: toPlanBinding(options.expectedBinding), expectedContentHash: options.expectedContentHash, requestedPath: options.requestedPath, scope: options.scope, recordId: options.recordId })).toString("base64");
   const lock = recordLockPath(dataRoot(root));
   mkdirSync(dirname(lock), { recursive: true });
   const output = await runRecorder(root, lock, payload, env, options);
@@ -127,10 +128,10 @@ export async function recordPlan(root: string, ticket: string, planPath: string,
 
 if (import.meta.filename === process.argv[1] && process.argv[2] === "--locked") {
   try {
-    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; expectedBinding: PlanBinding; recordId: number };
+    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; expectedBinding: PlanBinding; expectedContentHash: string; requestedPath: string; scope: PlanWriterScope; recordId: number };
     process.on("SIGTERM", () => {});
     process.stdout.write(LOCKED_MARKER);
-    process.stdout.write(JSON.stringify(recordPlanCore(payload.root, payload.ticket, payload.expectedBinding, payload.recordId)));
+    process.stdout.write(JSON.stringify(recordPlanCore(payload.root, payload.ticket, payload.expectedBinding, payload.expectedContentHash, payload.requestedPath, payload.scope, payload.recordId)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);

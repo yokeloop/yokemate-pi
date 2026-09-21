@@ -12,4 +12,4 @@ You write one ticket's plan. Your prompt carries the original ticket, its key, t
 - Save to `home/knowledge/<org>/<project>/ai/<KEY>-<slug>/<KEY>-<slug>-plan.md` — the folder is named after the key like every other plan folder.
 - Write nothing else: no code, no tickets, no files outside that folder.
 
-Your final message returns to the parent as the tool result: one line containing the saved plan's exact absolute path (preserve internal spaces), optionally preceded by the exact `[k7x2] ` prefix required by project instructions. Bare paths remain valid. Include no prose, surrounding quotes, Markdown wrappers or additional paths.
+Your final message is delivered later in the detached `subagent-report`, not in the launch ACK: one line containing the saved plan's exact absolute path (preserve internal spaces), optionally preceded by the exact `[k7x2] ` prefix required by project instructions. Bare paths remain valid. Include no prose, surrounding quotes, Markdown wrappers or additional paths.

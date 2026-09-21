@@ -71,7 +71,7 @@ const objectFact = (fields: Record<string, FactProjection>): FactProjection => (
   }
   return result;
 };
-const bytesFact = objectFact({ bytes: countFact, hash: hashFact });
+const bytesFact = objectFact({ class: enumFact("none", "unknown"), bytes: countFact, hash: hashFact });
 const errorFact = objectFact({ class: enumFact("ENOENT", "EACCES", "EPERM", "ENOSPC", "EIO", "EPIPE", "unknown"), bytes: countFact, hash: hashFact });
 const resourceFact = objectFact({ path: pathFact, hash: hashFact });
 const identityFact = objectFact({ ownerRunId: identifierFact, ownerSessionId: identifierFact, batchId: identifierFact, runId: identifierFact, runIds: listFact(identifierFact), agent: identifierFact, taskHash: hashFact, cwd: pathFact, ticket: identifierFact, review: objectFact({ baseSha: revisionFact, headSha: revisionFact }), acceptedInputId: countFact, writerRevisionOf: hashFact, parentRunId: identifierFact, parentSessionId: identifierFact, mode: enumFact("do", "ship"), role: enumFact("coordinator", "executor"), model: identifierFact });
@@ -79,16 +79,16 @@ const processOutcomeFact = enumFact("exited", "signaled", "spawn_error", "cancel
 const signalFact = enumFact(null, "SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGABRT", "SIGSEGV", "SIGPIPE", "SIGQUIT", "SIGBUS", "SIGILL", "SIGFPE");
 const stopFact = enumFact("stop", "length", "toolUse", "error", "aborted", "unexpected_exit");
 const verdictFact = enumFact(null, "approved", "changes_required");
-const payloadOutcomeFact = enumFact("pending", "valid", "missing_final", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete");
+const payloadOutcomeFact = enumFact("pending", "valid", "missing_final", "invalid_plan_result", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete");
 const outputLimitFact = enumFact("batch_transport");
 const terminalFact = objectFact({ processOutcome: processOutcomeFact, exitCode: exitFact, signal: signalFact, stopReason: stopFact });
 const deliveryFact = objectFact({ deliveryId: hashFact, batchId: identifierFact, runIds: listFact(identifierFact), envelopeHash: hashFact, state: enumFact("pending", "enqueued", "observed", "delivery_failed", "delivery_unknown"), enqueuedAt: timeFact, observedAt: timeFact, failedAt: timeFact });
 const parserErrorFact = objectFact({ kind: enumFact("invalid_json", "invalid_event", "record_limit", "partial_record"), offset: countFact });
 const streamFact = objectFact({
-  stdoutBytes: countFact, stdoutHash: hashFact, parserErrors: countFact, partialBytes: countFact, partialHash: hashFact,
+  stdoutBytes: countFact, stdoutHash: hashFact, parserErrors: countFact, parsedBytes: countFact, malformedBytes: countFact, ignoredBytes: countFact, framingBytes: countFact, partialBytes: countFact, partialHash: hashFact,
   events: objectFact(Object.fromEntries(["session", "agent_start", "turn_start", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "turn_end", "agent_end", "agent_settled", "other"].map((key) => [key, countFact]))),
   parserErrorCounters: objectFact({ invalid_json: countFact, invalid_event: countFact, record_limit: countFact, partial_record: countFact }),
-  firstParserError: parserErrorFact, lastParserError: parserErrorFact, assistantMessageSeen: booleanFact, finalTextPresent: booleanFact,
+  firstParserError: parserErrorFact, lastParserError: parserErrorFact, assistantMessageSeen: booleanFact, assistantMessageEndCount: countFact, assistantTextBearingCount: countFact, textDeltaEvents: countFact, textDeltaBytes: countFact, finalEventPresent: booleanFact, finalTextPresent: booleanFact, finalNonWhitespace: booleanFact, finalTextBytes: countFact, finalTextHash: hashFact,
   activeTools: countFact, retry: booleanFact, compaction: booleanFact, summaryRetry: booleanFact, phase: enumFact("text", "thinking", "toolcall", "unknown"), firstByteAt: timeFact, lastEventAt: timeFact, finalAt: timeFact,
 });
 const modelFact = objectFact({ model: identifierFact, provider: identifierFact, thinking: enumFact("off", "minimal", "low", "medium", "high", "xhigh", "max", "unknown") });
@@ -102,6 +102,7 @@ const metadataFact = objectFact({
   spawnError: errorFact, stream: streamFact, stderr: bytesFact,
   usage: objectFact({ input: countFact, output: countFact, cacheRead: countFact, cacheWrite: countFact, totalTokens: countFact, contextTokens: countFact, turns: countFact, cost: (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined }),
   payload: objectFact({ outcome: payloadOutcomeFact, bytes: countFact, hash: hashFact, retainedBytes: countFact, retainedHash: hashFact, truncated: booleanFact, verdict: verdictFact, outputLimit: outputLimitFact }),
+  writerResult: objectFact({ state: enumFact("verified", "rejected"), source: enumFact("final", "reconciled"), reason: identifierFact, candidateCount: countFact, artifactBytes: countFact, binding: objectFact({ ticket: identifierFact, path: pathFact, contentHash: hashFact, scopeHash: hashFact, repositories: listFact(identifierFact) }) }),
   artifact: objectFact({ state: enumFact("verified", "accepted", "blocked", "superseded"), path: pathFact, hash: hashFact, bytes: countFact, acceptanceId: countFact, reason: identifierFact }),
   publication: objectFact({ state: enumFact("pending", "complete"), revision: hashFact, publicationId: countFact, error: identifierFact, path: pathFact, hash: hashFact, bytes: countFact, targetHash: hashFact, acceptanceId: countFact }),
   scoutCandidate: objectFact({ id: identifierFact, hash: hashFact, bytes: countFact, failureHash: hashFact, refusal: identifierFact, error: errorFact }),
@@ -113,7 +114,7 @@ const metadataFact = objectFact({
 });
 const diagnosticFacts = objectFact({
   identity: identityFact, delivery: deliveryFact, stream: streamFact, stderr: bytesFact, process: metadataFact,
-  children: listFact(objectFact({ identity: identityFact, actualTaskHash: hashFact, processOutcome: processOutcomeFact, exitCode: exitFact, signal: signalFact, stopReason: stopFact, payloadOutcome: payloadOutcomeFact, reviewVerdict: verdictFact, outputLimit: outputLimitFact, metadata: metadataFact })),
+  children: listFact(objectFact({ identity: identityFact, actualTaskHash: hashFact, processOutcome: processOutcomeFact, exitCode: exitFact, signal: signalFact, stopReason: stopFact, payloadOutcome: payloadOutcomeFact, reviewVerdict: verdictFact, outputLimit: outputLimitFact, planResult: objectFact({ state: enumFact("verified", "rejected"), source: enumFact("final", "reconciled"), reason: identifierFact, candidateCount: countFact, artifactBytes: countFact, binding: objectFact({ ticket: identifierFact, path: pathFact, contentHash: hashFact, scopeHash: hashFact, repositories: listFact(identifierFact) }) }), metadata: metadataFact })),
   terminal: objectFact({ outcome: enumFact("done", "blocked"), summary: contentFact, reason: contentFact, verification: objectFact({ ok: booleanFact, reason: contentFact, parts: listFact(identifierFact), merged: listFact(identifierFact), remaining: listFact(identifierFact), partFacts: listFact(objectFact({ repo: identifierFact, pr: identifierFact, head: revisionFact, state: enumFact("merged", "remaining", "unknown"), reason: contentFact })) }) }),
 });
 

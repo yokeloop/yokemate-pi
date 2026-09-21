@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, type BigIntStats } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { parseAffected } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
@@ -125,4 +125,162 @@ export async function readWorkflowBindingSnapshot(root: string, signal: AbortSig
 export function assertPlanBinding(expected: PlanBinding, actual: PlanBinding): void {
   for (const [key, reason] of [["ticket", "ticket"], ["path", "path"], ["repositories", "repositories"], ["scopeHash", "scope"], ["contentHash", "content hash"]] as const)
     assertMandatoryBoundary("workflow.plan-binding", JSON.stringify(expected[key]) === JSON.stringify(actual[key]), `do approval ${reason} changed for ${expected.ticket}; approve the current recorded plan again`);
+}
+
+export interface PlanWriterScope { ticket: string; project: string; knowledgeRoot: string }
+export type PlanWriterArtifactReason = "scope_not_found" | "ambiguous_scope" | "invalid_scope" | "invalid_plan_path" | "outside_project" | "symlink_component" | "not_regular" | "invalid_utf8" | "wrong_heading" | "invalid_sections" | "invalid_repositories" | "binding_changed" | "artifact_not_found" | "ambiguous_artifact" | "artifact_unavailable";
+export class PlanWriterArtifactError extends Error {
+  readonly code: PlanWriterArtifactReason;
+  readonly candidateCount?: number;
+  constructor(ticket: string, code: PlanWriterArtifactReason, candidateCount?: number) {
+    super(`${ticket}: ${code}${candidateCount === undefined ? "" : ` (${candidateCount} candidates)`}`);
+    this.code = code;
+    this.candidateCount = candidateCount;
+  }
+}
+
+const canonicalProject = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/;
+const writerSlug = /^[^/\x00-\x1f\x7f]+$/;
+
+export function resolvePlanWriterScope(root: string, ticket: string): PlanWriterScope {
+  assertTicket(ticket);
+  const trackerKey = ticket.slice(0, ticket.lastIndexOf("-"));
+  const databasePath = join(root, "yokemate.db");
+  if (!existsSync(databasePath)) throw new PlanWriterArtifactError(ticket, "scope_not_found");
+  const db = new DatabaseSync(databasePath, { readOnly: true });
+  let rows: { org?: unknown; repo?: unknown }[];
+  try { rows = db.prepare("SELECT org, repo FROM project WHERE tracker_key = ?").all(trackerKey) as { org?: unknown; repo?: unknown }[]; }
+  catch { throw new PlanWriterArtifactError(ticket, "artifact_unavailable"); }
+  finally { db.close(); }
+  const projects = new Set<string>();
+  for (const row of rows) {
+    if (typeof row.org !== "string" || typeof row.repo !== "string" || !canonicalProject.test(`${row.org}/${row.repo}`)) throw new PlanWriterArtifactError(ticket, "invalid_scope");
+    projects.add(`${row.org}/${row.repo}`);
+  }
+  if (!projects.size) throw new PlanWriterArtifactError(ticket, "scope_not_found");
+  if (projects.size !== 1) throw new PlanWriterArtifactError(ticket, "ambiguous_scope", projects.size);
+  const project = [...projects][0]!;
+  return Object.freeze({ ticket, project, knowledgeRoot: resolve(dataRoot(root), "knowledge", ...project.split("/")) });
+}
+
+function lexicalComponents(value: string): string[] {
+  return value.slice(parse(value).root.length).split(/[\\/]/).filter(Boolean);
+}
+
+function writerPath(scope: PlanWriterScope, requestedPath: string): { path: string; components: string[] } {
+  if (!isAbsolute(requestedPath)) throw new PlanWriterArtifactError(scope.ticket, "invalid_plan_path");
+  const raw = lexicalComponents(requestedPath);
+  if (raw.includes(".") || raw.includes("..")) throw new PlanWriterArtifactError(scope.ticket, "invalid_plan_path");
+  const path = resolve(requestedPath);
+  const lexical = relative(scope.knowledgeRoot, path);
+  if (!lexical || lexical === ".." || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) throw new PlanWriterArtifactError(scope.ticket, "outside_project");
+  const components = lexical.split(sep);
+  if (components.length !== 3 || components[0] !== "ai") throw new PlanWriterArtifactError(scope.ticket, "invalid_plan_path");
+  const folder = components[1]!;
+  const file = components[2]!;
+  const prefix = `${scope.ticket}-`;
+  if (!folder.startsWith(prefix) || !file.startsWith(prefix) || !file.endsWith("-plan.md")) throw new PlanWriterArtifactError(scope.ticket, "invalid_plan_path");
+  const folderSlug = folder.slice(prefix.length);
+  const fileSlug = file.slice(prefix.length, -"-plan.md".length);
+  if (!folderSlug || folderSlug !== fileSlug || !writerSlug.test(folderSlug)) throw new PlanWriterArtifactError(scope.ticket, "invalid_plan_path");
+  return { path, components };
+}
+
+function sameStat(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs && left.mode === right.mode;
+}
+
+function checkedComponents(scope: PlanWriterScope, target: string): { path: string; stat: BigIntStats }[] {
+  const parsed = parse(target);
+  let current = parsed.root;
+  const paths = lexicalComponents(target).map((component) => {
+    current = join(current, component);
+    return current;
+  });
+  return paths.map((path, index) => {
+    let stat: BigIntStats;
+    try { stat = lstatSync(path, { bigint: true }); }
+    catch (error) {
+      throw new PlanWriterArtifactError(scope.ticket, "artifact_unavailable");
+    }
+    if (stat.isSymbolicLink()) throw new PlanWriterArtifactError(scope.ticket, "symlink_component");
+    if (index < paths.length - 1 && !stat.isDirectory()) throw new PlanWriterArtifactError(scope.ticket, "not_regular");
+    return { path, stat };
+  });
+}
+
+function validationReason(error: unknown): PlanWriterArtifactReason {
+  if (error instanceof PlanWriterArtifactError) return error.code;
+  const message = error instanceof Error ? error.message : "";
+  if (/UTF-8/.test(message)) return "invalid_utf8";
+  if (/heading/.test(message)) return "wrong_heading";
+  if (/Affected repositories|duplicate affected repository/.test(message)) return "invalid_repositories";
+  if (/section|PLAN-FORMAT/.test(message)) return "invalid_sections";
+  return "artifact_unavailable";
+}
+
+export interface PlanWriterReadHooks { beforeOpen?(): void; afterOpen?(): void; afterRead?(): void; beforeFinalStat?(): void }
+
+export function readPlanWriterSnapshot(root: string, scope: PlanWriterScope, requestedPath: string, hooks: PlanWriterReadHooks = {}): CandidatePlanSnapshot {
+  assertTicket(scope.ticket);
+  let parsed: ReturnType<typeof writerPath>;
+  try { parsed = writerPath(scope, requestedPath); }
+  catch (error) { throw error instanceof PlanWriterArtifactError ? error : new PlanWriterArtifactError(scope.ticket, "invalid_plan_path"); }
+  const before = checkedComponents(scope, parsed.path);
+  const final = before.at(-1)!;
+  if (!final.stat.isFile()) throw new PlanWriterArtifactError(scope.ticket, "not_regular");
+  let descriptor: number | undefined;
+  try {
+    hooks.beforeOpen?.();
+    descriptor = openSync(parsed.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const opened = fstatSync(descriptor, { bigint: true });
+    hooks.afterOpen?.();
+    if (!opened.isFile()) throw new PlanWriterArtifactError(scope.ticket, "not_regular");
+    if (!sameStat(final.stat, opened)) throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
+    const bytes = readFileSync(descriptor);
+    hooks.afterRead?.();
+    const afterDescriptor = fstatSync(descriptor, { bigint: true });
+    hooks.beforeFinalStat?.();
+    const after = checkedComponents(scope, parsed.path);
+    if (!sameStat(opened, afterDescriptor) || before.length !== after.length || before.some((entry, index) => entry.path !== after[index]!.path || !sameStat(entry.stat, after[index]!.stat))) throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
+    const canonicalRoot = realpathSync(scope.knowledgeRoot);
+    const canonical = realpathSync(parsed.path);
+    if (!contained(canonicalRoot, canonical)) throw new PlanWriterArtifactError(scope.ticket, "outside_project");
+    try { return snapshotFromBytes(scope.ticket, parsed.path, bytes); }
+    catch (error) { throw new PlanWriterArtifactError(scope.ticket, validationReason(error)); }
+  } catch (error) {
+    if (error instanceof PlanWriterArtifactError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new PlanWriterArtifactError(scope.ticket, code === "ELOOP" ? "symlink_component" : "artifact_unavailable");
+  } finally { if (descriptor !== undefined) closeSync(descriptor); }
+}
+
+export function reconcilePlanWriterArtifact(root: string, scope: PlanWriterScope): CandidatePlanSnapshot {
+  const ai = join(scope.knowledgeRoot, "ai");
+  let entries: import("node:fs").Dirent[];
+  try {
+    const aiStat = lstatSync(ai);
+    if (aiStat.isSymbolicLink()) throw new PlanWriterArtifactError(scope.ticket, "symlink_component");
+    if (!aiStat.isDirectory()) throw new PlanWriterArtifactError(scope.ticket, "not_regular");
+    entries = readdirSync(ai, { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof PlanWriterArtifactError) throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new PlanWriterArtifactError(scope.ticket, "artifact_not_found", 0);
+    throw new PlanWriterArtifactError(scope.ticket, "artifact_unavailable");
+  }
+  const candidates: Array<{ path?: string; reason?: PlanWriterArtifactReason }> = [];
+  for (const entry of entries.filter((item) => item.name.startsWith(`${scope.ticket}-`))) {
+    const folder = join(ai, entry.name);
+    if (entry.isSymbolicLink()) { candidates.push({ reason: "symlink_component" }); continue; }
+    if (!entry.isDirectory()) { candidates.push({ reason: "not_regular" }); continue; }
+    let children: import("node:fs").Dirent[];
+    try { children = readdirSync(folder, { withFileTypes: true }); }
+    catch { candidates.push({ reason: "artifact_unavailable" }); continue; }
+    for (const child of children) if (child.name.startsWith(`${scope.ticket}-`) && child.name.endsWith("-plan.md")) candidates.push({ path: join(folder, child.name) });
+  }
+  if (!candidates.length) throw new PlanWriterArtifactError(scope.ticket, "artifact_not_found", 0);
+  if (candidates.length !== 1) throw new PlanWriterArtifactError(scope.ticket, "ambiguous_artifact", candidates.length);
+  const candidate = candidates[0]!;
+  if (candidate.reason) throw new PlanWriterArtifactError(scope.ticket, candidate.reason, 1);
+  return readPlanWriterSnapshot(root, scope, candidate.path!);
 }
