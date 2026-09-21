@@ -1343,6 +1343,22 @@ test("interactive templates preserve surface controls and literal tail with spli
 });
 
 
+test("grill-docs instruction contract", () => {
+  const root = join(import.meta.dirname, "..");
+  const path = join(root, ".pi/skills/grill-docs/SKILL.md");
+  assert.equal(fs.existsSync(path), true);
+  const skill = fs.readFileSync(path, "utf8");
+  assert.match(skill, /^---\nname: grill-docs\ndescription: [^\n]+\n---/);
+  assert.match(skill, /glossary.*ADR.*code.*history/is);
+  assert.match(skill, /plain text.*one question at a time/is);
+  assert.match(skill, /2–4.*recommended.*first.*free-form/is);
+  assert.match(skill, /all three.*hard to reverse.*surprising without context.*real trade-off/is);
+  assert.match(skill, /explicit (?:instruction|permission).*write/is);
+  assert.match(skill, /create (?:files and directories|them) lazily/is);
+  assert.match(skill, /no open questions.*ask no questions/is);
+  assert.doesNotMatch(skill, /AskUserQuestion|question quota|mandatory ADR/i);
+});
+
 test("plan templates launch ordinary input in a tab and preserve explicit split aliases", async () => {
   const root = join(import.meta.dirname, "..");
   const promptTemplates = await import(
