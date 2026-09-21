@@ -24,6 +24,50 @@ async function waitFor(predicate: () => boolean, timeoutMs = 10000, label = "fix
   }
 }
 
+function closeOf(proc: ReturnType<typeof spawn>): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve({ code: proc.exitCode, signal: proc.signalCode });
+  return new Promise((resolve) => proc.once("close", (code, signal) => resolve({ code, signal })));
+}
+
+async function boundedStop(proc: ReturnType<typeof spawn>, emergency = false): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const pid = proc.pid;
+  const groupAlive = () => {
+    if (!emergency || !pid || process.platform === "win32") return false;
+    try { process.kill(-pid, 0); return true; } catch { return false; }
+  };
+  const waitGroup = () => new Promise<void>((resolve, reject) => {
+    const started = Date.now();
+    const inspect = () => {
+      if (!groupAlive()) return resolve();
+      if (Date.now() - started > 1000) return reject(new Error("owned fixture process group remained live"));
+      setTimeout(inspect, 10);
+    };
+    inspect();
+  });
+  const signal = (value: NodeJS.Signals) => {
+    if (emergency && pid && process.platform !== "win32") {
+      try { process.kill(-pid, value); return; } catch {}
+    }
+    try { proc.kill(value); } catch {}
+  };
+  const finish = async (value: { code: number | null; signal: NodeJS.Signals | null }) => {
+    if (groupAlive()) {
+      signal("SIGKILL");
+      await waitGroup();
+    }
+    return value;
+  };
+  if (proc.exitCode !== null || proc.signalCode !== null) return finish({ code: proc.exitCode, signal: proc.signalCode });
+  const close = closeOf(proc);
+  signal("SIGTERM");
+  const graceful = await Promise.race([close.then((value) => ({ value })), new Promise<{ value?: undefined }>((resolve) => setTimeout(() => resolve({}), 1000))]);
+  if (graceful.value) return finish(graceful.value);
+  signal("SIGKILL");
+  const forced = await Promise.race([close.then((value) => ({ value })), new Promise<{ value?: undefined }>((resolve) => setTimeout(() => resolve({}), 1000))]);
+  if (!forced.value) throw new Error("owned fixture process did not close after SIGKILL");
+  return finish(forced.value);
+}
+
 function latestDeliveries(fixture: LoadedFixture): any[] {
   return [...fixture.entries].reverse().find((entry) => entry.type === "yokemate-child-state")?.data?.deliveries ?? [];
 }
@@ -103,13 +147,41 @@ test("fixture context ACK and shutdown preserve delivery truth", async () => {
   });
 
   const failed = createFixtureEngine({ label: "body-error", agents: { worker } });
-  await assert.rejects(withFixtureEnvironment(failed, { YOKEMATE_SUBAGENT_TEST_TARGET: failed.resources["subagent-report-child.js"] }, async () => {
-    const fixture = await loadFixtureExtension(failed, { sessionId: "body-error-owner" });
-    await fixture.tool.execute("body-error", { agent: "worker", task: "complete before body error" }, undefined, () => undefined, fixture.ctx);
-    await waitFor(() => fixture.sent.length === 2, 5000, "body error reports");
-    await shutdownFixture(fixture, { expectedDeliveryState: "delivery_unknown" });
-    throw new Error("intentional fixture body error");
-  }), /intentional fixture body error/);
+  const failedSocketPath = path.join(failed.runtimeDir, "body-error.sock");
+  const failedSockets = new Set<Socket>();
+  const failedEvents: any[] = [];
+  let failedPid: number | undefined;
+  const failedServer = createServer((socket) => {
+    failedSockets.add(socket);
+    socket.once("close", () => failedSockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const event = JSON.parse(buffer.slice(0, newline));
+        failedEvents.push(event);
+        failedPid ??= event.pid;
+        buffer = buffer.slice(newline + 1);
+      }
+    });
+  });
+  await new Promise<void>((resolve) => failedServer.listen(failedSocketPath, resolve));
+  try {
+    await assert.rejects(withFixtureEnvironment(failed, { RUNTIME_SETTINGS_TEST_SOCKET: failedSocketPath, SUBAGENT_CANCEL_MODE: "term", YOKEMATE_SUBAGENT_TEST_TARGET: failed.resources["runtime-settings-child.mjs"] }, async () => {
+      const fixture = await loadFixtureExtension(failed, { sessionId: "body-error-owner" });
+      await fixture.tool.execute("body-error", { agent: "worker", task: "remain live during body error" }, undefined, () => undefined, fixture.ctx);
+      await waitFor(() => failedEvents.some((event) => event.task?.includes("remain live during body error")), 5000, "body error live child");
+      assert.doesNotThrow(() => process.kill(failedPid!, 0));
+      throw new Error("intentional fixture body error");
+    }), /intentional fixture body error/);
+  } finally {
+    for (const socket of failedSockets) socket.destroy();
+    await new Promise<void>((resolve) => failedServer.close(() => resolve()));
+  }
+  assert.ok(failedPid);
+  assert.throws(() => process.kill(failedPid!, 0));
   assert.equal(fs.existsSync(failed.root), false);
 });
 
@@ -171,18 +243,16 @@ export async function runFixturePass(engine: PersistentEngine, signal: AbortSign
     cwd: engine.root,
     env: { PATH: process.env.PATH, HOME: engine.homeDir, TMPDIR: engine.tmpDir, XDG_RUNTIME_DIR: engine.runtimeDir, YM245_FIXTURE_DEPENDENCY_ROOT: engine.dependencyRoot },
     stdio: ["ignore", "ignore", "pipe"],
+    detached: process.platform !== "win32",
   });
   let stderr = "";
   proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-  const abort = () => proc.kill("SIGTERM");
-  signal.addEventListener("abort", abort, { once: true });
   try {
-    const close = await untilAborted(new Promise<{ code: number; signal: NodeJS.Signals | null }>((resolve) => proc.once("close", (code, childSignal) => resolve({ code: code ?? -1, signal: childSignal }))), signal);
+    const close = await untilAborted(closeOf(proc), signal);
     if (close.signal) throw new Error(`fixture pass signaled ${close.signal}`);
-    return { code: close.code, stderr };
+    return { code: close.code ?? -1, stderr };
   } finally {
-    signal.removeEventListener("abort", abort);
-    if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGTERM");
+    await boundedStop(proc, true);
   }
 }
 
@@ -230,6 +300,7 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
       YM204_FIXTURE_SCENARIO: "snapshot_probe",
     },
     stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   const events: any[] = [];
   let stdout = "";
@@ -245,8 +316,6 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
     }
   });
   proc.stderr!.on("data", (chunk) => { stderr += chunk.toString(); });
-  const abort = () => proc.kill("SIGTERM");
-  signal.addEventListener("abort", abort, { once: true });
   try {
     proc.stdin!.write(JSON.stringify({ id: "snapshot-probe", type: "prompt", message: "Run the snapshot probe." }) + "\n");
     await waitFor(() => events.some((event) => event.type === "tool_execution_end" && event.toolName === "subagent") && events.filter((event) => event.type === "message_end" && event.message?.details?.envelope).some((event) => event.message.details.envelope.kind === "batch") && events.some((event) => event.type === "entry_appended" && event.entry?.customType === "yokemate-child-state" && event.entry.data?.deliveries?.length === 2 && event.entry.data.deliveries.every((delivery: any) => delivery.state === "observed")), 15000, `snapshot probe ${stderr.slice(-1000)}`);
@@ -257,16 +326,14 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
     assert.equal(result.details.envelope.identity.runId, ack.children[0].identity.runId);
     assert.equal(batch.details.envelope.results[0].identity.runId, ack.children[0].identity.runId);
     assert.equal(result.content, fs.readFileSync(result.details.display.archive.reportPath, "utf8"));
-    proc.kill("SIGTERM");
-    const close = await untilAborted(new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => proc.once("close", (code, childSignal) => resolve({ code, signal: childSignal }))), signal);
+    const close = await untilAborted(boundedStop(proc), signal);
     const snapshots = snapshotStoreManifest(engine);
     const name = `${ack.children[0].identity.ownerRunId}-${ack.children[0].identity.runId}.json`;
     const item = snapshots.find((entry) => entry.name === name);
     const snapshot = item ? JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, item.name), "utf8")) : undefined;
     return { ack, result, batch, snapshot, snapshots, reports: reportManifest(engine), phases, close };
   } finally {
-    signal.removeEventListener("abort", abort);
-    if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGTERM");
+    await boundedStop(proc, true);
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

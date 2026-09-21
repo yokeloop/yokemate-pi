@@ -342,6 +342,7 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     await waitFor(() => sent.length === unknownSingleStart + 2);
     assert.equal(sent[unknownSingleStart]!.message.details.envelope.processOutcome, "not_started");
     assert.equal(sent[unknownSingleStart]!.message.details.display.diagnosticCode, "unknown_agent");
+    assertCanonicalReports(sent.slice(unknownSingleStart));
     await acknowledgeFixtureReports(fixture, sent.slice(unknownSingleStart));
     const unknownChainStart = sent.length;
     await tool.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
