@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { boundBatchResult, ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { boundBatchResult, ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, sha256, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
 import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
@@ -336,6 +336,51 @@ test("ordinary snapshots are private, bounded, locked and protect active deliver
     const completedDir = path.join(completedRoot, "sessions/subagent-runs");
     assert.equal(fs.readdirSync(completedDir).filter((name: string) => name.endsWith(".json")).length, 20);
     assert.doesNotMatch(fs.readFileSync(path.join(completedDir, fs.readdirSync(completedDir).find((name: string) => name.endsWith(".json"))!), "utf8"), /private sentinel/);
+
+    const protectedRoot = path.join(root, "protected-delivery");
+    const protectedStore = new RunSnapshots(protectedRoot);
+    const time = new Date().toISOString();
+    const protectedCases = [
+      { name: "pending", metadata: { closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { ["d".repeat(64)]: { state: "pending", envelopeHash: "e".repeat(64) } } }, completed: true },
+      { name: "enqueued", metadata: { closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { ["1".repeat(64)]: { state: "observed", envelopeHash: "2".repeat(64) }, ["3".repeat(64)]: { state: "enqueued", envelopeHash: "4".repeat(64) } } }, completed: true },
+      { name: "missing-proof", metadata: { closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: {} }, completed: true },
+      { name: "unknown", metadata: { closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { ["5".repeat(64)]: { state: "unknown", envelopeHash: "6".repeat(64) } } }, completed: true },
+      { name: "dead-pid", metadata: { pid: 999999, starttime: "1", closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { ["7".repeat(64)]: { state: "enqueued", envelopeHash: "8".repeat(64) } } }, completed: true },
+      { name: "live-process", metadata: { pid: process.pid, starttime: "1", deliveries: { ["9".repeat(64)]: { state: "observed", envelopeHash: "a".repeat(64), observedAt: time } } }, completed: false },
+    ];
+    for (let i = 0; i < 40; i++) {
+      const candidate = protectedCases[i % protectedCases.length]!;
+      assert.equal(protectedStore.write("owner", `${candidate.name}-${i}`, { identity, ...candidate.metadata, rawTask: "raw-task-sentinel", prompt: "prompt-sentinel", result: "result-sentinel", secret: "secret-sentinel" }, candidate.completed).state, "available");
+    }
+    const protectedDir = path.join(protectedRoot, "sessions/subagent-runs");
+    const before = Object.fromEntries(fs.readdirSync(protectedDir).filter((name: string) => name.endsWith(".json")).map((name: string) => [name, sha256(fs.readFileSync(path.join(protectedDir, name)))]));
+    assert.deepEqual(protectedStore.write("owner", "overflow", { identity, deliveries: {} }, false), { state: "unavailable", code: "storage_limit" });
+    const after = Object.fromEntries(fs.readdirSync(protectedDir).filter((name: string) => name.endsWith(".json")).map((name: string) => [name, sha256(fs.readFileSync(path.join(protectedDir, name)))]));
+    assert.deepEqual(after, before);
+    assert.doesNotMatch(fs.readdirSync(protectedDir).filter((name: string) => name.endsWith(".json")).map((name: string) => fs.readFileSync(path.join(protectedDir, name), "utf8")).join("\n"), /raw-task-sentinel|prompt-sentinel|result-sentinel|secret-sentinel/);
+
+    const byteRoot = path.join(root, "protected-bytes");
+    const byteStore = new RunSnapshots(byteRoot);
+    for (let i = 0; i < 39; i++) assert.equal(byteStore.write("owner", `bytes-${i}`, { identity, closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { [sha256(`held-${i}`)]: { state: "enqueued", envelopeHash: sha256(`held-envelope-${i}`) } } }, true).state, "available");
+    const byteDir = path.join(byteRoot, "sessions/subagent-runs");
+    for (const name of fs.readdirSync(byteDir).filter((name: string) => name.endsWith(".json"))) {
+      const file = path.join(byteDir, name);
+      const data = fs.readFileSync(file);
+      fs.writeFileSync(file, Buffer.concat([data, Buffer.alloc(50 * 1024 - data.length, 0x20)]));
+    }
+    fs.writeFileSync(path.join(byteDir, "held-provenance.bin"), Buffer.alloc(100_000, 0x78));
+    const byteFiles = fs.readdirSync(byteDir).filter((name: string) => name !== ".lock");
+    const byteTotal = byteFiles.reduce((sum: number, name: string) => sum + fs.statSync(path.join(byteDir, name)).size, 0);
+    assert.ok(byteTotal < 2 * 1024 * 1024);
+    const byteBefore = Object.fromEntries(byteFiles.map((name: string) => [name, sha256(fs.readFileSync(path.join(byteDir, name)))]));
+    assert.deepEqual(byteStore.write("owner", "bytes-overflow", { identity, deliveries: {} }, false), { state: "unavailable", code: "storage_limit" });
+    const byteAfter = Object.fromEntries(fs.readdirSync(byteDir).filter((name: string) => name !== ".lock").map((name: string) => [name, sha256(fs.readFileSync(path.join(byteDir, name)))]));
+    assert.deepEqual(byteAfter, byteBefore);
+
+    const unknownRoot = path.join(root, "delivery-unknown");
+    const unknownStore = new RunSnapshots(unknownRoot);
+    for (let i = 0; i < 24; i++) assert.equal(unknownStore.write("owner", `unknown-${i}`, { identity, closeAt: time, terminal: { processOutcome: "exited", exitCode: 0, signal: null }, deliveries: { [sha256(`delivery-${i}`)]: { state: "delivery_unknown", envelopeHash: sha256(`envelope-${i}`), failedAt: time } } }, true).state, "available");
+    assert.equal(fs.readdirSync(path.join(unknownRoot, "sessions/subagent-runs")).filter((name: string) => name.endsWith(".json")).length, 20);
 
     const liveLockRoot = path.join(root, "live-lock");
     const liveLock = new RunSnapshots(liveLockRoot, { pid: 42, processStarttime: () => "live" });

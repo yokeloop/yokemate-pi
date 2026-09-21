@@ -8,6 +8,7 @@ import { convertToLlm, CustomMessageComponent, DefaultResourceLoader, initTheme,
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { reportContent, sha256, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
 import { openDb } from "../src/db.ts";
+import { acknowledgeFixtureReports, createFixtureEngine, loadFixtureExtension, shutdownFixture, withFixtureEnvironment } from "./fixtures/subagent-fixture-engine.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
@@ -119,19 +120,8 @@ async function coordinatorTerminalScenario(scenario: "verified" | "blocked" | "l
 }
 
 test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closing the runtime", { timeout: 30000 }, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "ym228-cancel-"));
-  const socketPath = join(dir, "cancel.sock");
-  const agentDir = join(dir, "agent");
-  const promptTmp = join(dir, "tmp");
-  mkdirSync(promptTmp);
-  const previousTmpdir = process.env.TMPDIR;
-  process.env.TMPDIR = promptTmp;
-  const previousArgv = process.argv[1];
-  const previousSocket = process.env.RUNTIME_SETTINGS_TEST_SOCKET;
-  const previousMode = process.env.SUBAGENT_CANCEL_MODE;
-  const previousRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
-  const previousTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
-  const previousOwner = { YOKEMATE_MODE: process.env.YOKEMATE_MODE, YOKEMATE_ROLE: process.env.YOKEMATE_ROLE, YOKEMATE_RUN_ID: process.env.YOKEMATE_RUN_ID, YOKEMATE_TICKET: process.env.YOKEMATE_TICKET, YOKEMATE_PLAN_RUN_ID: process.env.YOKEMATE_PLAN_RUN_ID, PI_SESSION_ID: process.env.PI_SESSION_ID };
+  const engine = createFixtureEngine({ label: "cancel", agents: { worker: "---\nname: worker\ndescription: cancellation fixture\n---\nReturn only after release.\n" } });
+  const socketPath = join(engine.runtimeDir, "cancel.sock");
   const sockets = new Set<Socket>();
   const events: any[] = [];
   const waiters: Array<() => void> = [];
@@ -154,89 +144,73 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
     while (!events.some(predicate)) await new Promise<void>((resolve) => waiters.push(resolve));
     return events.find(predicate)!;
   };
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
   try {
-    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
-    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: cancellation fixture\n---\nReturn only after release.\n");
-    process.env.RUNTIME_SETTINGS_TEST_SOCKET = socketPath;
-    process.env.SUBAGENT_CANCEL_MODE = "term";
-    delete process.env.YOKEMATE_MODE;
-    delete process.env.YOKEMATE_ROLE;
-    delete process.env.YOKEMATE_RUN_ID;
-    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
-    await loader.reload();
-    const loaded = loader.getExtensions();
-    assert.deepEqual(loaded.errors, []);
-    const states: any[] = [];
-    const reports: any[] = [];
-    loaded.runtime.appendEntry = (_type, data) => { states.push(data); };
-    loaded.runtime.sendMessage = (message) => { if ((message as any).customType === "subagent-report") reports.push(message); };
-    const tool = loaded.extensions[0]!.tools.get("subagent")!.definition;
-    const widgets: unknown[] = [];
-    const ctx = { cwd: dir, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "cancel-owner" }, ui: { setWidget: (_key: string, value: unknown) => widgets.push(value) } } as unknown as ExtensionContext;
-    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
-    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(root, "test/fixtures/runtime-settings-child.mjs");
-    const promptsBefore = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-")));
-    const launched = await tool.execute("cancel-term", { agent: "worker", task: "held TERM child" }, undefined, () => undefined, ctx);
-    const runId = (launched.details as any).children[0].identity.runId;
-    const child = await waitEvent((event) => event.task?.includes("held TERM child"));
-    const foreign = await tool.execute("foreign", { cancelRun: runId }, undefined, () => undefined, { ...ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext);
-    assert.equal((foreign.details as any).status, "not_owned");
-    assert.doesNotThrow(() => process.kill(child.pid, 0));
-    const cancelling = tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-    await waitEvent((event) => event.pid === child.pid && event.phase === "term");
-    assert.notEqual(widgets.at(-1), undefined);
-    const cancelled = await cancelling;
-    assert.equal((cancelled.details as any).status, "cancelled");
-    assert.equal((cancelled.details as any).targetKind, "ordinary");
-    assert.equal((cancelled.details as any).processOutcome, "cancelled");
-    assert.equal((cancelled.details as any).exitCode, 0);
-    assert.equal((cancelled.details as any).signal, null);
-    assert.equal((cancelled.details as any).cancellationInitiator, "tool_cancel");
-    assert.throws(() => process.kill(child.pid, 0));
-    await waitFor(() => reports.filter((message) => message.details?.envelope?.identity?.runId === runId || message.details?.envelope?.results?.some((result: any) => result.identity.runId === runId)).length === 2);
-    assert.equal(reports.find((message) => message.details?.envelope?.identity?.runId === runId).details.envelope.processOutcome, "cancelled");
-    assert.equal((await tool.execute("repeat", { cancelRun: runId }, undefined, () => undefined, ctx) as any).details.status, "already_terminal");
-    assert.equal((await tool.execute("unknown", { cancelRun: "11111111-1111-4111-8111-111111111111" }, undefined, () => undefined, ctx) as any).details.status, "unknown");
-    const mixed = await tool.execute("mixed", { cancelRun: "11111111-1111-4111-8111-111111111111", agent: "worker", task: "must not launch" }, undefined, () => undefined, ctx);
-    assert.equal("isError" in mixed && mixed.isError, true);
-    assert.match((mixed.content[0] as any).text, /cannot be combined/);
-    await waitFor(() => widgets.at(-1) === undefined);
-    assert.deepEqual(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-subagent-") && !promptsBefore.has(name)), []);
+    await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, SUBAGENT_CANCEL_MODE: "term", YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] }, async () => {
+      const widgets: unknown[] = [];
+      const fixture = await loadFixtureExtension(engine, { sessionId: "cancel-owner", hasUI: true, ui: { setWidget: (_key: string, value: unknown) => widgets.push(value) } });
+      const promptsBefore = new Set(readdirSync(engine.tmpDir).filter((name) => name.startsWith("pi-subagent-")));
+      const termStart = fixture.sent.length;
+      const launched = await fixture.tool.execute("cancel-term", { agent: "worker", task: "held TERM child" }, undefined, () => undefined, fixture.ctx);
+      const runId = (launched.details as any).children[0].identity.runId;
+      const child = await waitEvent((event) => event.task?.includes("held TERM child"));
+      const foreign = await fixture.tool.execute("foreign", { cancelRun: runId }, undefined, () => undefined, { ...fixture.ctx, sessionManager: { getSessionId: () => "foreign" } } as ExtensionContext);
+      assert.equal((foreign.details as any).status, "not_owned");
+      assert.doesNotThrow(() => process.kill(child.pid, 0));
+      const cancelling = fixture.tool.execute("cancel", { cancelRun: runId }, undefined, () => undefined, fixture.ctx);
+      await waitEvent((event) => event.pid === child.pid && event.phase === "term");
+      assert.notEqual(widgets.at(-1), undefined);
+      const cancelled = await cancelling;
+      assert.equal((cancelled.details as any).status, "cancelled");
+      assert.equal((cancelled.details as any).targetKind, "ordinary");
+      assert.equal((cancelled.details as any).processOutcome, "cancelled");
+      assert.equal((cancelled.details as any).exitCode, 0);
+      assert.equal((cancelled.details as any).signal, null);
+      assert.equal((cancelled.details as any).cancellationInitiator, "tool_cancel");
+      assert.throws(() => process.kill(child.pid, 0));
+      await waitFor(() => fixture.sent.length === termStart + 2);
+      const termReports = fixture.sent.slice(termStart);
+      assert.equal(termReports.find(({ message }) => message.details?.envelope?.identity?.runId === runId)!.message.details.envelope.processOutcome, "cancelled");
+      await acknowledgeFixtureReports(fixture, termReports);
+      assert.equal((await fixture.tool.execute("repeat", { cancelRun: runId }, undefined, () => undefined, fixture.ctx) as any).details.status, "already_terminal");
+      assert.equal((await fixture.tool.execute("unknown", { cancelRun: "11111111-1111-4111-8111-111111111111" }, undefined, () => undefined, fixture.ctx) as any).details.status, "unknown");
+      const mixed = await fixture.tool.execute("mixed", { cancelRun: "11111111-1111-4111-8111-111111111111", agent: "worker", task: "must not launch" }, undefined, () => undefined, fixture.ctx);
+      assert.equal("isError" in mixed && mixed.isError, true);
+      assert.match((mixed.content[0] as any).text, /cannot be combined/);
+      await waitFor(() => widgets.at(-1) === undefined);
+      assert.deepEqual(readdirSync(engine.tmpDir).filter((name) => name.startsWith("pi-subagent-") && !promptsBefore.has(name)), []);
 
-    process.env.SUBAGENT_CANCEL_MODE = "kill";
-    const killLaunch = await tool.execute("cancel-kill", { agent: "worker", task: "held KILL child" }, undefined, () => undefined, ctx);
-    const killRunId = (killLaunch.details as any).children[0].identity.runId;
-    const killChild = await waitEvent((event) => event.task?.includes("held KILL child"));
-    const killed = await tool.execute("kill", { cancelRun: killRunId }, undefined, () => undefined, ctx);
-    assert.ok(events.some((event) => event.pid === killChild.pid && event.phase === "term-ignored"));
-    assert.equal((killed.details as any).status, "cancelled");
-    assert.equal((killed.details as any).signal, "SIGKILL");
-    assert.equal((killed.details as any).exitCode, null);
-    assert.throws(() => process.kill(killChild.pid, 0));
-    assert.ok(states.some((state) => state.children?.some((entry: any) => entry.identity.runId === killRunId)));
-    assert.ok(states.some((state) => state.children?.length === 0));
+      process.env.SUBAGENT_CANCEL_MODE = "kill";
+      const killStart = fixture.sent.length;
+      const killLaunch = await fixture.tool.execute("cancel-kill", { agent: "worker", task: "held KILL child" }, undefined, () => undefined, fixture.ctx);
+      const killRunId = (killLaunch.details as any).children[0].identity.runId;
+      const killChild = await waitEvent((event) => event.task?.includes("held KILL child"));
+      const killed = await fixture.tool.execute("kill", { cancelRun: killRunId }, undefined, () => undefined, fixture.ctx);
+      assert.ok(events.some((event) => event.pid === killChild.pid && event.phase === "term-ignored"));
+      assert.equal((killed.details as any).status, "cancelled");
+      assert.equal((killed.details as any).signal, "SIGKILL");
+      assert.equal((killed.details as any).exitCode, null);
+      assert.throws(() => process.kill(killChild.pid, 0));
+      await waitFor(() => fixture.sent.length === killStart + 2);
+      await acknowledgeFixtureReports(fixture, fixture.sent.slice(killStart));
+      const states = fixture.entries.filter((entry) => entry.type === "yokemate-child-state").map((entry) => entry.data);
+      assert.ok(states.some((state) => state.children?.some((entry: any) => entry.identity.runId === killRunId)));
+      assert.ok(states.some((state) => state.children?.length === 0));
 
-    Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_PLAN_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_TICKET: "YM-1" });
-    delete process.env.PI_SESSION_ID;
-    const planFinish = loaded.extensions[0]!.tools.get("plan_finish")!.definition;
-    const stopped = await planFinish.execute("finish", { outcome: "cancelled", reason: "fixture stop" }, undefined, () => undefined, ctx);
-    assert.equal("isError" in stopped && stopped.isError, true);
-    assert.doesNotMatch((stopped.content[0] as any).text, /PI_SESSION_ID/);
-    const fenced = await tool.execute("after-stop", { agent: "worker", task: "must stay conversational" }, undefined, () => undefined, ctx);
-    assert.equal("isError" in fenced && fenced.isError, true);
-    assert.match((fenced.content[0] as any).text, /plan run is stopped/);
+      Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_PLAN_RUN_ID: "22222222-2222-4222-8222-222222222222", YOKEMATE_TICKET: "YM-1" });
+      delete process.env.PI_SESSION_ID;
+      const planFinish = fixture.extension.tools.get("plan_finish")!.definition;
+      const stopped = await planFinish.execute("finish", { outcome: "cancelled", reason: "fixture stop" }, undefined, () => undefined, fixture.ctx);
+      assert.equal("isError" in stopped && stopped.isError, true);
+      assert.doesNotMatch((stopped.content[0] as any).text, /PI_SESSION_ID/);
+      const fenced = await fixture.tool.execute("after-stop", { agent: "worker", task: "must stay conversational" }, undefined, () => undefined, fixture.ctx);
+      assert.equal("isError" in fenced && fenced.isError, true);
+      assert.match((fenced.content[0] as any).text, /plan run is stopped/);
+      await shutdownFixture(fixture);
+    });
   } finally {
-    process.argv[1] = previousArgv;
-    if (previousSocket === undefined) delete process.env.RUNTIME_SETTINGS_TEST_SOCKET; else process.env.RUNTIME_SETTINGS_TEST_SOCKET = previousSocket;
-    if (previousMode === undefined) delete process.env.SUBAGENT_CANCEL_MODE; else process.env.SUBAGENT_CANCEL_MODE = previousMode;
-    if (previousRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = previousRelay;
-    if (previousTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = previousTarget;
-    for (const [key, value] of Object.entries(previousOwner)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
-    if (previousTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previousTmpdir;
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -248,81 +222,37 @@ test("real loader sends one compact parent terminal for every coordinator termin
 });
 
 test("D01 ordinary descendants inherit isolation and retain default session behavior", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "isolation-loader-"));
-  const originalCwd = process.cwd();
-  const keys = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "YOKEMATE_ROLE", "YM217_REPORT_SCENARIO", "YOKEMATE_SUBAGENT_TEST_RELAY", "YOKEMATE_SUBAGENT_TEST_TARGET"];
-  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-  const sent: any[] = [];
-  try {
-    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
-    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: isolation fixture\n---\nReturn output.\n");
-    const agentDir = join(dir, "isolated agent");
-    const loader = new DefaultResourceLoader({ cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [extension] });
-    await loader.reload();
-    const loaded = loader.getExtensions();
-    assert.deepEqual(loaded.errors, []);
-    loaded.runtime.appendEntry = () => undefined;
-    loaded.runtime.sendMessage = ((message: any) => { sent.push(message); }) as any;
-    const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent")!;
-    const ctx = { cwd: dir, mode: "rpc", hasUI: false, ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "isolation-session" } } as unknown as ExtensionContext;
-    process.chdir(dir);
-    Object.assign(process.env, { PI_CODING_AGENT_DIR: agentDir, YM217_REPORT_SCENARIO: "isolation", YOKEMATE_SUBAGENT_TEST_RELAY: join(root, "test/fixtures/subagent-json-relay.mjs"), YOKEMATE_SUBAGENT_TEST_TARGET: child });
+  const engine = createFixtureEngine({ label: "isolation", agents: { worker: "---\nname: worker\ndescription: isolation fixture\n---\nReturn output.\n" } });
+  await withFixtureEnvironment(engine, { YM217_REPORT_SCENARIO: "isolation", YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["subagent-report-child.js"] }, async () => {
+    const fixture = await loadFixtureExtension(engine, { sessionId: "isolation-session" });
     for (const coordinator of [false, true]) for (const isolated of [false, true]) {
       if (coordinator) process.env.YOKEMATE_ROLE = "coordinator"; else delete process.env.YOKEMATE_ROLE;
-      if (isolated) process.env.PI_CODING_AGENT_SESSION_DIR = join(dir, "isolated sessions"); else delete process.env.PI_CODING_AGENT_SESSION_DIR;
-      const before = sent.length;
-      await tool.definition.execute(`isolation-${coordinator}-${isolated}`, { agent: "worker", task: "inspect safe fixture configuration" }, undefined, () => undefined, ctx);
-      await waitFor(() => sent.length === before + 2);
-      const observed = JSON.parse(sent[before].details.envelope.payload);
-      assert.equal(observed.agentDir, agentDir);
-      assert.equal(observed.sessionDir, isolated ? join(dir, "isolated sessions") : undefined);
+      if (isolated) process.env.PI_CODING_AGENT_SESSION_DIR = join(engine.root, "isolated sessions"); else delete process.env.PI_CODING_AGENT_SESSION_DIR;
+      const before = fixture.sent.length;
+      await fixture.tool.execute(`isolation-${coordinator}-${isolated}`, { agent: "worker", task: "inspect safe fixture configuration" }, undefined, () => undefined, fixture.ctx);
+      await waitFor(() => fixture.sent.length === before + 2);
+      const reports = fixture.sent.slice(before);
+      const observed = JSON.parse(reports[0]!.message.details.envelope.payload);
+      assert.equal(observed.agentDir, engine.agentDir);
+      assert.equal(observed.sessionDir, isolated ? join(engine.root, "isolated sessions") : undefined);
       assert.equal(observed.role, "executor");
       assert.equal(observed.args.includes("--no-session"), !coordinator);
       assert.equal(observed.args.includes("--session-dir"), coordinator && !isolated);
-      if (coordinator && !isolated) assert.equal(observed.args[observed.args.indexOf("--session-dir") + 1], join(dir, "sessions"));
+      if (coordinator && !isolated) assert.equal(observed.args[observed.args.indexOf("--session-dir") + 1], engine.sessionDir);
+      await acknowledgeFixtureReports(fixture, reports);
     }
-  } finally {
-    process.chdir(originalCwd);
-    for (const [key, val] of Object.entries(previous)) if (val === undefined) delete process.env[key]; else process.env[key] = val;
-    rmSync(dir, { recursive: true, force: true });
-  }
+    await shutdownFixture(fixture);
+  });
 });
 
 test("real loader keeps canonical reports byte-equivalent while renderer collapses and expands", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "ym217-loader-"));
-  const agentDir = join(dir, "agent");
-  const originalArgv = process.argv[1];
-  const originalCwd = process.cwd();
-  const originalRelay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
-  const originalTarget = process.env.YOKEMATE_SUBAGENT_TEST_TARGET;
-  const sent: { message: any; options: any }[] = [];
-  let providerTurns = 0;
-  try {
-    mkdirSync(join(dir, ".pi/agents"), { recursive: true });
-    writeFileSync(join(dir, ".pi/agents/worker.md"), "---\nname: worker\ndescription: report fixture\n---\nReturn output.\n");
-    const loader = new DefaultResourceLoader({
-      cwd: dir,
-      agentDir,
-      settingsManager: SettingsManager.create(dir, agentDir),
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
-      additionalExtensionPaths: [extension],
-    });
-    await loader.reload();
-    const loaded = loader.getExtensions();
-    assert.deepEqual(loaded.errors, []);
-    loaded.runtime.appendEntry = () => undefined;
-    loaded.runtime.sendMessage = ((message: any, options: any) => { sent.push({ message, options }); }) as any;
-    const tool = loaded.extensions.flatMap((entry) => [...entry.tools.values()]).find((entry) => entry.definition.name === "subagent");
-    assert.ok(tool);
-    const ctx = { cwd: dir, mode: "rpc", hasUI: false, model: undefined, thinkingLevel: "off", ui: { setWidget: () => undefined }, sessionManager: { getSessionId: () => "loader-session" } } as unknown as ExtensionContext;
-    process.chdir(dir);
-    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
-    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = child;
-    const ack = await tool.definition.execute("loader-batch", { agent: "worker", task: "produce multiline canonical output" }, undefined, () => undefined, ctx);
+  const engine = createFixtureEngine({ label: "loader", agents: { worker: "---\nname: worker\ndescription: report fixture\n---\nReturn output.\n" } });
+  await withFixtureEnvironment(engine, { YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["subagent-report-child.js"] }, async () => {
+    const fixture = await loadFixtureExtension(engine, { sessionId: "loader-session" });
+    const sent = fixture.sent;
+    const tool = fixture.tool;
+    const ctx = fixture.ctx;
+    const ack = await tool.execute("loader-batch", { agent: "worker", task: "produce multiline canonical output" }, undefined, () => undefined, ctx);
     assert.match((ack.content[0] as any).text, /^Detached, not terminal: /);
     const parsedAck = JSON.parse((ack.content[0] as any).text.slice("Detached, not terminal: ".length));
     assert.deepEqual(parsedAck, { version: 1, kind: "ack", terminal: false, batchId: "loader-batch", children: (ack.details as any).children });
@@ -358,7 +288,7 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     assert.equal(sent[0]!.message.details.envelope.identity.runId, parsedAck.children[0].identity.runId);
 
     initTheme("dark", false);
-    const renderer = loaded.extensions.flatMap((entry) => [...entry.messageRenderers.entries()]).find(([name]) => name === "subagent-report")?.[1];
+    const renderer = [...fixture.extension.messageRenderers.entries()].find(([name]) => name === "subagent-report")?.[1];
     assert.ok(renderer);
     const component = new CustomMessageComponent({ role: "custom", timestamp: 0, ...sent[0]!.message }, renderer, undefined, 1);
     const collapsed = component.render(80).map(stripTerminalSequences);
@@ -385,49 +315,49 @@ test("real loader keeps canonical reports byte-equivalent while renderer collaps
     batchComponent.invalidate();
     batchComponent.render(40);
     assert.equal(sent.length, sendsBefore);
-    assert.equal(providerTurns, 0);
 
+    await acknowledgeFixtureReports(fixture, sent.slice(0));
     const parallelStart = sent.length;
-    const parallelAck = await tool.definition.execute("loader-parallel", { tasks: [{ agent: "worker", task: "parallel one" }, { agent: "worker", task: "parallel two" }] }, undefined, () => undefined, ctx);
+    const parallelAck = await tool.execute("loader-parallel", { tasks: [{ agent: "worker", task: "parallel one" }, { agent: "worker", task: "parallel two" }] }, undefined, () => undefined, ctx);
     await waitFor(() => sent.length === parallelStart + 3);
     const parallelReports = sent.slice(parallelStart);
     assert.deepEqual(parallelReports.map((entry) => entry.message.details.envelope.kind), ["result", "result", "batch"]);
     assert.deepEqual(new Set(parallelReports.slice(0, 2).map((entry) => entry.message.details.envelope.identity.runId)), new Set((parallelAck.details as any).children.map((child: any) => child.identity.runId)));
     assertCanonicalReports(parallelReports);
+    await acknowledgeFixtureReports(fixture, parallelReports);
 
     const chainStart = sent.length;
-    await tool.definition.execute("loader-chain", { chain: [{ agent: "worker", task: "chain one" }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
+    await tool.execute("loader-chain", { chain: [{ agent: "worker", task: "chain one" }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
     await waitFor(() => sent.length === chainStart + 2);
     const chainReports = sent.slice(chainStart);
     assert.deepEqual(chainReports.map((entry) => entry.message.details.envelope.kind), ["chain", "batch"]);
     assert.equal(chainReports[0]!.message.details.envelope.results.length, 2);
     assertCanonicalReports(chainReports);
+    await acknowledgeFixtureReports(fixture, chainReports);
 
     const controlledTask = `${"\0".repeat(24)}visible unknown task`;
     const unknownSingleStart = sent.length;
-    const unknownAck = await tool.definition.execute("unknown-single", { agent: "missing", task: controlledTask }, undefined, () => undefined, ctx);
+    const unknownAck = await tool.execute("unknown-single", { agent: "missing", task: controlledTask }, undefined, () => undefined, ctx);
     assert.equal((unknownAck.details as any).display.members[0].taskExcerpt, "visible unknown task");
     await waitFor(() => sent.length === unknownSingleStart + 2);
     assert.equal(sent[unknownSingleStart]!.message.details.envelope.processOutcome, "not_started");
     assert.equal(sent[unknownSingleStart]!.message.details.display.diagnosticCode, "unknown_agent");
+    assertCanonicalReports(sent.slice(unknownSingleStart));
+    await acknowledgeFixtureReports(fixture, sent.slice(unknownSingleStart));
     const unknownChainStart = sent.length;
-    await tool.definition.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
+    await tool.execute("unknown-chain", { chain: [{ agent: "missing", task: controlledTask }, { agent: "worker", task: "after {previous}" }] }, undefined, () => undefined, ctx);
     await waitFor(() => sent.length === unknownChainStart + 2);
     assert.equal(sent[unknownChainStart]!.message.details.envelope.kind, "chain");
     assert.deepEqual(sent[unknownChainStart]!.message.details.envelope.results.map((entry: any) => entry.processOutcome), ["not_started", "not_started"]);
     assert.equal(sent[unknownChainStart]!.message.details.display.diagnosticCode, "unknown_agent");
-    assertCanonicalReports(sent.slice(unknownSingleStart));
+    assertCanonicalReports(sent.slice(unknownChainStart));
+    await acknowledgeFixtureReports(fixture, sent.slice(unknownChainStart));
 
     const legacy = { ...sent[0]!.message, details: { envelope: sent[0]!.message.details.envelope } };
     const legacyComponent = new CustomMessageComponent({ role: "custom", timestamp: 0, ...legacy }, renderer, undefined, 1);
     assert.doesNotThrow(() => legacyComponent.render(40));
     legacyComponent.setExpanded(true);
     assert.match(legacyComponent.render(120).map(stripTerminalSequences).join("\n"), /canonical tail/);
-  } finally {
-    process.argv[1] = originalArgv;
-    process.chdir(originalCwd);
-    if (originalRelay === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_RELAY; else process.env.YOKEMATE_SUBAGENT_TEST_RELAY = originalRelay;
-    if (originalTarget === undefined) delete process.env.YOKEMATE_SUBAGENT_TEST_TARGET; else process.env.YOKEMATE_SUBAGENT_TEST_TARGET = originalTarget;
-    rmSync(dir, { recursive: true, force: true });
-  }
+    await shutdownFixture(fixture);
+  });
 });

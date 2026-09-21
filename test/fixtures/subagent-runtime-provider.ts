@@ -65,7 +65,7 @@ let cancelledRunId: string | undefined;
     await barrier("loaded", { pid: process.pid, file, hash: createHash("sha256").update(readFileSync(file)).digest("hex"), sessionId: ctx.sessionManager.getSessionId(), model: ctx.model?.id, thinking: ctx.thinkingLevel, commands: pi.getCommands().map((command) => ({ name: command.name, path: command.sourceInfo.path })), tools: pi.getAllTools().map((tool) => ({ name: tool.name, path: tool.sourceInfo.path })) });
   });
   pi.on("context", async (event) => {
-    if (process.env.YOKEMATE_ROLE !== "coordinator") return;
+    if (process.env.YOKEMATE_ROLE !== "coordinator" && !(scenario === "snapshot_probe" && process.env.YOKEMATE_ROLE !== "executor")) return;
     const reports = event.messages.filter((message) => message.role === "custom" && message.customType === "subagent-report");
     await barrier("context", reports);
   });
@@ -150,7 +150,13 @@ let cancelledRunId: string | undefined;
           };
           if (!calledA) {
             calledA = true;
-            if (scenario?.includes("read_heavy")) {
+            if (scenario === "snapshot_probe") {
+              message.stopReason = "toolUse";
+              const single = { agent: "worker", task: "return deterministic snapshot probe" };
+              message.content = [{ type: "toolCall", id: "snapshot-probe", name: "subagent", arguments: process.env.YM245_PRESERVATION === "1" ? { tasks: [single, { ...single, task: "return held-delivery snapshot probe" }] } : single }];
+              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+            } else if (scenario?.includes("read_heavy")) {
               message.stopReason = "toolUse";
               const items = scenario.includes("parallel") ? ["read-heavy-24", "read-heavy-32"] : [scenario.includes("32") ? "read-heavy-32" : "read-heavy-24"];
               const tasks = items.map((task) => ({ agent: "plan-scout", task, ticket: "YM-204" }));
