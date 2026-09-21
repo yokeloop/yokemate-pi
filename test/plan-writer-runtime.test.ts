@@ -20,6 +20,15 @@ const cases = [
   { name: "YM-221 write-empty-final-record ordinary", final: (path: string) => path, valid: true, writeEmpty: true },
   { name: "YM-221 empty-no-artifact", final: (path: string) => path, valid: false, empty: true, expected: "missing_final", reason: "artifact_not_found" },
   { name: "YM-221 multiple-artifacts", final: (path: string) => path, valid: false, empty: true, multiple: true, expected: "invalid_plan_result", reason: "ambiguous_artifact" },
+  { name: "YM-221 writer nonzero", final: (path: string) => path, valid: false, runtimeFault: "nonzero", expected: "incomplete", processOutcome: "exited", exitCode: 7 },
+  { name: "YM-221 writer error", final: (path: string) => path, valid: false, runtimeFault: "error", expected: "incomplete", processOutcome: "exited" },
+  { name: "YM-221 writer aborted", final: (path: string) => path, valid: false, runtimeFault: "aborted", expected: "incomplete", processOutcome: "exited" },
+  { name: "YM-221 writer length", final: (path: string) => path, valid: false, runtimeFault: "length", expected: "incomplete", processOutcome: "exited" },
+  { name: "YM-221 writer signal", final: (path: string) => path, valid: false, runtimeFault: "signal", expected: "incomplete", processOutcome: "signaled", signal: "SIGKILL" },
+  { name: "YM-221 writer cancellation", final: (path: string) => path, valid: false, runtimeFault: "cancel", expected: "incomplete", processOutcome: "cancelled" },
+  { name: "YM-221 writer malformed JSONL", final: (path: string) => path, valid: false, runtimeFault: "protocol_invalid", expected: "protocol_error", processOutcome: "exited" },
+  { name: "YM-221 writer partial JSONL", final: (path: string) => path, valid: false, runtimeFault: "protocol_partial", expected: "protocol_error", processOutcome: "exited" },
+  { name: "YM-221 writer oversized JSONL", final: (path: string) => path, valid: false, runtimeFault: "protocol_overflow", expected: "protocol_error", processOutcome: "exited" },
   { name: "observed canary path", final: (path: string) => `[k7x2] ${path}`, valid: true },
   { name: "bare path", final: (path: string) => path, valid: true },
   { name: "bare path with spaces", final: (path: string) => path, valid: true, spaced: true },
@@ -43,6 +52,7 @@ const cases = [
   { name: "foreign writer", final: (path: string) => `[k7x2] ${path}`, valid: false, fault: "writer" },
   { name: "stale writer hash", final: (path: string) => `[k7x2] ${path}`, valid: false, fault: "hash" },
   { name: "foreign accepted input", final: (path: string) => `[k7x2] ${path}`, valid: false, fault: "input" },
+  { name: "draft persistence unavailable", final: (path: string) => `[k7x2] ${path}`, valid: false, fault: "draft_unavailable", reason: "artifact_unavailable" },
 ];
 
 for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scenario.name : `production writer settle and record: ${scenario.name}`}`, { timeout: 30000 }, async () => {
@@ -53,12 +63,18 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
   const sockets = new Set<Socket>();
   let beforeFinal: (() => void) | undefined;
   let priorDraft: WriterDraftRow | undefined;
+  let writerLaunched = false;
   const server = createServer((socket) => {
     sockets.add(socket);
+    socket.on("error", () => undefined);
     socket.once("close", () => sockets.delete(socket));
     socket.on("data", (chunk) => {
       if (chunk.toString().includes("\n")) {
-        if (JSON.parse(chunk.toString()).phase === "child-working") beforeFinal?.();
+        const event = JSON.parse(chunk.toString());
+        if (event.phase === "child-working") {
+          beforeFinal?.();
+          if (writerLaunched && scenario.runtimeFault === "signal") process.kill(event.data.pid, "SIGKILL");
+        }
         socket.end("release\n");
       }
     });
@@ -70,6 +86,8 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
     await once(server, "listening");
     cpSync(join(source, "src"), join(root, "src"), { recursive: true });
     cpSync(join(source, ".pi/extensions/subagent"), join(root, ".pi/extensions/subagent"), { recursive: true });
+    mkdirSync(join(root, "test", "fixtures"), { recursive: true });
+    cpSync(join(source, "test/fixtures/subagent-json-relay.mjs"), join(root, "test/fixtures/subagent-json-relay.mjs"));
     symlinkSync(join(source, "node_modules"), join(root, "node_modules"));
     mkdirSync(join(root, ".pi/agents"), { recursive: true });
     writeFileSync(join(root, ".pi/agents/plan-scout.md"), "---\nname: plan-scout\ndescription: fixture scout\ntools: read\n---\nInvestigate.\n");
@@ -99,12 +117,15 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
     assert.deepEqual(loaded.errors, []);
     loaded.runtime.appendEntry = () => undefined;
     let resolveReport!: (value: ResultEnvelope) => void;
-    let report = new Promise<ResultEnvelope>((resolve) => { resolveReport = resolve; });
+    const report = new Promise<ResultEnvelope>((resolve) => { resolveReport = resolve; });
+    let resolveWriterBatch!: (value: any) => void;
+    const writerBatch = new Promise<any>((resolve) => { resolveWriterBatch = resolve; });
     let resolveScout!: (value: any) => void;
     const scoutReport = new Promise<any>((resolve) => { resolveScout = resolve; });
     loaded.runtime.sendMessage = (message) => {
       const envelope = (message.details as any)?.envelope;
       if (envelope?.identity?.agent === "plan-writer") resolveReport(envelope);
+      if (envelope?.kind === "batch" && envelope.results?.some((result: any) => result.identity?.agent === "plan-writer")) resolveWriterBatch(envelope);
       if (envelope?.identity?.agent === "plan-scout") resolveScout(envelope);
     };
     const extension = loaded.extensions[0]!;
@@ -147,13 +168,20 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
     const final = scenario.final(planPath);
     const resultFile = join(root, "writer-final.txt");
     writeFileSync(resultFile, final);
-    process.env.YM204_FIXTURE_SCENARIO = scenario.writeEmpty ? "plan_writer_write_empty" : scenario.empty ? "missing" : "plan_writer";
+    process.env.YM204_FIXTURE_SCENARIO = scenario.writeEmpty ? "plan_writer_write_empty" : scenario.empty ? "missing" : scenario.runtimeFault ? `plan_writer_${scenario.runtimeFault}` : "plan_writer";
+    if (scenario.runtimeFault === "protocol_partial" || scenario.runtimeFault === "protocol_overflow") {
+      process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(root, "test/fixtures/subagent-json-relay.mjs");
+      process.env.YOKEMATE_SUBAGENT_TEST_FAULT = scenario.runtimeFault === "protocol_partial" ? "eof_without_lf" : "record_overflow";
+      process.env.YOKEMATE_SUBAGENT_TEST_MANIFEST_DIR = join(root, "relay-facts");
+      mkdirSync(process.env.YOKEMATE_SUBAGENT_TEST_MANIFEST_DIR);
+    }
     process.env.YM204_FIXTURE_READ_FILE = resultFile;
     process.env.YM204_FIXTURE_PLAN_PATH = planPath;
     process.env.YM204_FIXTURE_PLAN_CONTENT = planText;
     beforeFinal = () => {
       const state = openDb(join(root, "yokemate.db"));
       try {
+        if (scenario.fault === "draft_unavailable") state.exec("CREATE TRIGGER fail_writer_draft BEFORE INSERT ON workflow_writer_draft BEGIN SELECT RAISE(ABORT, 'fixture unavailable'); END");
         if (["writer", "hash", "input"].includes(scenario.fault ?? "")) {
           const dispatch = state.prepare("SELECT * FROM workflow_writer_dispatch").get()!;
           const acceptedInputId = scenario.fault === "input"
@@ -170,14 +198,25 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
         }
       } finally { state.close(); }
     };
+    writerLaunched = true;
     const launched = await tool.execute("writer", { agent: "plan-writer", task: "Write from the accepted source.", ticket: "YM-1", acceptedInputId: scout.id }, undefined, () => undefined, ctx);
     assert.match(JSON.stringify(launched), /Detached, not terminal/);
+    if (scenario.runtimeFault === "cancel") {
+      const runId = (launched.details as any).children[0].identity.runId;
+      const cancelled = await tool.execute("cancel-writer", { cancelRun: runId }, undefined, () => undefined, ctx);
+      assert.match(JSON.stringify(cancelled), /cancellation_requested|cancelled/);
+    }
     const result = await report;
+    const batch = await writerBatch;
     beforeFinal = undefined;
-    assert.equal(result.processOutcome, "exited");
-    assert.equal(result.exitCode, 0);
+    assert.equal(result.processOutcome, scenario.processOutcome ?? "exited");
+    assert.equal(result.exitCode, scenario.exitCode ?? (scenario.processOutcome === "signaled" || scenario.processOutcome === "cancelled" ? null : 0));
+    assert.equal(result.signal, scenario.signal ?? null);
     assert.equal(result.payloadOutcome, scenario.valid ? "valid" : scenario.expected ?? "invalid_plan_result");
+    assert.equal(batch.results[0].payloadOutcome, result.payloadOutcome);
+    assert.equal(batch.results[0].processOutcome, result.processOutcome);
     assert.equal(result.payload, scenario.valid ? scenario.writeEmpty ? planPath : final : "");
+    if (scenario.runtimeFault) assert.equal(result.planResult, undefined);
     if (scenario.reason) {
       assert.equal(result.planResult?.state, "rejected");
       assert.equal((result.planResult as any).reason, scenario.reason);

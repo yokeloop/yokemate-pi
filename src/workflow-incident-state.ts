@@ -320,6 +320,8 @@ export function claimWriterDispatch(db: DatabaseSync, incident: WorkflowIncident
   }
 }
 
+export class WriterDraftConflictError extends Error {}
+
 export interface WriterDraftRow {
   content_hash: string;
   accepted_input_id: number;
@@ -344,7 +346,7 @@ export function recordWriterDraft(db: DatabaseSync, input: WriterDraftRow): Writ
     input.writer_actual_task_hash, input.plan_path, input.bytes, input.result_hash,
   );
   const row = writerDraftFor(db, input.content_hash);
-  if (!row || JSON.stringify(row) !== JSON.stringify(input)) throw new Error("writer draft identity changed");
+  if (!row || JSON.stringify(row) !== JSON.stringify(input)) throw new WriterDraftConflictError("writer draft identity changed");
   return row;
 }
 

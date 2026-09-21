@@ -114,9 +114,17 @@ test("YM-221 writer scope, unsafe candidates and deterministic snapshot races fa
     assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "YM-8-race plan-plan.md")), /invalid_plan_path/);
     assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "YM-9-other-plan.md")), /invalid_plan_path/);
     assert.throws(() => readPlanWriterSnapshot(root, scope, join(root, "outside.md")), /outside_project/);
+    writeFileSync(file, plan("YM-9").replace("## Steps", "## Cross-repository contract\n- invalid for one repository\n\n## Steps"));
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file), /invalid_sections/);
 
-    const original = readFileSync(file);
+    const original = Buffer.from(plan("YM-9"));
+    writeFileSync(file, original);
     assert.throws(() => readPlanWriterSnapshot(root, scope, file, { beforeOpen: () => {
+      renameSync(file, `${file}.old`);
+      writeFileSync(file, original);
+    } }), /binding_changed/);
+    rmSync(`${file}.old`);
+    assert.throws(() => readPlanWriterSnapshot(root, scope, file, { beforeCanonical: () => {
       renameSync(file, `${file}.old`);
       writeFileSync(file, original);
     } }), /binding_changed/);
@@ -144,14 +152,24 @@ test("YM-221 writer scope, unsafe candidates and deterministic snapshot races fa
     mkdirSync(second);
     writeFileSync(join(second, "YM-9-second-plan.md"), plan("YM-9"));
     assert.throws(() => reconcilePlanWriterArtifact(root, scope), /ambiguous_artifact/);
-    rmSync(folder, { recursive: true });
     rmSync(second, { recursive: true });
+    writeFileSync(file, original);
+    assert.throws(() => reconcilePlanWriterArtifact(root, scope, { afterSnapshot: () => {
+      const added = join(scope.knowledgeRoot, "ai", "YM-9-added");
+      mkdirSync(added);
+      writeFileSync(join(added, "YM-9-added-plan.md"), original);
+    } }), /ambiguous_artifact/);
+    rmSync(folder, { recursive: true });
+    rmSync(join(scope.knowledgeRoot, "ai", "YM-9-added"), { recursive: true });
     const unsafe = join(scope.knowledgeRoot, "ai", "YM-9-unsafe");
     writeFileSync(unsafe, "not a directory");
     assert.throws(() => reconcilePlanWriterArtifact(root, scope), /not_regular/);
     rmSync(unsafe);
 
     const many = openDb(join(root, "yokemate.db"));
+    many.prepare("UPDATE project SET repo='..' WHERE tracker_key='YM'").run();
+    assert.throws(() => resolvePlanWriterScope(root, "YM-9"), /invalid_scope/);
+    many.prepare("UPDATE project SET repo='repo' WHERE tracker_key='YM'").run();
     many.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES('other','repo','/three','github','YM','test/model')").run();
     many.close();
     assert.throws(() => resolvePlanWriterScope(root, "YM-9"), /ambiguous_scope/);

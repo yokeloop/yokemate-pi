@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -66,15 +66,24 @@ if (process.env.WORKFLOW_PLAN_WORKER_SCOUT_RESULT && process.env.WORKFLOW_PLAN_W
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+const expectedPlan = Buffer.from(process.env.WORKFLOW_PLAN_CONTENT_BASE64 ?? "", "base64");
+if (!expectedPlan.length) throw new Error("expected plan bytes are unavailable");
+if (existsSync(plan)) throw new Error("plan artifact existed before writer launch");
 process.env.YM204_FIXTURE_SCENARIO = "plan_writer_write_empty";
 process.env.YM204_FIXTURE_PLAN_PATH = plan;
-process.env.YM204_FIXTURE_PLAN_CONTENT = readFileSync(plan, "utf8");
+process.env.YM204_FIXTURE_PLAN_CONTENT = expectedPlan.toString("utf8");
 await tool.execute("save-only-writer", { agent: "plan-writer", task: "Write the exact scoped fixture plan.", ticket: "YM-1", acceptedInputId: scout.artifact.acceptanceId }, undefined, () => undefined, ctx);
 const writer = await Promise.race([writerReport, new Promise((_, reject) => setTimeout(() => reject(new Error("plan writer timeout")), 30000))]);
 if (writer.payloadOutcome !== "valid" || writer.planResult?.state !== "verified") throw new Error(`plan writer failed: ${writer.payloadOutcome}/${writer.planResult?.reason ?? "unknown"}`);
 const reviewed = readFileSync(writer.planResult.binding.path);
-if (createHash("sha256").update(reviewed).digest("hex") !== writer.planResult.binding.contentHash) throw new Error("reviewed writer binding changed");
+if (!reviewed.equals(expectedPlan) || createHash("sha256").update(reviewed).digest("hex") !== writer.planResult.binding.contentHash) throw new Error("reviewed writer binding changed");
+const writtenStat = statSync(plan, { bigint: true });
+const writeToolEvents = writer.diagnostics?.stream?.events?.tool_execution_end ?? 0;
+if (writeToolEvents !== 1) throw new Error(`expected one successful writer tool, observed ${writeToolEvents}`);
 process.argv[1] = previousArgv;
 const recorded = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", path.join(root, "src", "plan-ticket.ts"), "YM-1", writer.planResult.binding.path, "--content-hash", writer.planResult.binding.contentHash], { cwd: root, env: { ...process.env, PI_SESSION_ID: sessionId } });
+const recordedBytes = readFileSync(plan);
+const recordedStat = statSync(plan, { bigint: true });
+if (!recordedBytes.equals(expectedPlan) || writtenStat.mtimeNs !== recordedStat.mtimeNs || writtenStat.size !== recordedStat.size || writtenStat.ino !== recordedStat.ino) throw new Error("record changed writer artifact");
 for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, ctx);
-process.stdout.write(`PLAN_WORKER_RESULT ${JSON.stringify({ scout, writer, foreign, stdout: recorded.stdout, stderr: recorded.stderr })}\n`);
+process.stdout.write(`PLAN_WORKER_RESULT ${JSON.stringify({ scout, writer, foreign, proof: { writeToolEvents, bytes: expectedPlan.length, hash: writer.planResult.binding.contentHash, mtimeNs: String(recordedStat.mtimeNs) }, stdout: recorded.stdout, stderr: recorded.stderr })}\n`);

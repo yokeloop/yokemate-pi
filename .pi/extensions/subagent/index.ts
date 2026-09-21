@@ -19,7 +19,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { boundBatchResult, cancellationResult, type CancellationResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
-import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor } from "../../../src/workflow-incident-state.ts";
+import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor, WriterDraftConflictError } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2491,10 +2491,14 @@ export default function (pi: ExtensionAPI) {
 							try {
 								recordWriterDraft(state, { content_hash: draft.contentHash, accepted_input_id: result.identity.acceptedInputId!, planning_identity: dispatch.planning_identity, writer_run_id: result.identity.runId, writer_task_hash: result.identity.taskHash, writer_actual_task_hash: result.actualTaskHash, plan_path: draft.path, bytes: draft.bytes.length, result_hash: sha256(result.payload) });
 								verifiedWriterDrafts.set(draft.contentHash, { acceptedInputId: result.identity.acceptedInputId!, planningIdentity: dispatch.planning_identity, runId: result.identity.runId });
-							} catch {
+							} catch (error) {
 								result.payloadOutcome = "invalid_plan_result";
 								result.payload = "";
-								result.planResult = { state: "rejected", reason: "writer_draft_conflict" };
+								result.planResult = { state: "rejected", reason: error instanceof WriterDraftConflictError ? "writer_draft_conflict" : "artifact_unavailable" };
+								if (!(error instanceof WriterDraftConflictError)) {
+									const diagnostic = diagnostics.get(result.identity.runId);
+									if (diagnostic) diagnostic.metadata.writerDraft = { refusal: "artifact_unavailable", error: errorMetadata(error) };
+								}
 							}
 						}
 					} finally { state.close(); }
@@ -2502,6 +2506,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			const diagnostic = diagnostics.get(result.identity.runId);
 			if (diagnostic) diagnostic.metadata.writerResult = result.planResult;
+		} else if (result.identity.agent === "plan-writer") {
+			result.payload = "";
+			result.reviewVerdict = null;
 		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
 			if (!runs.isCurrentScout(result.identity) || stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID ?? "") || result.processOutcome === "cancelled") {

@@ -139,7 +139,8 @@ export class PlanWriterArtifactError extends Error {
   }
 }
 
-const canonicalProject = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/;
+const canonicalOrg = /^[A-Za-z0-9_-]+$/;
+const canonicalRepo = /^[A-Za-z0-9_.-]+$/;
 const writerSlug = /^[^/\x00-\x1f\x7f]+$/;
 
 export function resolvePlanWriterScope(root: string, ticket: string): PlanWriterScope {
@@ -154,13 +155,17 @@ export function resolvePlanWriterScope(root: string, ticket: string): PlanWriter
   finally { db.close(); }
   const projects = new Set<string>();
   for (const row of rows) {
-    if (typeof row.org !== "string" || typeof row.repo !== "string" || !canonicalProject.test(`${row.org}/${row.repo}`)) throw new PlanWriterArtifactError(ticket, "invalid_scope");
+    if (typeof row.org !== "string" || typeof row.repo !== "string" || !canonicalOrg.test(row.org) || !canonicalRepo.test(row.repo) || [row.org, row.repo].some((part) => part === "." || part === "..")) throw new PlanWriterArtifactError(ticket, "invalid_scope");
     projects.add(`${row.org}/${row.repo}`);
   }
   if (!projects.size) throw new PlanWriterArtifactError(ticket, "scope_not_found");
   if (projects.size !== 1) throw new PlanWriterArtifactError(ticket, "ambiguous_scope", projects.size);
   const project = [...projects][0]!;
-  return Object.freeze({ ticket, project, knowledgeRoot: resolve(dataRoot(root), "knowledge", ...project.split("/")) });
+  const knowledgeBase = resolve(dataRoot(root), "knowledge");
+  const knowledgeRoot = resolve(knowledgeBase, ...project.split("/"));
+  const scoped = relative(knowledgeBase, knowledgeRoot).split(sep);
+  if (scoped.length !== 2 || scoped.some((part) => !part || part === "." || part === "..") || isAbsolute(relative(knowledgeBase, knowledgeRoot))) throw new PlanWriterArtifactError(ticket, "invalid_scope");
+  return Object.freeze({ ticket, project, knowledgeRoot });
 }
 
 function lexicalComponents(value: string): string[] {
@@ -215,11 +220,11 @@ function validationReason(error: unknown): PlanWriterArtifactReason {
   if (/UTF-8/.test(message)) return "invalid_utf8";
   if (/heading/.test(message)) return "wrong_heading";
   if (/Affected repositories|duplicate affected repository/.test(message)) return "invalid_repositories";
-  if (/section|PLAN-FORMAT/.test(message)) return "invalid_sections";
+  if (/section|PLAN-FORMAT|Cross-repository contract/.test(message)) return "invalid_sections";
   return "artifact_unavailable";
 }
 
-export interface PlanWriterReadHooks { beforeOpen?(): void; afterOpen?(): void; afterRead?(): void; beforeFinalStat?(): void }
+export interface PlanWriterReadHooks { beforeOpen?(): void; afterOpen?(): void; afterRead?(): void; beforeFinalStat?(): void; beforeCanonical?(): void; afterSnapshot?(): void }
 
 export function readPlanWriterSnapshot(root: string, scope: PlanWriterScope, requestedPath: string, hooks: PlanWriterReadHooks = {}): CandidatePlanSnapshot {
   assertTicket(scope.ticket);
@@ -243,9 +248,18 @@ export function readPlanWriterSnapshot(root: string, scope: PlanWriterScope, req
     hooks.beforeFinalStat?.();
     const after = checkedComponents(scope, parsed.path);
     if (!sameStat(opened, afterDescriptor) || before.length !== after.length || before.some((entry, index) => entry.path !== after[index]!.path || !sameStat(entry.stat, after[index]!.stat))) throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
-    const canonicalRoot = realpathSync(scope.knowledgeRoot);
-    const canonical = realpathSync(parsed.path);
-    if (!contained(canonicalRoot, canonical)) throw new PlanWriterArtifactError(scope.ticket, "outside_project");
+    hooks.beforeCanonical?.();
+    try {
+      const canonicalRoot = realpathSync(scope.knowledgeRoot);
+      const canonical = realpathSync(parsed.path);
+      if (!contained(canonicalRoot, canonical)) throw new PlanWriterArtifactError(scope.ticket, "outside_project");
+      const canonicalStat = lstatSync(canonical, { bigint: true });
+      const finalComponents = checkedComponents(scope, parsed.path);
+      if (!sameStat(opened, canonicalStat) || before.length !== finalComponents.length || before.some((entry, index) => entry.path !== finalComponents[index]!.path || !sameStat(entry.stat, finalComponents[index]!.stat)) || !sameStat(opened, fstatSync(descriptor, { bigint: true }))) throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
+    } catch (error) {
+      if (error instanceof PlanWriterArtifactError && error.code === "outside_project") throw error;
+      throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
+    }
     try { return snapshotFromBytes(scope.ticket, parsed.path, bytes); }
     catch (error) { throw new PlanWriterArtifactError(scope.ticket, validationReason(error)); }
   } catch (error) {
@@ -255,32 +269,52 @@ export function readPlanWriterSnapshot(root: string, scope: PlanWriterScope, req
   } finally { if (descriptor !== undefined) closeSync(descriptor); }
 }
 
-export function reconcilePlanWriterArtifact(root: string, scope: PlanWriterScope): CandidatePlanSnapshot {
+function enumeratePlanWriterArtifacts(scope: PlanWriterScope): { candidates: Array<{ path?: string; reason?: PlanWriterArtifactReason }>; signature: string } {
   const ai = join(scope.knowledgeRoot, "ai");
   let entries: import("node:fs").Dirent[];
+  let aiStat: BigIntStats;
   try {
-    const aiStat = lstatSync(ai);
+    aiStat = lstatSync(ai, { bigint: true });
     if (aiStat.isSymbolicLink()) throw new PlanWriterArtifactError(scope.ticket, "symlink_component");
     if (!aiStat.isDirectory()) throw new PlanWriterArtifactError(scope.ticket, "not_regular");
-    entries = readdirSync(ai, { withFileTypes: true });
+    entries = readdirSync(ai, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
   } catch (error) {
     if (error instanceof PlanWriterArtifactError) throw error;
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new PlanWriterArtifactError(scope.ticket, "artifact_not_found", 0);
     throw new PlanWriterArtifactError(scope.ticket, "artifact_unavailable");
   }
   const candidates: Array<{ path?: string; reason?: PlanWriterArtifactReason }> = [];
+  const observed: string[] = [];
   for (const entry of entries.filter((item) => item.name.startsWith(`${scope.ticket}-`))) {
     const folder = join(ai, entry.name);
+    const kind = entry.isSymbolicLink() ? "symlink" : entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other";
+    observed.push(`${entry.name}\u0000${kind}`);
     if (entry.isSymbolicLink()) { candidates.push({ reason: "symlink_component" }); continue; }
     if (!entry.isDirectory()) { candidates.push({ reason: "not_regular" }); continue; }
     let children: import("node:fs").Dirent[];
-    try { children = readdirSync(folder, { withFileTypes: true }); }
+    try { children = readdirSync(folder, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name)); }
     catch { candidates.push({ reason: "artifact_unavailable" }); continue; }
-    for (const child of children) if (child.name.startsWith(`${scope.ticket}-`) && child.name.endsWith("-plan.md")) candidates.push({ path: join(folder, child.name) });
+    for (const child of children) if (child.name.startsWith(`${scope.ticket}-`) && child.name.endsWith("-plan.md")) {
+      const childKind = child.isSymbolicLink() ? "symlink" : child.isDirectory() ? "directory" : child.isFile() ? "file" : "other";
+      observed.push(`${entry.name}\u0000${child.name}\u0000${childKind}`);
+      candidates.push({ path: join(folder, child.name) });
+    }
   }
-  if (!candidates.length) throw new PlanWriterArtifactError(scope.ticket, "artifact_not_found", 0);
-  if (candidates.length !== 1) throw new PlanWriterArtifactError(scope.ticket, "ambiguous_artifact", candidates.length);
-  const candidate = candidates[0]!;
+  return { candidates, signature: JSON.stringify([String(aiStat.dev), String(aiStat.ino), String(aiStat.mtimeNs), String(aiStat.ctimeNs), observed]) };
+}
+
+export function reconcilePlanWriterArtifact(root: string, scope: PlanWriterScope, hooks: PlanWriterReadHooks = {}): CandidatePlanSnapshot {
+  const before = enumeratePlanWriterArtifacts(scope);
+  if (!before.candidates.length) throw new PlanWriterArtifactError(scope.ticket, "artifact_not_found", 0);
+  if (before.candidates.length !== 1) throw new PlanWriterArtifactError(scope.ticket, "ambiguous_artifact", before.candidates.length);
+  const candidate = before.candidates[0]!;
   if (candidate.reason) throw new PlanWriterArtifactError(scope.ticket, candidate.reason, 1);
-  return readPlanWriterSnapshot(root, scope, candidate.path!);
+  const snapshot = readPlanWriterSnapshot(root, scope, candidate.path!, hooks);
+  hooks.afterSnapshot?.();
+  let after: ReturnType<typeof enumeratePlanWriterArtifacts>;
+  try { after = enumeratePlanWriterArtifacts(scope); }
+  catch { throw new PlanWriterArtifactError(scope.ticket, "binding_changed"); }
+  if (after.candidates.length > 1) throw new PlanWriterArtifactError(scope.ticket, "ambiguous_artifact", after.candidates.length);
+  if (after.candidates.length !== 1 || before.signature !== after.signature) throw new PlanWriterArtifactError(scope.ticket, "binding_changed");
+  return snapshot;
 }
