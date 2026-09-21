@@ -8,12 +8,9 @@ const firecrawl = new Map<string, readonly string[]>([
   ["firecrawl_search", ["query", "limit", "sources", "categories", "includeDomains", "excludeDomains"]],
   ["firecrawl_scrape", ["url", "formats", "maxAge", "onlyMainContent"]],
 ]);
-const youtrackRead = new Map<string, readonly string[]>([
-  ["find_projects", ["fields"]], ["get_project", ["project", "fields"]],
-  ["get_issue_fields_schema", ["project"]], ["get_issue", ["issueId", "fields"]],
-  ["get_issue_comments", ["issueId", "fields", "top", "skip"]],
-  ["search_issues", ["query", "fields", "top", "skip"]], ["get_article", ["articleId", "fields"]],
-  ["search_articles", ["query", "fields", "top", "skip"]], ["get_current_user", ["fields"]],
+const youtrackRead = new Set([
+  "find_projects", "get_project", "get_issue_fields_schema", "get_issue", "get_issue_comments",
+  "search_issues", "get_article", "search_articles", "get_current_user",
 ]);
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -45,10 +42,7 @@ export function classifyResearchMcp(server: string | undefined, tool: string | u
     }
     return { ok: true };
   }
-  if (server === trackerServer() && youtrackRead.has(tool)) {
-    if (!exactKeys(args, youtrackRead.get(tool)!)) return { ok: false, reason: "research YouTrack read has unsupported arguments" };
-    return { ok: true };
-  }
+  if (server === trackerServer() && youtrackRead.has(tool)) return { ok: true };
   if (server === trackerServer() && tool === "create_issue") {
     if (!exactKeys(args, ["project", "summary", "description", "customFields", "parentIssue", "permittedUsers", "permittedGroups"])) return { ok: false, reason: "research create_issue has unsupported arguments" };
     if (args.project !== process.env.YOKEMATE_RESEARCH_TRACKER_KEY || typeof args.summary !== "string" || args.summary.length === 0) return { ok: false, reason: "research issue must use the selected passport tracker project and a summary" };
