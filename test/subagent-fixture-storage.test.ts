@@ -7,7 +7,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { appendRecoveryDecision } from "../src/workflow-incident-state.ts";
 import { openDb } from "../src/db.ts";
-import { sha256 } from "../src/subagent-runs.ts";
+import { deliveryFor, reportContent, sha256 } from "../src/subagent-runs.ts";
 import { acknowledgeFixtureReports, createFixtureEngine, loadFixtureExtension, shutdownFixture, snapshotStoreManifest, withFixtureEnvironment, type FixtureEngine, type LoadedFixture, type SentFixtureMessage } from "./fixtures/subagent-fixture-engine.ts";
 import { runBoundedRuntimeCase, untilAborted } from "./fixtures/bounded-runtime-case.ts";
 
@@ -259,6 +259,7 @@ export async function runFixturePass(engine: PersistentEngine, signal: AbortSign
 interface ProbeResult {
   ack: any;
   result: any;
+  results: any[];
   batch: any;
   snapshot?: any;
   snapshots: ReturnType<typeof snapshotStoreManifest>;
@@ -267,20 +268,64 @@ interface ProbeResult {
   close: { code: number | null; signal: NodeJS.Signals | null };
 }
 
-export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSignal): Promise<ProbeResult> {
+interface ProbeControl {
+  reached: Promise<void>;
+  release(): void;
+  finish(): Promise<ProbeResult>;
+  stop(): Promise<void>;
+}
+
+function safeProbeFacts(probe: ProbeResult): Record<string, unknown> {
+  const identity = probe.result.details.envelope.identity;
+  const diagnostics = JSON.parse(fs.readFileSync(probe.result.details.display.archive.diagnosticsPath, "utf8"));
+  const metadata = diagnostics.diagnostics?.children?.[0]?.metadata ?? {};
+  return {
+    ownerRunId: identity.ownerRunId,
+    ownerSessionId: identity.ownerSessionId,
+    batchId: identity.batchId,
+    runId: identity.runId,
+    pid: probe.snapshot?.process?.pid ?? metadata.pid,
+    starttime: probe.snapshot?.process?.starttime ?? metadata.starttime,
+    snapshotState: probe.result.details.envelope.diagnostics.snapshotStorage,
+    deliveries: [...probe.results, probe.batch].map((message) => ({ deliveryId: message.details.deliveryId, envelopeHash: message.details.envelopeHash })),
+    canonical: [...probe.results, probe.batch].map((message) => ({ kind: message.details.envelope.kind, bytes: Buffer.byteLength(message.content), hash: sha256(message.content) })),
+    resources: { extension: probe.snapshot?.resources?.extension ?? metadata.extension, guard: probe.snapshot?.resources?.guard ?? metadata.guard, agentDefinition: probe.snapshot?.resources?.agentDefinition ?? metadata.agentDefinition },
+    snapshotCount: probe.snapshots.length,
+    reportFiles: probe.reports.length,
+  };
+}
+
+async function startSnapshotProbe(engine: PersistentEngine, signal: AbortSignal, heldPhase?: "child-working" | "context" | "preservation"): Promise<ProbeControl> {
   const socketPath = path.join(engine.runtimeDir, `probe-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`);
   const sockets = new Set<Socket>();
   const phases: any[] = [];
+  const held: Socket[] = [];
+  let liveHeld = false;
+  let markReached!: () => void;
+  const reached = heldPhase ? new Promise<void>((resolve) => { markReached = resolve; }) : Promise.resolve();
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
     let buffer = "";
     socket.on("data", (chunk) => {
       buffer += chunk.toString();
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      phases.push(JSON.parse(buffer.slice(0, newline)));
-      socket.end("release\n");
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const phase = JSON.parse(buffer.slice(0, newline));
+        phases.push(phase);
+        buffer = buffer.slice(newline + 1);
+        if (heldPhase === "preservation" && phase.phase === "child-working" && !liveHeld) {
+          liveHeld = true;
+          held.push(socket);
+        } else if (heldPhase === "preservation" && phase.phase === "context" && phase.data?.length > 0 && held.length === 1) {
+          held.push(socket);
+          markReached();
+        } else if (phase.phase === heldPhase && held.length === 0 && (heldPhase !== "context" || phase.data?.length > 0)) {
+          held.push(socket);
+          markReached();
+        } else socket.end("release\n");
+      }
     });
   });
   await untilAborted(new Promise<void>((resolve) => server.listen(socketPath, resolve)), signal);
@@ -298,6 +343,7 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
       PI_CODING_AGENT_SESSION_DIR: engine.sessionDir,
       YM204_FIXTURE_SOCKET: socketPath,
       YM204_FIXTURE_SCENARIO: "snapshot_probe",
+      ...(heldPhase === "preservation" ? { YM245_PRESERVATION: "1" } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
@@ -305,6 +351,7 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
   const events: any[] = [];
   let stdout = "";
   let stderr = "";
+  let cleaned = false;
   proc.stdout!.on("data", (chunk) => {
     stdout += chunk.toString();
     for (;;) {
@@ -316,27 +363,75 @@ export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSi
     }
   });
   proc.stderr!.on("data", (chunk) => { stderr += chunk.toString(); });
-  try {
-    proc.stdin!.write(JSON.stringify({ id: "snapshot-probe", type: "prompt", message: "Run the snapshot probe." }) + "\n");
-    await waitFor(() => events.some((event) => event.type === "tool_execution_end" && event.toolName === "subagent") && events.filter((event) => event.type === "message_end" && event.message?.details?.envelope).some((event) => event.message.details.envelope.kind === "batch") && events.some((event) => event.type === "entry_appended" && event.entry?.customType === "yokemate-child-state" && event.entry.data?.deliveries?.length === 2 && event.entry.data.deliveries.every((delivery: any) => delivery.state === "observed")), 15000, `snapshot probe ${stderr.slice(-1000)}`);
-    const ack = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent")!.result.details;
-    const messages = events.filter((event) => event.type === "message_end" && event.message?.details?.envelope).map((event) => event.message);
-    const result = messages.find((message) => message.details.envelope.kind === "result")!;
-    const batch = messages.find((message) => message.details.envelope.kind === "batch")!;
-    assert.equal(result.details.envelope.identity.runId, ack.children[0].identity.runId);
-    assert.equal(batch.details.envelope.results[0].identity.runId, ack.children[0].identity.runId);
-    assert.equal(result.content, fs.readFileSync(result.details.display.archive.reportPath, "utf8"));
-    const close = await untilAborted(boundedStop(proc), signal);
-    const snapshots = snapshotStoreManifest(engine);
-    const name = `${ack.children[0].identity.ownerRunId}-${ack.children[0].identity.runId}.json`;
-    const item = snapshots.find((entry) => entry.name === name);
-    const snapshot = item ? JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, item.name), "utf8")) : undefined;
-    return { ack, result, batch, snapshot, snapshots, reports: reportManifest(engine), phases, close };
-  } finally {
-    await boundedStop(proc, true);
+  proc.stdin!.write(JSON.stringify({ id: "snapshot-probe", type: "prompt", message: "Run the snapshot probe." }) + "\n");
+  const release = () => {
+    for (const socket of held.splice(0)) socket.end("release\n");
+  };
+  const cleanup = async (emergency: boolean) => {
+    if (cleaned) return;
+    cleaned = true;
+    release();
+    await boundedStop(proc, emergency);
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+  };
+  const finish = async (): Promise<ProbeResult> => {
+    try {
+      release();
+      await waitFor(() => {
+        const ack = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent")?.result?.details;
+        return !!ack && events.filter((event) => event.type === "message_end" && event.message?.details?.envelope).some((event) => event.message.details.envelope.kind === "batch") && events.some((event) => event.type === "entry_appended" && event.entry?.customType === "yokemate-child-state" && event.entry.data?.deliveries?.length === ack.children.length + 1 && event.entry.data.deliveries.every((delivery: any) => delivery.state === "observed"));
+      }, 15000, `snapshot probe ${stderr.slice(-1000)}`);
+      const ack = events.find((event) => event.type === "tool_execution_end" && event.toolName === "subagent")!.result.details;
+      const messages = events.filter((event) => event.type === "message_end" && event.message?.details?.envelope).map((event) => event.message);
+      const results = messages.filter((message) => message.details.envelope.kind === "result");
+      const result = results[0]!;
+      const batch = messages.find((message) => message.details.envelope.kind === "batch")!;
+      const identity = ack.children[0].identity;
+      assert.equal(ack.batchId, identity.batchId);
+      assert.equal(results.length, ack.children.length);
+      assert.deepEqual(new Set(results.map((message) => JSON.stringify(message.details.envelope.identity))), new Set(ack.children.map((child: any) => JSON.stringify(child.identity))));
+      assert.equal(batch.details.envelope.ownerRunId, identity.ownerRunId);
+      assert.equal(batch.details.envelope.ownerSessionId, identity.ownerSessionId);
+      assert.equal(batch.details.envelope.batchId, identity.batchId);
+      assert.equal(batch.details.envelope.results.length, ack.children.length);
+      assert.deepEqual(new Set(batch.details.envelope.results.map((entry: any) => JSON.stringify(entry.identity))), new Set(ack.children.map((child: any) => JSON.stringify(child.identity))));
+      for (const message of [...results, batch]) {
+        const delivery = deliveryFor(message.details.envelope);
+        assert.equal(message.details.deliveryId, delivery.deliveryId);
+        assert.equal(message.details.envelopeHash, delivery.envelopeHash);
+        assert.equal(message.content, reportContent(message.details.envelope, delivery));
+        assert.equal(fs.readFileSync(message.details.display.archive.reportPath, "utf8"), message.content);
+        assert.equal(message.details.display.archive.reportHash, sha256(message.content));
+        assert.equal(message.details.display.archive.reportBytes, Buffer.byteLength(message.content));
+      }
+      assert.equal(new Set([...results, batch].map((message) => message.details.deliveryId)).size, results.length + 1);
+      const loaded = phases.filter((phase) => phase.phase === "loaded");
+      assert.ok(loaded.some((phase) => phase.role === "executor"));
+      assert.ok(loaded.some((phase) => phase.role === undefined));
+      const contexts = phases.filter((phase) => phase.phase === "context" && phase.role === undefined && phase.data?.some((message: any) => message.details?.deliveryId));
+      assert.ok(contexts.length > 0);
+      assert.deepEqual(new Set(contexts.flatMap((phase) => phase.data.map((message: any) => message.details.deliveryId))), new Set([...results, batch].map((message) => message.details.deliveryId)));
+      const close = await untilAborted(boundedStop(proc), signal);
+      const snapshots = snapshotStoreManifest(engine);
+      const item = snapshots.find((entry) => {
+        const value = JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8"));
+        return value.ownerRunId === identity.ownerRunId && value.runId === identity.runId;
+      });
+      const snapshot = item ? JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, item.name), "utf8")) : undefined;
+      await cleanup(false);
+      return { ack, result, results, batch, snapshot, snapshots, reports: reportManifest(engine), phases, close };
+    } catch (error) {
+      await cleanup(true);
+      throw error;
+    }
+  };
+  return { reached, release, finish, stop: async () => { await cleanup(true); } };
+}
+
+export async function runSnapshotProbe(engine: PersistentEngine, signal: AbortSignal): Promise<ProbeResult> {
+  const control = await startSnapshotProbe(engine, signal);
+  return control.finish();
 }
 
 function recordAuditBaseline(engine: PersistentEngine): string {
@@ -349,57 +444,37 @@ function recordAuditBaseline(engine: PersistentEngine): string {
   return auditFingerprint(engine);
 }
 
-test("fixture isolation preserves live and held-delivery evidence", { timeout: 90000 }, (t) => runBoundedRuntimeCase(t, async (signal) => {
+test("fixture isolation preserves live and held-delivery evidence", { timeout: 120000 }, (t) => runBoundedRuntimeCase(t, async (signal) => {
   const engine = createPersistentEngine();
-  const socketPath = path.join(engine.runtimeDir, "held-child.sock");
-  const sockets = new Set<Socket>();
-  const events: any[] = [];
-  const server = createServer((socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-    let buffer = "";
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString();
-      const newline = buffer.indexOf("\n");
-      if (newline >= 0) events.push({ ...JSON.parse(buffer.slice(0, newline)), socket });
-    });
-  });
-  await untilAborted(new Promise<void>((resolve) => server.listen(socketPath, resolve)), signal);
+  let probe: ProbeControl | undefined;
   try {
-    await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] ?? path.join(engine.root, "test/fixtures/runtime-settings-child.mjs") }, async () => {
-      const fixture = await loadFixtureExtension(engine, { sessionId: "preservation-owner" });
-      const liveAck = await fixture.tool.execute("live", { agent: "worker", task: "held live child" }, undefined, () => undefined, fixture.ctx);
-      await waitFor(() => events.length === 1, 5000, "live child barrier");
-      const liveRunId = liveAck.details.children[0].identity.runId;
-      await waitFor(() => snapshotStoreManifest(engine).some((entry) => entry.name.endsWith(`-${liveRunId}.json`)), 5000, "live snapshot");
-      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = path.join(engine.root, "test/fixtures/subagent-report-child.js");
-      await fixture.tool.execute("held-delivery", { agent: "worker", task: "closed child with held delivery" }, undefined, () => undefined, fixture.ctx);
-      await waitFor(() => fixture.sent.length === 2, 5000, "held delivery reports");
-      const audit = recordAuditBaseline(engine);
-      const snapshots = snapshotStoreManifest(engine);
-      const reports = reportManifest(engine);
-      const values = snapshots.map((entry) => JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8")));
-      assert.ok(values.some((value) => value.runId === liveRunId && value.lifecycle.processClosed === false));
-      assert.ok(values.some((value) => value.runId !== liveRunId && value.lifecycle.processClosed === true && value.deliveries.some((delivery: any) => delivery.state === "enqueued")));
-      for (let i = 0; i < 3; i++) {
-        const outcome = await runFixturePass(engine, signal);
-        assert.equal(outcome.code, 0, outcome.stderr.slice(-2000));
-      }
-      assert.deepEqual(snapshotStoreManifest(engine), snapshots);
-      assert.deepEqual(reportManifest(engine), reports);
-      assert.equal(auditFingerprint(engine), audit);
-      events[0]!.socket.end("release\n");
-      await waitFor(() => fixture.sent.length === 4, 5000, "released live reports");
-      await acknowledgeFixtureReports(fixture, fixture.sent);
-      await shutdownFixture(fixture);
-      assert.ok(snapshotStoreManifest(engine).every((entry) => {
-        const value = JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8"));
-        return value.lifecycle.processClosed && value.lifecycle.deliveriesTerminal;
-      }));
-    });
+    const audit = recordAuditBaseline(engine);
+    probe = await startSnapshotProbe(engine, signal, "preservation");
+    await untilAborted(probe.reached, signal);
+    const snapshots = snapshotStoreManifest(engine);
+    const reports = reportManifest(engine);
+    const values = snapshots.map((entry) => JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8")));
+    assert.equal(values.length, 2);
+    assert.ok(values.some((value) => value.lifecycle.processClosed === false && value.process?.pid));
+    assert.ok(values.some((value) => value.lifecycle.processClosed === true && value.deliveries.some((delivery: any) => delivery.state === "enqueued")));
+    for (let i = 0; i < 3; i++) {
+      const outcome = await runFixturePass(engine, signal);
+      assert.equal(outcome.code, 0, outcome.stderr.slice(-2000));
+    }
+    assert.deepEqual(snapshotStoreManifest(engine), snapshots);
+    assert.deepEqual(reportManifest(engine), reports);
+    assert.equal(auditFingerprint(engine), audit);
+    probe.release();
+    const completed = await probe.finish();
+    probe = undefined;
+    const completedValues = completed.ack.children.map((child: any) => completed.snapshots.find((entry) => {
+      const value = JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8"));
+      return value.runId === child.identity.runId && value.ownerRunId === child.identity.ownerRunId;
+    })).map((entry: any) => JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8")));
+    assert.ok(completedValues.every((value: any) => value.lifecycle.processClosed && value.lifecycle.deliveriesTerminal && value.deliveries.every((delivery: any) => delivery.state === "observed")));
+    assert.equal(auditFingerprint(engine), audit);
   } finally {
-    for (const socket of sockets) socket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await probe?.stop();
     fs.rmSync(engine.root, { recursive: true, force: true });
   }
 }));
@@ -416,10 +491,16 @@ test("real loader fixtures leave persistent engine snapshot capacity", { timeout
       const manifest = snapshotStoreManifest(engine);
       passes.push({ snapshots: manifest.length, bytes: manifest.reduce((sum, entry) => sum + entry.bytes, 0), reports: reportManifest(engine).length });
     }
+    let protectedBaseline: ReturnType<typeof snapshotStoreManifest> | undefined;
+    let protectedFacts: any[] | undefined;
     if (sourceRef) {
       assert.deepEqual(passes.map((pass) => pass.snapshots), [14, 28, 40]);
-      const owners = snapshotStoreManifest(engine).map((entry) => JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8")).ownerSessionId);
+      protectedBaseline = snapshotStoreManifest(engine);
+      protectedFacts = protectedBaseline.map((entry) => JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8")));
+      const owners = protectedFacts.map((entry) => entry.ownerSessionId);
       assert.deepEqual({ cancel: owners.filter((owner) => owner === "cancel-owner").length, isolation: owners.filter((owner) => owner === "isolation-session").length, loader: owners.filter((owner) => owner === "loader-session").length }, { cancel: 6, isolation: 12, loader: 22 });
+      assert.ok(protectedFacts.every((entry) => entry.lifecycle.processClosed === true && entry.lifecycle.deliveriesTerminal === false));
+      assert.ok(protectedFacts.every((entry) => (entry.process?.outcome === "not_started" || entry.process?.pid && entry.process?.starttime) && entry.deliveries.length > 0 && entry.deliveries.every((delivery: any) => ["pending", "enqueued", "unknown"].includes(delivery.state))));
     } else {
       assert.deepEqual(passes.map((pass) => pass.snapshots), [0, 0, 0]);
       assert.deepEqual(passes.map((pass) => pass.reports), [0, 0, 0]);
@@ -430,7 +511,13 @@ test("real loader fixtures leave persistent engine snapshot capacity", { timeout
     assert.equal(first.result.details.envelope.diagnostics.snapshotStorage.state, sourceRef ? "unavailable" : "available");
     if (sourceRef) {
       assert.equal(first.result.details.envelope.diagnostics.snapshotStorage.code, "storage_limit");
-      console.log(JSON.stringify({ stage: "red", baseSha: sourceRef, node: process.version, pi: "0.85.1", engine: fs.realpathSync(engine.root), dependencyRoot: fs.realpathSync(engine.dependencyRoot), passes, probe: { ownerRunId: first.ack.children[0].identity.ownerRunId, runId: first.ack.children[0].identity.runId, batchId: first.ack.batchId, snapshotState: first.result.details.envelope.diagnostics.snapshotStorage, canonicalBytes: Buffer.byteLength(first.result.content), canonicalHash: sha256(first.result.content), reportCount: first.reports.length }, audit }));
+      assert.deepEqual(first.snapshots, protectedBaseline);
+      const identity = first.result.details.envelope.identity;
+      assert.equal(first.snapshots.some((entry) => {
+        const value = JSON.parse(fs.readFileSync(path.join(engine.snapshotDir, entry.name), "utf8"));
+        return value.ownerRunId === identity.ownerRunId && value.runId === identity.runId;
+      }), false);
+      console.log(JSON.stringify({ stage: "red", exitCode: 1, baseSha: sourceRef, node: process.version, pi: "0.85.1", engine: fs.realpathSync(engine.root), dependencyRoot: fs.realpathSync(engine.dependencyRoot), passes, protected: protectedFacts!.map((entry) => ({ ownerRunId: entry.ownerRunId, ownerSessionId: entry.ownerSessionId, batchId: entry.batchId, runId: entry.runId, pid: entry.process.pid, starttime: entry.process.starttime, processClosed: entry.lifecycle.processClosed, deliveriesTerminal: entry.lifecycle.deliveriesTerminal, deliveries: entry.deliveries })), probe: safeProbeFacts(first), audit }));
     }
     assert.ok(first.snapshot, `snapshot unavailable: ${JSON.stringify(first.result.details.envelope.diagnostics.snapshotStorage)}`);
     assert.equal(first.snapshot.snapshotStorage.state, "available");
@@ -453,7 +540,7 @@ test("real loader fixtures leave persistent engine snapshot capacity", { timeout
       assert.equal(restarted.snapshots.length, 3);
       assert.ok(restarted.reports.length >= 6);
       assert.equal(auditFingerprint(engine), audit);
-      console.log(JSON.stringify({ stage: "green", baseSha: baselineRef, fixSha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(), node: process.version, pi: "0.85.1", engine: fs.realpathSync(engine.root), dependencyRoot: fs.realpathSync(engine.dependencyRoot), passes, probes: [first, second, restarted].map((probe) => ({ ownerRunId: probe.ack.children[0].identity.ownerRunId, runId: probe.ack.children[0].identity.runId, batchId: probe.ack.batchId, snapshotState: probe.result.details.envelope.diagnostics.snapshotStorage, snapshotCount: probe.snapshots.length, reportCount: probe.reports.length })), audit }));
+      console.log(JSON.stringify({ stage: "green", exitCode: 0, baseSha: baselineRef, fixSha: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(), node: process.version, pi: "0.85.1", engine: fs.realpathSync(engine.root), dependencyRoot: fs.realpathSync(engine.dependencyRoot), passes, probes: [first, second, restarted].map(safeProbeFacts), audit }));
     }
   } finally {
     fs.rmSync(engine.root, { recursive: true, force: true });

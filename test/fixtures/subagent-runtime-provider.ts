@@ -137,7 +137,8 @@ let cancelledRunId: string | undefined;
             calledA = true;
             if (scenario === "snapshot_probe") {
               message.stopReason = "toolUse";
-              message.content = [{ type: "toolCall", id: "snapshot-probe", name: "subagent", arguments: { agent: "worker", task: "return deterministic snapshot probe" } }];
+              const single = { agent: "worker", task: "return deterministic snapshot probe" };
+              message.content = [{ type: "toolCall", id: "snapshot-probe", name: "subagent", arguments: process.env.YM245_PRESERVATION === "1" ? { tasks: [single, { ...single, task: "return held-delivery snapshot probe" }] } : single }];
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
               stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
             } else if (scenario?.includes("read_heavy")) {
