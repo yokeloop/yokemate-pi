@@ -74,6 +74,50 @@ async function underMutex<T>(key: string, operation: () => Promise<T>): Promise<
   }
 }
 
+export interface FreshMergeScope {
+  repo: string;
+  cwd: string;
+  remote: string;
+  sourceBranch: string;
+  targetBranch: string;
+  pr: string;
+  expectedHead: string;
+  live(): boolean;
+  gate(): Promise<{ ok: boolean; reason?: string; head?: string }>;
+}
+
+export function freshMerge(scope: FreshMergeScope, method: CoordinatorMergeRequest["method"], deps: Pick<CoordinatorMergeDeps, "snapshot" | "merge"> = defaults): Promise<CoordinatorMergeResult> {
+  if (!/^[0-9a-f]{40}$/.test(scope.expectedHead)) throw new Error("merge expectedHead must be a full commit SHA");
+  const remote = canonicalRepository(scope.remote);
+  if (remote !== repositoryFromPr(scope.pr)) throw new Error(`prepared remote ${remote} does not match ${scope.pr}`);
+  return underMutex(`${remote}#${scope.targetBranch}`, async () => {
+    if (!scope.live()) throw new Error("merge authority is no longer live");
+    const before = await deps.snapshot(scope.cwd, scope.pr);
+    if (before.url !== scope.pr || before.baseRefName !== scope.targetBranch || before.headRefName !== scope.sourceBranch || before.headRefOid !== scope.expectedHead) throw new Error("PR identity, target, source, or head changed before merge");
+    if (before.state === "MERGED") {
+      if (!before.mergedAt) throw new Error("merged PR has no merge timestamp");
+      return { repo: scope.repo, pr: before.url, head: before.headRefOid, state: "merged" as const };
+    }
+    if (before.state !== "OPEN") return { repo: scope.repo, pr: before.url, head: before.headRefOid, state: "unknown" as const, reason: `PR is ${before.state}` };
+    const gate = await scope.gate();
+    if (!gate.ok) {
+      assertMandatoryBoundary("workflow.quality-gates", false, `gate: ${gate.reason ?? "failed"}`);
+      throw new Error(`gate: ${gate.reason ?? "failed"}`);
+    }
+    assertMandatoryBoundary("workflow.quality-gates", gate.head === before.headRefOid, `fresh gate head for ${scope.repo} is ${gate.head ?? "missing"}, PR head is ${before.headRefOid}`);
+    const fresh = await deps.snapshot(scope.cwd, scope.pr);
+    if (fresh.url !== scope.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.targetBranch || fresh.headRefName !== scope.sourceBranch || fresh.headRefOid !== before.headRefOid) throw new Error("PR identity, base, state, or head changed after fresh gate");
+    if (!scope.live()) throw new Error("merge authority was revoked before merge spawn");
+    const merged = await deps.merge(scope.cwd, { pr: scope.pr, expectedHead: fresh.headRefOid, method });
+    let after: MergeSnapshot;
+    try { after = await deps.snapshot(scope.cwd, scope.pr); }
+    catch (error) { return { repo: scope.repo, pr: scope.pr, head: before.headRefOid, state: "unknown" as const, reason: `merge result cannot be reconciled: ${(error as Error).message}` }; }
+    if (after.url === scope.pr && after.state === "MERGED" && after.mergedAt && after.headRefOid === before.headRefOid && after.headRefName === scope.sourceBranch && after.baseRefName === scope.targetBranch) return { repo: scope.repo, pr: after.url, head: after.headRefOid, state: "merged" as const };
+    if (merged.exit !== 0 && after.url === scope.pr && after.state === "OPEN" && after.headRefOid === before.headRefOid) return { repo: scope.repo, pr: after.url, head: after.headRefOid, state: "open" as const, reason: merged.output || "merge command failed" };
+    return { repo: scope.repo, pr: after.url || scope.pr, head: after.headRefOid || before.headRefOid, state: "unknown" as const, reason: merged.output || `merge exited ${merged.exit} but PR is ${after.state}` };
+  });
+}
+
 function assertScope(scope: CoordinatorMergeScope, request: CoordinatorMergeRequest): string {
   assertMandatoryBoundary("workflow.explicit-ship", scope.live(), "ship coordinator authority is no longer live");
   if (!scope.part.pr || scope.part.pr !== request.pr) throw new Error("merge PR is outside the prepared coordinator scope");

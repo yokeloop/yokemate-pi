@@ -371,6 +371,29 @@ export async function enumValues(
   return out;
 }
 
+export async function ensureIssueState(t: Tracker, issueId: string, desired: "To Verify" | "Done", fetchImpl: typeof fetch = fetch): Promise<{ state: string; changed: boolean }> {
+  const current = await fetchIssue(t, issueId, fetchImpl);
+  if (!current) throw new Error(`${t.name}: issue ${issueId} is unavailable`);
+  if (current.resolved != null && desired === "To Verify") return { state: pickStatus(current).name, changed: false };
+  const before = pickStatus(current);
+  if (before.name === desired || before.status === desired) return { state: before.name, changed: false };
+  const field = await stageField(t, issueId, fetchImpl);
+  if (!field) throw new Error(`${t.name}: state field is unavailable for ${issueId}`);
+  const selected = field.values.find((value) => value.name === desired || value.label === desired);
+  if (!selected) throw new Error(`${t.name}: state ${desired} does not exist for ${issueId}`);
+  const response = await fetchImpl(`${t.baseUrl}/api/issues/${encodeURIComponent(issueId)}?fields=${encodeURIComponent(FIELDS)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${t.token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ customFields: [{ name: field.field, $type: "StateIssueCustomField", value: { name: selected.name } }] }),
+  });
+  if (!response.ok) throw new Error(`${t.name}: HTTP ${response.status} setting ${issueId} to ${desired}`);
+  const observed = await fetchIssue(t, issueId, fetchImpl);
+  if (!observed) throw new Error(`${t.name}: issue ${issueId} disappeared after state update`);
+  const after = pickStatus(observed);
+  if (after.name !== selected.name && after.status !== selected.label) throw new Error(`${t.name}: ${issueId} state update was not confirmed`);
+  return { state: after.name, changed: true };
+}
+
 /** Every value an issue carries across its custom fields, names only. */
 export function valueNames(raw: RawIssue): string[] {
   const out: string[] = [];
