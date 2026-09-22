@@ -526,6 +526,7 @@ test("review control separates launcher, worker input and descendant record auth
     reviewInput: async (_ticket, _runId, raw) => { calls.push(`input:${raw}`); return { serial: 1, revision: 0, inputHash: "hash" }; },
     reviewExtraction: async (_ticket, _runId, extraction) => { calls.push(`extract:${extraction.kind}`); },
     reviewRecord: async (_ticket, _runId, plan) => { calls.push(`record:${plan}`); return { state: "started", recorded: true, runId: "do-run" }; },
+    reviewAccept: async (_ticket, _runId, facts) => { calls.push(`accept:${facts.candidateHash}`); },
     reviewEnded: async () => { calls.push("ended"); },
   }, { root, ...target, pid: process.pid, starttime: main.starttime, cwd: root, pane: "main" }, env);
   try {
@@ -552,8 +553,10 @@ test("review control separates launcher, worker input and descendant record auth
     assert.equal((await requestReviewControl(root, "review-extraction", { ticket: "YM-1", runId, generation: input.generation, extraction: { kind: "rework", evidence: [{ start: 0, end: 12, text: "на доработку" }] } }, worker, target, env)).state, "accepted");
     assert.equal((await requestReviewControl(root, "review-record", { ticket: "YM-1", runId, path: "/plan.md" }, cli, target, env)).rework?.runId, "do-run");
     assert.equal((await requestReviewControl(root, "review-input", { ticket: "YM-1", runId, raw: "foreign" }, cli, target, env)).state, "refused");
+    assert.equal((await requestReviewControl(root, "review-accept", { ticket: "YM-1", runId, facts: { candidateHash: "foreign" } }, cli, target, env)).state, "refused");
+    assert.equal((await requestReviewControl(root, "review-accept", { ticket: "YM-1", runId, facts: { candidateHash: "exact" } }, worker, target, env)).state, "accepted");
     assert.equal((await requestReviewControl(root, "review-ended", { ticket: "YM-1", runId, reason: "shutdown" }, worker, target, env)).state, "accepted");
-    assert.deepEqual(calls, ["started", "input:на доработку", "extract:rework", "record:/plan.md", "ended"]);
+    assert.deepEqual(calls, ["started", "input:на доработку", "extract:rework", "record:/plan.md", "accept:exact", "ended"]);
   } finally {
     if (descendant && descendant.exitCode === null) { descendant.kill("SIGKILL"); descendant.unref(); }
     await new Promise<void>((resolve) => server.close(() => resolve()));

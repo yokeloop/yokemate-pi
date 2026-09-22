@@ -2069,6 +2069,20 @@ export default function (pi: ExtensionAPI) {
 						}
 					});
 				},
+				reviewAccept: async (ticket, reviewRunId, facts, acceptOrigin) => {
+					if (!acceptOrigin.runtimeId) throw new Error("group acceptance runtime identity is missing");
+					if (typeof facts.groupId !== "string" || typeof facts.revisionHash !== "string" || typeof facts.candidateHash !== "string") throw new Error("group acceptance facts are incomplete");
+					const artifactPath = path.join(ENGINE_ROOT, "work", ticket, `group-review-${facts.candidateHash}.json`);
+					if (!fs.existsSync(artifactPath)) throw new Error("group acceptance candidate artifact is missing");
+					const candidate = JSON.parse(fs.readFileSync(artifactPath, "utf8")) as GroupCandidate;
+					if (candidate.groupId !== facts.groupId || candidate.revisionHash !== facts.revisionHash || candidate.candidateHash !== facts.candidateHash) throw new Error("group acceptance candidate identity changed");
+					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+					try {
+						acceptGroupCandidate(db, candidate, { reviewSource: { runId: reviewRunId, runtimeId: acceptOrigin.runtimeId, sessionId: acceptOrigin.sessionId, candidateHash: candidate.candidateHash }, evidence: candidate.obligationEvidence });
+					} finally { db.close(); }
+					logMove(dataRoot(ENGINE_ROOT), ticket, "принято", `group ${candidate.candidateHash}`);
+					syncPush(dataRoot(ENGINE_ROOT), `${ticket} принято`);
+				},
 				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),
 				reviewEnded: async (_ticket, reviewRunId, reason) => { await revokeReviewRun(reviewRunId, reason); },
 				groupPlanActivated: async (ticket, context, facts, _origin, approach) => {
@@ -3141,16 +3155,12 @@ export default function (pi: ExtensionAPI) {
 			const rootTicket = process.env.YOKEMATE_TICKET;
 			const candidate = runId ? groupReviewCandidates.get(runId) : undefined;
 			if (process.env.YOKEMATE_MODE !== "review" || !runId || !runtimeId || !rootTicket || !candidate) return { content: [{ type: "text", text: "group_review_accept requires the exact candidate prepared in this registered review surface" }], isError: true };
-			const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
-			const db = openDb(path.join(root, "yokemate.db"));
 			try {
-				acceptGroupCandidate(db, candidate, { reviewSource: { runId, runtimeId, sessionId: ctx.sessionManager.getSessionId(), candidateHash: candidate.candidateHash }, evidence: candidate.obligationEvidence });
+				const reply = await requestReviewControl(ENGINE_ROOT, "review-accept", { ticket: rootTicket, runId, facts: { groupId: candidate.groupId, revisionHash: candidate.revisionHash, candidateHash: candidate.candidateHash } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+				if (reply.state !== "accepted") throw new Error(reply.reason ?? "group acceptance refused");
 				groupReviewCandidates.delete(runId);
-				logMove(dataRoot(root), rootTicket, "принято", `group ${candidate.candidateHash}`);
-				syncPush(dataRoot(root), `${rootTicket} принято`);
 				return { content: [{ type: "text", text: `${rootTicket}: accepted group candidate ${candidate.candidateHash}` }], details: candidate };
 			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
-			finally { db.close(); }
 		},
 	});
 
