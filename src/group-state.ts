@@ -1,0 +1,226 @@
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import type { Stage } from "./db.ts";
+
+export const GROUP_PHASES = ["planning", "planned", "running", "review", "accepted", "shipping", "done", "blocked"] as const;
+export type GroupPhase = (typeof GROUP_PHASES)[number];
+export const GROUP_MEMBER_STAGES = ["new", "scouted", "planned", "running", "review", "accepted", "integrated"] as const;
+export type GroupMemberStage = (typeof GROUP_MEMBER_STAGES)[number];
+export const GROUP_EXECUTIONS = ["not_started", "queued", "running", "ready", "integrated", "blocked"] as const;
+export type GroupExecution = (typeof GROUP_EXECUTIONS)[number];
+export type ClaimState = "reserved" | "active" | "suspended";
+
+export interface GroupMemberSeed {
+  identity: string;
+  ticket: string;
+  parentIdentity: string | null;
+  planRecordId?: number | null;
+  priorState?: unknown;
+  stage?: GroupMemberStage;
+  execution?: GroupExecution;
+  trackerState?: string | null;
+}
+
+export interface GroupRevisionInput {
+  groupId: string;
+  revisionHash: string;
+  treeHash: string;
+  manifest: unknown;
+  bindings: unknown;
+  compatibility: unknown;
+  approachReceiptId: string;
+  members: GroupMemberSeed[];
+}
+
+export interface GroupMoveRequest {
+  groupId: string;
+  revisionHash?: string | null;
+  expectedPhase: GroupPhase;
+  toPhase: GroupPhase;
+  idempotencyKey: string;
+  blocker?: string | null;
+  resumePhase?: Exclude<GroupPhase, "blocked" | "done"> | null;
+}
+
+export type GroupMoveOutcome =
+  | { ok: true; repeat: boolean; from: GroupPhase; to: GroupPhase }
+  | { ok: false; refuse: string };
+
+export interface GroupClaimOwner {
+  runtimeId: string;
+  runId: string;
+  sessionId: string;
+  process?: { pid: number; starttime: string };
+}
+
+export interface ExistingMemberClassification {
+  kind: "fresh" | "planned_material" | "active_blocker" | "result_candidate" | "reuse_candidate" | "evidence_blocker";
+  priorState: Record<string, unknown>;
+  blocker?: string;
+}
+
+const stable = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(stable);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, stable(child)]));
+};
+
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(stable(value));
+}
+
+export function canonicalHash(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+export function createPlanningGroup(db: DatabaseSync, input: { id?: string; rootIdentity: string; rootTicket: string; ownerProject: string }): string {
+  const id = input.id ?? randomUUID();
+  db.prepare(`INSERT INTO task_group (id,root_identity,root_ticket,owner_project,phase)
+    VALUES (?,?,?,?, 'planning')
+    ON CONFLICT(root_identity) DO NOTHING`).run(id, input.rootIdentity, input.rootTicket, input.ownerProject);
+  const row = db.prepare("SELECT id,root_ticket,owner_project FROM task_group WHERE root_identity = ?").get(input.rootIdentity) as { id: string; root_ticket: string; owner_project: string };
+  if (row.root_ticket !== input.rootTicket || row.owner_project !== input.ownerProject) throw new Error("group root identity is already bound to another target");
+  return row.id;
+}
+
+export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; treeHash: string; members: string[]; owners: GroupClaimOwner[] }): void {
+  const members = [...new Set(input.members)].sort();
+  if (!members.length || members.some((member) => !member)) throw new Error("group claims require a complete nonempty member set");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const member of members) {
+      const existing = db.prepare("SELECT kind,group_id,state FROM member_claim WHERE member_identity = ?").get(member) as { kind: string; group_id: string | null; state: string } | undefined;
+      if (existing && (existing.kind !== "group" || existing.group_id !== input.groupId)) throw new Error(`${member} is claimed by ${existing.kind === "group" ? existing.group_id : "a single run"}`);
+    }
+    const owners = canonicalJson(input.owners);
+    for (const member of members) db.prepare(`INSERT INTO member_claim (member_identity,kind,group_id,tree_hash,owners_json,state)
+      VALUES (?, 'group', ?, ?, ?, 'reserved')
+      ON CONFLICT(member_identity) DO UPDATE SET tree_hash=excluded.tree_hash,owners_json=excluded.owners_json,state='reserved',updated_at=datetime('now')`).run(member, input.groupId, input.treeHash, owners);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
+export function activateGroupRevision(db: DatabaseSync, input: GroupRevisionInput): void {
+  if (!/^[a-f0-9]{64}$/.test(input.revisionHash) || !/^[a-f0-9]{64}$/.test(input.treeHash)) throw new Error("group revision hashes must be SHA-256 values");
+  const identities = new Set(input.members.map((member) => member.identity));
+  if (identities.size !== input.members.length || input.members.length === 0) throw new Error("group revision members must be unique and nonempty");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const group = db.prepare("SELECT phase FROM task_group WHERE id = ?").get(input.groupId) as { phase: GroupPhase } | undefined;
+    if (!group) throw new Error("group does not exist");
+    if (!["planning", "blocked", "planned"].includes(group.phase)) throw new Error(`group cannot activate from ${group.phase}`);
+    for (const member of input.members) {
+      const claim = db.prepare("SELECT kind,group_id,tree_hash FROM member_claim WHERE member_identity = ?").get(member.identity) as { kind: string; group_id: string | null; tree_hash: string | null } | undefined;
+      if (!claim || claim.kind !== "group" || claim.group_id !== input.groupId || claim.tree_hash !== input.treeHash) throw new Error(`${member.ticket}: group claim is missing or stale`);
+    }
+    db.prepare(`INSERT INTO group_revision (group_id,revision_hash,tree_hash,manifest_json,bindings_json,compatibility_json,approach_receipt_id)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash) DO NOTHING`).run(input.groupId, input.revisionHash, input.treeHash, canonicalJson(input.manifest), canonicalJson(input.bindings), canonicalJson(input.compatibility), input.approachReceiptId);
+    for (const member of input.members) db.prepare(`INSERT INTO group_member
+      (group_id,revision_hash,member_identity,ticket,parent_identity,plan_record_id,prior_state_json,stage,execution,tracker_state)
+      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash,member_identity) DO NOTHING`).run(input.groupId, input.revisionHash, member.identity, member.ticket, member.parentIdentity, member.planRecordId ?? null, canonicalJson(member.priorState ?? {}), member.stage ?? "planned", member.execution ?? "not_started", member.trackerState ?? null);
+    db.prepare("UPDATE member_claim SET revision_hash=?,state='active',updated_at=datetime('now') WHERE group_id=? AND tree_hash=?").run(input.revisionHash, input.groupId, input.treeHash);
+    db.prepare("UPDATE task_group SET active_revision=?,phase='planned',resume_phase=NULL,blocker=NULL,updated_at=datetime('now') WHERE id=?").run(input.revisionHash, input.groupId);
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
+export function applyGroupMove(db: DatabaseSync, request: GroupMoveRequest, write?: () => void): GroupMoveOutcome {
+  if (!request.idempotencyKey) throw new Error("group move idempotency key is required");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const prior = db.prepare("SELECT outcome_json FROM group_move WHERE idempotency_key = ?").get(request.idempotencyKey) as { outcome_json: string } | undefined;
+    if (prior) {
+      const outcome = JSON.parse(prior.outcome_json) as { groupId: string; revisionHash: string | null; from: GroupPhase; to: GroupPhase };
+      if (outcome.groupId !== request.groupId || outcome.revisionHash !== (request.revisionHash ?? null) || outcome.to !== request.toPhase) throw new Error("group move idempotency key was reused with different inputs");
+      db.exec("ROLLBACK");
+      return { ok: true, repeat: true, from: outcome.from, to: outcome.to };
+    }
+    const row = db.prepare("SELECT active_revision,phase FROM task_group WHERE id = ?").get(request.groupId) as { active_revision: string | null; phase: GroupPhase } | undefined;
+    if (!row) { db.exec("ROLLBACK"); return { ok: false, refuse: "group does not exist" }; }
+    if (row.phase !== request.expectedPhase) { db.exec("ROLLBACK"); return { ok: false, refuse: `group changed from ${request.expectedPhase} to ${row.phase}` }; }
+    if (request.revisionHash !== undefined && row.active_revision !== request.revisionHash) { db.exec("ROLLBACK"); return { ok: false, refuse: `group revision changed from ${request.revisionHash ?? "none"} to ${row.active_revision ?? "none"}` }; }
+    write?.();
+    const resume = request.toPhase === "blocked" ? request.resumePhase ?? request.expectedPhase : null;
+    db.prepare("UPDATE task_group SET phase=?,resume_phase=?,blocker=?,updated_at=datetime('now') WHERE id=?").run(request.toPhase, resume, request.blocker ?? null, request.groupId);
+    const outcome = { groupId: request.groupId, revisionHash: request.revisionHash ?? null, from: row.phase, to: request.toPhase };
+    db.prepare("INSERT INTO group_move (idempotency_key,group_id,revision_hash,from_phase,to_phase,outcome_json) VALUES (?,?,?,?,?,?)").run(request.idempotencyKey, request.groupId, request.revisionHash ?? null, row.phase, request.toPhase, canonicalJson(outcome));
+    if (request.toPhase === "done") db.prepare("DELETE FROM member_claim WHERE group_id=? AND revision_hash=?").run(request.groupId, row.active_revision);
+    if (request.toPhase === "blocked") db.prepare("UPDATE member_claim SET state='suspended',updated_at=datetime('now') WHERE group_id=? AND revision_hash=?").run(request.groupId, row.active_revision);
+    db.exec("COMMIT");
+    return { ok: true, repeat: false, from: row.phase, to: request.toPhase };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
+export function recordGroupEffect(db: DatabaseSync, effect: { key: string; groupId: string; revisionHash: string; type: "integrate" | "ship" | "to_verify" | "done" | "cleanup"; scope: unknown; input: unknown; state: "intent" | "unknown" | "confirmed" | "failed"; outcome?: unknown }): { repeat: boolean; state: string } {
+  const existing = db.prepare("SELECT group_id,revision_hash,type,input_json,state FROM group_effect WHERE effect_key=?").get(effect.key) as { group_id: string; revision_hash: string; type: string; input_json: string; state: string } | undefined;
+  const inputJson = canonicalJson(effect.input);
+  if (existing) {
+    if (existing.group_id !== effect.groupId || existing.revision_hash !== effect.revisionHash || existing.type !== effect.type || existing.input_json !== inputJson) throw new Error("group effect key was reused with different inputs");
+    return { repeat: true, state: existing.state };
+  }
+  db.prepare(`INSERT INTO group_effect (effect_key,group_id,revision_hash,scope_json,type,input_json,state,outcome_json)
+    VALUES (?,?,?,?,?,?,?,?)`).run(effect.key, effect.groupId, effect.revisionHash, canonicalJson(effect.scope), effect.type, inputJson, effect.state, effect.outcome === undefined ? null : canonicalJson(effect.outcome));
+  return { repeat: false, state: effect.state };
+}
+
+export function confirmGroupEffect(db: DatabaseSync, key: string, state: "unknown" | "confirmed" | "failed", outcome: unknown): void {
+  const changed = db.prepare("UPDATE group_effect SET state=?,outcome_json=?,updated_at=datetime('now') WHERE effect_key=? AND state!='confirmed'").run(state, canonicalJson(outcome), key);
+  if (changed.changes === 0) {
+    const row = db.prepare("SELECT state,outcome_json FROM group_effect WHERE effect_key=?").get(key) as { state: string; outcome_json: string | null } | undefined;
+    if (!row) throw new Error("group effect does not exist");
+    if (row.state !== "confirmed" || row.outcome_json !== canonicalJson(outcome)) throw new Error("confirmed group effect is immutable");
+  }
+}
+
+export function classifyExistingMember(db: DatabaseSync, ticket: string): ExistingMemberClassification {
+  const row = db.prepare("SELECT id,stage,plan,pr FROM work WHERE ticket=?").get(ticket) as { id: number; stage: Stage; plan: string | null; pr: string | null } | undefined;
+  const claim = db.prepare(`SELECT c.kind,c.group_id,c.revision_hash,c.state FROM member_claim c
+    LEFT JOIN group_member m ON m.member_identity=c.member_identity AND m.ticket=?
+    WHERE m.ticket=? OR c.member_identity=? LIMIT 1`).get(ticket, ticket, ticket) as { kind: string; group_id: string | null; revision_hash: string | null; state: string } | undefined;
+  const priorState = { ...(row ?? {}), ...(claim ? { claim } : {}) };
+  if (claim?.state === "active") return { kind: "active_blocker", priorState, blocker: `${ticket} has an active ${claim.kind} owner` };
+  if (!row) return { kind: "fresh", priorState };
+  if (row.stage === "planned") return { kind: "planned_material", priorState };
+  if (row.stage === "running") return { kind: "active_blocker", priorState, blocker: `${ticket} has an active single run` };
+  if ((row.stage === "review" || row.stage === "accepted") && row.pr) return { kind: "result_candidate", priorState };
+  if (row.stage === "accepted") return { kind: "evidence_blocker", priorState, blocker: `${ticket} is accepted without preserved PR evidence` };
+  return { kind: "fresh", priorState };
+}
+
+export function groupClaimForTicket(db: DatabaseSync, ticket: string): { groupId: string; revisionHash: string | null; memberIdentity: string; state: ClaimState } | null {
+  const row = db.prepare(`SELECT c.group_id,c.revision_hash,c.member_identity,c.state
+    FROM member_claim c JOIN group_member m ON m.group_id=c.group_id AND m.revision_hash=c.revision_hash AND m.member_identity=c.member_identity
+    WHERE c.kind='group' AND m.ticket=? AND c.state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as { group_id: string; revision_hash: string | null; member_identity: string; state: ClaimState } | undefined;
+  return row ? { groupId: row.group_id, revisionHash: row.revision_hash, memberIdentity: row.member_identity, state: row.state } : null;
+}
+
+export function snapshotGroupFacts(db: DatabaseSync, groupId: string, path: string): { hash: string; sequence: number } {
+  const group = db.prepare("SELECT * FROM task_group WHERE id=?").get(groupId) as Record<string, unknown> | undefined;
+  if (!group || typeof group.active_revision !== "string") throw new Error("active group revision is required for a facts snapshot");
+  const revisionHash = group.active_revision;
+  const members = db.prepare("SELECT * FROM group_member WHERE group_id=? AND revision_hash=? ORDER BY member_identity").all(groupId, revisionHash);
+  const repositories = db.prepare("SELECT * FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupId, revisionHash);
+  const acceptances = db.prepare("SELECT * FROM group_acceptance WHERE group_id=? AND revision_hash=? ORDER BY candidate_hash").all(groupId, revisionHash);
+  const effects = db.prepare("SELECT * FROM group_effect WHERE group_id=? AND revision_hash=? AND state='confirmed' ORDER BY effect_key").all(groupId, revisionHash);
+  let sequence = 1;
+  try { sequence = Number((JSON.parse(readFileSync(path, "utf8")) as { sequence?: number }).sequence ?? 0) + 1; } catch {}
+  const payload = { version: 1, groupId, revisionHash, sequence, group, members, repositories, acceptances, confirmedEffects: effects };
+  const hash = canonicalHash(payload);
+  const document = `${JSON.stringify({ ...payload, hash }, null, 2)}\n`;
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
+  writeFileSync(temporary, document, { mode: 0o600 });
+  renameSync(temporary, path);
+  return { hash, sequence };
+}
