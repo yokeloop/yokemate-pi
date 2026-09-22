@@ -340,7 +340,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         const watcher = watch(snapshotDir, inspect);
         function inspect() {
           const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
-          const snapshot = snapshots.find((entry) => entry.ownerRunId === "owner-parent-cancel" && entry.agent === "task-reviewer" && entry.stream.phase === "thinking");
+          const snapshot = snapshots.find((entry) => entry.ownerRunId === "owner-parent-cancel" && entry.agent === "task-reviewer" && entry.stream?.phase === "thinking");
           if (!snapshot) return;
           clearTimeout(timer);
           watcher.close();

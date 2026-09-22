@@ -72,7 +72,7 @@ import { installWorkflowIngress, WorkflowIngressWitnessStore, type WorkflowIngre
 import { BreakGlassPermitStore, parseBreakGlass, previewScoutAcceptance, resolveScoutAcceptance, type BreakGlassPreview, type PlanSnapshotIdentity } from "../../../src/workflow-break-glass.ts";
 import { assertMandatoryBoundary } from "../../../src/workflow-boundaries.ts";
 import { PlanApproachStore, PLAN_APPROACH_EXTRACTION_INSTRUCTION, validatePlanApproachExtraction, type PlanApproachProposal } from "../../../src/plan-approach.ts";
-import { discoverTaskTreeForTicket, type TaskTree } from "../../../src/group-tree.ts";
+import { assertCurrentTaskTree, discoverTaskTreeForTicket, type TaskTree } from "../../../src/group-tree.ts";
 import { canonicalHash, classifyExistingMember, confirmGroupEffect, createPlanningGroup, groupClaimForTicket, persistGroupFacts, recordGroupEffect, reserveMemberClaims, restorePersistedGroupFacts } from "../../../src/group-state.ts";
 import { reconcileGroupEffects } from "../../../src/group-recovery.ts";
 import { trackers } from "../../../src/trackers.ts";
@@ -93,6 +93,11 @@ const COLLAPSED_ITEM_COUNT = 10;
 const persistPortableGroupFacts = (db: ReturnType<typeof openDb>, groupId: string, message: string): void => {
 	persistGroupFacts(ENGINE_ROOT, db, groupId);
 	syncPush(dataRoot(ENGINE_ROOT), message);
+};
+
+const assertCurrentGroupTopology = (db: ReturnType<typeof openDb>, groupId: string, revisionHash: string, tree: Parameters<typeof assertCurrentTaskTree>[0]): void => {
+	const rows = db.prepare("SELECT member_identity,parent_identity,execution FROM group_member WHERE group_id=? AND revision_hash=? ORDER BY member_identity").all(groupId, revisionHash) as unknown as { member_identity: string; parent_identity: string | null; execution: string }[];
+	assertCurrentTaskTree(tree, rows.map((row) => ({ memberIdentity: row.member_identity, parentIdentity: row.parent_identity, execution: row.execution })));
 };
 
 // Отвязанные дети живут дольше своего тул-колла: AbortSignal тула у них уже
@@ -3115,9 +3120,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const group = db.prepare("SELECT id,active_revision FROM task_group WHERE root_ticket=? AND phase='review'").get(rootTicket) as { id: string; active_revision: string } | undefined;
 				if (!group?.active_revision) throw new Error(`${rootTicket}: no active group review revision`);
-				const revision = db.prepare("SELECT manifest_json,tree_hash FROM group_revision WHERE group_id=? AND revision_hash=?").get(group.id, group.active_revision) as { manifest_json: string; tree_hash: string };
+				const revision = db.prepare("SELECT manifest_json FROM group_revision WHERE group_id=? AND revision_hash=?").get(group.id, group.active_revision) as { manifest_json: string };
 				const freshTree = await discoverTaskTreeForTicket(db, rootTicket, { trackers: trackers() });
-				if (freshTree.treeHash !== revision.tree_hash) throw new Error(`${rootTicket}: tracker tree changed before group review`);
+				assertCurrentGroupTopology(db, group.id, group.active_revision, freshTree);
 				const manifest = JSON.parse(revision.manifest_json) as GroupExecutionManifest;
 				const supplied = params.evidence as { id: string; value: unknown }[];
 				const evidence: ObligationEvidence[] = supplied.map((item) => ({ id: item.id, evidence: item.value, hash: canonicalHash(item.value) }));
@@ -3207,13 +3212,13 @@ export default function (pi: ExtensionAPI) {
 				if (!currentStarttime) throw new Error("cannot prove current group owner process identity");
 				db.prepare("UPDATE member_claim SET owners_json=?,updated_at=datetime('now') WHERE group_id=? AND revision_hash=?").run(JSON.stringify([{ runtimeId: ownerRunId, runId: ownerRunId, sessionId: ctx.sessionManager.getSessionId(), process: { pid: process.pid, starttime: currentStarttime } }]), groupId, revisionHash);
 				const manifest = JSON.parse(row.manifest_json) as GroupExecutionManifest;
-				const storedTree = db.prepare("SELECT tree_hash FROM group_revision WHERE group_id=? AND revision_hash=?").get(groupId, revisionHash) as { tree_hash: string };
-				const freshTree = await discoverTaskTreeForTicket(db, rootTicket, { trackers: trackers() });
-				if (freshTree.treeHash !== storedTree.tree_hash) {
-					db.prepare("UPDATE task_group SET phase='blocked',resume_phase=CASE WHEN phase='blocked' THEN resume_phase ELSE phase END,blocker='tracker tree changed during group recovery',updated_at=datetime('now') WHERE id=?").run(groupId);
-					throw new Error("tracker tree changed during group recovery; rediscovery and replanning are required");
-				}
 				restorePersistedGroupFacts(root, db, groupId, (facts) => facts.groupId === groupId && facts.revisionHash === revisionHash);
+				const freshTree = await discoverTaskTreeForTicket(db, rootTicket, { trackers: trackers() });
+				try { assertCurrentGroupTopology(db, groupId, revisionHash, freshTree); }
+				catch (error) {
+					db.prepare("UPDATE task_group SET phase='blocked',resume_phase=CASE WHEN phase='blocked' THEN resume_phase ELSE phase END,blocker=?,updated_at=datetime('now') WHERE id=?").run((error as Error).message, groupId);
+					throw error;
+				}
 				prepareGroupWorkScopes(db, path.join(root, "work", rootTicket), { groupId, revisionHash, manifest });
 				await reconcileGroupEffects(db, { groupId, revisionHash }, {
 					observeIntegration: async ({ member, repo, pr }) => {

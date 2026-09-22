@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverTaskTree, type TaskTreeSourceNode } from "../src/group-tree.ts";
+import { assertCurrentTaskTree, discoverTaskTree, type TaskTreeSourceNode } from "../src/group-tree.ts";
 import { fetchHierarchy } from "../src/youtrack.ts";
 import type { Tracker } from "../src/trackers.ts";
 
@@ -29,6 +29,25 @@ test("discovers a nested non-Epic tree including closed and foreign-assignee chi
     ["YM-3", "yt:YM-1", "open"],
   ]);
   assert.match(tree.treeHash, /^[a-f0-9]{64}$/);
+});
+
+test("recovery verifies topology while allowing expected issue changes and requiring evidence for closure", async () => {
+  const tree = await discoverTaskTree("yt:YM-1", fetcher([
+    { ...node("YM-1", [], ["yt:YM-2"]), snapshot: { title: "changed after planning" } },
+    node("YM-2", ["yt:YM-1"], [], "closed"),
+  ]));
+  assert.doesNotThrow(() => assertCurrentTaskTree(tree, [
+    { memberIdentity: "yt:YM-1", parentIdentity: null, execution: "ready" },
+    { memberIdentity: "yt:YM-2", parentIdentity: "yt:YM-1", execution: "integrated" },
+  ]));
+  assert.throws(() => assertCurrentTaskTree(tree, [
+    { memberIdentity: "yt:YM-1", parentIdentity: null, execution: "ready" },
+    { memberIdentity: "yt:YM-2", parentIdentity: "yt:YM-1", execution: "queued" },
+  ]), /closed without preserved integrated evidence/);
+  assert.throws(() => assertCurrentTaskTree(tree, [
+    { memberIdentity: "yt:YM-1", parentIdentity: null, execution: "ready" },
+    { memberIdentity: "yt:YM-2", parentIdentity: null, execution: "integrated" },
+  ]), /topology changed/);
 });
 
 test("rejects cycles, multiple parents, unavailable nodes and mismatched direct parent", async () => {
