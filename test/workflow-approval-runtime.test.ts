@@ -140,9 +140,11 @@ test("raw interactive authority flows through real plan CLI and parent control w
           await new Promise<void>((resolve) => { releaseExtraction = resolve; });
         }
         if (extraction === "error") throw new Error("workflow extraction timed out");
-        const { raw, bindings } = JSON.parse(context.messages[0]!.content);
-        const value = extraction === "none" ? { kind: "none" } : { kind: extraction, ticket: "YM-1", binding: extraction === "approve-ready-do" ? bindings[0].contentHash : null, actions: extraction === "approve-ready-do" ? ["do"] : ["plan", "do"], evidence: [{ start: 0, end: raw.length, text: raw }] };
-        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(value) }] };
+        const value = JSON.parse(context.messages[0]!.content);
+        if ("proposal" in value) return { stopReason: "stop", content: [{ type: "text", text: '{"kind":"approve","evidence":[{"start":0,"end":8,"text":"approved"}]}' }] };
+        const { raw, bindings } = value;
+        const result = extraction === "none" ? { kind: "none" } : { kind: extraction, ticket: "YM-1", binding: extraction === "approve-ready-do" ? bindings[0].contentHash : null, actions: extraction === "approve-ready-do" ? ["do"] : ["plan", "do"], evidence: [{ start: 0, end: raw.length, text: raw }] };
+        return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify(result) }] };
       },
     }, ui: { setWidget() {}, notify(message: string) { notifications.push(message); }, confirm: async () => { confirms++; return true; } } } as unknown as ExtensionContext;
     process.env.HERDR_PANE_ID = "main-pane";
@@ -187,6 +189,14 @@ test("raw interactive authority flows through real plan CLI and parent control w
     const scoutEnvelope = await runScout("scout-long");
     assert.equal(scoutEnvelope.artifact.state, "accepted", JSON.stringify(scoutEnvelope));
     assert.equal(scoutEnvelope.publication.state, "complete", JSON.stringify(scoutEnvelope.publication));
+    process.env.YOKEMATE_MODE = "plan";
+    process.env.YOKEMATE_ROLE = "coordinator";
+    delete process.env.YOKEMATE_TICKET;
+    const approach = extension.tools.get("plan_approach")!.definition;
+    await approach.execute("approach", { approachText: "Use the accepted fixture plan.", treeHash: createHash("sha256").update("YM-1").digest("hex"), acceptedScouts: [{ ticket: "YM-1", acceptanceId: scoutEnvelope.artifact.acceptanceId, hash: scoutEnvelope.artifact.hash }] }, undefined, () => undefined, ctx);
+    for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "approved" } as never, { ...ctx, mode: "tui" } as ExtensionContext);
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
     assert.match(readFileSync(scoutEnvelope.artifact.path, "utf8"), /EVIDENCE-TAIL/);
     assert.ok(Buffer.byteLength(scoutEnvelope.payload) <= 50 * 1024 + 32);
     assert.doesNotMatch(scoutEnvelope.payload, /EVIDENCE-TAIL/);

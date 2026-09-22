@@ -71,6 +71,12 @@ import { githubPublicationAdapter } from "../../../src/github.ts";
 import { installWorkflowIngress, WorkflowIngressWitnessStore, type WorkflowIngressWitness } from "../../../src/workflow-ingress.ts";
 import { BreakGlassPermitStore, parseBreakGlass, previewScoutAcceptance, resolveScoutAcceptance, type BreakGlassPreview, type PlanSnapshotIdentity } from "../../../src/workflow-break-glass.ts";
 import { assertMandatoryBoundary } from "../../../src/workflow-boundaries.ts";
+import { PlanApproachStore, PLAN_APPROACH_EXTRACTION_INSTRUCTION, validatePlanApproachExtraction, type PlanApproachProposal } from "../../../src/plan-approach.ts";
+import { discoverTaskTreeForTicket, type TaskTree } from "../../../src/group-tree.ts";
+import { classifyExistingMember, createPlanningGroup, reserveMemberClaims } from "../../../src/group-state.ts";
+import { trackers } from "../../../src/trackers.ts";
+import { activateGroupPlan, bindGroupRevision, parseGroupExecution, type CompatibilityReport } from "../../../src/group-plan.ts";
+import { prepareGroupMemberPlanRecord } from "../../../src/group-plan-record.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -935,6 +941,10 @@ export default function (pi: ExtensionAPI) {
 	const coordinators = new CoordinatorRegistry();
 	const listRuns = new ListRunRegistry();
 	const authorityByCycle = new Map<string, DoAuthorityStore>();
+	let planApproachStore: PlanApproachStore | undefined;
+	let planApproachProposal: PlanApproachProposal | undefined;
+	let planGroupTree: TaskTree | undefined;
+	let planGroupId: string | undefined;
 	const sendListMessage = (message: { customType: string; content: string; display: boolean; details: unknown }) => {
 		const deliveryId = createHash("sha256").update(`${message.customType}\u0000${JSON.stringify(message.details)}`).digest("hex");
 		const delivery = listDeliveries.get(deliveryId) ?? { state: "pending" as const, customType: message.customType, content: message.content };
@@ -1228,6 +1238,37 @@ export default function (pi: ExtensionAPI) {
 		}));
 	};
 	pi.on("input", async (event, ctx) => {
+		if (event.source === "interactive" && ctx.mode === "tui" && process.env.YOKEMATE_MODE === "plan" && process.env.YOKEMATE_ROLE === "coordinator" && planApproachStore && planApproachProposal) {
+			try {
+				const model = ctx.model;
+				if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error("model authentication is unavailable");
+				const generation = planApproachStore.observeInput(event.text, planApproachStore.owner);
+				const rootTicket = process.env.YOKEMATE_TICKET;
+				const runId = process.env.YOKEMATE_PLAN_RUN_ID;
+				let parentGeneration: Record<string, unknown> | undefined;
+				if (rootTicket) {
+					const observed = await requestPlanControl(ENGINE_ROOT, "plan-input", { ticket: rootTicket, ...(runId ? { runId } : {}), raw: event.text }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+					if (observed.state !== "accepted" || !observed.facts) throw new Error(observed.reason ?? "parent refused plan approach input");
+					parentGeneration = observed.facts;
+				}
+				const message = await ctx.modelRegistry.complete(model, { systemPrompt: PLAN_APPROACH_EXTRACTION_INSTRUCTION, messages: [{ role: "user", content: JSON.stringify({ raw: event.text, proposal: planApproachProposal.approachText }), timestamp: Date.now() }] }, { maxTokens: 512 });
+				if (message.stopReason !== "stop" || message.content.some((part) => part.type === "toolCall")) throw new Error("unclean extraction response");
+				const raw = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+				const extraction = validatePlanApproachExtraction(JSON.parse(raw), event.text);
+				if (extraction.kind === "approve") {
+					if (rootTicket && parentGeneration) {
+						const approved = await requestPlanControl(ENGINE_ROOT, "plan-approach-extraction", { ticket: rootTicket, ...(runId ? { runId } : {}), facts: { generation: parentGeneration, extraction } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+						if (approved.state !== "accepted") throw new Error(approved.reason ?? "parent refused plan approach approval");
+					}
+					planApproachStore.approve(generation, extraction, planApproachStore.owner);
+					ctx.ui.notify("plan approach approved for the current scope", "info");
+				} else if (extraction.kind === "revoke") {
+					if (rootTicket && parentGeneration) await requestPlanControl(ENGINE_ROOT, "plan-approach-extraction", { ticket: rootTicket, ...(runId ? { runId } : {}), facts: { generation: parentGeneration, extraction } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+					planApproachStore.revoke();
+					ctx.ui.notify("plan approach approval revoked", "warning");
+				}
+			} catch (error) { planApproachStore.revoke(); ctx.ui.notify(`plan approach extraction unavailable: ${(error as Error).message}`, "warning"); }
+		}
 		if (event.source === "interactive" && ctx.mode === "tui" && process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_ROLE === "coordinator" && process.env.YOKEMATE_TICKET && process.env.YOKEMATE_REVIEW_RUN_ID) {
 			const ticket = process.env.YOKEMATE_TICKET;
 			const runId = process.env.YOKEMATE_REVIEW_RUN_ID;
@@ -1625,6 +1666,11 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown = false;
 		sessionGeneration += 1;
 		latestCtx = ctx;
+		planApproachStore?.revoke();
+		planApproachStore = undefined;
+		planApproachProposal = undefined;
+		planGroupTree = undefined;
+		planGroupId = undefined;
 		publicationMcp.setContext(ctx);
 		if (process.env.YOKEMATE_MODE === "review" && process.env.YOKEMATE_REVIEW_RUN_ID && process.env.YOKEMATE_TICKET) {
 			try {
@@ -1673,6 +1719,10 @@ export default function (pi: ExtensionAPI) {
 		planRunMetadata.clear();
 		planRecordGenerations.clear();
 		const prepareLocalPlanRecord = (ticket: string, candidatePath: string, expectedContentHash: string, acceptanceId: number, origin: import("../../../src/coordinator-control.ts").ControlOrigin, planRunId?: string) => {
+			if (!planRunId && !origin.mode) {
+				if (!planApproachStore || !planApproachProposal) throw new Error("plan record requires an approved current plan approach");
+				planApproachStore.assertCurrent({ treeHash: planApproachProposal.treeHash, acceptedScouts: planApproachProposal.acceptedScouts, approachHash: planApproachProposal.approachHash }, planApproachStore.owner);
+			}
 			if (!/^[a-f0-9]{64}$/.test(expectedContentHash)) throw new Error("binding_changed");
 			const scope = resolvePlanWriterScope(ENGINE_ROOT, ticket);
 			const snapshot = readPlanWriterSnapshot(ENGINE_ROOT, scope, candidatePath);
@@ -1908,6 +1958,14 @@ export default function (pi: ExtensionAPI) {
 				},
 				reviewStatus: (_ticket, reviewRunId) => reviewReworks.get(reviewRunId)?.store.outcome(),
 				reviewEnded: async (_ticket, reviewRunId, reason) => { await revokeReviewRun(reviewRunId, reason); },
+				groupPlanActivated: async (ticket, context, facts) => {
+					const found = listRuns.get(context.runId);
+					if (context.listRunId && (!found || !("run" in found) || !listRuns.settle(found.run.identity.listRunId, context.runId, { outcome: "recorded", facts: { ...facts, handoff: { state: "plan-only", reason: "group plan ready; a new /do approval is required" } } }))) throw new Error("group plan run is no longer active");
+					if (listRuns.releaseLifetime(context.runId)) { listUnits = Math.max(0, listUnits - 1); activeUnits = Math.max(0, activeUnits - 1); }
+					planRunGenerations.delete(context.runId);
+					planRunMetadata.delete(context.runId);
+					ctx.ui.notify(`${ticket}: group plan activated ${String(facts.revisionHash)}`, "info");
+				},
 				publishPlanScout: async (ticket, acceptanceId, child, origin) => {
 					const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					let acceptance;
@@ -2429,6 +2487,8 @@ export default function (pi: ExtensionAPI) {
 	};
 	const assertPlanWriterAdmission = (identity: ChildIdentity): void => {
 		if (identity.agent !== "plan-writer" || !identity.ticket || !runs) return;
+		if (!planApproachStore || !planApproachProposal) throw new Error("plan-writer requires an approved current plan approach");
+		planApproachStore.assertCurrent({ treeHash: planApproachProposal.treeHash, acceptedScouts: planApproachProposal.acceptedScouts, approachHash: planApproachProposal.approachHash }, planApproachStore.owner);
 		const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 		try {
 			const accepted = identity.acceptedInputId ? publicationAcceptanceById(state, identity.acceptedInputId) : undefined;
@@ -2611,6 +2671,112 @@ export default function (pi: ExtensionAPI) {
 		}
 		return request.waitForCleanup ? await request.completion : request.result;
 	};
+
+	pi.registerTool({
+		name: "plan_group_discover",
+		label: "Plan group discovery",
+		description: "Discover and reserve the complete native tracker subtree for the owned root plan run.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx): Promise<any> {
+			const rootTicket = process.env.YOKEMATE_TICKET;
+			const runId = process.env.YOKEMATE_PLAN_RUN_ID;
+			if (process.env.YOKEMATE_MODE !== "plan" || process.env.YOKEMATE_ROLE !== "coordinator" || !rootTicket || !runId) return { content: [{ type: "text", text: "plan_group_discover is available only to an owned keyed plan worker" }], isError: true };
+			try {
+				const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					const projects = db.prepare("SELECT DISTINCT org,repo FROM project WHERE tracker_key=? ORDER BY org,repo").all(rootTicket.slice(0, rootTicket.lastIndexOf("-"))) as unknown as { org: string; repo: string }[];
+					if (projects.length !== 1) throw new Error(`${rootTicket}: owner project is missing or ambiguous`);
+					const ownerProject = `${projects[0]!.org}/${projects[0]!.repo}`;
+					const tree = await discoverTaskTreeForTicket(db, rootTicket, { trackers: trackers() });
+					planGroupTree = tree;
+					if (tree.nodes.length === 1) return { content: [{ type: "text", text: `${rootTicket}: single-ticket tree ${tree.treeHash}` }], details: { kind: "single", tree } };
+					const classifications = tree.nodes.map((node) => ({ ticket: node.ticket, classification: classifyExistingMember(db, node.ticket) }));
+					const blockers = classifications.filter((item) => ["active_blocker", "evidence_blocker"].includes(item.classification.kind));
+					if (blockers.length) throw new Error(blockers.map((item) => `${item.ticket}: ${item.classification.blocker}`).join("; "));
+					const groupId = createPlanningGroup(db, { rootIdentity: tree.root.identity, rootTicket, ownerProject });
+					reserveMemberClaims(db, { groupId, treeHash: tree.treeHash, members: tree.nodes.map((node) => node.identity), tickets: Object.fromEntries(tree.nodes.map((node) => [node.identity, node.ticket])), owners: [{ runtimeId: runId, runId, sessionId: ctx.sessionManager.getSessionId(), process: { pid: process.pid, starttime: processStarttime(process.pid) ?? "unknown" } }] });
+					const reply = await requestPlanControl(ENGINE_ROOT, "register-group-plan-scope", { ticket: rootTicket, runId, facts: { groupId, treeHash: tree.treeHash, ownerProject, members: tree.nodes.map((node) => node.ticket) } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+					if (reply.state !== "accepted") throw new Error(reply.reason ?? "group plan scope registration refused");
+					planGroupId = groupId;
+					return { content: [{ type: "text", text: `${rootTicket}: group ${groupId}, ${tree.nodes.length} members, tree ${tree.treeHash}` }], details: { kind: "group", groupId, tree, ownerProject, classifications } };
+				} finally { db.close(); }
+			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_approach",
+		label: "Plan approach",
+		description: "Present the exact planning approach and wait for a fresh interactive engineer approval before any writer dispatch.",
+		parameters: Type.Object({ approachText: Type.String(), treeHash: Type.String(), acceptedScouts: Type.Array(Type.Object({ ticket: Type.String(), acceptanceId: Type.Integer({ minimum: 1 }), hash: Type.String() }), { minItems: 1 }) }),
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
+			if (process.env.YOKEMATE_MODE !== "plan" || process.env.YOKEMATE_ROLE !== "coordinator") return { content: [{ type: "text", text: "plan_approach is available only to an owned plan worker" }], isError: true };
+			try {
+				if (process.env.YOKEMATE_TICKET && (!planGroupTree || params.treeHash !== planGroupTree.treeHash)) throw new Error("plan approach requires the current complete tracker tree");
+				const scouts = params.acceptedScouts as { ticket: string; acceptanceId: number; hash: string }[];
+				if (planGroupTree && JSON.stringify([...scouts.map((scout) => scout.ticket)].sort()) !== JSON.stringify(planGroupTree.nodes.map((node) => node.ticket).sort())) throw new Error("plan approach accepted scouts do not cover the complete tree");
+				const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					for (const scout of scouts) {
+						const accepted = publicationAcceptanceById(db, scout.acceptanceId);
+						if (!accepted || accepted.ticket !== scout.ticket || accepted.content_hash !== scout.hash) throw new Error(`${scout.ticket}: accepted scout binding is not current`);
+					}
+				} finally { db.close(); }
+				const approachRunId = process.env.YOKEMATE_PLAN_RUN_ID ?? ctx.sessionManager.getSessionId();
+				const owner = { sessionId: ctx.sessionManager.getSessionId(), runtimeId: approachRunId, planRunId: approachRunId };
+				if (process.env.YOKEMATE_TICKET) {
+					const presented = await requestPlanControl(ENGINE_ROOT, "plan-approach-present", { ticket: process.env.YOKEMATE_TICKET, ...(process.env.YOKEMATE_PLAN_RUN_ID ? { runId: process.env.YOKEMATE_PLAN_RUN_ID } : {}), facts: { approachText: params.approachText, treeHash: params.treeHash, acceptedScouts: scouts } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+					if (presented.state !== "accepted") throw new Error(presented.reason ?? "parent refused plan approach");
+				}
+				planApproachStore = new PlanApproachStore(owner);
+				planApproachProposal = planApproachStore.present({ approachText: params.approachText, treeHash: params.treeHash, acceptedScouts: scouts });
+				return { content: [{ type: "text", text: `Proposed approach (approval required before writers):\n\n${planApproachProposal.approachText}` }], details: { generation: planApproachProposal.generation, approachHash: planApproachProposal.approachHash, treeHash: planApproachProposal.treeHash } };
+			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+		},
+	});
+
+	pi.registerTool({
+		name: "group_plan_activate",
+		label: "Group plan activation",
+		description: "Record every verified member plan and atomically activate the complete compatible group revision.",
+		parameters: Type.Object({ plans: Type.Array(Type.Object({ ticket: Type.String(), path: Type.String(), contentHash: Type.String(), acceptanceId: Type.Integer({ minimum: 1 }) }), { minItems: 2 }), compatibility: Type.Any() }),
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
+			const rootTicket = process.env.YOKEMATE_TICKET;
+			const runId = process.env.YOKEMATE_PLAN_RUN_ID;
+			if (process.env.YOKEMATE_MODE !== "plan" || process.env.YOKEMATE_ROLE !== "coordinator" || !rootTicket || !runId || !planGroupTree || !planGroupId || !planApproachStore || !planApproachProposal) return { content: [{ type: "text", text: "group_plan_activate requires an owned registered group plan scope" }], isError: true };
+			try {
+				const plans = params.plans as { ticket: string; path: string; contentHash: string; acceptanceId: number }[];
+				if (JSON.stringify(plans.map((plan) => plan.ticket).sort()) !== JSON.stringify(planGroupTree.nodes.map((node) => node.ticket).sort())) throw new Error("group activation plans do not cover every member exactly once");
+				const bindings: PlanBinding[] = [];
+				const recordIds = new Map<string, number>();
+				for (const plan of plans) {
+					const prepared = prepareGroupMemberPlanRecord(ENGINE_ROOT, { groupId: planGroupId, treeHash: planGroupTree.treeHash, ticket: plan.ticket, path: plan.path, contentHash: plan.contentHash, acceptanceId: plan.acceptanceId, ownerSessionId: ctx.sessionManager.getSessionId() });
+					await recordPlanFile(ENGINE_ROOT, plan.ticket, plan.path, process.env, { expectedBinding: prepared.binding, expectedContentHash: plan.contentHash, requestedPath: plan.path, scope: prepared.scope, recordId: prepared.record.id });
+					bindings.push(prepared.binding);
+					recordIds.set(plan.ticket, prepared.record.id);
+				}
+				const rootBinding = bindings.find((binding) => binding.ticket === rootTicket);
+				if (!rootBinding) throw new Error("group root plan binding is missing");
+				const rootScope = resolvePlanWriterScope(ENGINE_ROOT, rootTicket);
+				const rootSnapshot = readPlanWriterSnapshot(ENGINE_ROOT, rootScope, rootBinding.path);
+				const manifest = parseGroupExecution(rootSnapshot.text);
+				const ownerProject = manifest.ownerProject;
+				const revision = bindGroupRevision({ rootIdentity: planGroupTree.root.identity, ownerProject, tree: planGroupTree, manifest, bindings });
+				const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
+				try {
+					activateGroupPlan(db, { groupId: planGroupId, rootIdentity: planGroupTree.root.identity, tree: planGroupTree, revision, compatibility: params.compatibility as CompatibilityReport, approachStore: planApproachStore, approachOwner: planApproachStore.owner, acceptedScouts: planApproachProposal.acceptedScouts, planRecordIds: recordIds });
+					db.prepare(`INSERT INTO work (ticket,url,stage,plan) VALUES (?,?, 'planned',?) ON CONFLICT(ticket) DO UPDATE SET stage='planned',plan=excluded.plan,updated_at=datetime('now')`).run(rootTicket, `ticket:${rootTicket}`, rootBinding.path);
+				} finally { db.close(); }
+				const artifactPath = path.join(path.dirname(rootBinding.path), `${rootTicket}-group-${revision.revisionHash}.json`);
+				const artifact = `${JSON.stringify({ version: 1, rootIdentity: planGroupTree.root.identity, tree: planGroupTree, manifest, bindings: revision.bindings, compatibility: params.compatibility, revisionHash: revision.revisionHash }, null, 2)}\n`;
+				if (fs.existsSync(artifactPath)) { if (fs.readFileSync(artifactPath, "utf8") !== artifact) throw new Error("group revision artifact changed"); }
+				else fs.writeFileSync(artifactPath, artifact, { flag: "wx", mode: 0o600 });
+				const confirmed = await requestPlanControl(ENGINE_ROOT, "group-plan-activated", { ticket: rootTicket, runId, facts: { groupId: planGroupId, revisionHash: revision.revisionHash, artifactPath } }, currentControlOrigin(ENGINE_ROOT, ctx.sessionManager.getSessionId()), resolveCoordinatorParent(ENGINE_ROOT));
+				if (confirmed.state !== "accepted") throw new Error(confirmed.reason ?? "parent did not confirm group plan activation");
+				return { content: [{ type: "text", text: `${rootTicket}: group plan activated ${revision.revisionHash}\n${artifactPath}` }], details: { groupId: planGroupId, revisionHash: revision.revisionHash, artifactPath } };
+			} catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+		},
+	});
 
 	pi.registerTool({
 		name: "plan_finish",

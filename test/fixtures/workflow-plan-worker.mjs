@@ -49,7 +49,7 @@ loaded.runtime.sendMessage = (message) => {
 };
 const extension = loaded.extensions[0];
 const tool = extension.tools.get("subagent").definition;
-const ctx = { cwd: root, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => sessionId }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { getAll: () => [{ provider: "ym204-fixture", id: "deterministic", name: "Deterministic", reasoning: true }], hasConfiguredAuth: () => true }, ui: { setWidget() {}, notify() {}, confirm: async () => true } };
+const ctx = { cwd: root, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => sessionId }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { getAll: () => [{ provider: "ym204-fixture", id: "deterministic", name: "Deterministic", reasoning: true }], hasConfiguredAuth: () => true, complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"kind":"approve","evidence":[{"start":0,"end":8,"text":"approved"}]}' }] }) }, ui: { setWidget() {}, notify() {}, confirm: async () => true } };
 const previousArgv = process.argv[1];
 process.argv[1] = realpathSync(path.join(source, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"));
 for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
@@ -66,6 +66,18 @@ if (process.env.WORKFLOW_PLAN_WORKER_SCOUT_RESULT && process.env.WORKFLOW_PLAN_W
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+const approach = extension.tools.get("plan_approach").definition;
+const stampedTicket = process.env.YOKEMATE_TICKET;
+delete process.env.YOKEMATE_TICKET;
+const proposed = await approach.execute("plan-approach", { approachText: "Use the accepted fixture plan.", treeHash: createHash("sha256").update("YM-1").digest("hex"), acceptedScouts: [{ ticket: "YM-1", acceptanceId: scout.artifact.acceptanceId, hash: scout.artifact.hash }] }, undefined, () => undefined, ctx);
+if (proposed.isError) throw new Error(proposed.content.map((part) => part.text).join("\n"));
+process.env.YOKEMATE_TICKET = stampedTicket;
+const parent = resolveCoordinatorParent(root);
+const origin = currentControlOrigin(root, sessionId);
+const owner = { ticket: "YM-1", ...(runId ? { runId } : {}) };
+const parentProposal = await requestPlanControl(root, "plan-approach-present", { ...owner, facts: { approachText: "Use the accepted fixture plan.", treeHash: createHash("sha256").update("YM-1").digest("hex"), acceptedScouts: [{ ticket: "YM-1", acceptanceId: scout.artifact.acceptanceId, hash: scout.artifact.hash }] } }, origin, parent);
+if (parentProposal.state !== "accepted") throw new Error(parentProposal.reason ?? "parent plan approach refused");
+for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "approved" }, { ...ctx, mode: "tui" });
 const expectedPlan = Buffer.from(process.env.WORKFLOW_PLAN_CONTENT_BASE64 ?? "", "base64");
 if (!expectedPlan.length) throw new Error("expected plan bytes are unavailable");
 if (existsSync(plan)) throw new Error("plan artifact existed before writer launch");

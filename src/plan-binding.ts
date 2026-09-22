@@ -150,8 +150,15 @@ export function resolvePlanWriterScope(root: string, ticket: string): PlanWriter
   if (!existsSync(databasePath)) throw new PlanWriterArtifactError(ticket, "scope_not_found");
   const db = new DatabaseSync(databasePath, { readOnly: true });
   let rows: { org?: unknown; repo?: unknown }[];
-  try { rows = db.prepare("SELECT org, repo FROM project WHERE tracker_key = ?").all(trackerKey) as { org?: unknown; repo?: unknown }[]; }
-  catch { throw new PlanWriterArtifactError(ticket, "artifact_unavailable"); }
+  try {
+    const group = db.prepare(`SELECT g.owner_project FROM member_claim c JOIN task_group g ON g.id=c.group_id WHERE c.kind='group' AND c.ticket=? AND c.state IN ('reserved','active','suspended') LIMIT 2`).all(ticket) as unknown as { owner_project: string }[];
+    if (group.length > 1) throw new PlanWriterArtifactError(ticket, "ambiguous_scope");
+    if (group.length === 1) {
+      const [org, repo] = group[0]!.owner_project.split("/");
+      rows = [{ org, repo }];
+    } else rows = db.prepare("SELECT org, repo FROM project WHERE tracker_key = ?").all(trackerKey) as { org?: unknown; repo?: unknown }[];
+  }
+  catch (error) { if (error instanceof PlanWriterArtifactError) throw error; throw new PlanWriterArtifactError(ticket, "artifact_unavailable"); }
   finally { db.close(); }
   const projects = new Set<string>();
   for (const row of rows) {

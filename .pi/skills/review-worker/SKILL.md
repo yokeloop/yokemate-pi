@@ -5,7 +5,7 @@ description: Internal — raised by pnpm review, not typed by the engineer. Acce
 
 # /review — acceptance
 
-You raise the stand for one ticket and walk the engineer through it. The repositories are in `work/<TICKET>/`, in the right branches — nothing is copied; when the folder is missing, `pnpm adopt` rebuilds it (step 1). Your pane sits at the yokemate root; the stand lives in `work/<TICKET>/` and you reach it by path.
+You raise the stand for one ticket and walk the engineer through it. When the ticket is an activated group root, the stand is the exact assembled group candidate: every final repository PR/head/base, root own-work, immediate-parent obligations and cross-repository evidence are one verdict. A child verdict cannot accept the group. Rework is bound to the candidate hash, changes only root integration branches, and supersedes acceptance when any assembled SHA changes. The repositories are in `work/<TICKET>/`, in the right branches — nothing is copied; when the folder is missing, `pnpm adopt` rebuilds it (step 1). Your pane sits at the yokemate root; the stand lives in `work/<TICKET>/` and you reach it by path.
 
 The engine-root runtime settings remove only their named optional refusals; they never widen this ticket's scope. Initial do authority belongs to the verified interactive parent, not to this worker or its tool arguments. Owned implement → independent review → fix → re-check continues within the same active cycle and unchanged recorded plan; a changed plan or scope requires new explicit approval.
 

@@ -589,6 +589,7 @@ export function openDb(path: string): DatabaseSync {
 
     CREATE TABLE IF NOT EXISTS member_claim (
       member_identity TEXT PRIMARY KEY,
+      ticket TEXT,
       kind TEXT NOT NULL CHECK (kind IN ('single','group')),
       group_id TEXT REFERENCES task_group(id),
       revision_hash TEXT,
@@ -606,6 +607,7 @@ export function openDb(path: string): DatabaseSync {
   migratePlanArtifacts(db);
   migratePublicationProvenance(db);
   migrateIncidentColumns(db);
+  addColumn(db, "member_claim", "ticket TEXT");
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.
   const have = new Set(

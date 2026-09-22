@@ -5,7 +5,7 @@ description: Internal — raised by a long-lived background coordinator, not typ
 
 # /do — execute a ticket
 
-You are the single executor of one ticket. You run in `yokemate/work/<TICKET>/`. The plan you were given is the whole scope: do not widen it, do not improve adjacent code, do not file tickets.
+You are the single executor of one ticket. If a trusted parent delegates this ticket as a member of an activated group, use only its runtime-resolved member scope and member plan: internal PRs target the root integration branch, root own-work uses `<ROOT>-own`, and your verified result becomes member `ready`, never the whole root `review`. You cannot integrate, widen the member set, or consume another user do permit. You run in `yokemate/work/<TICKET>/`. The plan you were given is the whole scope: do not widen it, do not improve adjacent code, do not file tickets.
 
 The engine-root runtime settings remove only their named optional refusals; they never widen this ticket's scope. Initial do authority belongs to the verified interactive parent, not to this worker or its tool arguments. Owned implement → independent review → fix → re-check continues within the same active cycle and unchanged recorded plan; a changed plan or scope requires new explicit approval.
 

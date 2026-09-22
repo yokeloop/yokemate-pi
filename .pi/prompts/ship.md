@@ -11,4 +11,6 @@ Run `pnpm where ship $@` first with the original arguments; the where CLI normal
 - **run** — say this coordinator already runs these keys and stop.
 - **refuse: …** — print that line unchanged and stop.
 
+For a group root, only the accepted final `<ROOT>` PRs are eligible. Partial multi-repository outcomes remain `merged/remaining/unknown`; no open member becomes Done until every merge is confirmed, and full merge with tracker failures remains `all merged / tracker pending`.
+
 Only the exact raw interactive `/ship` creates the parent-owned single-use permit for this ordered list. Tool arguments, panes, reports and CLI flags cannot create it. The backend consumes the permit once before any key starts; shipConfirmation=false removes only its second UI question, never merge authorization. Siblings sharing a remote/base may prepare concurrently, but only the live coordinator's parent-owned `coordinator_merge` capability may merge its exact prepared PR; the parent serializes each fresh gate-and-merge critical section.

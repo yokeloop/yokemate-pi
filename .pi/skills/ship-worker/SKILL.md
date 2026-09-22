@@ -5,7 +5,7 @@ description: Internal — raised by pnpm ship, not typed by the engineer. Drive 
 
 # /ship — drive the ticket to the merge
 
-The typed /ship command is the engineer's word to merge. This coordinator owns one accepted key and takes it to the end — update from the base, settle conflicts, push, green CI, merge the PRs, log the outcome, remove the task folder. The repositories are already in `work/<KEY>/`, in the ticket's branches — nothing is copied, nothing new is planned. Sibling keys run independently; a shared remote/base merge is serialized only for the fresh gate-and-merge critical section.
+The typed /ship command is the engineer's word to merge. For an accepted group root, only the final registered `<ROOT>` PRs of the current candidate are shipped; internal member PRs are already integration facts. Preserve exact `merged/remaining/unknown` results. Do not update any open member to Done until every final merge is confirmed; after that update children postorder and the root last. Full merge with unfinished tracker effects is `all merged / tracker pending`, not done, and cleanup is a separate retryable effect. This coordinator owns one accepted key and takes it to the end — update from the base, settle conflicts, push, green CI, merge the PRs, log the outcome, remove the task folder. The repositories are already in `work/<KEY>/`, in the ticket's branches — nothing is copied, nothing new is planned. Sibling keys run independently; a shared remote/base merge is serialized only for the fresh gate-and-merge critical section.
 
 ## Where this runs
 

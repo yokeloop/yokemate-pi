@@ -63,27 +63,33 @@ export function recordPlanCore(root: string, ticket: string, expectedBinding: Pl
   const dataRelative = relative(data, plan);
   if (dataRelative.startsWith("..") || isAbsolute(dataRelative)) { db.close(); throw new Error(`plan is outside the data root: ${plan}`); }
   const settings = readRuntimeSettings(root);
-  let out;
+  let out: { ok: true; repeat: boolean } | { ok: false; refuse: string };
   let sideEffects = false;
+  const groupClaim = db.prepare("SELECT group_id,tree_hash,state FROM member_claim WHERE kind='group' AND ticket=? AND state IN ('reserved','active','suspended') LIMIT 1").get(ticket) as { group_id: string; tree_hash: string; state: string } | undefined;
+  const writeRecord = (single: boolean): void => {
+    const current = planRecordById(db, record.id);
+    if (!current || current.scout_acceptance === null || current.scout_acceptance !== record.scout_acceptance || current.successful_record !== record.successful_record) throw new Error("binding_changed");
+    const currentScout = publicationAcceptanceById(db, current.scout_acceptance);
+    if (!currentScout || currentScout.ticket !== ticket) throw new Error("artifact_invalid");
+    assertPublishable(readPublicationArtifact(root, currentScout));
+    if (incident) {
+      assertMandatoryBoundary("workflow.audit", !!scout.continuation_id && !!record.writer_run_id, "recovered record audit lineage is incomplete");
+      appendIncidentEvent(db, incident, { kind: "effect-start", code: "record-plan", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "started" });
+    }
+    if (single) db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
+    markSuccessfulRecord(db, record.id);
+    if (incident) appendIncidentEvent(db, incident, { kind: "outcome", code: "local-record", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: single ? "planned" : "group-recorded" });
+  };
   try {
-    out = applyMove(db, "plan", env, ticket, () => {
-      const current = planRecordById(db, record.id);
-      if (!current || current.scout_acceptance === null || current.scout_acceptance !== record.scout_acceptance || current.successful_record !== record.successful_record) throw new Error("binding_changed");
-      const currentScout = publicationAcceptanceById(db, current.scout_acceptance);
-      if (!currentScout || currentScout.ticket !== ticket) throw new Error("artifact_invalid");
-      assertPublishable(readPublicationArtifact(root, currentScout));
-      if (incident) {
-        assertMandatoryBoundary("workflow.audit", !!scout.continuation_id && !!record.writer_run_id, "recovered record audit lineage is incomplete");
-        appendIncidentEvent(db, incident, { kind: "effect-start", code: "record-plan", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "started" });
-      }
-      db.prepare(`INSERT INTO work (ticket, url, stage, plan) VALUES (?, ?, 'planned', ?) ON CONFLICT (ticket) DO UPDATE SET stage = 'planned', plan = excluded.plan, updated_at = datetime('now')`).run(ticket, ticketUrl(db, ticket), plan);
-      markSuccessfulRecord(db, record.id);
-      if (incident) appendIncidentEvent(db, incident, { kind: "outcome", code: "local-record", continuationId: scout.continuation_id ?? undefined, writerId: record.writer_run_id ?? undefined, payloadHash: record.writer_actual_task_hash ?? undefined, planHash: candidate.contentHash, effect: "record-plan", outcome: "planned" });
-    }, { settings });
+    if (groupClaim) {
+      db.exec("BEGIN IMMEDIATE");
+      try { writeRecord(false); db.exec("COMMIT"); out = { ok: true, repeat: record.successful_record === 1 }; }
+      catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+    } else out = applyMove(db, "plan", env, ticket, () => writeRecord(true), { settings });
     if (out.ok) sideEffects = markSideEffectsStarted(db, record.id);
   } finally { db.close(); }
   if (!out.ok) throw new Error(out.refuse);
-  const logged = sideEffects ? logMoveDetailed(data, ticket, "запланировано", `план ${basename(plan, ".md")}`) : null;
+  const logged = sideEffects && !groupClaim ? logMoveDetailed(data, ticket, "запланировано", `план ${basename(plan, ".md")}`) : null;
   const targets = [dataRelative, ...(logged ? [relative(data, logged.path)] : [])];
   const localSync = sideEffects ? commitExact(data, `${ticket} план`, targets) : { state: "unchanged" as const };
   assertMandatoryBoundary("workflow.truthful-outcome", existsSync(plan), "local plan record outcome cannot be verified");

@@ -85,7 +85,7 @@ export function createPlanningGroup(db: DatabaseSync, input: { id?: string; root
   return row.id;
 }
 
-export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; treeHash: string; members: string[]; owners: GroupClaimOwner[] }): void {
+export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; treeHash: string; members: string[]; owners: GroupClaimOwner[]; tickets?: Record<string, string> }): void {
   const members = [...new Set(input.members)].sort();
   if (!members.length || members.some((member) => !member)) throw new Error("group claims require a complete nonempty member set");
   db.exec("BEGIN IMMEDIATE");
@@ -95,9 +95,9 @@ export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; 
       if (existing && (existing.kind !== "group" || existing.group_id !== input.groupId)) throw new Error(`${member} is claimed by ${existing.kind === "group" ? existing.group_id : "a single run"}`);
     }
     const owners = canonicalJson(input.owners);
-    for (const member of members) db.prepare(`INSERT INTO member_claim (member_identity,kind,group_id,tree_hash,owners_json,state)
-      VALUES (?, 'group', ?, ?, ?, 'reserved')
-      ON CONFLICT(member_identity) DO UPDATE SET tree_hash=excluded.tree_hash,owners_json=excluded.owners_json,state='reserved',updated_at=datetime('now')`).run(member, input.groupId, input.treeHash, owners);
+    for (const member of members) db.prepare(`INSERT INTO member_claim (member_identity,ticket,kind,group_id,tree_hash,owners_json,state)
+      VALUES (?, ?, 'group', ?, ?, ?, 'reserved')
+      ON CONFLICT(member_identity) DO UPDATE SET ticket=excluded.ticket,tree_hash=excluded.tree_hash,owners_json=excluded.owners_json,state='reserved',updated_at=datetime('now')`).run(member, input.tickets?.[member] ?? member.slice(Math.max(member.lastIndexOf(":"), member.lastIndexOf("#")) + 1), input.groupId, input.treeHash, owners);
     db.exec("COMMIT");
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch {}
@@ -123,6 +123,7 @@ export function activateGroupRevision(db: DatabaseSync, input: GroupRevisionInpu
     for (const member of input.members) db.prepare(`INSERT INTO group_member
       (group_id,revision_hash,member_identity,ticket,parent_identity,plan_record_id,prior_state_json,stage,execution,tracker_state)
       VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash,member_identity) DO NOTHING`).run(input.groupId, input.revisionHash, member.identity, member.ticket, member.parentIdentity, member.planRecordId ?? null, canonicalJson(member.priorState ?? {}), member.stage ?? "planned", member.execution ?? "not_started", member.trackerState ?? null);
+    for (const member of input.members) db.prepare("UPDATE member_claim SET ticket=? WHERE member_identity=? AND group_id=?").run(member.ticket, member.identity, input.groupId);
     db.prepare("UPDATE member_claim SET revision_hash=?,state='active',updated_at=datetime('now') WHERE group_id=? AND tree_hash=?").run(input.revisionHash, input.groupId, input.treeHash);
     db.prepare("UPDATE task_group SET active_revision=?,phase='planned',resume_phase=NULL,blocker=NULL,updated_at=datetime('now') WHERE id=?").run(input.revisionHash, input.groupId);
     db.exec("COMMIT");
