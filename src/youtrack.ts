@@ -132,6 +132,82 @@ export async function fetchAll(
   }
 }
 
+export interface HierarchyIssue {
+  idReadable: string;
+  summary: string;
+  resolved?: number | null;
+}
+
+export interface IssueHierarchy {
+  issue: HierarchyIssue;
+  parents: HierarchyIssue[];
+  subtasks: HierarchyIssue[];
+}
+
+interface RawIssueLink {
+  direction?: "INWARD" | "OUTWARD" | "BOTH";
+  linkType?: { name?: string; sourceToTarget?: string; targetToSource?: string; directed?: boolean };
+  issues?: HierarchyIssue[];
+}
+
+const HIERARCHY_FIELDS = "direction,linkType(name,sourceToTarget,targetToSource,directed),issues(idReadable,summary,resolved)";
+const parentWords = /parent|parent for|depends on|родител|подзадач[аи] для/iu;
+const childWords = /subtask|sub-task|child|подзадач/iu;
+
+function hierarchySide(link: RawIssueLink): "parent" | "child" | null {
+  const direction = link.direction ?? "BOTH";
+  const outward = `${link.linkType?.sourceToTarget ?? ""} ${link.linkType?.name ?? ""}`;
+  const inward = `${link.linkType?.targetToSource ?? ""} ${link.linkType?.name ?? ""}`;
+  if (direction === "OUTWARD") {
+    if (parentWords.test(outward)) return "parent";
+    if (childWords.test(outward)) return "child";
+  }
+  if (direction === "INWARD") {
+    if (childWords.test(inward)) return "child";
+    if (parentWords.test(inward)) return "parent";
+  }
+  const source = link.linkType?.sourceToTarget ?? "";
+  const target = link.linkType?.targetToSource ?? "";
+  if (direction === "OUTWARD" && parentWords.test(source) && childWords.test(target)) return "parent";
+  if (direction === "INWARD" && parentWords.test(source) && childWords.test(target)) return "child";
+  return null;
+}
+
+export async function fetchHierarchy(t: Tracker, key: string, fetchImpl: typeof fetch = fetch): Promise<IssueHierarchy> {
+  const issue = await fetchIssue(t, key, fetchImpl);
+  if (!issue) throw new Error(`incomplete_tree: ${key} is unavailable`);
+  const parents: HierarchyIssue[] = [];
+  const subtasks: HierarchyIssue[] = [];
+  const seenPages = new Set<string>();
+  const seenLinks = new Set<string>();
+  for (let skip = 0; ; skip += PAGE) {
+    const url = `${t.baseUrl}/api/issues/${encodeURIComponent(key)}/links?fields=${encodeURIComponent(HIERARCHY_FIELDS)}&$skip=${skip}&$top=${PAGE}`;
+    const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${t.token}`, Accept: "application/json" } });
+    if (!res.ok) throw new Error(`incomplete_tree: ${t.name} HTTP ${res.status} reading hierarchy of ${key}`);
+    const page = await res.json() as unknown;
+    if (!Array.isArray(page)) throw new Error(`incomplete_tree: invalid hierarchy response for ${key}`);
+    const pageKey = JSON.stringify(page);
+    if (page.length && seenPages.has(pageKey)) throw new Error(`incomplete_tree: repeated hierarchy page for ${key}`);
+    seenPages.add(pageKey);
+    for (const raw of page) {
+      if (!raw || typeof raw !== "object") throw new Error(`incomplete_tree: invalid link for ${key}`);
+      const link = raw as RawIssueLink;
+      const side = hierarchySide(link);
+      if (!side) continue;
+      if (!Array.isArray(link.issues)) throw new Error(`incomplete_tree: missing linked issues for ${key}`);
+      for (const linked of link.issues) {
+        if (!linked || typeof linked.idReadable !== "string" || typeof linked.summary !== "string") throw new Error(`incomplete_tree: invalid linked issue for ${key}`);
+        const identity = `${side}:${linked.idReadable}`;
+        if (seenLinks.has(identity)) throw new Error(`ambiguous_membership: duplicate ${side} ${linked.idReadable} for ${key}`);
+        seenLinks.add(identity);
+        (side === "parent" ? parents : subtasks).push(linked);
+      }
+    }
+    if (page.length < PAGE) break;
+  }
+  return { issue: { idReadable: issue.idReadable, summary: issue.summary, resolved: issue.resolved }, parents, subtasks };
+}
+
 /** Fetch one issue by readable id; null when it does not exist. */
 export async function fetchIssue(
   t: Tracker,

@@ -51,6 +51,51 @@ export interface GhIssue {
   assignees: { login: string }[];
 }
 
+export interface GithubHierarchyIssue { number: number; title: string; state: "open" | "closed" }
+export interface GithubIssueHierarchy { issue: GithubHierarchyIssue; parent: GithubHierarchyIssue | null; subtasks: GithubHierarchyIssue[] }
+
+function parseHierarchyIssue(value: unknown, context: string): GithubHierarchyIssue {
+  if (!value || typeof value !== "object") throw new Error(`incomplete_tree: invalid GitHub ${context}`);
+  const issue = value as { number?: unknown; title?: unknown; state?: unknown };
+  if (!Number.isSafeInteger(issue.number) || Number(issue.number) < 1 || typeof issue.title !== "string" || issue.state !== "open" && issue.state !== "closed") throw new Error(`incomplete_tree: invalid GitHub ${context}`);
+  return { number: Number(issue.number), title: issue.title, state: issue.state };
+}
+
+export function fetchSubIssues(project: GithubProject, number: number, exec: GhExec = gh): GithubIssueHierarchy {
+  const repository = `${project.org}/${project.repo}`;
+  let issue: GithubHierarchyIssue;
+  try { issue = parseHierarchyIssue(JSON.parse(exec(["api", `repos/${repository}/issues/${number}`], project.path)), "issue"); }
+  catch (error) { throw error instanceof Error && error.message.startsWith("incomplete_tree:") ? error : new Error(`incomplete_tree: GitHub issue ${repository}#${number} is unavailable`); }
+  let parent: GithubHierarchyIssue | null = null;
+  try {
+    const raw = JSON.parse(exec(["api", `repos/${repository}/issues/${number}/parent`], project.path)) as unknown;
+    parent = parseHierarchyIssue(raw, "parent");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/404|not found/i.test(message)) throw new Error(`incomplete_tree: cannot read GitHub parent of ${repository}#${number}`);
+  }
+  const subtasks: GithubHierarchyIssue[] = [];
+  const seen = new Set<number>();
+  const pageFingerprints = new Set<string>();
+  for (let page = 1; ; page++) {
+    let values: unknown;
+    try { values = JSON.parse(exec(["api", `repos/${repository}/issues/${number}/sub_issues?per_page=100&page=${page}`], project.path)); }
+    catch { throw new Error(`incomplete_tree: cannot read GitHub sub-issues of ${repository}#${number}`); }
+    if (!Array.isArray(values)) throw new Error(`incomplete_tree: invalid GitHub sub-issues response for ${repository}#${number}`);
+    const fingerprint = JSON.stringify(values);
+    if (values.length && pageFingerprints.has(fingerprint)) throw new Error(`incomplete_tree: repeated GitHub sub-issues page for ${repository}#${number}`);
+    pageFingerprints.add(fingerprint);
+    for (const value of values) {
+      const child = parseHierarchyIssue(value, "sub-issue");
+      if (seen.has(child.number)) throw new Error(`ambiguous_membership: duplicate GitHub sub-issue ${repository}#${child.number}`);
+      seen.add(child.number);
+      subtasks.push(child);
+    }
+    if (values.length < 100) break;
+  }
+  return { issue, parent, subtasks };
+}
+
 export function listIssues(p: GithubProject, all = false, exec: GhExec = gh): GhIssue[] {
   const out = exec(
     [
