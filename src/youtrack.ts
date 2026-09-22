@@ -159,17 +159,17 @@ function hierarchySide(link: RawIssueLink): "parent" | "child" | null {
   const outward = `${link.linkType?.sourceToTarget ?? ""} ${link.linkType?.name ?? ""}`;
   const inward = `${link.linkType?.targetToSource ?? ""} ${link.linkType?.name ?? ""}`;
   if (direction === "OUTWARD") {
-    if (parentWords.test(outward)) return "parent";
-    if (childWords.test(outward)) return "child";
+    if (parentWords.test(outward)) return "child";
+    if (childWords.test(outward)) return "parent";
   }
   if (direction === "INWARD") {
-    if (childWords.test(inward)) return "child";
-    if (parentWords.test(inward)) return "parent";
+    if (childWords.test(inward)) return "parent";
+    if (parentWords.test(inward)) return "child";
   }
   const source = link.linkType?.sourceToTarget ?? "";
   const target = link.linkType?.targetToSource ?? "";
-  if (direction === "OUTWARD" && parentWords.test(source) && childWords.test(target)) return "parent";
-  if (direction === "INWARD" && parentWords.test(source) && childWords.test(target)) return "child";
+  if (direction === "OUTWARD" && parentWords.test(source) && childWords.test(target)) return "child";
+  if (direction === "INWARD" && parentWords.test(source) && childWords.test(target)) return "parent";
   return null;
 }
 

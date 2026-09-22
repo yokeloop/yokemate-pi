@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
-import { activateGroupRevision, applyGroupMove, canonicalHash, createPlanningGroup, readGroupFactsSnapshot, recordGroupEffect, reserveMemberClaims, restoreGroupFacts, snapshotGroupFacts } from "../src/group-state.ts";
+import { activateGroupRevision, applyGroupMove, canonicalHash, classifyExistingMember, createPlanningGroup, readGroupFactsSnapshot, recordGroupEffect, reserveMemberClaims, restoreGroupFacts, snapshotGroupFacts } from "../src/group-state.ts";
 import { drop } from "../src/drop.ts";
 import { applyMove } from "../src/transitions.ts";
 
@@ -69,6 +69,16 @@ test("group CAS and idempotency refuse stale moves and repeat exact effects", ()
   assert.deepEqual(recordGroupEffect(db, { key: "merge:r:p:h:t", groupId, revisionHash: HASH_B, type: "integrate", scope: { repo: "o/r" }, input: { head: "h" }, state: "intent" }), { repeat: true, state: "intent" });
 });
 
+test("reserved planning claims block single execution before activation", () => {
+  const db = openDb(":memory:");
+  const groupId = createPlanningGroup(db, { id: "planning", rootIdentity: "youtrack:yokeloop:YM-1", rootTicket: "YM-1", ownerProject: "yokeloop/yokemate-pi" });
+  reserveMemberClaims(db, { groupId, treeHash: HASH_A, members: ["youtrack:yokeloop:YM-2"], tickets: { "youtrack:yokeloop:YM-2": "YM-2" }, owners: [{ runtimeId: "runtime", runId: "run", sessionId: "session" }] });
+  const refused = applyMove(db, "spawn", {}, "YM-2", () => {}, { allowFresh: true });
+  assert.equal(refused.ok, false);
+  assert.match(refused.ok ? "" : refused.refuse, /planning\/null \(reserved\)/);
+  assert.throws(() => reserveMemberClaims(db, { groupId, treeHash: HASH_A, members: ["youtrack:yokeloop:YM-2"], tickets: { "youtrack:yokeloop:YM-2": "YM-2" }, owners: [{ runtimeId: "other", runId: "other", sessionId: "other" }] }), /live owner/);
+});
+
 test("single transitions cannot move a claimed group member", () => {
   const { db, groupId } = prepared();
   db.prepare("INSERT INTO work (ticket,url,stage) VALUES ('YM-2','https://t/YM-2','planned')").run();
@@ -79,6 +89,13 @@ test("single transitions cannot move a claimed group member", () => {
   assert.match(refused.ok ? "" : refused.refuse, new RegExp(groupId));
   const allowed = applyMove(db, "spawn", {}, "YM-2", () => { db.prepare("UPDATE work SET stage='running' WHERE ticket='YM-2'").run(); }, { groupScope: { groupId, revisionHash: HASH_B, memberIdentity: "youtrack:yokeloop:YM-2" } });
   assert.equal(allowed.ok, true);
+});
+
+test("closed tracker members require preserved result evidence", () => {
+  const db = openDb(":memory:");
+  assert.equal(classifyExistingMember(db, "YM-8", "closed").kind, "evidence_blocker");
+  db.prepare("INSERT INTO work (ticket,url,stage,pr) VALUES ('YM-8','https://t/YM-8','accepted','https://github.com/o/r/pull/8')").run();
+  assert.equal(classifyExistingMember(db, "YM-8", "closed").kind, "reuse_candidate");
 });
 
 test("canonical group hashes ignore object key insertion order", () => {

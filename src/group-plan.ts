@@ -179,7 +179,7 @@ export function validateCompatibility(report: CompatibilityReport, revision: Bou
   for (const member of revision.manifest.members) if ((member.parent !== null || member.ticket === revision.manifest.root) && !parentWork.has(member.ticket)) throw new Error(`${member.ticket}: parent/root own-work declaration is not covered`);
 }
 
-export function activateGroupPlan(db: DatabaseSync, input: { groupId: string; rootIdentity: string; tree: TaskTree; revision: BoundGroupRevision; compatibility: CompatibilityReport; approachStore: PlanApproachStore; approachOwner: PlanApproachOwner; acceptedScouts: AcceptedScoutBinding[]; planRecordIds: Map<string, number> }): void {
+export function activateGroupPlan(db: DatabaseSync, input: { groupId: string; rootIdentity: string; tree: TaskTree; revision: BoundGroupRevision; compatibility: CompatibilityReport; approachStore: PlanApproachStore; approachOwner: PlanApproachOwner; acceptedScouts: AcceptedScoutBinding[]; planRecordIds: Map<string, number>; write?: () => void }): void {
   validateCompatibility(input.compatibility, input.revision);
   const receipt = input.approachStore.assertCurrent({ treeHash: input.tree.treeHash, acceptedScouts: input.acceptedScouts }, input.approachOwner);
   activateGroupRevision(db, {
@@ -191,6 +191,6 @@ export function activateGroupPlan(db: DatabaseSync, input: { groupId: string; ro
     compatibility: input.compatibility,
     approachReceiptId: receipt.id,
     members: input.tree.nodes.map((node) => ({ identity: node.identity, ticket: node.ticket, parentIdentity: node.parentIdentity, planRecordId: input.planRecordIds.get(node.ticket), trackerState: node.trackerState })),
-  });
+  }, input.write);
   input.approachStore.assertCurrent({ treeHash: input.tree.treeHash, acceptedScouts: input.acceptedScouts, consume: true }, input.approachOwner);
 }

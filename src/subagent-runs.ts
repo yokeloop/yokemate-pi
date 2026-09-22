@@ -397,6 +397,16 @@ export class ChildRuns {
   }
   isCurrentScout(identity: ChildIdentity): boolean { return identity.agent === "plan-scout" && !!identity.ticket && this.currentScouts.get(identity.ticket)?.runId === identity.runId; }
   currentScout(ticket: string): ResultEnvelope | undefined { const result = this.currentScouts.get(ticket)?.result; return result ? structuredClone(result) : undefined; }
+  verifiedResult(runId: string, agent: string): ResultEnvelope | undefined {
+    const result = this.children.get(runId)?.result;
+    if (!result || result.identity.agent !== agent || result.payloadOutcome !== "valid" || result.actualTaskHash !== result.identity.taskHash) return undefined;
+    return structuredClone(result);
+  }
+  verifiedPlanWriter(ticket: string, acceptedInputId: number, binding: PlanBinding): ResultEnvelope | undefined {
+    const matches = [...this.children.values()].flatMap((child) => child.result ? [child.result] : []).filter((result) => result.identity.agent === "plan-writer" && result.identity.ticket === ticket && result.identity.acceptedInputId === acceptedInputId && result.payloadOutcome === "valid" && result.actualTaskHash === result.identity.taskHash && result.planResult?.state === "verified" && JSON.stringify(result.planResult.binding) === JSON.stringify(binding));
+    if (matches.length !== 1) return undefined;
+    return structuredClone(matches[0]!);
+  }
   assertPlanWriterAdmission(identity: ChildIdentity): ResultEnvelope {
     if (identity.agent !== "plan-writer" || !identity.ticket) throw new Error("plan-writer requires an explicit ticket binding");
     const result = this.currentScout(identity.ticket);

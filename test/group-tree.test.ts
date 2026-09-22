@@ -54,8 +54,8 @@ test("YouTrack hierarchy reads directed native links and fails closed on HTTP er
   const okFetch = async (input: string | URL | Request) => {
     const url = String(input);
     if (url.includes("/links?")) return new Response(JSON.stringify([
-      { direction: "OUTWARD", linkType: { sourceToTarget: "parent for", targetToSource: "subtask of", directed: true }, issues: [{ idReadable: "D-1", summary: "parent" }] },
-      { direction: "INWARD", linkType: { sourceToTarget: "parent for", targetToSource: "subtask of", directed: true }, issues: [{ idReadable: "D-3", summary: "child" }] },
+      { direction: "OUTWARD", linkType: { sourceToTarget: "parent for", targetToSource: "subtask of", directed: true }, issues: [{ idReadable: "D-3", summary: "child" }] },
+      { direction: "INWARD", linkType: { sourceToTarget: "parent for", targetToSource: "subtask of", directed: true }, issues: [{ idReadable: "D-1", summary: "parent" }] },
     ]), { status: 200 });
     return new Response(JSON.stringify({ idReadable: "D-2", summary: "middle", resolved: null }), { status: 200 });
   };

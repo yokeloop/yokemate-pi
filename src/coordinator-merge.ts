@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import type { PreparedPart } from "./coordinator-launch.ts";
-import { gatherGateFacts, verifyGate } from "./coordinator-result.ts";
+import { gatherGateFacts, gatherScopedGateFacts, verifyGate } from "./coordinator-result.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export interface CoordinatorMergeRequest { pr: string; expectedHead: string; method: "merge" | "squash" | "rebase" }
@@ -31,7 +31,7 @@ async function defaultSnapshot(cwd: string, pr: string): Promise<MergeSnapshot> 
 }
 
 async function defaultGate(root: string, ticket: string, part: PreparedPart): Promise<ReturnType<typeof verifyGate>> {
-  const payload = Buffer.from(JSON.stringify({ root, ticket, repo: part.repo, selector: part.pr })).toString("base64");
+  const payload = Buffer.from(JSON.stringify({ root, ticket, repo: part.repo, selector: part.pr, ...(part.worktree && part.targetBranch ? { worktree: part.worktree, branch: part.branch, targetBranch: part.targetBranch, receiptPath: `${part.worktree}/.yokemate-ready.json`, expectedScopeId: part.scopeId } : {}) })).toString("base64");
   const result = await run(process.execPath, ["--experimental-strip-types", "--no-warnings", import.meta.filename, "--gate", payload], root);
   if (result.exit !== 0) throw new Error(result.output || `cannot gather fresh gate for ${part.repo}`);
   return JSON.parse(result.output) as ReturnType<typeof verifyGate>;
@@ -169,8 +169,9 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
 
 if (import.meta.filename === process.argv[1] && process.argv[2] === "--gate") {
   try {
-    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; repo: string; selector: string };
-    process.stdout.write(JSON.stringify(verifyGate(gatherGateFacts(payload.root, payload.ticket, [{ repo: payload.repo, selector: payload.selector }]))));
+    const payload = JSON.parse(Buffer.from(process.argv[3] ?? "", "base64").toString("utf8")) as { root: string; ticket: string; repo: string; selector: string; worktree?: string; branch?: string; targetBranch?: string; receiptPath?: string; expectedScopeId?: string };
+    const facts = payload.worktree && payload.branch ? gatherScopedGateFacts(payload.ticket, [{ repo: payload.repo, selector: payload.selector, worktree: payload.worktree, branch: payload.branch, targetBranch: payload.targetBranch, receiptPath: payload.receiptPath, expectedScopeId: payload.expectedScopeId }]) : gatherGateFacts(payload.root, payload.ticket, [{ repo: payload.repo, selector: payload.selector }]);
+    process.stdout.write(JSON.stringify(verifyGate(facts)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

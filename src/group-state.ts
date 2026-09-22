@@ -90,11 +90,12 @@ export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; 
   if (!members.length || members.some((member) => !member)) throw new Error("group claims require a complete nonempty member set");
   db.exec("BEGIN IMMEDIATE");
   try {
-    for (const member of members) {
-      const existing = db.prepare("SELECT kind,group_id,state FROM member_claim WHERE member_identity = ?").get(member) as { kind: string; group_id: string | null; state: string } | undefined;
-      if (existing && (existing.kind !== "group" || existing.group_id !== input.groupId)) throw new Error(`${member} is claimed by ${existing.kind === "group" ? existing.group_id : "a single run"}`);
-    }
     const owners = canonicalJson(input.owners);
+    for (const member of members) {
+      const existing = db.prepare("SELECT kind,group_id,state,owners_json FROM member_claim WHERE member_identity = ?").get(member) as { kind: string; group_id: string | null; state: string; owners_json: string } | undefined;
+      if (existing && (existing.kind !== "group" || existing.group_id !== input.groupId)) throw new Error(`${member} is claimed by ${existing.kind === "group" ? existing.group_id : "a single run"}`);
+      if (existing && existing.owners_json !== owners) throw new Error(`${member} still belongs to another live owner of group ${input.groupId}`);
+    }
     for (const member of members) db.prepare(`INSERT INTO member_claim (member_identity,ticket,kind,group_id,tree_hash,owners_json,state)
       VALUES (?, ?, 'group', ?, ?, ?, 'reserved')
       ON CONFLICT(member_identity) DO UPDATE SET ticket=excluded.ticket,tree_hash=excluded.tree_hash,owners_json=excluded.owners_json,state='reserved',updated_at=datetime('now')`).run(member, input.tickets?.[member] ?? member.slice(Math.max(member.lastIndexOf(":"), member.lastIndexOf("#")) + 1), input.groupId, input.treeHash, owners);
@@ -105,7 +106,7 @@ export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; 
   }
 }
 
-export function activateGroupRevision(db: DatabaseSync, input: GroupRevisionInput): void {
+export function activateGroupRevision(db: DatabaseSync, input: GroupRevisionInput, write?: () => void): void {
   if (!/^[a-f0-9]{64}$/.test(input.revisionHash) || !/^[a-f0-9]{64}$/.test(input.treeHash)) throw new Error("group revision hashes must be SHA-256 values");
   const identities = new Set(input.members.map((member) => member.identity));
   if (identities.size !== input.members.length || input.members.length === 0) throw new Error("group revision members must be unique and nonempty");
@@ -126,6 +127,7 @@ export function activateGroupRevision(db: DatabaseSync, input: GroupRevisionInpu
     for (const member of input.members) db.prepare("UPDATE member_claim SET ticket=? WHERE member_identity=? AND group_id=?").run(member.ticket, member.identity, input.groupId);
     db.prepare("UPDATE member_claim SET revision_hash=?,state='active',updated_at=datetime('now') WHERE group_id=? AND tree_hash=?").run(input.revisionHash, input.groupId, input.treeHash);
     db.prepare("UPDATE task_group SET active_revision=?,phase='planned',resume_phase=NULL,blocker=NULL,updated_at=datetime('now') WHERE id=?").run(input.revisionHash, input.groupId);
+    write?.();
     db.exec("COMMIT");
   } catch (error) {
     try { db.exec("ROLLBACK"); } catch {}
@@ -184,25 +186,23 @@ export function confirmGroupEffect(db: DatabaseSync, key: string, state: "unknow
   }
 }
 
-export function classifyExistingMember(db: DatabaseSync, ticket: string): ExistingMemberClassification {
+export function classifyExistingMember(db: DatabaseSync, ticket: string, trackerState = "open"): ExistingMemberClassification {
   const row = db.prepare("SELECT id,stage,plan,pr FROM work WHERE ticket=?").get(ticket) as { id: number; stage: Stage; plan: string | null; pr: string | null } | undefined;
-  const claim = db.prepare(`SELECT c.kind,c.group_id,c.revision_hash,c.state FROM member_claim c
-    LEFT JOIN group_member m ON m.member_identity=c.member_identity AND m.ticket=?
-    WHERE m.ticket=? OR c.member_identity=? LIMIT 1`).get(ticket, ticket, ticket) as { kind: string; group_id: string | null; revision_hash: string | null; state: string } | undefined;
-  const priorState = { ...(row ?? {}), ...(claim ? { claim } : {}) };
-  if (claim?.state === "active") return { kind: "active_blocker", priorState, blocker: `${ticket} has an active ${claim.kind} owner` };
-  if (!row) return { kind: "fresh", priorState };
-  if (row.stage === "planned") return { kind: "planned_material", priorState };
+  const claim = db.prepare("SELECT kind,group_id,revision_hash,state FROM member_claim WHERE ticket=? LIMIT 1").get(ticket) as { kind: string; group_id: string | null; revision_hash: string | null; state: string } | undefined;
+  const closed = ["closed", "resolved", "done", "merged"].includes(trackerState.toLowerCase());
+  const priorState = { ...(row ?? {}), trackerState, ...(claim ? { claim } : {}) };
+  if (["reserved", "active", "suspended"].includes(claim?.state ?? "")) return { kind: "active_blocker", priorState, blocker: `${ticket} has an active ${claim!.kind} owner` };
+  if (!row) return closed ? { kind: "evidence_blocker", priorState, blocker: `${ticket} is closed without preserved merge evidence` } : { kind: "fresh", priorState };
+  if (row.stage === "planned") return closed ? { kind: "evidence_blocker", priorState, blocker: `${ticket} is closed but only planned material is preserved` } : { kind: "planned_material", priorState };
   if (row.stage === "running") return { kind: "active_blocker", priorState, blocker: `${ticket} has an active single run` };
-  if ((row.stage === "review" || row.stage === "accepted") && row.pr) return { kind: "result_candidate", priorState };
-  if (row.stage === "accepted") return { kind: "evidence_blocker", priorState, blocker: `${ticket} is accepted without preserved PR evidence` };
+  if ((row.stage === "review" || row.stage === "accepted") && row.pr) return { kind: closed ? "reuse_candidate" : "result_candidate", priorState };
+  if (row.stage === "accepted" || closed) return { kind: "evidence_blocker", priorState, blocker: `${ticket} has no preserved PR evidence for reuse` };
   return { kind: "fresh", priorState };
 }
 
 export function groupClaimForTicket(db: DatabaseSync, ticket: string): { groupId: string; revisionHash: string | null; memberIdentity: string; state: ClaimState } | null {
-  const row = db.prepare(`SELECT c.group_id,c.revision_hash,c.member_identity,c.state
-    FROM member_claim c JOIN group_member m ON m.group_id=c.group_id AND m.revision_hash=c.revision_hash AND m.member_identity=c.member_identity
-    WHERE c.kind='group' AND m.ticket=? AND c.state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as { group_id: string; revision_hash: string | null; member_identity: string; state: ClaimState } | undefined;
+  const row = db.prepare(`SELECT group_id,revision_hash,member_identity,state FROM member_claim
+    WHERE kind='group' AND ticket=? AND state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as { group_id: string; revision_hash: string | null; member_identity: string; state: ClaimState } | undefined;
   return row ? { groupId: row.group_id, revisionHash: row.revision_hash, memberIdentity: row.member_identity, state: row.state } : null;
 }
 

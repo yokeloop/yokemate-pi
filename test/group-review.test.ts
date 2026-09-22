@@ -32,7 +32,7 @@ test("prepares and accepts an exact assembled candidate", async () => {
   const { db, groupId } = fixture();
   const candidate = await prepareGroupReview(db, { groupId, revisionHash, obligations: [obligation], evidence: [evidence] }, deps);
   assert.match(candidate.candidateHash, /^[a-f0-9]{64}$/);
-  acceptGroupCandidate(db, candidate, { reviewSource: { runId: "review" }, evidence: { verdict: "accepted" } });
+  acceptGroupCandidate(db, candidate, { reviewSource: { runId: "review", runtimeId: "runtime", sessionId: "session", candidateHash: candidate.candidateHash }, evidence: { verdict: "accepted" } });
   const group = db.prepare("SELECT phase FROM task_group WHERE id=?").get(groupId) as { phase: string };
   assert.equal(group.phase, "accepted");
   const accepted = db.prepare("SELECT candidate_hash,state FROM group_acceptance").get() as { candidate_hash: string; state: string };
@@ -43,7 +43,7 @@ test("one changed repository head makes the verdict stale", async () => {
   const { db, groupId } = fixture();
   const candidate = await prepareGroupReview(db, { groupId, revisionHash, obligations: [obligation], evidence: [evidence] }, deps);
   db.prepare("UPDATE group_repository SET head_sha=?").run("e".repeat(40));
-  assert.throws(() => acceptGroupCandidate(db, candidate, { reviewSource: {}, evidence: {} }), /changed/);
+  assert.throws(() => acceptGroupCandidate(db, candidate, { reviewSource: { runId: "review", runtimeId: "runtime", sessionId: "session", candidateHash: candidate.candidateHash }, evidence: {} }), /changed/);
 });
 
 test("incomplete members, tracker pending and assembled incompatibility block review", async () => {

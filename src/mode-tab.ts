@@ -289,14 +289,15 @@ if (import.meta.filename === process.argv[1]) {
       }
 
       let stand: StandFacts | undefined;
+      let groupReview: { groupId: string; revisionHash: string; root: string; memberId: string } | undefined;
       if (mode === "review") {
         const folder = existsSync(join(ROOT, "work", ticket));
         stand = { folder, plan: folder || Boolean(findPlan(dataRoot(ROOT), ticket)) };
-      } else if (mode === "ship") {
-        for (const key of ticket.split("+")) {
-          const taskFolder = join(ROOT, "work", key);
-          if (!existsSync(taskFolder)) throw new Error(`no task folder ${taskFolder} — /ship runs after /do`);
-        }
+        const state = openDb(join(ROOT, "yokemate.db"));
+        try {
+          const row = state.prepare("SELECT id,active_revision,root_ticket AS root FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('integrated','review') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { id: string; active_revision: string; root: string } | undefined;
+          if (row) groupReview = { groupId: row.id, revisionHash: row.active_revision, root: row.root, memberId: ticket };
+        } finally { state.close(); }
       }
 
       const launch = resolveLaunch(ROOT, mode, ticket, tail.join(" "), model, parentPane, stand, parsed.surface, workerWords);
@@ -307,6 +308,12 @@ if (import.meta.filename === process.argv[1]) {
       const env = [
         ...launch.env, "YOKEMATE_ROLE=coordinator",
         ...(mode === "plan" && parsed.literal.length ? [`YOKEMATE_PLAN_LITERAL=${JSON.stringify(parsed.literal)}`] : []),
+        ...(groupReview ? [
+          `YOKEMATE_GROUP_ID=${groupReview.groupId}`,
+          `YOKEMATE_GROUP_REVISION=${groupReview.revisionHash}`,
+          `YOKEMATE_GROUP_ROOT=${groupReview.root}`,
+          `YOKEMATE_GROUP_MEMBER=${groupReview.memberId}`,
+        ] : []),
         ...(runId ? [`YOKEMATE_RUN_ID=${runId}`] : []),
       ];
       let agentName = runId ? `${launch.agentName.slice(0, 23)}-${runId}` : launch.agentName;

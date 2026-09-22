@@ -46,13 +46,24 @@ export class GroupRuntime {
 
   start(): void {
     const group = this.db.prepare("SELECT active_revision,phase FROM task_group WHERE id=?").get(this.groupId) as { active_revision: string; phase: string } | undefined;
-    if (!group || group.active_revision !== this.revisionHash || group.phase !== "planned") throw new Error("group runtime requires the active planned revision");
+    if (!group || group.active_revision !== this.revisionHash || !["planned", "running", "blocked"].includes(group.phase)) throw new Error("group runtime requires an active executable revision");
+    const uncertain = this.db.prepare("SELECT COUNT(*) count FROM group_effect WHERE group_id=? AND revision_hash=? AND state IN ('intent','unknown')").get(this.groupId, this.revisionHash) as { count: number };
+    if (uncertain.count) throw new Error("group runtime cannot resume with unreconciled external effects");
     const members = this.db.prepare("SELECT ticket,execution FROM group_member WHERE group_id=? AND revision_hash=?").all(this.groupId, this.revisionHash) as unknown as { ticket: string; execution: string }[];
     if (members.length !== this.manifest.members.length || this.manifest.members.some((member) => !members.some((row) => row.ticket === member.ticket))) throw new Error("group runtime membership does not match the manifest");
-    const moved = applyGroupMove(this.db, { groupId: this.groupId, revisionHash: this.revisionHash, expectedPhase: "planned", toPhase: "running", idempotencyKey: `group-do:${this.cycleId}` }, () => {
-      this.db.prepare("UPDATE group_member SET execution='queued',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND execution='not_started'").run(this.groupId, this.revisionHash);
-    });
-    if (!moved.ok) throw new Error(moved.refuse);
+    if (group.phase === "planned") {
+      const moved = applyGroupMove(this.db, { groupId: this.groupId, revisionHash: this.revisionHash, expectedPhase: "planned", toPhase: "running", idempotencyKey: `group-do:${this.cycleId}` }, () => {
+        this.db.prepare("UPDATE group_member SET execution='queued',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND execution='not_started'").run(this.groupId, this.revisionHash);
+      });
+      if (!moved.ok) throw new Error(moved.refuse);
+    } else {
+      if (group.phase === "blocked") {
+        const moved = applyGroupMove(this.db, { groupId: this.groupId, revisionHash: this.revisionHash, expectedPhase: "blocked", toPhase: "running", idempotencyKey: `group-resume:${this.cycleId}` });
+        if (!moved.ok) throw new Error(moved.refuse);
+      }
+      this.db.prepare("UPDATE group_member SET execution='queued',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND execution IN ('running','blocked')").run(this.groupId, this.revisionHash);
+      this.db.prepare("UPDATE member_claim SET state='active',updated_at=datetime('now') WHERE group_id=? AND revision_hash=?").run(this.groupId, this.revisionHash);
+    }
     this.pump();
   }
 
@@ -96,6 +107,11 @@ export class GroupRuntime {
   memberIntegrated(member: string): void {
     if (this.state !== "active" || this.execution(member) !== "ready") throw new Error("group member is not ready for integration");
     this.db.prepare("UPDATE group_member SET execution='integrated',stage='integrated',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND ticket=?").run(this.groupId, this.revisionHash, member);
+    this.integrationObserved(member);
+  }
+
+  integrationObserved(member: string): void {
+    if (this.state !== "active" || this.execution(member) !== "integrated") throw new Error("group member has no confirmed integration result");
     this.deps.onChange?.();
     if (this.manifest.members.every((candidate) => this.execution(candidate.ticket) === "integrated")) {
       const moved = applyGroupMove(this.db, { groupId: this.groupId, revisionHash: this.revisionHash, expectedPhase: "running", toPhase: "review", idempotencyKey: `group-review:${this.cycleId}` });

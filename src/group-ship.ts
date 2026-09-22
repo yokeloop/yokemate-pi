@@ -33,7 +33,7 @@ function currentAcceptance(db: DatabaseSync, groupId: string, revisionHash: stri
 
 export function prepareGroupShip(db: DatabaseSync, groupId: string, candidateHash: string): { candidate: GroupCandidate; repositories: RepositoryRow[] } {
   const group = db.prepare("SELECT active_revision,phase FROM task_group WHERE id=?").get(groupId) as { active_revision: string | null; phase: string } | undefined;
-  if (!group || !group.active_revision || !["accepted", "shipping"].includes(group.phase)) throw new Error("group is not accepted for ship");
+  if (!group || !group.active_revision || !["accepted", "shipping", "done"].includes(group.phase)) throw new Error("group is not accepted for ship or cleanup recovery");
   const candidate = currentAcceptance(db, groupId, group.active_revision);
   if (candidate.candidateHash !== candidateHash) throw new Error("group ship candidate is stale");
   const repositories = db.prepare("SELECT repo,remote,integration_branch,external_base,final_pr,head_sha,base_sha,merge_commit,ship_state FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupId, group.active_revision) as unknown as RepositoryRow[];
@@ -45,7 +45,7 @@ export function prepareGroupShip(db: DatabaseSync, groupId: string, candidateHas
 export async function shipGroup(db: DatabaseSync, taskRoot: string, groupId: string, candidateHash: string, deps: GroupShipDeps): Promise<GroupShipOutcome> {
   assertMandatoryBoundary("workflow.explicit-ship", deps.authorized(), "group ship requires an exact interactive ship permit");
   const prepared = prepareGroupShip(db, groupId, candidateHash);
-  const group = db.prepare("SELECT active_revision,phase,root_ticket FROM task_group WHERE id=?").get(groupId) as { active_revision: string; phase: "accepted" | "shipping"; root_ticket: string };
+  const group = db.prepare("SELECT active_revision,phase,root_ticket FROM task_group WHERE id=?").get(groupId) as { active_revision: string; phase: "accepted" | "shipping" | "done"; root_ticket: string };
   if (group.phase === "accepted") {
     const moved = applyGroupMove(db, { groupId, revisionHash: group.active_revision, expectedPhase: "accepted", toPhase: "shipping", idempotencyKey: `ship-start:${groupId}:${candidateHash}` });
     if (!moved.ok) throw new Error(moved.refuse);
@@ -116,8 +116,10 @@ export async function shipGroup(db: DatabaseSync, taskRoot: string, groupId: str
     }
   }
   if (trackerPending.length) return { state: "all_merged_tracker_pending", merged, remaining: [], unknown: [], trackerPending, cleanupPending: false };
-  const moved = applyGroupMove(db, { groupId, revisionHash: group.active_revision, expectedPhase: "shipping", toPhase: "done", idempotencyKey: `ship-done:${groupId}:${candidateHash}` });
-  if (!moved.ok) throw new Error(moved.refuse);
+  if (group.phase !== "done") {
+    const moved = applyGroupMove(db, { groupId, revisionHash: group.active_revision, expectedPhase: "shipping", toPhase: "done", idempotencyKey: `ship-done:${groupId}:${candidateHash}` });
+    if (!moved.ok) throw new Error(moved.refuse);
+  }
   let cleanupPending = false;
   if (deps.cleanup) {
     const key = `cleanup:${groupId}:${group.active_revision}`;

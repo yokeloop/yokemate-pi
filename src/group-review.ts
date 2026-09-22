@@ -42,7 +42,10 @@ export async function prepareGroupReview(db: DatabaseSync, input: { groupId: str
   return { groupId: input.groupId, revisionHash: input.revisionHash, parts, obligationEvidence, candidateHash };
 }
 
-export function acceptGroupCandidate(db: DatabaseSync, candidate: GroupCandidate, input: { reviewSource: unknown; evidence: unknown }): void {
+export interface GroupReviewSource { runId: string; runtimeId: string; sessionId: string; candidateHash: string }
+
+export function acceptGroupCandidate(db: DatabaseSync, candidate: GroupCandidate, input: { reviewSource: GroupReviewSource; evidence: unknown }): void {
+  if (!input.reviewSource.runId || !input.reviewSource.runtimeId || !input.reviewSource.sessionId || input.reviewSource.candidateHash !== candidate.candidateHash) throw new Error("group acceptance requires the registered exact review source");
   const group = db.prepare("SELECT active_revision,phase FROM task_group WHERE id=?").get(candidate.groupId) as { active_revision: string | null; phase: string } | undefined;
   if (!group || group.active_revision !== candidate.revisionHash || !["review", "accepted"].includes(group.phase)) throw new Error("group acceptance candidate revision is stale");
   const repositories = db.prepare("SELECT repo,final_pr,head_sha,external_base,base_sha FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(candidate.groupId, candidate.revisionHash) as unknown as { repo: string; final_pr: string | null; head_sha: string | null; external_base: string; base_sha: string }[];

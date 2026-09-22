@@ -128,11 +128,9 @@ export function applyMove(
       | { stage: Stage }
       | undefined;
     const prev: From = row?.stage ?? "absent";
-    const claim = db.prepare(`SELECT c.group_id,c.revision_hash,c.member_identity,c.state
-      FROM member_claim c JOIN group_member m
-        ON m.group_id=c.group_id AND m.revision_hash=c.revision_hash AND m.member_identity=c.member_identity
-      WHERE c.kind='group' AND m.ticket=? AND c.state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as
-      | { group_id: string; revision_hash: string; member_identity: string; state: string }
+    const claim = db.prepare(`SELECT group_id,revision_hash,member_identity,state
+      FROM member_claim WHERE kind='group' AND ticket=? AND state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as
+      | { group_id: string; revision_hash: string | null; member_identity: string; state: string }
       | undefined;
     if (claim && (!opts.groupScope || opts.groupScope.groupId !== claim.group_id || opts.groupScope.revisionHash !== claim.revision_hash || opts.groupScope.memberIdentity !== claim.member_identity)) {
       db.exec("ROLLBACK");
