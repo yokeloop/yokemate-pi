@@ -19,6 +19,17 @@ function approved(store: ReviewReworkStore, raw = "Отправляй на до�
   return generation;
 }
 
+test("clean acceptance is fresh, candidate-bound and single-use", () => {
+  const store = new ReviewReworkStore(owner);
+  const generation = store.beginInput("Принимаю весь результат");
+  store.approveAcceptance(generation);
+  const candidate = "a".repeat(64);
+  store.consumeAcceptance(generation, candidate);
+  assert.throws(() => store.consumeAcceptance(generation, candidate), /fresh interactive verdict receipt/);
+  const next = store.beginInput("Принимаю другой результат");
+  assert.throws(() => store.consumeAcceptance(next, "b".repeat(64)), /fresh interactive verdict receipt/);
+});
+
 test("review rework receipt binds the exact generation, owner and recorded plan", async () => {
   const store = new ReviewReworkStore(owner);
   const generation = approved(store);

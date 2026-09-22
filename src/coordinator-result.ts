@@ -147,8 +147,8 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
       const db = openDb(join(root, "yokemate.db"));
       if (prepared.group) {
         if (prepared.group.role === "rework") {
-          const rework = db.prepare("SELECT state FROM group_rework WHERE group_id=? AND revision_hash=? ORDER BY updated_at DESC LIMIT 1").get(prepared.group.groupId, prepared.group.revisionHash) as { state: string } | undefined;
-          if (rework?.state !== "ready") return { ok: false, reason: `${ticket}: group rework is ${rework?.state ?? "missing"}` };
+          const rework = db.prepare("SELECT state,reviewer_json FROM group_rework WHERE group_id=? AND revision_hash=? ORDER BY updated_at DESC LIMIT 1").get(prepared.group.groupId, prepared.group.revisionHash) as { state: string; reviewer_json: string | null } | undefined;
+          if (rework?.state !== "ready" || !rework.reviewer_json) return { ok: false, reason: `${ticket}: group rework is ${rework?.state ?? "missing"} without bound reviewer evidence` };
           const allRows = db.prepare("SELECT repo,final_pr FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(prepared.group.groupId, prepared.group.revisionHash) as unknown as { repo: string; final_pr: string | null }[];
           const rows = allRows.filter((row) => prepared.parts.some((part) => part.repo === row.repo));
           if (rows.length !== prepared.parts.length || rows.some((row) => !row.final_pr)) return { ok: false, reason: `${ticket}: group rework final PR set is incomplete` };

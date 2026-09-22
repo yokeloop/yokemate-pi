@@ -55,6 +55,13 @@ test("same repository and base serializes fresh sections while different reposit
   assert.equal(max, 2);
 });
 
+test("trusted merge accepts a registered head branch distinct from the ticket", async () => {
+  const prepared = { ...part(), branch: "YM-1-own" };
+  const ownSnapshot = (): MergeSnapshot => ({ ...snapshot(), headRefName: "YM-1-own" });
+  const result = await coordinatorMerge({ ...scope(), part: prepared }, { pr: prepared.pr!, expectedHead: HEAD, method: "merge" }, deps([ownSnapshot(), ownSnapshot(), { ...ownSnapshot(), state: "MERGED", mergedAt: "now" }]));
+  assert.equal(result.state, "merged");
+});
+
 test("ambiguous merge reconciles exact merged state and duplicate attempt is not spawned twice", async () => {
   let merges = 0;
   const request = { pr: snapshot().url, expectedHead: HEAD, method: "squash" as const };

@@ -138,10 +138,10 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
     const before = await deps.snapshot(scope.part.path, request.pr);
     if (before.url !== request.pr || before.baseRefName !== scope.part.base || repositoryFromPr(before.url) !== repositoryFromPr(request.pr)) throw new Error("PR identity or target changed before merge");
     if (before.state === "MERGED") {
-      if (before.headRefOid !== request.expectedHead || before.headRefName !== scope.ticket || !before.mergedAt) throw new Error("merged PR does not match the prepared ticket head");
+      if (before.headRefOid !== request.expectedHead || before.headRefName !== scope.part.branch || !before.mergedAt) throw new Error("merged PR does not match the prepared ticket head");
       return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "merged" as const };
     }
-    if (before.state !== "OPEN" || before.headRefName !== scope.ticket) return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "unknown" as const, reason: `PR is ${before.state} on ${before.headRefName}` };
+    if (before.state !== "OPEN" || before.headRefName !== scope.part.branch) return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "unknown" as const, reason: `PR is ${before.state} on ${before.headRefName}` };
     if (before.headRefOid !== request.expectedHead) throw new Error(`PR head moved from ${request.expectedHead} to ${before.headRefOid}`);
     const verdict = await deps.gate(scope.root, scope.ticket, scope.part);
     if (!verdict.ok) {
@@ -151,7 +151,7 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
     assertMandatoryBoundary("workflow.quality-gates", true);
     if (verdict.heads[scope.part.repo] !== before.headRefOid) throw new Error(`fresh gate head for ${scope.part.repo} is ${verdict.heads[scope.part.repo] ?? "missing"}, PR head is ${before.headRefOid}`);
     const fresh = await deps.snapshot(scope.part.path, request.pr);
-    if (fresh.url !== request.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.part.base || fresh.headRefName !== scope.ticket || fresh.headRefOid !== before.headRefOid) throw new Error("PR identity, base, state, or head changed after fresh gate");
+    if (fresh.url !== request.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.part.base || fresh.headRefName !== scope.part.branch || fresh.headRefOid !== before.headRefOid) throw new Error("PR identity, base, state, or head changed after fresh gate");
     if (verdict.heads[scope.part.repo] !== fresh.headRefOid) throw new Error("fresh PR head no longer matches the gate verdict");
     if (!scope.live()) throw new Error("ship coordinator authority was revoked before merge spawn");
     const merge = deps.merge(scope.part.path, { ...request, expectedHead: fresh.headRefOid });
@@ -159,7 +159,7 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
     let after: MergeSnapshot;
     try { after = await deps.snapshot(scope.part.path, request.pr); }
     catch (error) { return { repo: scope.part.repo, pr: request.pr, head: before.headRefOid, state: "unknown" as const, reason: `merge result cannot be reconciled: ${(error as Error).message}` }; }
-    if (after.url === request.pr && after.state === "MERGED" && after.mergedAt && after.headRefOid === before.headRefOid && after.headRefName === scope.ticket) return { repo: scope.part.repo, pr: after.url, head: after.headRefOid, state: "merged" as const };
+    if (after.url === request.pr && after.state === "MERGED" && after.mergedAt && after.headRefOid === before.headRefOid && after.headRefName === scope.part.branch) return { repo: scope.part.repo, pr: after.url, head: after.headRefOid, state: "merged" as const };
     if (merged.exit !== 0 && after.url === request.pr && after.state === "OPEN" && after.headRefOid === before.headRefOid) return { repo: scope.part.repo, pr: after.url, head: after.headRefOid, state: "open" as const, reason: merged.output || "merge command failed" };
     return { repo: scope.part.repo, pr: after.url || request.pr, head: after.headRefOid || before.headRefOid, state: "unknown" as const, reason: merged.output || `merge exited ${merged.exit} but PR is ${after.state}` };
   });

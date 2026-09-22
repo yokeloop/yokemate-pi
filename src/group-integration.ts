@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { confirmGroupEffect, recordGroupEffect } from "./group-state.ts";
+import { canonicalHash, confirmGroupEffect, recordGroupEffect } from "./group-state.ts";
 import type { WorkScope } from "./group-scope.ts";
 import { freshMerge, type CoordinatorMergeDeps, type MergeSnapshot } from "./coordinator-merge.ts";
 
@@ -97,7 +97,7 @@ export async function integrateMemberPart(db: DatabaseSync, scope: WorkScope, ev
 export function integrateCoordinationMember(db: DatabaseSync, input: { groupId: string; revisionHash: string; memberIdentity: string; resultHash: string; evidence: ReviewerEvidence }): void {
   if (!/^[a-f0-9]{64}$/.test(input.resultHash) || input.evidence.repo !== "coordination" || input.evidence.member !== input.memberIdentity || input.evidence.headSha !== input.resultHash || input.evidence.baseSha !== input.resultHash || input.evidence.verdict !== "approved" || !input.evidence.observedDelivery) throw new Error("coordination reviewer evidence is invalid");
   const row = db.prepare("SELECT execution,result_json FROM group_member WHERE group_id=? AND revision_hash=? AND member_identity=?").get(input.groupId, input.revisionHash, input.memberIdentity) as { execution: string; result_json: string | null } | undefined;
-  if (!row || row.execution !== "ready" || !row.result_json || JSON.parse(row.result_json).artifactHash !== input.resultHash) throw new Error("coordination result is not ready");
+  if (!row || row.execution !== "ready" || !row.result_json || canonicalHash(JSON.parse(row.result_json)) !== input.resultHash) throw new Error("coordination result is not ready");
   db.prepare("UPDATE group_member SET execution='integrated',stage='integrated',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND member_identity=?").run(input.groupId, input.revisionHash, input.memberIdentity);
 }
 

@@ -17,12 +17,12 @@ const manifest: GroupExecutionManifest = {
   acceptanceObligations: [{ id: "A", members, repos: [], criterion: "all", evidenceRequired: "review" }], repositories: [], planRefs: members.map((ticket) => ({ ticket, path: `ai/${ticket}-x/${ticket}-x-plan.md` })),
 };
 
-function fixture(delegate: (request: GroupDelegateRequest) => Promise<GroupMemberLaunch>, capacity = 2) {
+function fixture(delegate: (request: GroupDelegateRequest) => Promise<GroupMemberLaunch>, capacity: number | (() => number) = 2) {
   const db = openDb(":memory:");
   const groupId = createPlanningGroup(db, { id: "g", rootIdentity: "yt:YM-1", rootTicket: "YM-1", ownerProject: "o/r" });
   reserveMemberClaims(db, { groupId, treeHash, members: members.map((ticket) => `yt:${ticket}`), owners: [{ runtimeId: "r", runId: "x", sessionId: "s" }] });
   activateGroupRevision(db, { groupId, revisionHash, treeHash, manifest, bindings: {}, compatibility: {}, approachReceiptId: "a", members: members.map((ticket, index) => ({ identity: `yt:${ticket}`, ticket, parentIdentity: index ? "yt:YM-1" : null })) });
-  const runtime = startGroupDo(db, groupId, revisionHash, manifest, { capacity: () => capacity, delegate });
+  const runtime = startGroupDo(db, groupId, revisionHash, manifest, { capacity: typeof capacity === "function" ? capacity : () => capacity, delegate });
   return { db, groupId, runtime };
 }
 
@@ -46,6 +46,22 @@ test("starts independent members up to capacity and retains overflow queued", as
   await tick();
   assert.deepEqual(launched, ["YM-1", "YM-2"]);
   assert.deepEqual(runtime.snapshot().queued, ["YM-3", "YM-4"]);
+});
+
+test("capacity admission refusal returns a member to the queue for a later pump", async () => {
+  let available = 1;
+  let attempts = 0;
+  const { db, runtime } = fixture(async (request) => {
+    attempts++;
+    if (attempts === 1) throw new Error("coordinator capacity exhausted");
+    return { runId: request.member, cancel() {} };
+  }, () => available);
+  await tick();
+  assert.equal((db.prepare("SELECT execution FROM group_member WHERE ticket='YM-1'").get() as { execution: string }).execution, "queued");
+  available = 2;
+  runtime.contractApproved("C");
+  await tick();
+  assert.ok(runtime.snapshot().active.length > 0);
 });
 
 test("an integrated dependency releases a child before an unrelated member finishes", async () => {

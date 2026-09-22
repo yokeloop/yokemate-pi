@@ -104,7 +104,11 @@ export class GroupRuntime {
       if (!active || active.generation !== generation || this.state !== "active") { void launch.cancel(); return; }
       active.launch = launch;
       this.deps.onChange?.();
-    }, (error) => this.memberBlocked(member, error instanceof Error ? error.message : String(error), generation));
+    }, (error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      if (/capacity|concurrent/i.test(reason)) this.memberDeferred(member, generation);
+      else this.memberBlocked(member, reason, generation);
+    });
   }
 
   memberReady(member: string, result: unknown): void {
@@ -135,6 +139,14 @@ export class GroupRuntime {
     if (!this.manifest.contracts.some((contract) => contract.id === contractId)) throw new Error("unknown group contract");
     this.approvedContracts.add(contractId);
     this.pump();
+  }
+
+  memberDeferred(member: string, generation = this.generation): void {
+    const active = this.active.get(member);
+    if (!active || active.generation !== generation) return;
+    this.active.delete(member);
+    this.db.prepare("UPDATE group_member SET execution='queued',stage='planned',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND ticket=? AND execution='running'").run(this.groupId, this.revisionHash, member);
+    this.deps.onChange?.();
   }
 
   memberBlocked(member: string, reason: string, generation = this.generation): void {

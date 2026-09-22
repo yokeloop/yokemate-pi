@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { Stage } from "./db.ts";
@@ -214,14 +214,16 @@ export interface GroupFactsSnapshot {
   group: Record<string, unknown>;
   members: Record<string, unknown>[];
   repositories: Record<string, unknown>[];
+  parts: Record<string, unknown>[];
   acceptances: Record<string, unknown>[];
+  reworks: Record<string, unknown>[];
   confirmedEffects: Record<string, unknown>[];
   hash: string;
 }
 
 export function readGroupFactsSnapshot(path: string): GroupFactsSnapshot {
   const value = JSON.parse(readFileSync(path, "utf8")) as GroupFactsSnapshot;
-  if (value.version !== 1 || !value.groupId || !/^[a-f0-9]{64}$/.test(value.revisionHash) || !Number.isInteger(value.sequence) || value.sequence < 1 || !Array.isArray(value.members) || !Array.isArray(value.repositories) || !Array.isArray(value.acceptances) || !Array.isArray(value.confirmedEffects) || !/^[a-f0-9]{64}$/.test(value.hash)) throw new Error("group facts snapshot is invalid");
+  if (value.version !== 1 || !value.groupId || !/^[a-f0-9]{64}$/.test(value.revisionHash) || !Number.isInteger(value.sequence) || value.sequence < 1 || !Array.isArray(value.members) || !Array.isArray(value.repositories) || !Array.isArray(value.parts) || !Array.isArray(value.acceptances) || !Array.isArray(value.reworks) || !Array.isArray(value.confirmedEffects) || !/^[a-f0-9]{64}$/.test(value.hash)) throw new Error("group facts snapshot is invalid");
   const { hash, ...payload } = value;
   if (canonicalHash(payload) !== hash) throw new Error("group facts snapshot hash mismatch");
   return value;
@@ -249,13 +251,20 @@ export function restoreGroupFacts(db: DatabaseSync, path: string, verify: (facts
       WHERE group_id=? AND revision_hash=? AND member_identity=?`).run(required(member, "stage"), required(member, "execution"), nullable(member, "blocker"), nullable(member, "result_json"), nullable(member, "tracker_state"), facts.groupId, facts.revisionHash, required(member, "member_identity"));
     for (const repository of facts.repositories) db.prepare(`UPDATE group_repository SET final_pr=?,head_sha=?,merge_commit=?,ship_state=?
       WHERE group_id=? AND revision_hash=? AND repo=?`).run(nullable(repository, "final_pr"), nullable(repository, "head_sha"), nullable(repository, "merge_commit"), required(repository, "ship_state"), facts.groupId, facts.revisionHash, required(repository, "repo"));
+    for (const part of facts.parts) db.prepare(`UPDATE group_part SET pr_identity=?,head_sha=?,base_sha=?,readiness_json=?,reviewer_json=?,merge_commit=?,outcome=?
+      WHERE group_id=? AND revision_hash=? AND member_identity=? AND repo=?`).run(nullable(part, "pr_identity"), nullable(part, "head_sha"), nullable(part, "base_sha"), nullable(part, "readiness_json"), nullable(part, "reviewer_json"), nullable(part, "merge_commit"), nullable(part, "outcome"), facts.groupId, facts.revisionHash, required(part, "member_identity"), required(part, "repo"));
     for (const acceptance of facts.acceptances) db.prepare(`INSERT INTO group_acceptance (group_id,revision_hash,candidate_hash,candidate_json,evidence_json,review_source_json,state,created_at)
       VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash,candidate_hash) DO NOTHING`).run(facts.groupId, facts.revisionHash, required(acceptance, "candidate_hash"), required(acceptance, "candidate_json"), required(acceptance, "evidence_json"), required(acceptance, "review_source_json"), required(acceptance, "state"), required(acceptance, "created_at"));
+    for (const rework of facts.reworks) db.prepare(`INSERT INTO group_rework (group_id,revision_hash,candidate_hash,plan_binding_json,reviewer_json,state,review_source_json,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash,candidate_hash) DO NOTHING`).run(facts.groupId, facts.revisionHash, required(rework, "candidate_hash"), required(rework, "plan_binding_json"), nullable(rework, "reviewer_json"), required(rework, "state"), required(rework, "review_source_json"), required(rework, "created_at"), required(rework, "updated_at"));
     for (const effect of facts.confirmedEffects) {
       if (effect.state !== "confirmed") throw new Error("portable facts may contain only confirmed effects");
       db.prepare(`INSERT INTO group_effect (effect_key,group_id,revision_hash,scope_json,type,input_json,state,outcome_json,updated_at)
         VALUES (?,?,?,?,?,?,'confirmed',?,?) ON CONFLICT(effect_key) DO NOTHING`).run(required(effect, "effect_key"), facts.groupId, facts.revisionHash, required(effect, "scope_json"), required(effect, "type"), required(effect, "input_json"), nullable(effect, "outcome_json"), required(effect, "updated_at"));
     }
+    const phase = required(facts.group, "phase");
+    if (!GROUP_PHASES.includes(phase as GroupPhase)) throw new Error("group facts phase is invalid");
+    db.prepare("UPDATE task_group SET phase=?,resume_phase=?,blocker=?,updated_at=datetime('now') WHERE id=? AND active_revision=?").run(phase, nullable(facts.group, "resume_phase"), nullable(facts.group, "blocker"), facts.groupId, facts.revisionHash);
     db.exec("COMMIT");
     return { restored: true };
   } catch (error) {
@@ -270,11 +279,13 @@ export function snapshotGroupFacts(db: DatabaseSync, groupId: string, path: stri
   const revisionHash = group.active_revision;
   const members = db.prepare("SELECT * FROM group_member WHERE group_id=? AND revision_hash=? ORDER BY member_identity").all(groupId, revisionHash);
   const repositories = db.prepare("SELECT * FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupId, revisionHash);
+  const parts = db.prepare("SELECT * FROM group_part WHERE group_id=? AND revision_hash=? ORDER BY member_identity,repo").all(groupId, revisionHash);
   const acceptances = db.prepare("SELECT * FROM group_acceptance WHERE group_id=? AND revision_hash=? ORDER BY candidate_hash").all(groupId, revisionHash);
+  const reworks = db.prepare("SELECT * FROM group_rework WHERE group_id=? AND revision_hash=? ORDER BY candidate_hash").all(groupId, revisionHash);
   const effects = db.prepare("SELECT * FROM group_effect WHERE group_id=? AND revision_hash=? AND state='confirmed' ORDER BY effect_key").all(groupId, revisionHash);
   let sequence = 1;
   try { sequence = Number((JSON.parse(readFileSync(path, "utf8")) as { sequence?: number }).sequence ?? 0) + 1; } catch {}
-  const payload = { version: 1, groupId, revisionHash, sequence, group, members, repositories, acceptances, confirmedEffects: effects };
+  const payload = { version: 1, groupId, revisionHash, sequence, group, members, repositories, parts, acceptances, reworks, confirmedEffects: effects };
   const hash = canonicalHash(payload);
   const document = `${JSON.stringify({ ...payload, hash }, null, 2)}\n`;
   mkdirSync(dirname(path), { recursive: true });
@@ -282,4 +293,21 @@ export function snapshotGroupFacts(db: DatabaseSync, groupId: string, path: stri
   writeFileSync(temporary, document, { mode: 0o600 });
   renameSync(temporary, path);
   return { hash, sequence };
+}
+
+export function groupFactsPath(root: string, db: DatabaseSync, groupId: string): string {
+  const group = db.prepare("SELECT root_ticket,owner_project FROM task_group WHERE id=?").get(groupId) as { root_ticket: string; owner_project: string } | undefined;
+  if (!group || !/^[A-Z][A-Z0-9]*-\d+$/.test(group.root_ticket) || !/^[^/]+\/[^/]+$/.test(group.owner_project)) throw new Error("group facts owner is invalid");
+  const [org, repo] = group.owner_project.split("/");
+  return join(root, "home", "knowledge", org!, repo!, "ai", `${group.root_ticket.toLowerCase()}-group`, `${group.root_ticket}-group-facts.json`);
+}
+
+export function persistGroupFacts(root: string, db: DatabaseSync, groupId: string): { path: string; hash: string; sequence: number } {
+  const path = groupFactsPath(root, db, groupId);
+  return { path, ...snapshotGroupFacts(db, groupId, path) };
+}
+
+export function restorePersistedGroupFacts(root: string, db: DatabaseSync, groupId: string, verify: (facts: GroupFactsSnapshot) => boolean): { restored: boolean; blocker?: string } | null {
+  const path = groupFactsPath(root, db, groupId);
+  return existsSync(path) ? restoreGroupFacts(db, path, verify) : null;
 }

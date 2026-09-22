@@ -22,6 +22,7 @@ import { applyMove, type MoveEnv } from "./transitions.ts";
 import { join, resolve } from "node:path";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { resolveGroupWorkScope } from "./group-scope.ts";
+import { persistGroupFacts } from "./group-state.ts";
 
 export interface Part {
   repo: string;
@@ -53,7 +54,7 @@ export function recordReport(
       const allRows = (rework
         ? db.prepare("SELECT repo,role FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION)
         : db.prepare("SELECT repo,role,source_ref,target_ref FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, member.member_identity)) as unknown as { repo: string; role: string; source_ref?: string; target_ref?: string }[];
-      const reworkRow = rework ? db.prepare("SELECT plan_binding_json FROM group_rework WHERE group_id=? AND revision_hash=? AND state='running'").get(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION) as { plan_binding_json: string } | undefined : undefined;
+      const reworkRow = rework ? db.prepare("SELECT plan_binding_json,reviewer_json FROM group_rework WHERE group_id=? AND revision_hash=? AND state='running'").get(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION) as { plan_binding_json: string; reviewer_json: string | null } | undefined : undefined;
       const reworkRepos = reworkRow ? (JSON.parse(reworkRow.plan_binding_json) as { repositories: string[] }).repositories : [];
       const rows = rework ? allRows.filter((row) => reworkRepos.includes(row.repo)) : allRows;
       if (rows.length !== parts.length || rows.some((row) => !parts.some((part) => part.repo === row.repo && part.role === row.role && part.branch === (rework ? groupEnv.YOKEMATE_GROUP_ROOT : row.source_ref)))) throw new Error(`${ticket}: report parts differ from the immutable group scope`);
@@ -64,6 +65,10 @@ export function recordReport(
       });
       const facts = gatherScopedGateFacts(ticket, scopes.map(({ part, scope }) => ({ repo: part.repo, selector: part.pr, worktree: scope.worktree!, branch: scope.branch!, targetBranch: scope.targetBranch!, receiptPath: scope.receiptPath!, expectedScopeId: scope.scopeId })));
       const verdict = verifyGate(facts);
+      if (rework) {
+        const reviewers = reworkRow?.reviewer_json ? JSON.parse(reworkRow.reviewer_json) as Record<string, { repo: string; headSha: string; verdict: string; observedDelivery: boolean }> : {};
+        if (facts.parts.some((fact) => { const review = reviewers[fact.repo]; return !review || review.repo !== fact.repo || review.headSha !== fact.pr.headRefOid || review.verdict !== "approved" || !review.observedDelivery; })) throw new Error(`${ticket}: exact independent rework review evidence is incomplete or stale`);
+      }
       assertMandatoryBoundary("workflow.quality-gates", verdict.ok, verdict.ok ? undefined : verdict.reason);
       assertMandatoryBoundary("workflow.ready-pr-report", verdict.ok, verdict.ok ? undefined : verdict.reason);
       for (const fact of facts.parts) {
@@ -78,6 +83,8 @@ export function recordReport(
           db.exec("COMMIT");
         } catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
       }
+      persistGroupFacts(root, db, groupEnv.YOKEMATE_GROUP_ID!);
+      (deps.push ?? syncPush)(dataRoot(root), `${groupEnv.YOKEMATE_GROUP_ROOT} group facts`);
       return { repeat: false };
     } finally { db.close(); }
   }

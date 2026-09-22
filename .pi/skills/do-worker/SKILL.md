@@ -32,6 +32,8 @@ The plan is one document for the whole ticket, however many repositories it touc
 
 When `YOKEMATE_GROUP_MEMBER` is set, this is a parent-delegated group member run: its immutable worktrees, branches, internal `<ROOT>` targets and scope receipts are already prepared and listed in the launch prompt. Skip ordinary worktree creation, never create `work/<MEMBER>/<repo>`, and do not change a target to an external base. `pnpm ready <MEMBER>` and `pnpm record-report <MEMBER>` resolve only those scoped worktrees and do not promote the child through the single-ticket lifecycle.
 
+When `YOKEMATE_GROUP_ROLE=rework`, change only the listed root integration worktrees and update the existing final PRs. Run `task-reviewer` on each complete changed integration diff from the prior candidate head to the new head, then call `group_rework_review` with every exact reviewer run before readiness and `record-report`. Do not restart members, create child PRs, or change external bases.
+
 Every part passes through the same stages, in order:
 
 ```

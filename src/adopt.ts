@@ -20,7 +20,10 @@ import { syncPull } from "./git-sync.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 import { prepareGroupWorkScopes } from "./group-scope.ts";
-import type { GroupExecutionManifest } from "./group-plan.ts";
+import { bindGroupRevision, validateCompatibility, type CompatibilityReport, type GroupExecutionManifest } from "./group-plan.ts";
+import type { PlanBinding } from "./plan-binding.ts";
+import type { TaskTree } from "./group-tree.ts";
+import { restorePersistedGroupFacts } from "./group-state.ts";
 
 /** The ticket's plan in knowledge/<org>/<project>/ai/<slug>/, by the slug's
  *  key prefix. Old slugs are lowercase (`acme-326-…` for ACME-326), so the match
@@ -116,12 +119,39 @@ export function adopt(
     throw new Error(`${key}: в плане ${planPath} нет секции Affected repositories — переносить нечего`);
 
   const db = openDb(join(root, "yokemate.db"));
-  const group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked','review','accepted') ORDER BY updated_at DESC LIMIT 1").get(key) as { id: string; active_revision: string; phase: string } | undefined;
+  let group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked','review','accepted') ORDER BY updated_at DESC LIMIT 1").get(key) as { id: string; active_revision: string; phase: string } | undefined;
+  if (!group) {
+    const artifacts = globSync(join(dirname(planPath), `${key}-group-*.json`));
+    if (artifacts.length > 1) throw new Error(`${key}: multiple durable group revisions require explicit recovery`);
+    if (artifacts.length === 1) {
+      const artifact = JSON.parse(readFileSync(artifacts[0]!, "utf8")) as { version: number; groupId: string; rootIdentity: string; tree: TaskTree; manifest: GroupExecutionManifest; bindings: PlanBinding[]; compatibility: CompatibilityReport; revisionHash: string; approachReceiptId: string };
+      if (artifact.version !== 1 || artifact.tree.root.ticket !== key || artifact.manifest.root !== key || !artifact.approachReceiptId) throw new Error(`${key}: durable group revision artifact is invalid`);
+      const revision = bindGroupRevision({ rootIdentity: artifact.rootIdentity, ownerProject: artifact.manifest.ownerProject, tree: artifact.tree, manifest: artifact.manifest, bindings: artifact.bindings });
+      if (revision.revisionHash !== artifact.revisionHash) throw new Error(`${key}: durable group revision hash changed`);
+      validateCompatibility(artifact.compatibility, revision);
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.prepare("INSERT INTO task_group (id,root_identity,root_ticket,owner_project,active_revision,phase,resume_phase,blocker) VALUES (?,?,?,?,?,'blocked','planned','recovered group facts require reconciliation')").run(artifact.groupId, artifact.rootIdentity, key, artifact.manifest.ownerProject, artifact.revisionHash);
+        db.prepare("INSERT INTO group_revision (group_id,revision_hash,tree_hash,manifest_json,bindings_json,compatibility_json,approach_receipt_id) VALUES (?,?,?,?,?,?,?)").run(artifact.groupId, artifact.revisionHash, artifact.tree.treeHash, JSON.stringify(artifact.manifest), JSON.stringify(artifact.bindings), JSON.stringify(artifact.compatibility), artifact.approachReceiptId);
+        for (const node of artifact.tree.nodes) {
+          const planned = artifact.manifest.members.find((member) => member.ticket === node.ticket);
+          if (!planned) throw new Error(`${node.ticket}: durable group member is absent from the manifest`);
+          db.prepare("INSERT INTO group_member (group_id,revision_hash,member_identity,ticket,parent_identity,prior_state_json,stage,execution) VALUES (?,?,?,?,?,?,'planned','queued')").run(artifact.groupId, artifact.revisionHash, node.identity, node.ticket, node.parentIdentity, JSON.stringify({ recovered: true }));
+          db.prepare("INSERT INTO member_claim (member_identity,ticket,kind,group_id,revision_hash,tree_hash,owners_json,state) VALUES (?,?,'group',?,?,?,?, 'suspended')").run(node.identity, node.ticket, artifact.groupId, artifact.revisionHash, artifact.tree.treeHash, "[]");
+        }
+        db.exec("COMMIT");
+      } catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+      group = { id: artifact.groupId, active_revision: artifact.revisionHash, phase: "blocked" };
+    }
+  }
   if (group) {
     try {
       const revision = db.prepare("SELECT manifest_json FROM group_revision WHERE group_id=? AND revision_hash=?").get(group.id, group.active_revision) as { manifest_json: string } | undefined;
       if (!revision) throw new Error(`${key}: active group revision is missing`);
       prepareGroupWorkScopes(db, join(root, "work", key), { groupId: group.id, revisionHash: group.active_revision, manifest: JSON.parse(revision.manifest_json) as GroupExecutionManifest });
+      const restored = restorePersistedGroupFacts(root, db, group.id, (facts) => facts.groupId === group!.id && facts.revisionHash === group!.active_revision);
+      if (restored?.blocker) throw new Error(`${key}: ${restored.blocker}`);
+      group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE id=?").get(group.id) as { id: string; active_revision: string; phase: string };
       const rows = db.prepare("SELECT repo,role,final_pr FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(group.id, group.active_revision) as unknown as { repo: string; role: string; final_pr: string | null }[];
       if (rows.some((row) => !row.final_pr) && ["review", "accepted"].includes(group.phase)) throw new Error(`${key}: group review topology has missing final PR identities`);
       return { repeat: true, planPath, parts: rows.filter((row) => row.final_pr).map((row) => ({ repo: row.repo, role: row.role, pr: row.final_pr! })) };

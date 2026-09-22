@@ -569,6 +569,7 @@ export function openDb(path: string): DatabaseSync {
       revision_hash TEXT NOT NULL,
       candidate_hash TEXT NOT NULL,
       plan_binding_json TEXT NOT NULL,
+      reviewer_json TEXT,
       state TEXT NOT NULL CHECK (state IN ('pending','running','ready','superseded')),
       review_source_json TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -624,6 +625,7 @@ export function openDb(path: string): DatabaseSync {
   migratePublicationProvenance(db);
   migrateIncidentColumns(db);
   addColumn(db, "member_claim", "ticket TEXT");
+  addColumn(db, "group_rework", "reviewer_json TEXT");
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.
   const have = new Set(

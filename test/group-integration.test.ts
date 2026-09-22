@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openDb } from "../src/db.ts";
-import { activateGroupRevision, createPlanningGroup, recordGroupEffect, reserveMemberClaims } from "../src/group-state.ts";
-import { integrateMemberPart, type GroupIntegrationDeps, type ReviewerEvidence } from "../src/group-integration.ts";
+import { activateGroupRevision, canonicalHash, createPlanningGroup, recordGroupEffect, reserveMemberClaims } from "../src/group-state.ts";
+import { integrateCoordinationMember, integrateMemberPart, type GroupIntegrationDeps, type ReviewerEvidence } from "../src/group-integration.ts";
 import { reconcileGroupEffects } from "../src/group-recovery.ts";
 import { resolveGroupWorkScope } from "../src/group-scope.ts";
 import type { MergeSnapshot } from "../src/coordinator-merge.ts";
@@ -48,6 +48,16 @@ function deps(overrides: Partial<GroupIntegrationDeps> = {}) {
   };
   return value;
 }
+
+test("coordination-only integration binds an explicit hash of the stored result", () => {
+  const { db, groupId } = fixture();
+  const result = { verification: { ok: true, parts: [] } };
+  const resultHash = canonicalHash(result);
+  db.prepare("UPDATE group_member SET execution='ready',stage='review',result_json=? WHERE group_id=? AND revision_hash=? AND member_identity='yt:YM-1'").run(JSON.stringify(result), groupId, revisionHash);
+  const evidence: ReviewerEvidence = { runId: "coord-review", ownerRunId: "owner", taskHash: "task", member: "yt:YM-1", repo: "coordination", baseSha: resultHash, headSha: resultHash, verdict: "approved", artifactHash: "f".repeat(64), observedDelivery: true };
+  integrateCoordinationMember(db, { groupId, revisionHash, memberIdentity: "yt:YM-1", resultHash, evidence });
+  assert.equal((db.prepare("SELECT execution FROM group_member WHERE group_id=? AND revision_hash=? AND member_identity='yt:YM-1'").get(groupId, revisionHash) as { execution: string }).execution, "integrated");
+});
 
 test("integrates only exact ready and reviewer evidence then records To Verify", async () => {
   const { db, scope, evidence } = fixture();
