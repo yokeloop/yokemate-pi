@@ -38,12 +38,26 @@ function queueSection(root: string): { lines: string[]; tickets: Set<string> } {
   const rows = db
     .prepare("SELECT ticket, title, stage, owner, next, pr FROM work ORDER BY updated_at DESC")
     .all() as unknown as QueueRow[];
+  const groups = db.prepare("SELECT id,root_ticket,active_revision,phase,blocker FROM task_group WHERE phase!='done' ORDER BY updated_at DESC").all() as unknown as { id: string; root_ticket: string; active_revision: string | null; phase: string; blocker: string | null }[];
+  const groupedTickets = new Set<string>();
+  const groupLines: string[] = [];
+  for (const group of groups) {
+    tickets.add(group.root_ticket);
+    groupLines.push(`${group.root_ticket} group/${group.phase} revision ${group.active_revision?.slice(0, 12) ?? "planning"}${group.blocker ? ` — ${group.blocker}` : ""}`);
+    if (!group.active_revision) continue;
+    const members = db.prepare("SELECT ticket,stage,execution,blocker FROM group_member WHERE group_id=? AND revision_hash=? ORDER BY rowid").all(group.id, group.active_revision) as unknown as { ticket: string; stage: string; execution: string; blocker: string | null }[];
+    for (const member of members) {
+      groupedTickets.add(member.ticket);
+      tickets.add(member.ticket);
+      groupLines.push(`  ${member.ticket} ${member.stage}/${member.execution}${member.blocker ? ` — ${member.blocker}` : ""}`);
+    }
+  }
   db.close();
-  if (rows.length === 0) return { lines: ["очередь пуста"], tickets };
-  const lines = rows.map((r) => {
+  const lines = [...groupLines, ...rows.filter((row) => !groupedTickets.has(row.ticket)).map((r) => {
     tickets.add(r.ticket);
     return queueLine(r).trimEnd();
-  });
+  })];
+  if (lines.length === 0) return { lines: ["очередь пуста"], tickets };
   return { lines, tickets };
 }
 

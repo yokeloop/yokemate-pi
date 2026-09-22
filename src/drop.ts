@@ -10,6 +10,10 @@ import { logMove } from "./move-log.ts";
 
 /** true — the row existed and is gone; false — nothing to drop. */
 export function drop(db: DatabaseSync, ticket: string): boolean {
+  const group = db.prepare(`SELECT c.group_id,c.revision_hash,c.state FROM member_claim c JOIN group_member m
+    ON m.group_id=c.group_id AND m.revision_hash=c.revision_hash AND m.member_identity=c.member_identity
+    WHERE c.kind='group' AND m.ticket=? AND c.state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as { group_id: string; revision_hash: string; state: string } | undefined;
+  if (group) throw new Error(`${ticket} belongs to group ${group.group_id}/${group.revision_hash} (${group.state}); drop cannot remove group membership or claims`);
   const row = db.prepare("SELECT 1 FROM work WHERE ticket = ?").get(ticket);
   if (!row) return false;
   db.prepare("DELETE FROM work WHERE ticket = ?").run(ticket);

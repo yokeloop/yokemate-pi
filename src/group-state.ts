@@ -205,6 +205,64 @@ export function groupClaimForTicket(db: DatabaseSync, ticket: string): { groupId
   return row ? { groupId: row.group_id, revisionHash: row.revision_hash, memberIdentity: row.member_identity, state: row.state } : null;
 }
 
+export interface GroupFactsSnapshot {
+  version: 1;
+  groupId: string;
+  revisionHash: string;
+  sequence: number;
+  group: Record<string, unknown>;
+  members: Record<string, unknown>[];
+  repositories: Record<string, unknown>[];
+  acceptances: Record<string, unknown>[];
+  confirmedEffects: Record<string, unknown>[];
+  hash: string;
+}
+
+export function readGroupFactsSnapshot(path: string): GroupFactsSnapshot {
+  const value = JSON.parse(readFileSync(path, "utf8")) as GroupFactsSnapshot;
+  if (value.version !== 1 || !value.groupId || !/^[a-f0-9]{64}$/.test(value.revisionHash) || !Number.isInteger(value.sequence) || value.sequence < 1 || !Array.isArray(value.members) || !Array.isArray(value.repositories) || !Array.isArray(value.acceptances) || !Array.isArray(value.confirmedEffects) || !/^[a-f0-9]{64}$/.test(value.hash)) throw new Error("group facts snapshot is invalid");
+  const { hash, ...payload } = value;
+  if (canonicalHash(payload) !== hash) throw new Error("group facts snapshot hash mismatch");
+  return value;
+}
+
+export function restoreGroupFacts(db: DatabaseSync, path: string, verify: (facts: GroupFactsSnapshot) => boolean): { restored: boolean; blocker?: string } {
+  const facts = readGroupFactsSnapshot(path);
+  if (!verify(facts)) throw new Error("group facts snapshot external facts are not verified");
+  const group = db.prepare("SELECT active_revision,phase FROM task_group WHERE id=?").get(facts.groupId) as { active_revision: string | null; phase: string } | undefined;
+  if (!group) throw new Error("group manifest and revision must be restored before facts");
+  if (group.active_revision !== facts.revisionHash) {
+    const blocker = `facts revision ${facts.revisionHash} conflicts with durable revision ${group.active_revision ?? "none"}`;
+    db.prepare("UPDATE task_group SET phase='blocked',resume_phase=CASE WHEN phase='blocked' THEN resume_phase ELSE phase END,blocker=?,updated_at=datetime('now') WHERE id=?").run(blocker, facts.groupId);
+    return { restored: false, blocker };
+  }
+  const required = (record: Record<string, unknown>, key: string): string => {
+    const value = record[key];
+    if (typeof value !== "string") throw new Error(`group facts field ${key} is invalid`);
+    return value;
+  };
+  const nullable = (record: Record<string, unknown>, key: string): string | null => record[key] === null || record[key] === undefined ? null : required(record, key);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const member of facts.members) db.prepare(`UPDATE group_member SET stage=?,execution=?,blocker=?,result_json=?,tracker_state=?,updated_at=datetime('now')
+      WHERE group_id=? AND revision_hash=? AND member_identity=?`).run(required(member, "stage"), required(member, "execution"), nullable(member, "blocker"), nullable(member, "result_json"), nullable(member, "tracker_state"), facts.groupId, facts.revisionHash, required(member, "member_identity"));
+    for (const repository of facts.repositories) db.prepare(`UPDATE group_repository SET final_pr=?,head_sha=?,merge_commit=?,ship_state=?
+      WHERE group_id=? AND revision_hash=? AND repo=?`).run(nullable(repository, "final_pr"), nullable(repository, "head_sha"), nullable(repository, "merge_commit"), required(repository, "ship_state"), facts.groupId, facts.revisionHash, required(repository, "repo"));
+    for (const acceptance of facts.acceptances) db.prepare(`INSERT INTO group_acceptance (group_id,revision_hash,candidate_hash,candidate_json,evidence_json,review_source_json,state,created_at)
+      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(group_id,revision_hash,candidate_hash) DO NOTHING`).run(facts.groupId, facts.revisionHash, required(acceptance, "candidate_hash"), required(acceptance, "candidate_json"), required(acceptance, "evidence_json"), required(acceptance, "review_source_json"), required(acceptance, "state"), required(acceptance, "created_at"));
+    for (const effect of facts.confirmedEffects) {
+      if (effect.state !== "confirmed") throw new Error("portable facts may contain only confirmed effects");
+      db.prepare(`INSERT INTO group_effect (effect_key,group_id,revision_hash,scope_json,type,input_json,state,outcome_json,updated_at)
+        VALUES (?,?,?,?,?,?,'confirmed',?,?) ON CONFLICT(effect_key) DO NOTHING`).run(required(effect, "effect_key"), facts.groupId, facts.revisionHash, required(effect, "scope_json"), required(effect, "type"), required(effect, "input_json"), nullable(effect, "outcome_json"), required(effect, "updated_at"));
+    }
+    db.exec("COMMIT");
+    return { restored: true };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
 export function snapshotGroupFacts(db: DatabaseSync, groupId: string, path: string): { hash: string; sequence: number } {
   const group = db.prepare("SELECT * FROM task_group WHERE id=?").get(groupId) as Record<string, unknown> | undefined;
   if (!group || typeof group.active_revision !== "string") throw new Error("active group revision is required for a facts snapshot");

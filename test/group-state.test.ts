@@ -5,7 +5,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
-import { activateGroupRevision, applyGroupMove, canonicalHash, createPlanningGroup, recordGroupEffect, reserveMemberClaims } from "../src/group-state.ts";
+import { activateGroupRevision, applyGroupMove, canonicalHash, createPlanningGroup, readGroupFactsSnapshot, recordGroupEffect, reserveMemberClaims, restoreGroupFacts, snapshotGroupFacts } from "../src/group-state.ts";
+import { drop } from "../src/drop.ts";
 import { applyMove } from "../src/transitions.ts";
 
 const HASH_A = "a".repeat(64);
@@ -82,4 +83,29 @@ test("single transitions cannot move a claimed group member", () => {
 
 test("canonical group hashes ignore object key insertion order", () => {
   assert.equal(canonicalHash({ b: 2, a: { d: 4, c: 3 } }), canonicalHash({ a: { c: 3, d: 4 }, b: 2 }));
+});
+
+test("portable facts restore confirmed outcomes but no process authority", () => {
+  const { db, groupId } = prepared();
+  db.prepare("UPDATE group_member SET execution='ready',stage='review' WHERE ticket='YM-2'").run();
+  recordGroupEffect(db, { key: "done", groupId, revisionHash: HASH_B, type: "done", scope: { ticket: "YM-2" }, input: { state: "Done" }, state: "confirmed", outcome: { state: "Done" } });
+  const directory = mkdtempSync(join(tmpdir(), "yokemate-group-facts-"));
+  const path = join(directory, "facts.json");
+  snapshotGroupFacts(db, groupId, path);
+  const facts = readGroupFactsSnapshot(path);
+  assert.equal(facts.confirmedEffects.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(facts, "claims"), false);
+  db.prepare("UPDATE group_member SET execution='queued',stage='planned' WHERE ticket='YM-2'").run();
+  assert.deepEqual(restoreGroupFacts(db, path, () => true), { restored: true });
+  const member = db.prepare("SELECT execution,stage FROM group_member WHERE ticket='YM-2'").get() as { execution: string; stage: string };
+  assert.deepEqual({ ...member }, { execution: "ready", stage: "review" });
+  rmSync(directory, { recursive: true, force: true });
+});
+
+test("drop cannot remove a group member or its claim", () => {
+  const { db } = prepared();
+  db.prepare("INSERT INTO work (ticket,url,stage) VALUES ('YM-2','https://t/YM-2','planned')").run();
+  assert.throws(() => drop(db, "YM-2"), /belongs to group/);
+  assert.ok(db.prepare("SELECT 1 FROM work WHERE ticket='YM-2'").get());
+  assert.ok(db.prepare("SELECT 1 FROM member_claim WHERE member_identity='youtrack:yokeloop:YM-2'").get());
 });

@@ -84,10 +84,14 @@ interface Row {
 let rows = db
   .prepare("SELECT ticket, title, stage, owner, next, pr FROM work ORDER BY updated_at DESC")
   .all() as unknown as Row[];
+let groups = db.prepare("SELECT id,root_ticket,active_revision,phase,blocker FROM task_group WHERE phase!='done' ORDER BY updated_at DESC").all() as unknown as { id: string; root_ticket: string; active_revision: string | null; phase: string; blocker: string | null }[];
+const groupedTickets = new Set<string>();
+for (const group of groups) if (group.active_revision) for (const member of db.prepare("SELECT ticket FROM group_member WHERE group_id=? AND revision_hash=?").all(group.id, group.active_revision) as unknown as { ticket: string }[]) groupedTickets.add(member.ticket);
+rows = rows.filter((row) => !groupedTickets.has(row.ticket));
 
 const filter = process.argv[2];
-if (filter === "planned") rows = rows.filter((r) => r.stage === "planned");
-else if (filter === "me") rows = rows.filter((r) => ownerFor(r.stage, r.owner) === "me");
+if (filter === "planned") { rows = rows.filter((r) => r.stage === "planned"); groups = groups.filter((group) => group.phase === "planned"); }
+else if (filter === "me") { rows = rows.filter((r) => ownerFor(r.stage, r.owner) === "me"); groups = groups.filter((group) => ["planning", "review", "blocked"].includes(group.phase)); }
 else if (filter && filter !== "--") {
   console.error(`unknown filter "${filter}" — known: planned, me`);
   process.exit(1);
@@ -100,13 +104,17 @@ const MARKERS: Record<Divergence["reason"], string> = {
 };
 const markerFor = new Map(diverged.map((d) => [d.ticket, MARKERS[d.reason]]));
 
-if (rows.length === 0) {
+if (rows.length === 0 && groups.length === 0) {
   console.log("queue is empty");
 } else {
+  for (const group of groups) {
+    console.log(`${group.root_ticket} group/${group.phase} revision ${group.active_revision?.slice(0, 12) ?? "planning"}${group.blocker ? ` — ${group.blocker}` : ""}`);
+    if (group.active_revision) for (const member of db.prepare("SELECT ticket,stage,execution,blocker FROM group_member WHERE group_id=? AND revision_hash=? ORDER BY rowid").all(group.id, group.active_revision) as unknown as { ticket: string; stage: string; execution: string; blocker: string | null }[]) console.log(`  ${member.ticket} ${member.stage}/${member.execution}${member.blocker ? ` — ${member.blocker}` : ""}`);
+  }
   for (const r of rows) {
     const marker = markerFor.get(r.ticket);
     console.log(`${queueLine(r)}${marker ? ` ${marker}` : ""}`);
   }
   const note = diverged.length ? ` · ${diverged.length} расходится с трекером` : "";
-  console.log(`\n${rows.length} row(s)${note}`);
+  console.log(`\n${rows.length + groups.length} unit(s)${note}`);
 }
