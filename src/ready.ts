@@ -137,12 +137,18 @@ export function readyTicket(root: string, ticket: string, deps: Partial<ReadyDep
     if (db && groupId && revisionHash && groupMember === ticket) {
       const member = db.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(groupId, revisionHash, ticket) as { member_identity: string } | undefined;
       if (!member) return refuse(`${ticket}: group member scope is missing`);
-      const rows = db.prepare("SELECT repo FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupId, revisionHash, member.member_identity) as unknown as { repo: string }[];
+      const rework = process.env.YOKEMATE_GROUP_ROLE === "rework";
+      const allRows = (rework
+        ? db.prepare("SELECT repo FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupId, revisionHash)
+        : db.prepare("SELECT repo FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupId, revisionHash, member.member_identity)) as unknown as { repo: string }[];
+      const reworkRow = rework ? db.prepare("SELECT plan_binding_json FROM group_rework WHERE group_id=? AND revision_hash=? AND state='running'").get(groupId, revisionHash) as { plan_binding_json: string } | undefined : undefined;
+      const reworkRepos = reworkRow ? (JSON.parse(reworkRow.plan_binding_json) as { repositories: string[] }).repositories : [];
+      const rows = rework ? allRows.filter((row) => reworkRepos.includes(row.repo)) : allRows;
       if (!rows.length) return refuse(`${ticket}: coordination-only member has no repository readiness command`);
       const receipt: ReadyReceipt = { ticket, parts: {} };
       const parts: ReadyPart[] = [];
       for (const row of rows) {
-        const kind = ticket === process.env.YOKEMATE_GROUP_ROOT ? "root-own" : "member";
+        const kind = rework ? "integration" : ticket === process.env.YOKEMATE_GROUP_ROOT ? "root-own" : "member";
         const scope = resolveGroupWorkScope(db, join(root, "work", process.env.YOKEMATE_GROUP_ROOT!), { groupId, revisionHash, memberIdentity: member.member_identity, kind, repo: row.repo });
         const part = { repo: row.repo, worktree: scope.worktree! };
         const outcome = readyPart(ticket, part, deps.run ?? defaultRun, scope.branch!);

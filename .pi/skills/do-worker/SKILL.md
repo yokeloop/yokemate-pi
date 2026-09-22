@@ -30,6 +30,8 @@ The plan is one document for the whole ticket, however many repositories it touc
 
 ## Pipeline
 
+When `YOKEMATE_GROUP_MEMBER` is set, this is a parent-delegated group member run: its immutable worktrees, branches, internal `<ROOT>` targets and scope receipts are already prepared and listed in the launch prompt. Skip ordinary worktree creation, never create `work/<MEMBER>/<repo>`, and do not change a target to an external base. `pnpm ready <MEMBER>` and `pnpm record-report <MEMBER>` resolve only those scoped worktrees and do not promote the child through the single-ticket lifecycle.
+
 Every part passes through the same stages, in order:
 
 ```

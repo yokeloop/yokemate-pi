@@ -19,6 +19,8 @@ import { openDb } from "./db.ts";
 import { syncPull } from "./git-sync.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
+import { prepareGroupWorkScopes } from "./group-scope.ts";
+import type { GroupExecutionManifest } from "./group-plan.ts";
 
 /** The ticket's plan in knowledge/<org>/<project>/ai/<slug>/, by the slug's
  *  key prefix. Old slugs are lowercase (`acme-326-…` for ACME-326), so the match
@@ -114,6 +116,17 @@ export function adopt(
     throw new Error(`${key}: в плане ${planPath} нет секции Affected repositories — переносить нечего`);
 
   const db = openDb(join(root, "yokemate.db"));
+  const group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked','review','accepted') ORDER BY updated_at DESC LIMIT 1").get(key) as { id: string; active_revision: string; phase: string } | undefined;
+  if (group) {
+    try {
+      const revision = db.prepare("SELECT manifest_json FROM group_revision WHERE group_id=? AND revision_hash=?").get(group.id, group.active_revision) as { manifest_json: string } | undefined;
+      if (!revision) throw new Error(`${key}: active group revision is missing`);
+      prepareGroupWorkScopes(db, join(root, "work", key), { groupId: group.id, revisionHash: group.active_revision, manifest: JSON.parse(revision.manifest_json) as GroupExecutionManifest });
+      const rows = db.prepare("SELECT repo,role,final_pr FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(group.id, group.active_revision) as unknown as { repo: string; role: string; final_pr: string | null }[];
+      if (rows.some((row) => !row.final_pr) && ["review", "accepted"].includes(group.phase)) throw new Error(`${key}: group review topology has missing final PR identities`);
+      return { repeat: true, planPath, parts: rows.filter((row) => row.final_pr).map((row) => ({ repo: row.repo, role: row.role, pr: row.final_pr! })) };
+    } finally { db.close(); }
+  }
   // Pre-flight before any git side effect: a move the stage machine would
   // refuse must not leave worktrees behind — a standing folder would mask the
   // adopt instruction on the next /review while the row stays unmovable. The

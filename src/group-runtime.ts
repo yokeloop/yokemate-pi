@@ -64,6 +64,17 @@ export class GroupRuntime {
       this.db.prepare("UPDATE group_member SET execution='queued',blocker=NULL,updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND execution IN ('running','blocked')").run(this.groupId, this.revisionHash);
       this.db.prepare("UPDATE member_claim SET state='active',updated_at=datetime('now') WHERE group_id=? AND revision_hash=?").run(this.groupId, this.revisionHash);
     }
+    const integrated = this.db.prepare("SELECT COUNT(*) count FROM group_member WHERE group_id=? AND revision_hash=? AND execution!='integrated'").get(this.groupId, this.revisionHash) as { count: number };
+    const trackerPending = this.db.prepare(`SELECT COUNT(*) count FROM group_member m WHERE m.group_id=? AND m.revision_hash=? AND m.execution='integrated' AND NOT EXISTS (
+      SELECT 1 FROM group_effect e WHERE e.effect_key='to-verify:' || m.group_id || ':' || m.revision_hash || ':' || m.ticket AND e.state='confirmed'
+    )`).get(this.groupId, this.revisionHash) as { count: number };
+    if (integrated.count === 0 && trackerPending.count === 0) {
+      const moved = applyGroupMove(this.db, { groupId: this.groupId, revisionHash: this.revisionHash, expectedPhase: "running", toPhase: "review", idempotencyKey: `group-review:${this.cycleId}` });
+      if (!moved.ok) throw new Error(moved.refuse);
+      this.state = "complete";
+      this.deps.onChange?.();
+      return;
+    }
     this.pump();
   }
 

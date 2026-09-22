@@ -42,16 +42,23 @@ export function recordReport(
   env: MoveEnv,
   deps: Partial<{ gather: typeof gatherGateFacts; push: typeof syncPush }> = {},
 ): { repeat: boolean } {
-  const groupEnv = env as MoveEnv & { YOKEMATE_GROUP_ID?: string; YOKEMATE_GROUP_REVISION?: string; YOKEMATE_GROUP_ROOT?: string; YOKEMATE_GROUP_MEMBER?: string };
+  const groupEnv = env as MoveEnv & { YOKEMATE_GROUP_ID?: string; YOKEMATE_GROUP_REVISION?: string; YOKEMATE_GROUP_ROOT?: string; YOKEMATE_GROUP_MEMBER?: string; YOKEMATE_GROUP_ROLE?: string };
   if (groupEnv.YOKEMATE_GROUP_ID && groupEnv.YOKEMATE_GROUP_REVISION && groupEnv.YOKEMATE_GROUP_ROOT && groupEnv.YOKEMATE_GROUP_MEMBER === ticket) {
     const db = openDb(join(root, "yokemate.db"));
     try {
       const member = db.prepare("SELECT member_identity,execution FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, ticket) as { member_identity: string; execution: string } | undefined;
-      if (!member || member.execution !== "running") throw new Error(`${ticket}: group member is not running in this owned revision`);
-      const rows = db.prepare("SELECT repo,role,source_ref,target_ref FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, member.member_identity) as unknown as { repo: string; role: string; source_ref: string; target_ref: string }[];
-      if (rows.length !== parts.length || rows.some((row) => !parts.some((part) => part.repo === row.repo && part.role === row.role && part.branch === row.source_ref))) throw new Error(`${ticket}: report parts differ from the immutable group scope`);
+      if (!member) throw new Error(`${ticket}: group member scope is unavailable`);
+      const rework = groupEnv.YOKEMATE_GROUP_ROLE === "rework";
+      if (!rework && member.execution !== "running") throw new Error(`${ticket}: group member is not running in this owned revision`);
+      const allRows = (rework
+        ? db.prepare("SELECT repo,role FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION)
+        : db.prepare("SELECT repo,role,source_ref,target_ref FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, member.member_identity)) as unknown as { repo: string; role: string; source_ref?: string; target_ref?: string }[];
+      const reworkRow = rework ? db.prepare("SELECT plan_binding_json FROM group_rework WHERE group_id=? AND revision_hash=? AND state='running'").get(groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION) as { plan_binding_json: string } | undefined : undefined;
+      const reworkRepos = reworkRow ? (JSON.parse(reworkRow.plan_binding_json) as { repositories: string[] }).repositories : [];
+      const rows = rework ? allRows.filter((row) => reworkRepos.includes(row.repo)) : allRows;
+      if (rows.length !== parts.length || rows.some((row) => !parts.some((part) => part.repo === row.repo && part.role === row.role && part.branch === (rework ? groupEnv.YOKEMATE_GROUP_ROOT : row.source_ref)))) throw new Error(`${ticket}: report parts differ from the immutable group scope`);
       const scopes = parts.map((part) => {
-        const kind = ticket === groupEnv.YOKEMATE_GROUP_ROOT ? "root-own" : "member";
+        const kind = rework ? "integration" : ticket === groupEnv.YOKEMATE_GROUP_ROOT ? "root-own" : "member";
         const scope = resolveGroupWorkScope(db, join(root, "work", groupEnv.YOKEMATE_GROUP_ROOT!), { groupId: groupEnv.YOKEMATE_GROUP_ID!, revisionHash: groupEnv.YOKEMATE_GROUP_REVISION!, memberIdentity: member.member_identity, kind, repo: part.repo });
         return { part, scope };
       });
@@ -59,7 +66,18 @@ export function recordReport(
       const verdict = verifyGate(facts);
       assertMandatoryBoundary("workflow.quality-gates", verdict.ok, verdict.ok ? undefined : verdict.reason);
       assertMandatoryBoundary("workflow.ready-pr-report", verdict.ok, verdict.ok ? undefined : verdict.reason);
-      for (const fact of facts.parts) db.prepare("UPDATE group_part SET pr_identity=?,head_sha=?,base_sha=?,readiness_json=?,outcome=NULL WHERE group_id=? AND revision_hash=? AND member_identity=? AND repo=?").run(fact.pr.url, fact.pr.headRefOid, fact.pr.baseRefOid, JSON.stringify({ ok: true, headSha: fact.pr.headRefOid, baseSha: fact.pr.baseRefOid, scopeId: scopes.find(({ part }) => part.repo === fact.repo)!.scope.scopeId }), groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, member.member_identity, fact.repo);
+      for (const fact of facts.parts) {
+        if (rework) db.prepare("UPDATE group_repository SET final_pr=?,head_sha=?,ship_state='pending' WHERE group_id=? AND revision_hash=? AND repo=?").run(fact.pr.url, fact.pr.headRefOid, groupEnv.YOKEMATE_GROUP_ID!, groupEnv.YOKEMATE_GROUP_REVISION!, fact.repo);
+        else db.prepare("UPDATE group_part SET pr_identity=?,head_sha=?,base_sha=?,readiness_json=?,outcome=NULL WHERE group_id=? AND revision_hash=? AND member_identity=? AND repo=?").run(fact.pr.url, fact.pr.headRefOid, fact.pr.baseRefOid, JSON.stringify({ ok: true, headSha: fact.pr.headRefOid, baseSha: fact.pr.baseRefOid, scopeId: scopes.find(({ part }) => part.repo === fact.repo)!.scope.scopeId }), groupEnv.YOKEMATE_GROUP_ID, groupEnv.YOKEMATE_GROUP_REVISION, member.member_identity, fact.repo);
+      }
+      if (rework) {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          db.prepare("UPDATE group_rework SET state='ready',updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND state='running'").run(groupEnv.YOKEMATE_GROUP_ID!, groupEnv.YOKEMATE_GROUP_REVISION!);
+          db.prepare("UPDATE group_acceptance SET state='superseded' WHERE group_id=? AND revision_hash=? AND state='current'").run(groupEnv.YOKEMATE_GROUP_ID!, groupEnv.YOKEMATE_GROUP_REVISION!);
+          db.exec("COMMIT");
+        } catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+      }
       return { repeat: false };
     } finally { db.close(); }
   }

@@ -564,6 +564,22 @@ export function openDb(path: string): DatabaseSync {
     CREATE UNIQUE INDEX IF NOT EXISTS group_acceptance_current
       ON group_acceptance(group_id, revision_hash) WHERE state = 'current';
 
+    CREATE TABLE IF NOT EXISTS group_rework (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      candidate_hash TEXT NOT NULL,
+      plan_binding_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending','running','ready','superseded')),
+      review_source_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, revision_hash, candidate_hash),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS group_rework_current
+      ON group_rework(group_id, revision_hash) WHERE state IN ('pending','running');
+
     CREATE TABLE IF NOT EXISTS group_effect (
       effect_key TEXT PRIMARY KEY,
       group_id TEXT NOT NULL REFERENCES task_group(id),

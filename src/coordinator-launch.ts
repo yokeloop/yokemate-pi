@@ -12,12 +12,13 @@ import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { resolveGroupWorkScope } from "./group-scope.ts";
+import { groupClaimForTicket } from "./group-state.ts";
 
 export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
 export interface CoordinatorOrigin extends MoveEnv { sessionId?: string; runId?: string; cwd?: string; pane?: string; parentPane?: string }
 export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; passportPath?: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string; remote?: string; observedHead?: string; targetBranch?: string; worktree?: string; scopeId?: string }
-export interface PreparedGroup { groupId: string; revisionHash: string; root: string; role: "parent" | "member"; memberIdentity?: string; ownWork?: "implementation" | "coordination-only" }
+export interface PreparedGroup { groupId: string; revisionHash: string; root: string; role: "parent" | "member" | "rework"; memberIdentity?: string; ownWork?: "implementation" | "coordination-only" }
 export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From; group?: PreparedGroup }
 
 const KEY = /^[A-Z][A-Z0-9]*-\d+$/;
@@ -79,14 +80,38 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
   if (request.mode !== "do" || request.tickets.length !== 1) fail("prepareDo needs exactly one do ticket");
   const ticket = request.tickets[0]!;
   const state = openDb(join(root, "yokemate.db"));
-  const activeGroup = delegatedGroup
+  const rework = delegatedGroup ? undefined : state.prepare(`SELECT g.id,g.root_ticket,g.active_revision,g.phase,r.plan_binding_json,r.candidate_hash
+    FROM task_group g JOIN group_rework r ON r.group_id=g.id AND r.revision_hash=g.active_revision
+    WHERE g.root_ticket=? AND g.phase='review' AND r.state IN ('pending','running') ORDER BY r.updated_at DESC LIMIT 1`).get(ticket) as { id: string; root_ticket: string; active_revision: string; phase: string; plan_binding_json: string; candidate_hash: string } | undefined;
+  const activeGroup = rework ?? (delegatedGroup
     ? state.prepare("SELECT id,root_ticket,active_revision,phase FROM task_group WHERE id=? AND active_revision=?").get(delegatedGroup.groupId, delegatedGroup.revisionHash) as { id: string; root_ticket: string; active_revision: string; phase: string } | undefined
-    : state.prepare("SELECT id,root_ticket,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { id: string; root_ticket: string; active_revision: string; phase: string } | undefined;
+    : state.prepare("SELECT id,root_ticket,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { id: string; root_ticket: string; active_revision: string; phase: string } | undefined);
   if (activeGroup) {
     const revision = state.prepare("SELECT manifest_json,bindings_json FROM group_revision WHERE group_id=? AND revision_hash=?").get(activeGroup.id, activeGroup.active_revision) as { manifest_json: string; bindings_json: string } | undefined;
     const activeRevision = revision ?? fail(`${ticket}: active group revision is missing`);
     const manifest = JSON.parse(activeRevision.manifest_json) as { ownerProject: string; members: { ticket: string; ownWork: "implementation" | "coordination-only"; implementationRepos: string[] }[]; repositories: { repo: string; role: string }[] };
     const bindings = JSON.parse(activeRevision.bindings_json) as { ticket: string; path: string }[];
+    if (rework) {
+      const reworkBinding = JSON.parse(rework.plan_binding_json) as { ticket: string; path: string; contentHash: string; scopeHash: string; repositories: string[] };
+      if (request.plan && resolve(request.plan) !== resolve(reworkBinding.path)) fail(`${ticket}: group rework plan differs from the recorded binding`);
+      const rootMember = state.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(activeGroup.id, activeGroup.active_revision, ticket) as { member_identity: string };
+      const allRows = state.prepare("SELECT repo,role FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(activeGroup.id, activeGroup.active_revision) as unknown as { repo: string; role: string }[];
+      const rows = allRows.filter((row) => reworkBinding.repositories.includes(row.repo));
+      if (!rows.length || rows.length !== reworkBinding.repositories.length) fail(`${ticket}: group rework repositories differ from the active group scope`);
+      const parts = rows.map((row): PreparedPart => {
+        const [org, name] = row.repo.split("/");
+        const passport = state.prepare("SELECT path,figma_mcp,figma_url FROM project WHERE org=? AND repo=?").get(org, name) as { path: string; figma_mcp: string | null; figma_url: string | null } | undefined;
+        if (!passport) throw new Error(`${row.repo}: passport is missing`);
+        const scope = resolveGroupWorkScope(state, join(root, "work", ticket), { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, memberIdentity: rootMember.member_identity, kind: "integration", repo: row.repo });
+        return { repo: row.repo, org: org!, role: row.role, roleAssumed: false, path: passport.path, passportPath: passport.path, figmaMcp: passport.figma_mcp ?? undefined, figmaUrl: passport.figma_url ?? undefined, branch: scope.branch!, targetBranch: scope.targetBranch!, worktree: scope.worktree!, remote: scope.remote!, scopeId: scope.scopeId, pr: scope.pr ?? undefined };
+      });
+      const model = request.model ?? modelForTicket(state, ticket, "do") ?? poolModel(dataRoot(root), "do");
+      const folder = join(root, "work", ticket);
+      settings(root, folder);
+      state.prepare("UPDATE group_rework SET state='running',updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND candidate_hash=? AND state IN ('pending','running')").run(activeGroup.id, activeGroup.active_revision, rework.candidate_hash);
+      state.close();
+      return { mode: "do", tickets: [ticket], model, cwd: folder, plan: reworkBinding.path, plans: { [ticket]: reworkBinding.path }, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:do-worker ${ticket}. This is group rework for candidate ${rework.candidate_hash}. Read ${reworkBinding.path} fully. Work only in the listed integration worktrees on branch ${ticket}; do not restart members or change external bases. Update the existing final PRs, run scoped readiness and independent review, then record the exact group rework result and call coordinator_finish done.`, group: { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, root: ticket, role: "rework" } };
+    }
     const memberTicket = delegatedGroup?.member ?? ticket;
     const member = manifest.members.find((item) => item.ticket === memberTicket);
     const binding = bindings.find((item) => item.ticket === memberTicket);
@@ -167,6 +192,11 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
   validateCoordinatorRequest(request);
   if (request.mode !== "ship" || request.tickets.length !== 1) fail("prepareShip needs exactly one ship ticket");
   const db = openDb(join(root, "yokemate.db"));
+  const claim = groupClaimForTicket(db, request.tickets[0]!);
+  if (claim) {
+    const owner = db.prepare("SELECT root_ticket FROM task_group WHERE id=?").get(claim.groupId) as { root_ticket: string } | undefined;
+    if (!owner || owner.root_ticket !== request.tickets[0]) fail(`${request.tickets[0]}: claimed by active task group ${claim.groupId}; ship the group root instead`);
+  }
   const group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('accepted','shipping','done') ORDER BY updated_at DESC LIMIT 1").get(request.tickets[0]!) as { id: string; active_revision: string; phase: string } | undefined;
   if (group) {
     const ticket = request.tickets[0]!;

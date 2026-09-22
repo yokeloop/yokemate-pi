@@ -103,7 +103,7 @@ export function refreshQueuedMemberWorkScopes(db: DatabaseSync, taskRoot: string
 
 export function prepareGroupWorkScopes(db: DatabaseSync, taskRoot: string, input: { groupId: string; revisionHash: string; manifest: GroupExecutionManifest }): PreparedGroupScopes {
   const group = db.prepare("SELECT root_ticket,active_revision,phase FROM task_group WHERE id=?").get(input.groupId) as GroupRow | undefined;
-  if (!group || group.active_revision !== input.revisionHash || !["planned", "running", "blocked"].includes(group.phase)) throw new Error("group work preparation requires the active executable revision");
+  if (!group || group.active_revision !== input.revisionHash || !["planned", "running", "blocked", "review", "accepted"].includes(group.phase)) throw new Error("group work preparation requires the active executable or review revision");
   const repositories: WorkScope[] = [];
   const members: WorkScope[] = [];
   for (const repository of input.manifest.repositories) {
@@ -112,16 +112,18 @@ export function prepareGroupWorkScopes(db: DatabaseSync, taskRoot: string, input
     if (!passport) throw new Error(`${repository.repo}: no exact project passport`);
     const clone = realpathSync(passport.path);
     const remote = git(clone, "remote", "get-url", "origin");
+    execFileSync("git", ["-C", clone, "fetch", "origin"], { stdio: "pipe" });
     const remoteHead = git(clone, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
     if (!remoteHead.startsWith("origin/")) throw new Error(`${repository.repo}: origin/HEAD is unavailable`);
-    const externalBase = remoteHead.slice("origin/".length);
-    const baseSha = git(clone, "rev-parse", `origin/${externalBase}^{commit}`);
+    let externalBase = remoteHead.slice("origin/".length);
+    let baseSha = git(clone, "rev-parse", `origin/${externalBase}^{commit}`);
     const existing = db.prepare("SELECT remote,role,integration_branch,external_base,base_sha FROM group_repository WHERE group_id=? AND revision_hash=? AND repo=?").get(input.groupId, input.revisionHash, repository.repo) as { remote: string; role: string; integration_branch: string; external_base: string; base_sha: string } | undefined;
+    if (existing && ["review", "accepted"].includes(group.phase)) { externalBase = existing.external_base; baseSha = existing.base_sha; }
     const expected = { remote, role: repository.role, integration_branch: group.root_ticket, external_base: externalBase, base_sha: baseSha };
     if (existing && JSON.stringify(existing) !== JSON.stringify(expected)) throw new Error(`${repository.repo}: registered integration scope changed`);
     if (!existing) db.prepare("INSERT INTO group_repository (group_id,revision_hash,repo,remote,role,integration_branch,external_base,base_sha) VALUES (?,?,?,?,?,?,?,?)").run(input.groupId, input.revisionHash, repository.repo, remote, repository.role, group.root_ticket, externalBase, baseSha);
     const integrationPath = join(resolve(taskRoot), "integration", org!, name!);
-    ensureWorktree(clone, integrationPath, group.root_ticket, `origin/${externalBase}`);
+    ensureWorktree(clone, integrationPath, group.root_ticket, existing && ["review", "accepted"].includes(group.phase) ? baseSha : `origin/${externalBase}`);
     const remoteIntegration = git(clone, "ls-remote", "--heads", "origin", group.root_ticket);
     if (!remoteIntegration) execFileSync("git", ["-C", integrationPath, "push", "--set-upstream", "origin", `${group.root_ticket}:${group.root_ticket}`], { stdio: "pipe" });
     else {

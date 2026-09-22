@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openDb } from "../src/db.ts";
-import { activateGroupRevision, createPlanningGroup, reserveMemberClaims } from "../src/group-state.ts";
+import { activateGroupRevision, createPlanningGroup, recordGroupEffect, reserveMemberClaims } from "../src/group-state.ts";
 import { integrateMemberPart, type GroupIntegrationDeps, type ReviewerEvidence } from "../src/group-integration.ts";
+import { reconcileGroupEffects } from "../src/group-recovery.ts";
 import { resolveGroupWorkScope } from "../src/group-scope.ts";
 import type { MergeSnapshot } from "../src/coordinator-merge.ts";
 
@@ -60,6 +61,34 @@ test("integrates only exact ready and reviewer evidence then records To Verify",
   const repeat = await integrateMemberPart(db, scope, evidence, head, operations);
   assert.equal(repeat.repeated, true);
   assert.equal(operations.counts().merges, 1);
+});
+
+test("reconciles interrupted integration and tracker effects before runtime resume", async () => {
+  const { db, groupId } = fixture();
+  const integrationKey = `integrate:${groupId}:${revisionHash}:one/repo:${pr}:${head}:YM-1`;
+  recordGroupEffect(db, { key: integrationKey, groupId, revisionHash, type: "integrate", scope: { member: "yt:YM-2", repo: "one/repo", pr }, input: { head, base, target: "YM-1", reviewerArtifact: "f".repeat(64) }, state: "intent" });
+  const trackerKey = `to-verify:${groupId}:${revisionHash}:YM-2`;
+  recordGroupEffect(db, { key: trackerKey, groupId, revisionHash, type: "to_verify", scope: { member: "yt:YM-2", ticket: "YM-2" }, input: { state: "To Verify" }, state: "unknown" });
+  let trackerCalls = 0;
+  await reconcileGroupEffects(db, { groupId, revisionHash }, {
+    observeIntegration: async () => ({ state: "MERGED", headRefOid: head, baseRefName: "YM-1", mergeCommit: { oid: mergeCommit } }),
+    trackerToVerify: async (ticket) => { assert.equal(ticket, "YM-2"); trackerCalls++; },
+  });
+  assert.equal(trackerCalls, 1);
+  assert.deepEqual({ ...(db.prepare("SELECT execution,stage FROM group_member WHERE ticket='YM-2'").get() as object) }, { execution: "integrated", stage: "integrated" });
+  assert.deepEqual((db.prepare("SELECT state FROM group_effect WHERE effect_key IN (?,?) ORDER BY effect_key").all(integrationKey, trackerKey) as unknown as { state: string }[]).map((row) => row.state), ["confirmed", "confirmed"]);
+});
+
+test("reconciliation records an observed open PR without manufacturing a merge", async () => {
+  const { db, groupId } = fixture();
+  const key = `integrate:${groupId}:${revisionHash}:one/repo:${pr}:${head}:YM-1`;
+  recordGroupEffect(db, { key, groupId, revisionHash, type: "integrate", scope: { member: "yt:YM-2", repo: "one/repo", pr }, input: { head, base, target: "YM-1", reviewerArtifact: "f".repeat(64) }, state: "unknown" });
+  await reconcileGroupEffects(db, { groupId, revisionHash }, {
+    observeIntegration: async () => ({ state: "OPEN", headRefOid: head, baseRefName: "YM-1" }),
+    trackerToVerify: async () => { throw new Error("unexpected tracker call"); },
+  });
+  assert.equal((db.prepare("SELECT state FROM group_effect WHERE effect_key=?").get(key) as { state: string }).state, "failed");
+  assert.equal((db.prepare("SELECT execution FROM group_member WHERE ticket='YM-2'").get() as { execution: string }).execution, "ready");
 });
 
 test("stale reviewer, readiness, head and dead owner fail before merge", async () => {

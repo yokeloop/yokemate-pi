@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openDb } from "../src/db.ts";
-import { activateGroupRevision, createPlanningGroup, reserveMemberClaims } from "../src/group-state.ts";
+import { activateGroupRevision, createPlanningGroup, recordGroupEffect, reserveMemberClaims } from "../src/group-state.ts";
 import { startGroupDo, type GroupDelegateRequest, type GroupMemberLaunch } from "../src/group-runtime.ts";
 import type { GroupExecutionManifest } from "../src/group-plan.ts";
 
@@ -27,6 +27,18 @@ function fixture(delegate: (request: GroupDelegateRequest) => Promise<GroupMembe
 }
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("resume completes a fully integrated group only after every tracker effect is confirmed", () => {
+  const db = openDb(":memory:");
+  const groupId = createPlanningGroup(db, { id: "g-resume", rootIdentity: "yt:YM-1", rootTicket: "YM-1", ownerProject: "o/r" });
+  reserveMemberClaims(db, { groupId, treeHash, members: members.map((ticket) => `yt:${ticket}`), owners: [{ runtimeId: "r", runId: "x", sessionId: "s" }] });
+  activateGroupRevision(db, { groupId, revisionHash, treeHash, manifest, bindings: {}, compatibility: {}, approachReceiptId: "a", members: members.map((ticket, index) => ({ identity: `yt:${ticket}`, ticket, parentIdentity: index ? "yt:YM-1" : null, execution: "integrated", stage: "integrated" })) });
+  db.prepare("UPDATE task_group SET phase='running' WHERE id=?").run(groupId);
+  for (const ticket of members) recordGroupEffect(db, { key: `to-verify:${groupId}:${revisionHash}:${ticket}`, groupId, revisionHash, type: "to_verify", scope: { member: `yt:${ticket}`, ticket }, input: { state: "To Verify" }, state: "confirmed", outcome: { state: "To Verify" } });
+  const runtime = startGroupDo(db, groupId, revisionHash, manifest, { capacity: () => 2, delegate: async () => { throw new Error("unexpected delegation"); } });
+  assert.equal(runtime.snapshot().state, "complete");
+  assert.equal((db.prepare("SELECT phase FROM task_group WHERE id=?").get(groupId) as { phase: string }).phase, "review");
+});
 
 test("starts independent members up to capacity and retains overflow queued", async () => {
   const launched: string[] = [];

@@ -146,6 +146,15 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
       const ticket = prepared.tickets[0]!;
       const db = openDb(join(root, "yokemate.db"));
       if (prepared.group) {
+        if (prepared.group.role === "rework") {
+          const rework = db.prepare("SELECT state FROM group_rework WHERE group_id=? AND revision_hash=? ORDER BY updated_at DESC LIMIT 1").get(prepared.group.groupId, prepared.group.revisionHash) as { state: string } | undefined;
+          if (rework?.state !== "ready") return { ok: false, reason: `${ticket}: group rework is ${rework?.state ?? "missing"}` };
+          const allRows = db.prepare("SELECT repo,final_pr FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(prepared.group.groupId, prepared.group.revisionHash) as unknown as { repo: string; final_pr: string | null }[];
+          const rows = allRows.filter((row) => prepared.parts.some((part) => part.repo === row.repo));
+          if (rows.length !== prepared.parts.length || rows.some((row) => !row.final_pr)) return { ok: false, reason: `${ticket}: group rework final PR set is incomplete` };
+          const verdict = verifyGate(gatherScopedGateFacts(ticket, prepared.parts.map((part) => ({ repo: part.repo, selector: rows.find((row) => row.repo === part.repo)!.final_pr!, worktree: part.worktree!, branch: part.branch, targetBranch: part.targetBranch, receiptPath: join(part.worktree!, ".yokemate-ready.json"), expectedScopeId: part.scopeId }))));
+          return verdict.ok ? { ok: true, parts: rows.map((row) => row.repo) } : { ok: false, reason: verdict.reason };
+        }
         if (prepared.group.role === "parent") {
           const group = db.prepare("SELECT phase FROM task_group WHERE id=? AND active_revision=?").get(prepared.group.groupId, prepared.group.revisionHash) as { phase: string } | undefined;
           if (group?.phase !== "review") return { ok: false, reason: `${prepared.group.root}: group is still ${group?.phase ?? "missing"}` };

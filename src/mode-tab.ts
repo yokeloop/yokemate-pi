@@ -15,6 +15,7 @@ import { readRuntimeSettings } from "./guard-policy.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 import type { Mode as ModelMode } from "./mode-guard.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
+import { groupClaimForTicket } from "./group-state.ts";
 
 function incompleteTerminalCapture(error: unknown): boolean {
   const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
@@ -272,6 +273,16 @@ if (import.meta.filename === process.argv[1]) {
     } catch (error) { fail((error as Error).message); }
   } else for (const { ticket, workerWords } of targets) {
     try {
+      if (ticket) {
+        const state = openDb(join(ROOT, "yokemate.db"));
+        try {
+          const claim = groupClaimForTicket(state, ticket);
+          if (claim) {
+            const group = state.prepare("SELECT root_ticket FROM task_group WHERE id=?").get(claim.groupId) as { root_ticket: string } | undefined;
+            if (!group || group.root_ticket !== ticket) throw new Error(`${ticket}: claimed by active task group ${claim.groupId}; launch the group root instead`);
+          }
+        } finally { state.close(); }
+      }
       let model = parsed.model;
       if (!model) {
         try {

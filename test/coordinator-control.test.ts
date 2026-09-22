@@ -6,7 +6,7 @@ import { createConnection } from "node:net";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, PlanRecorderFences, requestCoordinatorCancel, coordinatorSocketPath, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestReviewRecordWithStatus, requestShipFinalize, resolveCoordinatorParent, type ControlOrigin } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, PlanRecorderFences, requestCoordinatorCancel, coordinatorSocketPath, processStarttime, requestCoordinator, requestCoordinatorFinish, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestReviewRecordWithStatus, requestShipFinalize, resolveCoordinatorParent, type ControlOrigin } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 import { openDb } from "../src/db.ts";
 import { readCandidatePlanSnapshot, type PlanBinding } from "../src/plan-binding.ts";
@@ -97,6 +97,29 @@ test("coordinator control accepts one bound live origin and rejects a wrong pare
     const brokenChain = await requestCoordinator(root, { mode: "do", tickets: ["YM-5"] }, { ...origin, sessionId: "other-panel", pane: "plan", parentPane: "missing", mode: "plan" }, { sessionId: "session", runtimeId: "runtime" }, env);
     assert.equal(brokenChain.state, "refused");
     assert.equal(launches, 2);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("registered coordinator surface sends a correlated terminal proposal to its parent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-finish-"));
+  const runtime = mkdtempSync(join(tmpdir(), "coordinator-finish-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  let observed: unknown;
+  const server = bindCoordinatorControl(root, {
+    async launch() { return { runId: "run" }; },
+    async finish(runId, outcome, summary, reason, origin) { observed = { runId, outcome, summary, reason, sessionId: origin.sessionId }; },
+    status: (requestId) => ({ requestId, state: "status" }), cancel: async () => {},
+  }, { root, sessionId: "session", runtimeId: "runtime", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root }, env);
+  try {
+    if (!server.listening) await once(server, "listening");
+    const origin = { sessionId: "session", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+    const reply = await requestCoordinatorFinish(root, "run", "done", "group integrated", undefined, origin, { sessionId: "session", runtimeId: "runtime" }, env);
+    assert.equal(reply.state, "accepted");
+    assert.deepEqual(observed, { runId: "run", outcome: "done", summary: "group integrated", reason: undefined, sessionId: "session" });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
