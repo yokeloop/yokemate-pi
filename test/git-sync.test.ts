@@ -56,6 +56,10 @@ Record the fixture plan.
 The exact plan is recorded.
 `;
 
+function recordOptions(engine: string, ticket: string, plan: string, prepared: ReturnType<typeof prepareRecord>, extra: { signal?: AbortSignal } = {}) {
+  return { expectedBinding: prepared.binding, expectedContentHash: prepared.binding.contentHash, requestedPath: plan, scope: { ticket, project: "org/repo", knowledgeRoot: join(engine, "home", "knowledge", "org", "repo") }, recordId: prepared.recordId, ...extra };
+}
+
 function prepareRecord(engine: string, ticket: string, plan: string) {
   const binding = readCandidatePlanSnapshot(engine, ticket, plan);
   const db = openDb(join(engine, "yokemate.db"));
@@ -348,7 +352,7 @@ test("plan commit excludes foreign staged files and duplicate record does not re
     writeFileSync(join(engine, ".pi", "settings.json"), "{}");
     execFileSync("mv", [a, join(engine, "home")]);
     const home = join(engine, "home");
-    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
     mkdirSync(join(plan, ".."), { recursive: true });
     writeFileSync(plan, planText("YM-1"));
     writeFileSync(join(home, "foreign.txt"), "foreign\n");
@@ -357,17 +361,17 @@ test("plan commit excludes foreign staged files and duplicate record does not re
     db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
     db.close();
     const prepared = prepareRecord(engine, "YM-1", plan);
-    const first = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId });
+    const first = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared));
     assert.equal(first.recorded, true);
     assert.equal(first.localSync.state, "committed");
     const files = git(home, "show", "--name-only", "--format=", first.localSync.commit!).trim().split("\n");
-    assert.ok(files.includes("knowledge/org/repo/ai/YM-1-work/plan.md"));
+    assert.ok(files.includes("knowledge/org/repo/ai/YM-1-work/YM-1-work-plan.md"));
     assert.ok(files.some((file) => file.startsWith("journal/")));
     assert.equal(files.includes("foreign.txt"), false);
     assert.equal(git(home, "diff", "--cached", "--name-only").trim(), "foreign.txt");
     const journalFile = join(home, "journal", readdirSync(join(home, "journal"))[0]!);
     const before = readFileSync(journalFile, "utf8");
-    const repeat = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId });
+    const repeat = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared));
     assert.equal(repeat.repeat, true);
     assert.equal(readFileSync(journalFile, "utf8"), before);
     assert.equal(git(origin, "log", "-1", "--format=%s", "main").trim(), "YM-1 план");
@@ -383,7 +387,7 @@ test("large candidate snapshot is compacted before locked recorder spawn", async
     writeFileSync(join(engine, ".pi", "settings.json"), "{}");
     execFileSync("mv", [a, join(engine, "home")]);
     const home = join(engine, "home");
-    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
     mkdirSync(join(plan, ".."), { recursive: true });
     const largePlan = planText("YM-1").replace("1. Record it.", `1. Record it.\n${"- Preserve this detailed requirement.\n".repeat(1_500)}`);
     writeFileSync(plan, largePlan);
@@ -392,7 +396,7 @@ test("large candidate snapshot is compacted before locked recorder spawn", async
     db.close();
     const prepared = prepareRecord(engine, "YM-1", plan);
     assert.ok(prepared.binding.bytes.length > 50_000);
-    const recorded = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId });
+    const recorded = await recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared));
     assert.equal(recorded.recorded, true);
     const state = openDb(join(engine, "yokemate.db"));
     assert.equal((state.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get() as { stage: string }).stage, "planned");
@@ -410,7 +414,7 @@ test("a cancelled plan recorder waiting for the canonical lock makes no mutation
     writeFileSync(join(engine, ".pi", "settings.json"), "{}");
     execFileSync("mv", [a, join(engine, "home")]);
     const home = join(engine, "home");
-    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
     mkdirSync(join(plan, ".."), { recursive: true });
     writeFileSync(plan, planText("YM-1"));
     const db = openDb(join(engine, "yokemate.db"));
@@ -420,7 +424,7 @@ test("a cancelled plan recorder waiting for the canonical lock makes no mutation
     holder = spawn("flock", ["--exclusive", "--no-fork", gitMutationLockPath(home), "sh", "-c", "echo locked; exec sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
     await new Promise<void>((resolve) => holder!.stdout!.once("data", () => resolve()));
     const controller = new AbortController();
-    const pending = recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId, signal: controller.signal });
+    const pending = recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared, { signal: controller.signal }));
     controller.abort();
     await assert.rejects(pending, /cancelled before lock acquisition/);
     assert.equal(readFileSync(plan, "utf8").startsWith("# YM-1"), true);
@@ -439,13 +443,13 @@ test("plan changed while waiting for record lock is refused before CAS", async (
     writeFileSync(join(engine, ".pi", "settings.json"), "{}");
     execFileSync("mv", [a, join(engine, "home")]);
     const home = join(engine, "home");
-    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+    const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
     mkdirSync(join(plan, ".."), { recursive: true });
     writeFileSync(plan, planText("YM-1"));
     const prepared = prepareRecord(engine, "YM-1", plan);
     holder = spawn("flock", ["--exclusive", "--no-fork", gitMutationLockPath(home), "sh", "-c", "echo locked; exec sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
     await new Promise<void>((resolve) => holder!.stdout!.once("data", () => resolve()));
-    const pending = recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId });
+    const pending = recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared));
     writeFileSync(plan, planText("YM-1").replace("Record the fixture plan.", "Changed while locked."));
     holder.kill("SIGTERM");
     await assert.rejects(pending, /approval (?:content hash|scope) changed|binding_changed/);
@@ -468,7 +472,7 @@ test("missing scout or plan snapshot is refused before CAS", async () => {
       writeFileSync(join(engine, ".pi", "settings.json"), "{}");
       execFileSync("mv", [a, join(engine, "home")]);
       const home = join(engine, "home");
-      const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "plan.md");
+      const plan = join(home, "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
       mkdirSync(join(plan, ".."), { recursive: true });
       writeFileSync(plan, planText("YM-1"));
       const prepared = prepareRecord(engine, "YM-1", plan);
@@ -478,7 +482,7 @@ test("missing scout or plan snapshot is refused before CAS", async () => {
         : db.prepare("SELECT a.artifact_path FROM plan_record r JOIN plan_publication_acceptance a ON a.id=r.scout_acceptance WHERE r.id=?").get(prepared.recordId) as { artifact_path: string };
       db.close();
       rmSync(artifact.artifact_path);
-      await assert.rejects(recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, { expectedBinding: prepared.binding, recordId: prepared.recordId }), /artifact_invalid/);
+      await assert.rejects(recordPlan(engine, "YM-1", plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: "YM-1" }, recordOptions(engine, "YM-1", plan, prepared)), /artifact_invalid/);
       const after = openDb(join(engine, "yokemate.db"));
       assert.equal(after.prepare("SELECT stage FROM work WHERE ticket='YM-1'").get(), undefined);
       after.close();
@@ -502,12 +506,12 @@ test("parallel plan recorders serialize local writes", async () => {
     db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo','/tmp/repo','github','YM','test/model')").run();
     db.close();
     const plans = ["YM-1", "YM-2"].map((ticket) => {
-      const plan = join(home, "knowledge", "org", "repo", "ai", `${ticket}-work`, "plan.md");
+      const plan = join(home, "knowledge", "org", "repo", "ai", `${ticket}-work`, `${ticket}-work-plan.md`);
       mkdirSync(join(plan, ".."), { recursive: true });
       writeFileSync(plan, planText(ticket));
       return { ticket, plan, prepared: prepareRecord(engine, ticket, plan) };
     });
-    const results = await Promise.all(plans.map(({ ticket, plan, prepared }) => recordPlan(engine, ticket, plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: ticket }, { expectedBinding: prepared.binding, recordId: prepared.recordId })));
+    const results = await Promise.all(plans.map(({ ticket, plan, prepared }) => recordPlan(engine, ticket, plan, { ...process.env, YOKEMATE_MODE: "plan", YOKEMATE_TICKET: ticket }, recordOptions(engine, ticket, plan, prepared))));
     assert.ok(results.every((result) => result.recorded && result.localSync.state === "committed"));
     const log = git(origin, "log", "--format=%s", "main");
     assert.match(log, /YM-1 план/);
