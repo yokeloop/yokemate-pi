@@ -37,13 +37,59 @@ function timeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Prom
   });
 }
 
-function childStarttime(pid: number): string | undefined {
+interface ProcessIdentity { pid: number; ppid: number; starttime: string }
+
+function processIdentity(pid: number): ProcessIdentity | undefined {
   try {
     const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return raw.slice(raw.lastIndexOf(")") + 2).split(/\s+/)[19];
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).split(/\s+/);
+    return { pid, ppid: Number(fields[1]), starttime: fields[19]! };
   } catch {
     return undefined;
   }
+}
+
+function childStarttime(pid: number): string | undefined {
+  return processIdentity(pid)?.starttime;
+}
+
+function ownedProcessTree(rootPid: number, known = new Map<number, ProcessIdentity>()): Map<number, ProcessIdentity> {
+  const table = new Map<number, ProcessIdentity>();
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    const identity = processIdentity(Number(entry));
+    if (identity) table.set(identity.pid, identity);
+  }
+  const owned = new Set([...known.values()].filter((identity) => processIdentity(identity.pid)?.starttime === identity.starttime).map((identity) => identity.pid));
+  if (table.has(rootPid)) owned.add(rootPid);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const identity of table.values()) {
+      if (!owned.has(identity.pid) && owned.has(identity.ppid)) { owned.add(identity.pid); changed = true; }
+    }
+  }
+  for (const pid of owned) {
+    const identity = table.get(pid);
+    if (identity) known.set(pid, identity);
+  }
+  return known;
+}
+
+function signalProcessTree(known: Map<number, ProcessIdentity>, signal: NodeJS.Signals): void {
+  for (const identity of [...known.values()].reverse()) {
+    if (processIdentity(identity.pid)?.starttime !== identity.starttime) continue;
+    try { process.kill(identity.pid, signal); } catch {}
+  }
+}
+
+async function waitForProcessTree(known: Map<number, ProcessIdentity>, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (![...known.values()].some((identity) => processIdentity(identity.pid)?.starttime === identity.starttime)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return false;
 }
 
 export function waitForEvent<T = unknown>(source: EventEmitter, event: string, options: EventWaitOptions = {}): Promise<T> {
@@ -98,6 +144,19 @@ export async function stopOwnedProcess(child: ChildProcess, options: { termMs?: 
   signalIfOwned("SIGKILL");
   await timeout(close, killMs, "owned process KILL close");
   if (pid && childStarttime(pid) === starttime) throw new Error(`owned process ${pid} remains alive after close`);
+}
+
+export async function stopOwnedProcessTree(child: ChildProcess, options: { termMs?: number; killMs?: number } = {}): Promise<void> {
+  const pid = child.pid;
+  if (!pid) { await stopOwnedProcess(child, options); return; }
+  const known = ownedProcessTree(pid);
+  signalProcessTree(known, "SIGTERM");
+  const direct = childClose(child);
+  const termMs = options.termMs ?? 5_000;
+  if (await waitForProcessTree(known, termMs)) { await timeout(direct, termMs, "owned process tree TERM close"); return; }
+  signalProcessTree(known, "SIGKILL");
+  await timeout(direct, options.killMs ?? 3_000, "owned process tree KILL close");
+  if (!await waitForProcessTree(known, options.killMs ?? 3_000)) throw new Error("owned process tree remains alive after SIGKILL");
 }
 
 export async function closeOwnedServer(server: Server, sockets: Iterable<Socket> = [], options: { peerGraceMs?: number; closeMs?: number } = {}): Promise<void> {

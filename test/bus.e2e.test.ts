@@ -4,7 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RuntimeResources, stopOwnedProcess } from "./fixtures/runtime-resources.ts";
+import { RuntimeResources, stopOwnedProcessTree } from "./fixtures/runtime-resources.ts";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const PANE = "wT:p1";
@@ -80,7 +80,7 @@ test("a report says delivered and reaches the pi session as a custom message", a
     assert.match(content, new RegExp(MARKER));
     assert.match(content, /YM-0/);
   } finally {
-    await stopOwnedProcess(pi);
+    await stopOwnedProcessTree(pi);
     rmSync(tmp, { recursive: true, force: true });
     await resources.cleanup();
   }
