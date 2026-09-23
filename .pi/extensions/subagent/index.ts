@@ -1079,7 +1079,8 @@ export default function (pi: ExtensionAPI) {
 	let ownedBinding: PlanBinding | undefined;
 	const coordinatorUnits = new Set<string>();
 	const releaseCoordinatorUnit = (runId: string): void => {
-		releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `coordinator:${runId}`);
+		releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `detached:coordinator:${runId}`);
+		releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `running:coordinator:${runId}`);
 		if (coordinatorUnits.delete(runId)) { activeUnits -= 1; wakeGroupRuntimes(); }
 		authorityByCycle.get(runId)?.finish(runId);
 		authorityByCycle.delete(runId);
@@ -1499,8 +1500,15 @@ export default function (pi: ExtensionAPI) {
 			const ownedRun = run;
 			const ownerStarttime = processStarttime(process.pid);
 			if (!ownerStarttime) throw new Error("cannot prove runtime capacity owner process");
-			const globalLimit = Math.min(settings.limits.maxDetached, settings.limits.maxParallelTasks, settings.limits.maxConcurrency);
-			reserveRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), { ownerId: `coordinator:${ownedRun.identity.runId}`, pid: process.pid, starttime: ownerStarttime, units: 1 }, globalLimit);
+			const capacityPath = path.join(ENGINE_ROOT, "yokemate.db");
+			const detachedOwner = `detached:coordinator:${ownedRun.identity.runId}`;
+			reserveRuntimeCapacity(capacityPath, { ownerId: detachedOwner, pid: process.pid, starttime: ownerStarttime, units: 1 }, settings.policy.guards.detachedLimit ? settings.limits.maxDetached : Number.MAX_SAFE_INTEGER);
+			try {
+				reserveRuntimeCapacity(capacityPath, { ownerId: `running:coordinator:${ownedRun.identity.runId}`, pid: process.pid, starttime: ownerStarttime, units: 1 }, settings.policy.guards.parallelConcurrencyLimit ? settings.limits.maxConcurrency : Number.MAX_SAFE_INTEGER);
+			} catch (error) {
+				releaseRuntimeCapacity(capacityPath, detachedOwner);
+				throw error;
+			}
 			coordinatorAdmissions.set(ownedRun.identity.runId, { startedAt: Date.now(), taskExcerpt: reportTaskExcerpt(request.tickets.join("+")) });
 			const settleUnit = (outcome: "done" | "blocked", reason?: string, facts?: Record<string, unknown>) => {
 				if (lane?.review) lane.review.store.finish(ownedRun.identity.runId);
@@ -1712,7 +1720,15 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text: `accepted ${ownedRun.identity.runId}, model ${prepared.model}, cwd ${prepared.cwd}` }], details: { runId: ownedRun.identity.runId, identity: ownedRun.identity } };
 		} catch (error) {
 			if (cleanupReservation) await cleanupReservation((error as Error).message);
-			else if (!lane) activeUnits -= 1;
+			else {
+				if (run && !["done", "blocked"].includes(run.state)) coordinators.finalize(run.identity.runId, "blocked", (error as Error).message);
+				if (run) {
+					coordinatorAdmissions.delete(run.identity.runId);
+					releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `detached:coordinator:${run.identity.runId}`);
+					releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `running:coordinator:${run.identity.runId}`);
+				}
+				if (!lane) activeUnits -= 1;
+			}
 			throw error;
 		}
 	};
@@ -3286,7 +3302,7 @@ export default function (pi: ExtensionAPI) {
 				const schedulerSettings = readRuntimeSettings(root);
 				let runtime!: GroupRuntime;
 				runtime = startGroupDo(db, groupId, revisionHash, manifest, {
-					capacity: () => runtime.snapshot().active.length + availableRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), Math.min(schedulerSettings.limits.maxDetached, schedulerSettings.limits.maxParallelTasks, schedulerSettings.limits.maxConcurrency)),
+					capacity: () => runtime.snapshot().active.length + availableRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), schedulerSettings.policy.guards.parallelConcurrencyLimit ? schedulerSettings.limits.maxConcurrency : Number.MAX_SAFE_INTEGER, "running"),
 					delegate: async (delegation) => {
 						refreshQueuedMemberWorkScopes(db, path.join(root, "work", rootTicket), { groupId, revisionHash, ticket: delegation.member });
 						const response = await startOneCoordinator({ mode: "do", tickets: [delegation.member] }, ctx, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: rootTicket, YOKEMATE_ROLE: "coordinator", sessionId: ctx.sessionManager.getSessionId(), cwd: process.cwd() }, schedulerSettings, undefined, {}, { runtime, groupId, revisionHash, member: delegation.member, parentRunId: ownerRunId });
@@ -3715,11 +3731,25 @@ export default function (pi: ExtensionAPI) {
 			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
 				let envelope: ResultEnvelope | undefined;
+				const runningOwner = `running:subagent:${identity.runId}`;
+				let runningLease = false;
 				let output = "";
 				let cleanupError: string | undefined;
 				let cleanupPath: string | undefined;
 				try {
 					runs!.resolveTask(identity, task);
+					while (!shuttingDown && !runs!.claimed(identity)) {
+						const starttime = processStarttime(process.pid);
+						if (!starttime) throw new Error("cannot prove subagent capacity owner process");
+						try {
+							reserveRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), { ownerId: runningOwner, pid: process.pid, starttime, units: 1 }, settings.policy.guards.parallelConcurrencyLimit ? settings.limits.maxConcurrency : Number.MAX_SAFE_INTEGER);
+							runningLease = true;
+							break;
+						} catch (error) {
+							if (!String(error).includes("global running capacity exhausted")) throw error;
+							await new Promise<void>((resolve) => setTimeout(resolve, 25));
+						}
+					}
 					if (shuttingDown) {
 						envelope = runs!.claimNoSpawn(identity);
 						if (!envelope) throw new Error("subagent run cannot be fenced during shutdown");
@@ -3764,6 +3794,7 @@ export default function (pi: ExtensionAPI) {
 					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
 					if (!envelope) throw error;
 				} finally {
+					if (runningLease) releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), runningOwner);
 					if (child) detached.delete(child);
 					untrackRunning(child);
 					ordinaryProcesses.delete(identity.runId);
@@ -3793,10 +3824,11 @@ export default function (pi: ExtensionAPI) {
 				if (admission) throw new Error(admission);
 				const ownerStarttime = processStarttime(process.pid);
 				if (!ownerStarttime) throw new Error("cannot prove subagent capacity owner process");
-				reserveRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), { ownerId: `subagent:${sessionId}:${toolCallId}`, pid: process.pid, starttime: ownerStarttime, units }, Math.min(settings.limits.maxDetached, settings.limits.maxParallelTasks, settings.limits.maxConcurrency));
+				const detachedOwner = `detached:subagent:${sessionId}:${toolCallId}`;
+				reserveRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), { ownerId: detachedOwner, pid: process.pid, starttime: ownerStarttime, units }, settings.policy.guards.detachedLimit ? settings.limits.maxDetached : Number.MAX_SAFE_INTEGER);
 				const ack = (() => {
 					try { return runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission); }
-					catch (error) { releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `subagent:${sessionId}:${toolCallId}`); throw error; }
+					catch (error) { releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), detachedOwner); throw error; }
 				})();
 				for (const [index, child] of ack.children.entries()) {
 					const scope = writerScopes[index];
@@ -3869,7 +3901,7 @@ export default function (pi: ExtensionAPI) {
 						settleBatch(toolCallId);
 					} finally {
 						activeUnits -= units;
-						releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `subagent:${sessionId}:${toolCallId}`);
+						releaseRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), detachedOwner);
 						wakeGroupRuntimes();
 						batchCompletions.get(toolCallId)?.resolve();
 						batchCompletions.delete(toolCallId);

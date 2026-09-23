@@ -10,7 +10,8 @@ function prune(db: DatabaseSync): void {
 }
 
 export function reserveRuntimeCapacity(path: string, lease: CapacityLease, limit: number): void {
-  if (!lease.ownerId || lease.units < 1 || !Number.isInteger(lease.units) || limit < lease.units) throw new Error("global runtime capacity exhausted");
+  const pool = lease.ownerId.split(":", 1)[0];
+  if (!pool || lease.units < 1 || !Number.isInteger(lease.units) || limit < lease.units) throw new Error("global runtime capacity exhausted");
   const db = openDb(path);
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -21,8 +22,8 @@ export function reserveRuntimeCapacity(path: string, lease: CapacityLease, limit
       db.exec("COMMIT");
       return;
     }
-    const used = (db.prepare("SELECT COALESCE(SUM(units),0) total FROM runtime_capacity_lease").get() as { total: number }).total;
-    if (used + lease.units > limit) throw new Error(`global runtime capacity exhausted (${used}/${limit})`);
+    const used = (db.prepare("SELECT COALESCE(SUM(units),0) total FROM runtime_capacity_lease WHERE owner_id LIKE ?").get(`${pool}:%`) as { total: number }).total;
+    if (used + lease.units > limit) throw new Error(`global ${pool} capacity exhausted (${used}/${limit})`);
     db.prepare("INSERT INTO runtime_capacity_lease (owner_id,pid,starttime,units) VALUES (?,?,?,?)").run(lease.ownerId, lease.pid, lease.starttime, lease.units);
     db.exec("COMMIT");
   } catch (error) {
@@ -37,12 +38,12 @@ export function releaseRuntimeCapacity(path: string, ownerId: string): void {
   finally { db.close(); }
 }
 
-export function availableRuntimeCapacity(path: string, limit: number): number {
+export function availableRuntimeCapacity(path: string, limit: number, pool = "running"): number {
   const db = openDb(path);
   db.exec("BEGIN IMMEDIATE");
   try {
     prune(db);
-    const used = (db.prepare("SELECT COALESCE(SUM(units),0) total FROM runtime_capacity_lease").get() as { total: number }).total;
+    const used = (db.prepare("SELECT COALESCE(SUM(units),0) total FROM runtime_capacity_lease WHERE owner_id LIKE ?").get(`${pool}:%`) as { total: number }).total;
     db.exec("COMMIT");
     return Math.max(0, limit - used);
   } catch (error) {
