@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createConnection } from "node:net";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindCoordinatorControl, PlanRecorderFences, requestCoordinatorCancel, coordinatorSocketPath, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestReviewRecordWithStatus, requestShipFinalize, resolveCoordinatorParent } from "../src/coordinator-control.ts";
+import { bindCoordinatorControl, closeCoordinatorControl, PlanRecorderFences, requestCoordinatorCancel, coordinatorSocketPath, processStarttime, requestCoordinator, requestCoordinatorMerge, requestPlanLaunch, requestPlanControl, requestReviewControl, requestReviewRecordWithStatus, requestShipFinalize, resolveCoordinatorParent } from "../src/coordinator-control.ts";
 import { socketDir } from "../src/inbox.ts";
 import { openDb } from "../src/db.ts";
 import { readCandidatePlanSnapshot, type PlanBinding } from "../src/plan-binding.ts";
@@ -54,6 +54,47 @@ test("logical recorder fences do not stop the conversational agent unless teardo
   fences.fence("teardown", true);
   assert.deepEqual(fences.consume("teardown"), { fenced: true, stopAgent: true });
   assert.deepEqual(fences.consume("teardown"), { fenced: false, stopAgent: false });
+});
+
+test("coordinator close drains idle and incomplete peers and keeps a rebound endpoint", { timeout: 10000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "coordinator-close-"));
+  const runtime = "/tmp";
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  const identity = { root, sessionId: "session", runtimeId: "old", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: root };
+  const parent = { status: (requestId: string) => ({ requestId, state: "status" as const }), async cancel() {}, async launch() { return { runId: "unused" }; } };
+  const server = bindCoordinatorControl(root, parent, identity, env);
+  let idle: ReturnType<typeof createConnection> | undefined;
+  let incomplete: ReturnType<typeof createConnection> | undefined;
+  let rebound: ReturnType<typeof bindCoordinatorControl> | undefined;
+  try {
+    if (!existsSync(coordinatorSocketPath(root, env))) await once(server, "listening");
+    idle = createConnection(coordinatorSocketPath(root, env));
+    incomplete = createConnection(coordinatorSocketPath(root, env));
+    idle.on("error", () => undefined);
+    incomplete.on("error", () => undefined);
+    await Promise.all([once(idle, "connect"), once(incomplete, "connect")]);
+    incomplete.write("{");
+    const idleClosed = new Promise<void>((resolve) => idle!.once("close", () => resolve()));
+    const incompleteClosed = new Promise<void>((resolve) => incomplete!.once("close", () => resolve()));
+    const started = Date.now();
+    const first = closeCoordinatorControl(server);
+    assert.equal(first, closeCoordinatorControl(server));
+    await first;
+    assert.ok(Date.now() - started <= 2200);
+    await Promise.all([idleClosed, incompleteClosed]);
+    assert.equal(existsSync(coordinatorSocketPath(root, env)), false);
+    assert.equal(existsSync(`${coordinatorSocketPath(root, env)}.json`), false);
+    rebound = bindCoordinatorControl(root, parent, { ...identity, runtimeId: "new" }, env);
+    if (!existsSync(coordinatorSocketPath(root, env))) await once(rebound, "listening");
+    await closeCoordinatorControl(server);
+    assert.equal(existsSync(coordinatorSocketPath(root, env)), true);
+    await closeCoordinatorControl(rebound);
+  } finally {
+    idle?.destroy();
+    incomplete?.destroy();
+    if (rebound?.listening) await closeCoordinatorControl(rebound).catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("coordinator control accepts one bound live origin and rejects a wrong parent", async () => {

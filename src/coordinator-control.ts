@@ -41,6 +41,60 @@ export class PlanRecorderFences {
 
 export interface ParentIdentity { root: string; sessionId: string; runtimeId: string; pid: number; starttime: string; cwd: string; pane?: string }
 
+interface ControlServerState {
+  socketPath: string;
+  identity: ParentIdentity;
+  connections: Set<net.Socket>;
+  stopObservers: () => void;
+  closePromise?: Promise<void>;
+}
+
+const controlServers = new WeakMap<net.Server, ControlServerState>();
+
+function matchingControlSidecar(state: ControlServerState): boolean {
+  try {
+    const value = JSON.parse(readFileSync(`${state.socketPath}.json`, "utf8")) as Partial<ParentIdentity>;
+    return value.pid === state.identity.pid && value.starttime === state.identity.starttime && value.sessionId === state.identity.sessionId && value.runtimeId === state.identity.runtimeId;
+  } catch { return false; }
+}
+
+function removeOwnedControlEndpoint(state: ControlServerState): void {
+  if (!matchingControlSidecar(state)) return;
+  rmSync(state.socketPath, { force: true });
+  rmSync(`${state.socketPath}.json`, { force: true });
+}
+
+export function closeCoordinatorControl(server: net.Server): Promise<void> {
+  const state = controlServers.get(server);
+  if (!state) return Promise.reject(new Error("unknown coordinator control server"));
+  if (state.closePromise) return state.closePromise;
+  state.closePromise = new Promise<void>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    let forceTimer: NodeJS.Timeout | undefined;
+    let closeTimer: NodeJS.Timeout | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(closeTimer);
+      for (const connection of state.connections) if (!connection.destroyed) connection.destroy();
+      state.stopObservers();
+      removeOwnedControlEndpoint(state);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    for (const connection of state.connections) if (!connection.destroyed) connection.end();
+    forceTimer = setTimeout(() => { for (const connection of state.connections) if (!connection.destroyed) connection.destroy(); }, 1_000);
+    closeTimer = setTimeout(() => finish(new Error("coordinator control close timed out after 2000ms")), 2_000);
+    forceTimer.unref?.();
+    closeTimer.unref?.();
+    if (!server.listening) { finish(); return; }
+    server.once("close", () => setImmediate(() => finish()));
+    server.close((error) => { if (error) finish(error); });
+  });
+  return state.closePromise;
+}
+
 type PaneMode = "plan" | "review" | "do" | "ship" | "worklog" | "note" | "research";
 const PANE_MODES = new Set<PaneMode>(["plan", "review", "do", "ship", "worklog", "note", "research"]);
 
@@ -793,9 +847,16 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     }
     throw new Error("invalid plan control operation");
   };
+  const connections = new Set<net.Socket>();
   const server = net.createServer((connection) => {
+    connections.add(connection);
+    connection.once("close", () => connections.delete(connection));
+    connection.on("error", () => connection.destroy());
     let buffer = "";
-    const reply = (value: ControlReply) => { connection.write(JSON.stringify(value) + "\n"); };
+    const reply = (value: ControlReply) => {
+      if (connection.destroyed || !connection.writable) return;
+      connection.write(JSON.stringify(value) + "\n", (error) => { if (error) connection.destroy(); });
+    };
     connection.on("data", async (chunk) => {
       buffer += chunk.toString("utf8");
       for (;;) {
@@ -1030,10 +1091,16 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       }
     });
   });
+  const state: ControlServerState = {
+    socketPath: sock,
+    identity: { ...identity },
+    connections,
+    stopObservers: () => { for (const planRun of planRuns.values()) planRun.observer?.stop(); },
+  };
+  controlServers.set(server, state);
   server.on("close", () => {
-    for (const planRun of planRuns.values()) planRun.observer?.stop();
-    rmSync(sock, { force: true });
-    rmSync(`${sock}.json`, { force: true });
+    state.stopObservers();
+    removeOwnedControlEndpoint(state);
   });
   server.listen(sock);
   writeFileSync(`${sock}.json`, JSON.stringify({ root: canonicalRoot, pid: identity.pid, starttime: identity.starttime, sessionId: identity.sessionId, runtimeId: identity.runtimeId, cwd: identity.cwd, pane: identity.pane }), { mode: 0o600 });

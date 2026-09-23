@@ -44,7 +44,7 @@ import { composeWidgetParts, taskExcerpt, widgetParts } from "../../../src/subag
 import { continueOwnedCoordinator, startCoordinatorRpc } from "../../../src/coordinator-rpc.ts";
 import { resolveCoordinatorModel } from "../../../src/coordinator-model.ts";
 import { verifyCoordinatorOutcome, verifyPreparedShipMerged } from "../../../src/coordinator-result.ts";
-import { type PlanCompletionContext, currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
+import { type PlanCompletionContext, currentControlOrigin, requestPlanControl, requestReviewControl, bindCoordinatorControl, closeCoordinatorControl, processStarttime, requestCoordinator, requestCoordinatorCancel, PlanRecorderFences, requestCoordinatorMerge, requestShipFinalize, resolveCoordinatorParent } from "../../../src/coordinator-control.ts";
 import { showCoordinatorEditor } from "../../../src/coordinator-ui.ts";
 import { researchChildLaunch, researchIdentity } from "../../../src/research-guard.ts";
 import { ENGINE_ROOT, readRuntimeSettings, type RuntimeSettings, subagentAdmission, subagentConcurrency } from "../../../src/guard-policy.ts";
@@ -1646,7 +1646,7 @@ export default function (pi: ExtensionAPI) {
 		removeTerminalInputListener?.();
 		removeTerminalInputListener = undefined;
 		reviewReworks.clear();
-		if (controlServer) await new Promise<void>((resolve) => controlServer!.close(() => resolve()));
+		if (controlServer) await closeCoordinatorControl(controlServer);
 		const runtimeId = randomUUID();
 		controlIdentity = { sessionId, runtimeId };
 		authority = new DoAuthorityStore(controlIdentity);
@@ -2278,16 +2278,19 @@ export default function (pi: ExtensionAPI) {
 			updateReportArchive(delivery.deliveryId);
 		}
 		emitChildState();
-		await revoked;
-		await Promise.all([...recorderCompletions.values()]);
+		const shutdownErrors: unknown[] = [];
+		const attempt = async (operation: () => Promise<unknown>) => { try { await operation(); } catch (error) { shutdownErrors.push(error); } };
+		await attempt(() => revoked);
+		await attempt(() => Promise.all([...recorderCompletions.values()]));
 		authority?.revoke();
 		authority = undefined;
 		shipPermits.invalidate();
-		controlServer?.close();
+		const closingControl = controlServer;
 		controlServer = undefined;
 		controlIdentity = undefined;
+		if (closingControl) await attempt(() => closeCoordinatorControl(closingControl));
 		reviewReworks.clear();
-		await publicationMcp.shutdown();
+		await attempt(() => publicationMcp.shutdown());
 		for (const controller of uiAbortByRun.values()) controller.abort();
 		uiAbortByRun.clear();
 		for (const runId of coordinatorUnits) releaseCoordinatorUnit(runId);
@@ -2295,10 +2298,10 @@ export default function (pi: ExtensionAPI) {
 		const coordinatorStops = [...rpcByRun.values()].map((rpc) => rpc.stop("parent_session_shutdown"));
 		rpcByRun.clear();
 		coordinatorChildren.clear();
-		await Promise.all(ordinaryStops);
-		await Promise.all([...batchCompletions.values()].map((completion) => completion.promise));
-		await Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity)));
-		await Promise.all(coordinatorStops);
+		await attempt(() => Promise.all(ordinaryStops));
+		await attempt(() => Promise.all([...batchCompletions.values()].map((completion) => completion.promise)));
+		await attempt(() => Promise.all((runs?.active() ?? []).map((child) => runs!.finalized(child.identity))));
+		await attempt(() => Promise.all(coordinatorStops));
 		detached.clear();
 		ordinaryProcesses.clear();
 		batches.clear();
@@ -2312,6 +2315,7 @@ export default function (pi: ExtensionAPI) {
 		runningAgents.clear();
 		stopWidgetTimer();
 		renderRunningWidget();
+		if (shutdownErrors.length) throw new AggregateError(shutdownErrors, "subagent session shutdown failed");
 	});
 
 	pi.on("turn_start", (_event, ctx) => {
