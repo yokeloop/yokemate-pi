@@ -17,7 +17,7 @@ import { readCandidatePlanSnapshot, readRecordedPlanBinding, readWorkflowBinding
 import { DoAuthorityStore, isWorkflowCandidate, PendingWorkflowExtraction, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION, type ApprovalParent, type InputGeneration, type WorkflowCancellationReason, type WorkflowExtractionTerminal } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { boundBatchResult, cancellationResult, type CancellationResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
+import { boundBatchResult, cancellationResult, type CancellationResult, deliveryFor, reportContent, type ReportDelivery, type ReportEnvelope, RunSnapshots, errorMetadata, fileProvenance, JsonlObservation, ChildRuns, resultEnvelope, failedEnvelope, matchingObservedReview, sha256, type ChildIdentity, type ResultEnvelope, type BatchEnvelope, type LaunchAck } from "../../../src/subagent-runs.ts";
 import { captureScoutCandidate } from "../../../src/plan-scout-recovery.ts";
 import { appendIncidentEvent, appendRecoveryAttempt, appendRecoveryDecision, claimWriterDispatch, incidentById, persistScoutCandidate, recordWriterDraft, writerDraftFor, WriterDraftConflictError } from "../../../src/workflow-incident-state.ts";
 import * as fs from "node:fs";
@@ -88,7 +88,7 @@ interface OrdinaryProcess {
 	killTimer?: NodeJS.Timeout;
 }
 const ordinaryProcesses = new Map<string, OrdinaryProcess>();
-let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
+let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string, lifecycle?: ChildRuns) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -586,7 +586,7 @@ async function runSingleAgent(
 			if (proc.pid && starttime && lifecycle.attachProcess(identity, proc.pid, starttime)) ordinaryProcesses.set(identity.runId, { identity, process: proc, pid: proc.pid, starttime, closed: false, termSent: false, killSent: false });
 			diagnostic.save(false);
 			onSpawn?.(proc);
-			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId); };
+			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId, lifecycle); };
 			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
@@ -725,6 +725,24 @@ export default function (pi: ExtensionAPI) {
 	let runs: ChildRuns | undefined;
 	let shuttingDown = false;
 	let sessionGeneration = 0;
+	interface OwnedGeneration {
+		serial: number;
+		ownerRunId: string;
+		ownerSessionId: string;
+		runs: ChildRuns;
+		fenced: boolean;
+		producerObligations: number;
+		batchDispatches: number;
+		failureProduced: number;
+		failureConsumed: number;
+		retry: boolean;
+		compaction: boolean;
+		revision: number;
+		listeners: Set<() => void>;
+	}
+	let ownedGeneration: OwnedGeneration | undefined;
+	let nextOwnedGenerationSerial = 0;
+	const ownedGenerationByRunId = new Map<string, OwnedGeneration>();
 	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
 	let nextScoutSequence = 0;
 	const scoutSequenceByRunId = new Map<string, number>();
@@ -868,7 +886,35 @@ export default function (pi: ExtensionAPI) {
 	const coordinatorAdmissions = new Map<string, { startedAt: number; taskExcerpt: string }>();
 	const sentBatches = new Set<string>();
 	const settlingRuns = new Set<string>();
-	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope }>();
+	const deliveries = new Map<string, { delivery: ReportDelivery; envelope: ReportEnvelope; generation?: OwnedGeneration }>();
+	const wakeOwnedGeneration = (generation: OwnedGeneration, failure = false): void => {
+		if (failure) generation.failureProduced += 1;
+		generation.revision += 1;
+		for (const listener of [...generation.listeners]) listener();
+	};
+	const currentOwnedGeneration = (): OwnedGeneration | undefined => {
+		const generation = ownedGeneration;
+		if (!generation || generation.fenced || shuttingDown || ownedReadyRunId !== generation.ownerRunId || process.env.YOKEMATE_ROLE !== "coordinator" || process.env.YOKEMATE_RUN_ID !== generation.ownerRunId || runs !== generation.runs || runs.ownerSessionId !== generation.ownerSessionId) return;
+		return generation;
+	};
+	const ownedGenerationFor = (envelope: ReportEnvelope): OwnedGeneration | undefined => {
+		const identities = envelope.kind === "result" ? [envelope.identity] : envelope.results.map((result) => result.identity);
+		const generation = identities.length ? ownedGenerationByRunId.get(identities[0]!.runId) : undefined;
+		if (!generation || identities.some((identity) => ownedGenerationByRunId.get(identity.runId) !== generation || identity.ownerRunId !== generation.ownerRunId || identity.ownerSessionId !== generation.ownerSessionId || !generation.runs.owns(identity.runId, identity.ownerRunId, identity.ownerSessionId))) return;
+		return generation;
+	};
+	const beginProducer = (generation: OwnedGeneration | undefined): (() => void) => {
+		if (!generation || generation.fenced) return () => undefined;
+		generation.producerObligations += 1;
+		let completed = false;
+		return () => {
+			if (completed) return;
+			completed = true;
+			generation.producerObligations = Math.max(0, generation.producerObligations - 1);
+			wakeOwnedGeneration(generation);
+			emitChildState();
+		};
+	};
 	const diagnosticFacts = (runId: string): ReportDiagnosticFacts => {
 		const metadata = diagnostics.get(runId)?.metadata ?? {};
 		return {
@@ -890,7 +936,9 @@ export default function (pi: ExtensionAPI) {
 	let childSequence = 0;
 	const emitChildState = () => {
 		if (!runs) return;
-		pi.appendEntry("yokemate-child-state", { version: 1, ownerRunId: runs.ownerRunId, ownerSessionId: runs.ownerSessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", sequence: ++childSequence, children: runs.active(), deliveries: [...deliveries.values()].map(({ delivery }) => ({ ...delivery })) });
+		const generation = ownedGeneration?.runs === runs ? ownedGeneration : undefined;
+		const visibleDeliveries = [...deliveries.values()].filter((entry) => !generation || entry.generation === generation);
+		pi.appendEntry("yokemate-child-state", { version: 1, ownerRunId: runs.ownerRunId, ownerSessionId: runs.ownerSessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", sequence: ++childSequence, children: runs.active(), deliveries: visibleDeliveries.map(({ delivery }) => ({ ...delivery })), producerObligations: generation?.producerObligations ?? 0, batchDispatches: generation?.batchDispatches ?? 0 });
 	};
 	pi.on("context", (event) => {
 		let changed = false;
@@ -906,7 +954,9 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			if (message.customType !== "subagent-report") continue;
-			for (const { delivery, envelope } of deliveries.values()) {
+			for (const entry of deliveries.values()) {
+				const { delivery, envelope } = entry;
+				if (entry.generation && (entry.generation !== ownedGeneration || entry.generation.fenced)) continue;
 				if (delivery.state === "observed" || message.content !== reportContent(envelope, delivery)) continue;
 				const details = message.details as { deliveryId?: string; envelopeHash?: string } | undefined;
 				if (details?.deliveryId !== delivery.deliveryId || details.envelopeHash !== delivery.envelopeHash) continue;
@@ -926,6 +976,7 @@ export default function (pi: ExtensionAPI) {
 				updateReportArchive(delivery.deliveryId);
 				reportArchives.delete(delivery.deliveryId);
 				reportDisplays.delete(delivery.deliveryId);
+				if (entry.generation) wakeOwnedGeneration(entry.generation);
 				changed = true;
 			}
 		}
@@ -1622,6 +1673,7 @@ export default function (pi: ExtensionAPI) {
 		return { content: rows.map((row) => ({ type: "text" as const, text: row.state === "accepted" ? `accepted ${row.keyRunId}, key ${row.key}, reserved` : `refused ${row.key}: ${row.reason}` })), details: { runId: accepted[0]?.keyRunId, listRunId: run.identity.listRunId, runs: accepted.map((entry) => ({ ticket: entry.key, runId: entry.keyRunId })), results: rows }, isError: accepted.length === 0 };
 	};
 	pi.on("session_start", async (_event, ctx) => {
+		fenceOwnedGeneration("owner_replaced");
 		shuttingDown = false;
 		sessionGeneration += 1;
 		latestCtx = ctx;
@@ -2201,9 +2253,18 @@ export default function (pi: ExtensionAPI) {
 					assertPlanBinding(payload.prepared.doBinding, readRecordedPlanBinding(ENGINE_ROOT, payload.prepared.doBinding.ticket));
 					ownedBinding = payload.prepared.doBinding;
 				}
+				const replaced = ownedGeneration;
+				if (replaced) {
+					fenceOwnedGeneration("owner_replaced", replaced);
+					const active = replaced.runs.shutdownActive();
+					const completions = [...new Set(active.map((child) => child.identity.batchId))].map((batchId) => batchCompletions.get(batchId)?.promise).filter((promise): promise is Promise<void> => !!promise);
+					await Promise.all(active.map((child) => requestOrdinaryCancellation(child.identity.runId, "owner_replaced", replaced.ownerRunId, replaced.ownerSessionId, replaced.runs)));
+					await Promise.all(completions);
+				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
-				emitChildState();
 				ownedReadyRunId = identity.runId;
+				ownedGeneration = { serial: ++nextOwnedGenerationSerial, ownerRunId: identity.runId!, ownerSessionId: runs.ownerSessionId, runs, fenced: false, producerObligations: 0, batchDispatches: 0, failureProduced: 0, failureConsumed: 0, retry: false, compaction: false, revision: 0, listeners: new Set() };
+				emitChildState();
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
 			} catch (error) {
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "blocked", display: false, details: { ok: false, reason: (error as Error).message } }, { deliverAs: "followUp", triggerTurn: false });
@@ -2240,10 +2301,12 @@ export default function (pi: ExtensionAPI) {
 			const payload = JSON.parse(Buffer.from(args.trim(), "base64").toString("utf8"));
 			if (payload.runId !== ownedReadyRunId || !["parent_rpc_stop", "parent_control_cancel", "parent_cancel_run", "parent_session_shutdown"].includes(payload.reason)) throw new Error("invalid owned child cancellation");
 			const sessionId = ctx.sessionManager.getSessionId();
+			fenceOwnedGeneration(payload.reason);
 			await Promise.all((runs?.active() ?? []).map((child) => requestOrdinaryCancellation(child.identity.runId, payload.reason, payload.runId, sessionId)));
 		},
 	});
 	pi.on("session_shutdown", async (event) => {
+		fenceOwnedGeneration("parent_shutdown");
 		shuttingDown = true;
 		const revoked = revokeAuthority(event.reason === "reload" ? "session_reload" : event.reason === "fork" ? "session_fork" : "session_shutdown");
 		workflowExtraction = undefined;
@@ -2308,12 +2371,20 @@ export default function (pi: ExtensionAPI) {
 		deliveries.clear();
 		diagnostics.clear();
 		recorderFences.clear();
+		ownedGeneration = undefined;
+		ownedGenerationByRunId.clear();
+		ownedReadyRunId = undefined;
 		runs = undefined;
 		runningAgents.clear();
 		stopWidgetTimer();
 		renderRunningWidget();
 	});
 
+	pi.on("agent_start", () => { const generation = currentOwnedGeneration(); if (generation) generation.retry = false; });
+	pi.on("agent_end", (event) => { const generation = currentOwnedGeneration(); if (generation) generation.retry = (event as { willRetry?: boolean }).willRetry === true; });
+	pi.on("session_before_compact", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = true; });
+	pi.on("session_compact", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = false; });
+	pi.on("session_compact_failed", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = false; });
 	pi.on("turn_start", (_event, ctx) => {
 		latestCtx = ctx;
 		const signal = ctx.signal;
@@ -2330,9 +2401,61 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
+	const fenceOwnedGeneration = (code: string, generation = ownedGeneration): void => {
+		if (!generation || generation.fenced) return;
+		generation.fenced = true;
+		for (const entry of deliveries.values()) {
+			if (entry.generation !== generation || !["pending", "enqueued"].includes(entry.delivery.state)) continue;
+			entry.delivery.state = "delivery_unknown";
+			entry.delivery.code = code;
+			entry.delivery.failedAt = new Date().toISOString();
+			for (const runId of entry.delivery.runIds) {
+				const diagnostic = diagnostics.get(runId);
+				if (!diagnostic) continue;
+				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
+				states[entry.delivery.deliveryId] = { state: entry.delivery.state, envelopeHash: entry.delivery.envelopeHash, failedAt: entry.delivery.failedAt, code };
+				diagnostic.metadata.deliveries = states;
+				diagnostic.save(true);
+			}
+			const retained = reportArchives.get(entry.delivery.deliveryId);
+			if (retained) retained.facts = archiveFacts(entry.envelope, entry.delivery);
+			updateReportArchive(entry.delivery.deliveryId);
+		}
+		wakeOwnedGeneration(generation, true);
+		emitChildState();
+	};
+	pi.on("turn_end", async (_event, ctx) => {
+		const generation = currentOwnedGeneration();
+		if (!generation) return;
+		for (;;) {
+			if (generation !== ownedGeneration || generation.fenced || shuttingDown || ctx.signal?.aborted) return;
+			if ([...deliveries.values()].some((entry) => entry.generation === generation && entry.delivery.state === "enqueued")) return;
+			if (generation.failureConsumed < generation.failureProduced) {
+				generation.failureConsumed += 1;
+				return;
+			}
+			if (!generation.runs.active().length && generation.producerObligations === 0 && generation.batchDispatches === 0) return;
+			const revision = generation.revision;
+			await new Promise<void>((resolve) => {
+				let finished = false;
+				const finish = () => {
+					if (finished) return;
+					finished = true;
+					generation.listeners.delete(finish);
+					ctx.signal?.removeEventListener("abort", abort);
+					resolve();
+				};
+				const abort = () => { fenceOwnedGeneration("turn_abort"); finish(); };
+				generation.listeners.add(finish);
+				ctx.signal?.addEventListener("abort", abort, { once: true });
+				if (generation.revision !== revision || generation !== ownedGeneration || generation.fenced || ctx.signal?.aborted || [...deliveries.values()].some((entry) => entry.generation === generation && entry.delivery.state === "enqueued") || generation.failureConsumed < generation.failureProduced || (!generation.runs.active().length && generation.producerObligations === 0 && generation.batchDispatches === 0)) finish();
+			});
+		}
+	});
+
 	const registerDelivery = (envelope: ReportEnvelope) => {
 		const delivery = deliveryFor(envelope);
-		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope });
+		if (!deliveries.has(delivery.deliveryId)) deliveries.set(delivery.deliveryId, { delivery, envelope, generation: ownedGenerationFor(envelope) });
 		return deliveries.get(delivery.deliveryId)!;
 	};
 	const failDelivery = (deliveryId: string, code: string): void => {
@@ -2352,30 +2475,41 @@ export default function (pi: ExtensionAPI) {
 		const retained = reportArchives.get(deliveryId);
 		if (retained) retained.facts = archiveFacts(entry.envelope, entry.delivery);
 		updateReportArchive(deliveryId);
+		if (entry.generation) wakeOwnedGeneration(entry.generation, true);
 		emitChildState();
 	};
 	const sendReport = (envelope: ReportEnvelope): void => {
-		const { delivery } = registerDelivery(envelope);
+		const entry = registerDelivery(envelope);
+		const { delivery, generation } = entry;
 		if (delivery.state !== "pending") return;
-		const canonical = reportContent(envelope, delivery);
-		const factsByRun = new Map((envelope.kind === "result" ? [envelope] : envelope.results).map((result) => [result.identity.runId, diagnosticFacts(result.identity.runId)]));
-		const facts = archiveFacts(envelope, delivery);
-		const stored = reportStore.writeReport(delivery.deliveryId, canonical, facts);
-		reportArchives.set(delivery.deliveryId, { facts });
-		const diagnosticCode = delivery.runIds.map((runId) => diagnostics.get(runId)?.metadata.displayDiagnostic).find((value): value is string => typeof value === "string");
-		const display = reportDisplays.get(delivery.deliveryId) ?? buildReportDisplay(envelope, reportAdmissions, reportSettledAt, stored.archive, factsByRun, diagnosticCode);
-		reportDisplays.set(delivery.deliveryId, display);
-		emitChildState();
-		if (shuttingDown) delivery.state = "delivery_unknown";
-		else try {
-			pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: "followUp", triggerTurn: true, yokemateSendId: delivery.deliveryId, onYokemateSendError: (sendId) => failDelivery(sendId, "send_rejected") });
-			if (delivery.state === "pending") delivery.state = "enqueued";
+		try {
+			const canonical = reportContent(envelope, delivery);
+			const factsByRun = new Map((envelope.kind === "result" ? [envelope] : envelope.results).map((result) => [result.identity.runId, diagnosticFacts(result.identity.runId)]));
+			const facts = archiveFacts(envelope, delivery);
+			const stored = reportStore.writeReport(delivery.deliveryId, canonical, facts);
+			reportArchives.set(delivery.deliveryId, { facts });
+			const diagnosticCode = delivery.runIds.map((runId) => diagnostics.get(runId)?.metadata.displayDiagnostic).find((value): value is string => typeof value === "string");
+			const display = reportDisplays.get(delivery.deliveryId) ?? buildReportDisplay(envelope, reportAdmissions, reportSettledAt, stored.archive, factsByRun, diagnosticCode);
+			reportDisplays.set(delivery.deliveryId, display);
+			emitChildState();
+			if (shuttingDown || generation?.fenced || (generation && generation !== ownedGeneration)) {
+				delivery.state = "delivery_unknown";
+				delivery.code = "owner_fenced";
+				delivery.failedAt = new Date().toISOString();
+				if (generation) wakeOwnedGeneration(generation, true);
+			} else {
+				pi.sendMessage({ customType: "subagent-report", content: canonical, display: true, details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope, display } }, { deliverAs: generation ? "steer" : "followUp", triggerTurn: true, yokemateSendId: delivery.deliveryId, onYokemateSendError: (sendId) => failDelivery(sendId, "send_rejected") });
+				if (delivery.state === "pending") {
+					delivery.state = "enqueued";
+					if (generation) wakeOwnedGeneration(generation);
+				}
+			}
 		} catch { failDelivery(delivery.deliveryId, "send_throw"); }
 		for (const runId of delivery.runIds) {
 			const diagnostic = diagnostics.get(runId);
 			if (diagnostic) {
 				const states = (diagnostic.metadata.deliveries ?? {}) as Record<string, unknown>;
-				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, enqueuedAt: new Date().toISOString() };
+				states[delivery.deliveryId] = { state: delivery.state, envelopeHash: delivery.envelopeHash, ...(delivery.state === "enqueued" ? { enqueuedAt: new Date().toISOString() } : { failedAt: delivery.failedAt, code: delivery.code }) };
 				diagnostic.metadata.deliveries = states;
 				diagnostic.save(true);
 			}
@@ -2385,10 +2519,12 @@ export default function (pi: ExtensionAPI) {
 		updateReportArchive(delivery.deliveryId);
 		emitChildState();
 	};
-	const settleBatch = (batchId: string): void => {
-		const batch = runs?.batch(batchId);
-		if (!batch || sentBatches.has(batchId)) return;
-		sentBatches.add(batchId);
+	const settleBatch = (batchId: string, lifecycle = runs): void => {
+		const batch = lifecycle?.batch(batchId);
+		if (!batch) return;
+		const batchKey = deliveryFor(batch).deliveryId;
+		if (sentBatches.has(batchKey)) return;
+		sentBatches.add(batchKey);
 		sendReport(batch);
 		batches.delete(batchId);
 		batchModes.delete(batchId);
@@ -2397,7 +2533,7 @@ export default function (pi: ExtensionAPI) {
 			reportSettledAt.delete(result.identity.runId);
 		}
 		for (const [deliveryId, entry] of deliveries) if (entry.delivery.batchId === batchId) reportDisplays.delete(deliveryId);
-		runs?.compactBatch(batchId);
+		lifecycle?.compactBatch(batchId);
 	};
 	const publicationErrors = new Set<PublicationError>(["auth", "permission", "rate_limit", "size", "unavailable", "target_unavailable", "target_changed", "incomplete_listing", "remote_conflict", "unsafe_document", "binding_changed", "artifact_invalid"]);
 	const safePublicationReason = (value: unknown): PublicationError => value instanceof PublicationFailure ? value.code : typeof value === "string" && publicationErrors.has(value as PublicationError) ? value as PublicationError : "unavailable";
@@ -2449,8 +2585,19 @@ export default function (pi: ExtensionAPI) {
 			if (bytes.length !== reference.bytes || sha256(bytes) !== reference.hash) throw new Error(`plan-writer scout artifact changed for ${identity.ticket}`);
 		} finally { db.close(); }
 	};
-	const settleResult = async (result: ResultEnvelope, report: boolean) => {
-		if (!runs || runs.children.get(result.identity.runId)?.result || settlingRuns.has(result.identity.runId)) return;
+	const assertChildAdmission = (identity: ChildIdentity): void => {
+		assertPlanWriterAdmission(identity);
+		if (identity.agent !== "task-reviewer" || !identity.review || !runs) return;
+		const scope = { ownerRunId: identity.ownerRunId, ownerSessionId: identity.ownerSessionId, cwd: identity.cwd, baseSha: identity.review.baseSha, headSha: identity.review.headSha };
+		for (const prior of runs.terminalReviewers(identity)) {
+			if (matchingObservedReview(runs, prior, scope, deliveries.values())) continue;
+			const states = [...deliveries.values()].filter(({ delivery }) => delivery.runIds.includes(prior.runId)).map(({ delivery }) => `${delivery.deliveryId}:${delivery.state}`);
+			throw new Error(`reviewer ${prior.runId} for this cwd/base/head is terminal without matching observed delivery${states.length ? ` (${states.join(", ")})` : ""}`);
+		}
+	};
+	const settleResult = async (result: ResultEnvelope, report: boolean, lifecycle = ownedGenerationFor(result)?.runs ?? runs) => {
+		if (!lifecycle || lifecycle.children.get(result.identity.runId)?.result || !lifecycle.owns(result.identity.runId, result.identity.ownerRunId, result.identity.ownerSessionId) || settlingRuns.has(result.identity.runId)) return;
+		const completeProducer = beginProducer(ownedGenerationFor(result));
 		settlingRuns.add(result.identity.runId);
 		try {
 		if (result.identity.agent === "plan-writer" && result.identity.ticket && result.identity.acceptedInputId && ["valid", "missing_final"].includes(result.payloadOutcome)) {
@@ -2478,7 +2625,7 @@ export default function (pi: ExtensionAPI) {
 				result.planResult = { state: "rejected", reason: artifact.code, ...(artifact.candidateCount === undefined ? {} : { candidateCount: artifact.candidateCount }) };
 			}
 			if (draft && result.planResult?.state === "verified") {
-				result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
+				result = boundBatchResult(result, lifecycle.batches.get(result.identity.batchId)!);
 				if (result.payloadOutcome === "valid" && result.planResult?.state === "verified") {
 					const state = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
 					try {
@@ -2511,7 +2658,7 @@ export default function (pi: ExtensionAPI) {
 			result.reviewVerdict = null;
 		}
 		if (result.identity.agent === "plan-scout" && result.identity.ticket) {
-			if (!runs.isCurrentScout(result.identity) || stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID ?? "") || result.processOutcome === "cancelled") {
+			if (!lifecycle.isCurrentScout(result.identity) || stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID ?? "") || result.processOutcome === "cancelled") {
 				persistScoutBlock(result, "artifact_invalid");
 			} else if (result.actualTaskHash !== result.identity.taskHash || result.payloadOutcome !== "valid" || result.artifact?.state !== "verified") {
 				await rejectScout(result, result.artifact?.state === "blocked" ? result.artifact.reason : "artifact_invalid");
@@ -2552,11 +2699,11 @@ export default function (pi: ExtensionAPI) {
 			const snapshotStorage = diagnostic.metadata.snapshotStorage as { state: "available" | "unavailable"; code?: string } | undefined;
 			if (snapshotStorage && result.diagnostics) result.diagnostics.snapshotStorage = { ...snapshotStorage };
 		}
-		result = boundBatchResult(result, runs.batches.get(result.identity.batchId)!);
-		if (!runs.settle(result)) return;
+		result = boundBatchResult(result, lifecycle.batches.get(result.identity.batchId)!);
+		if (!lifecycle.settle(result)) return;
 		reportSettledAt.set(result.identity.runId, settledAt);
 		if (report) registerDelivery(result);
-		const batch = runs.batch(result.identity.batchId);
+		const batch = lifecycle.batch(result.identity.batchId);
 		if (batch) {
 			registerDelivery(batch);
 			if (!report) registerDelivery({ ...batch, kind: "chain" });
@@ -2565,13 +2712,15 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			settlingRuns.delete(result.identity.runId);
 			if (result.identity.agent === "plan-writer") planWriterScopes.delete(result.identity.runId);
+			completeProducer();
 		}
 	};
 
-	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId) => {
-		if (!runs) return cancellationResult(runId, "unknown", "unknown", false);
-		if (runs.children.has(runId) && !runs.owns(runId, ownerRunId, ownerSessionId)) return cancellationResult(runId, "ordinary", "not_owned", false, "ordinary run belongs to another owner");
-		const request = runs.requestCancel(runId, initiator);
+	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId, ownedLifecycle) => {
+		const lifecycle = ownedLifecycle ?? runs;
+		if (!lifecycle) return cancellationResult(runId, "unknown", "unknown", false);
+		if (lifecycle.children.has(runId) && !lifecycle.owns(runId, ownerRunId, ownerSessionId)) return cancellationResult(runId, "ordinary", "not_owned", false, "ordinary run belongs to another owner");
+		const request = lifecycle.requestCancel(runId, initiator);
 		if (request.result.targetKind === "unknown") return request.result;
 		if (request.first) {
 			const diagnostic = diagnostics.get(runId);
@@ -2580,32 +2729,32 @@ export default function (pi: ExtensionAPI) {
 				diagnostic.save(false);
 			}
 		}
-		const identity = runs.children.get(runId)?.identity;
-		const claimed = identity ? runs.claimed(identity) : undefined;
+		const identity = lifecycle.children.get(runId)?.identity;
+		const claimed = identity ? lifecycle.claimed(identity) : undefined;
 		if (identity && claimed && request.first) {
-			runs.completeCleanup(identity);
-			void settleResult(claimed, batchModes.get(identity.batchId) !== "chain").then(() => settleBatch(identity.batchId));
+			lifecycle.completeCleanup(identity);
+			void settleResult(claimed, batchModes.get(identity.batchId) !== "chain", lifecycle).then(() => settleBatch(identity.batchId, lifecycle));
 		}
 		if (request.shouldSignal) {
 			const owned = ordinaryProcesses.get(runId);
-			const attached = identity ? runs.process(identity) : undefined;
-			const verified = !!owned && !!attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !runs.claimed(owned.identity) && !owned.termSent;
-			if (!verified) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			const attached = identity ? lifecycle.process(identity) : undefined;
+			const verified = !!owned && !!attached && detached.has(owned.process) && owned.process.pid === owned.pid && attached.pid === owned.pid && attached.starttime === owned.starttime && processStarttime(owned.pid) === owned.starttime && !owned.closed && !lifecycle.claimed(owned.identity) && !owned.termSent;
+			if (!verified) return lifecycle.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
 			let sent = false;
 			try { sent = owned.process.kill("SIGTERM"); } catch {}
-			if (!sent) return runs.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+			if (!sent) return lifecycle.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
 			owned.termSent = true;
 			owned.killTimer = setTimeout(() => {
 				const current = ordinaryProcesses.get(runId);
-				if (current !== owned || current.closed || current.killSent || runs?.claimed(current.identity)) return;
+				if (current !== owned || current.closed || current.killSent || lifecycle.claimed(current.identity)) return;
 				if (processStarttime(current.pid) !== current.starttime || current.process.pid !== current.pid) {
-					runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+					lifecycle.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
 					return;
 				}
 				let killed = false;
 				try { killed = current.process.kill("SIGKILL"); } catch {}
 				if (killed) current.killSent = true;
-				else runs?.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
+				else lifecycle.markCancellationUnconfirmed(runId, "process identity could not be verified for cancellation");
 			}, 5000);
 			owned.killTimer.unref();
 		}
@@ -2659,17 +2808,25 @@ export default function (pi: ExtensionAPI) {
 		label: "Coordinator finish",
 		description: "Finish this owned background coordinator with a verified outcome.",
 		parameters: Type.Object({ outcome: StringEnum(["done", "blocked"] as const), summary: Type.String(), reason: Type.Optional(Type.String()), passedTickets: Type.Optional(Type.Array(Type.String())) }),
-		async execute(_id, params): Promise<any> {
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
 			const runId = process.env.YOKEMATE_RUN_ID;
 			if (!runId || process.env.YOKEMATE_ROLE !== "coordinator" || ownedReadyRunId !== runId)
 				return { content: [{ type: "text", text: "coordinator_finish is available only to its owned RPC coordinator" }], isError: true };
 			if (params.outcome === "blocked" && !params.reason)
 				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
 			if (finishingCoordinatorRunId) return { content: [{ type: "text", text: "coordinator is already finishing" }], isError: true };
-			if (runs?.active().length || batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
-			const pending = [...deliveries.values()].map(({ delivery }) => delivery).filter((delivery) => delivery.state !== "observed");
-			if (pending.length && !(params.outcome === "blocked" && pending.some((delivery) => delivery.state === "delivery_failed" || delivery.state === "delivery_unknown") && pending.every((delivery) => params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
+			const finishBlock = (): string | undefined => {
+				const generation = currentOwnedGeneration();
+				if (!generation) return "coordinator owned generation is unavailable";
+				if (generation.runs.active().length || generation.producerObligations || generation.batchDispatches || generation.retry || generation.compaction || ctx.hasPendingMessages?.()) return "coordinator still has active child batches";
+				const pending = [...deliveries.values()].filter((entry) => entry.generation === generation && entry.delivery.state !== "observed").map((entry) => entry.delivery);
+				if (pending.length && !(params.outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && params.reason?.includes(delivery.deliveryId)))) return `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}`;
+			};
+			let blocked = finishBlock();
+			if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
 			await new Promise<void>((resolve) => setImmediate(resolve));
+			blocked = finishBlock();
+			if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
 			const run = coordinators.get(runId);
 			if (!run) {
 				if (params.outcome === "done" && process.env.YOKEMATE_MODE === "ship") {
@@ -2709,6 +2866,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
 			const admittedGeneration = sessionGeneration;
+			const invocationGeneration = currentOwnedGeneration();
+			const invocationRuns = runs;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
 			if (!params.cancelRun && shuttingDown) return { content: [{ type: "text", text: "parent session is shutting down; only cancellation remains available" }], isError: true };
 			if (!params.cancelRun && process.env.YOKEMATE_PLAN_RUN_ID && stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID)) return { content: [{ type: "text", text: "plan run is stopped; only cancellation and conversation remain available" }], isError: true };
@@ -2859,37 +3018,37 @@ export default function (pi: ExtensionAPI) {
 					return injected;
 				} finally { state.close(); }
 			};
-			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
+			const runDetachedAgent = async (mode: "single" | "parallel" | "chain", identity: ChildIdentity, task: string, lifecycle: ChildRuns, step?: number): Promise<{ envelope: ResultEnvelope; output: string }> => {
 				let child: ChildProcess | undefined;
 				let envelope: ResultEnvelope | undefined;
 				let output = "";
 				let cleanupError: string | undefined;
 				let cleanupPath: string | undefined;
 				try {
-					runs!.resolveTask(identity, task);
+					lifecycle.resolveTask(identity, task);
 					if (shuttingDown) {
-						envelope = runs!.claimNoSpawn(identity);
+						envelope = lifecycle.claimNoSpawn(identity);
 						if (!envelope) throw new Error("subagent run cannot be fenced during shutdown");
 						return { envelope, output };
 					}
-					if (!runs!.start(identity)) {
-						envelope = runs!.claimed(identity) ?? runs!.claimNoSpawn(identity);
+					if (!lifecycle.start(identity)) {
+						envelope = lifecycle.claimed(identity) ?? lifecycle.claimNoSpawn(identity);
 						if (!envelope) throw new Error("subagent run cannot start");
 						return { envelope, output };
 					}
 					assertPlanWriterAdmission(identity);
 					task = await admitPlanWriter(identity, diagnostics.get(identity.runId)?.metadata.requestedTask as string ?? task, task, true);
-					runs!.resolveTask(identity, task);
+					lifecycle.resolveTask(identity, task);
 					emitChildState();
 					const result = await runSingleAgent(ctx.cwd, dispatchDefaults, agents, identity.agent, task, identity.cwd, step, undefined, undefined, makeDetails(mode), (proc) => {
 						child = proc;
 						detached.add(proc);
 						trackRunning(proc, identity.agent, task);
-					}, identity, runs!, diagnostics.get(identity.runId)!);
+					}, identity, lifecycle, diagnostics.get(identity.runId)!);
 					output = getFinalOutput(result.messages);
 					cleanupError = result.cleanupError;
 					cleanupPath = result.cleanupPath;
-					envelope = result.envelope ?? runs!.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
+					envelope = result.envelope ?? lifecycle.claimNoSpawn(identity) ?? resultEnvelope(identity, task, { processOutcome: "not_started", exitCode: null, signal: null }, "");
 					const diagnostic = diagnostics.get(identity.runId)!;
 					if (result.agentSource === "unknown") diagnostic.metadata.displayDiagnostic = "unknown_agent";
 					const originalPayload = diagnostic.metadata.payload as Record<string, unknown> | undefined;
@@ -2908,22 +3067,23 @@ export default function (pi: ExtensionAPI) {
 						if (error instanceof PromptCleanupFailure) diagnostic.metadata.cleanupError = { reason: cleanupError, path: error.dir, writeFailure: error.writeFailure, cleanupFailure: error.cleanupFailure };
 						diagnostic.save(true);
 					}
-					envelope = runs!.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? runs!.claimed(identity);
+					envelope = lifecycle.claimTerminal(identity, task, { processOutcome: "spawn_error", exitCode: null, signal: null }, "")?.result ?? lifecycle.claimed(identity);
 					if (!envelope) throw error;
 				} finally {
 					if (child) detached.delete(child);
 					untrackRunning(child);
 					ordinaryProcesses.delete(identity.runId);
-					if (cleanupError) runs!.markCancellationUnconfirmed(identity.runId, cleanupPath ? `${cleanupError}: ${cleanupPath}` : cleanupError);
-					else runs!.completeCleanup(identity);
+					if (cleanupError) lifecycle.markCancellationUnconfirmed(identity.runId, cleanupPath ? `${cleanupError}: ${cleanupPath}` : cleanupError);
+					else lifecycle.completeCleanup(identity);
 				}
 				return { envelope: envelope!, output };
 			};
 			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
+				const launchRuns = invocationGeneration?.runs ?? runs!;
 				tasks = await Promise.all(tasks.map(async (task) => {
 					if (task.agent !== "plan-writer" || task.acceptedInputId) return task;
 					const ticket = task.ticket ?? process.env.YOKEMATE_TICKET;
-					const current = ticket ? runs!.currentScout(ticket) : undefined;
+					const current = ticket ? launchRuns.currentScout(ticket) : undefined;
 					if (current?.artifact?.state === "accepted") return { ...task, ticket, acceptedInputId: current.artifact.acceptanceId };
 					const runId = process.env.YOKEMATE_PLAN_RUN_ID;
 					if (!ticket || !runId || process.env.YOKEMATE_MODE !== "plan") return task;
@@ -2934,17 +3094,19 @@ export default function (pi: ExtensionAPI) {
 				const writerScopes = tasks.map((task) => task.agent === "plan-writer"
 					? resolvePlanWriterScope(ENGINE_ROOT, task.ticket ?? process.env.YOKEMATE_TICKET ?? "")
 					: undefined);
-				if (shuttingDown || sessionGeneration !== admittedGeneration) throw new Error("parent session changed before subagent admission");
+				if (shuttingDown || sessionGeneration !== admittedGeneration || (invocationGeneration ? invocationGeneration.fenced || ownedGeneration !== invocationGeneration || currentOwnedGeneration() !== invocationGeneration || runs !== invocationRuns || launchRuns !== invocationRuns : process.env.YOKEMATE_ROLE === "coordinator" && !!ownedReadyRunId)) throw new Error("parent session changed before subagent admission");
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
-				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertPlanWriterAdmission);
+				const admissionGeneration = invocationGeneration;
+				const ack = launchRuns.admit(toolCallId, tasks, ctx.cwd, assertChildAdmission);
+				if (admissionGeneration) for (const child of ack.children) ownedGenerationByRunId.set(child.identity.runId, admissionGeneration);
 				for (const [index, child] of ack.children.entries()) {
 					const scope = writerScopes[index];
 					if (scope) planWriterScopes.set(child.identity.runId, scope);
 				}
 				for (const [index, child] of ack.children.entries()) await admitPlanWriter(child.identity, tasks[index]!.task, tasks[index]!.task, false);
-				if (mode === "chain") for (const child of ack.children.slice(1)) runs!.defer(child.identity);
+				if (mode === "chain") for (const child of ack.children.slice(1)) launchRuns.defer(child.identity);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					if (identity.agent === "plan-scout") scoutSequenceByRunId.set(identity.runId, 2 * ++nextScoutSequence);
@@ -2968,6 +3130,9 @@ export default function (pi: ExtensionAPI) {
 				activeUnits += units;
 				batches.add(toolCallId);
 				batchModes.set(toolCallId, mode);
+				const dispatchRuns = launchRuns;
+				const dispatchGeneration = admissionGeneration;
+				if (dispatchGeneration) dispatchGeneration.batchDispatches += 1;
 				let resolveCompletion!: () => void;
 				const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
 				batchCompletions.set(toolCallId, { promise: completion, resolve: resolveCompletion });
@@ -2976,9 +3141,9 @@ export default function (pi: ExtensionAPI) {
 					try {
 						try { await admissionFence; }
 						catch {
-							for (const { identity } of ack.children) await settleResult(resultEnvelope(identity, tasks[ack.children.findIndex((child) => child.identity.runId === identity.runId)]!.task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), mode !== "chain");
-							if (mode === "chain") sendReport(runs!.batch(toolCallId, "chain")!);
-							settleBatch(toolCallId);
+							for (const { identity } of ack.children) await settleResult(resultEnvelope(identity, tasks[ack.children.findIndex((child) => child.identity.runId === identity.runId)]!.task, { processOutcome: "not_started", exitCode: null, signal: null }, ""), mode !== "chain", dispatchRuns);
+							if (mode === "chain") sendReport(dispatchRuns.batch(toolCallId, "chain")!);
+							settleBatch(toolCallId, dispatchRuns);
 							return;
 						}
 						if (mode === "chain") {
@@ -2989,27 +3154,32 @@ export default function (pi: ExtensionAPI) {
 								const task = tasks[i]!.task.replace(/\{previous\}/g, previous);
 								let terminal: { envelope: ResultEnvelope; output: string };
 								if (failed) {
-									runs!.resolveTask(identity, task);
-									const envelope = runs!.claimNoSpawn(identity)!;
-									runs!.completeCleanup(identity);
+									dispatchRuns.resolveTask(identity, task);
+									const envelope = dispatchRuns.claimNoSpawn(identity)!;
+									dispatchRuns.completeCleanup(identity);
 									terminal = { envelope, output: "" };
-								} else terminal = await runDetachedAgent(mode, identity, task, i + 1);
+								} else terminal = await runDetachedAgent(mode, identity, task, dispatchRuns, i + 1);
 								const { envelope: result, output } = terminal;
-								await settleResult(result, false);
-								const finalized = await runs!.finalized(identity) ?? result;
+								await settleResult(result, false, dispatchRuns);
+								const finalized = await dispatchRuns.finalized(identity) ?? result;
 								failed ||= failedEnvelope(finalized);
 								previous = identity.agent === "plan-writer" && finalized.planResult?.state === "verified" ? finalized.planResult.binding.path : output;
 							}
-							sendReport(runs!.batch(toolCallId, "chain")!);
+							sendReport(dispatchRuns.batch(toolCallId, "chain")!);
 						} else {
 							await mapWithConcurrencyLimit(tasks, subagentConcurrency(settings, tasks.length), async (task, i) => {
-								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task);
-								await settleResult(result, true);
+								const { envelope: result } = await runDetachedAgent(mode, ack.children[i]!.identity, task.task, dispatchRuns);
+								await settleResult(result, true, dispatchRuns);
 							});
 						}
-						settleBatch(toolCallId);
+						settleBatch(toolCallId, dispatchRuns);
 					} finally {
 						activeUnits -= units;
+						if (dispatchGeneration) {
+							dispatchGeneration.batchDispatches = Math.max(0, dispatchGeneration.batchDispatches - 1);
+							wakeOwnedGeneration(dispatchGeneration);
+							emitChildState();
+						}
 						batchCompletions.get(toolCallId)?.resolve();
 						batchCompletions.delete(toolCallId);
 					}

@@ -326,6 +326,58 @@ test("an observed delivery retires its asynchronous error before a later healthy
   assert.equal(tracker.settled(), "wait");
 });
 
+test("delivery failure becomes terminal only after every producer and delivery is terminal", async () => {
+  const { ChildRuns, OwnedChildState, deliveryFor, resultEnvelope } = await import("../src/subagent-runs.ts");
+  const tracker = new OwnedChildState("owner", 100, "start");
+  tracker.bindSession("session");
+  const runs = new ChildRuns("owner", "session");
+  const tasks = ["A", "B"].map((task) => ({ agent: "worker", task, cwd: process.cwd() }));
+  const a = runs.admit("A", [tasks[0]!], process.cwd());
+  const b = runs.admit("B", [tasks[1]!], process.cwd());
+  tracker.toolStart("A", tasks[0]); tracker.toolEnd("A", a, false);
+  tracker.toolStart("B", tasks[1]); tracker.toolEnd("B", b, false);
+  const terminal = { processOutcome: "exited" as const, exitCode: 0, signal: null, stopReason: "stop" };
+  const deliveryA = deliveryFor(resultEnvelope(a.children[0]!.identity, "A", terminal, "A"));
+  const deliveryB = deliveryFor(resultEnvelope(b.children[0]!.identity, "B", terminal, "B"));
+  const snapshot = { version: 1 as const, ownerRunId: "owner", ownerSessionId: "session", pid: 100, starttime: "start", sequence: 1, children: [], deliveries: [{ ...deliveryA, state: "delivery_failed" as const }, deliveryB], producerObligations: 1, batchDispatches: 0 };
+  assert.equal(tracker.accept(snapshot), true);
+  assert.equal(tracker.deliveryFailureReason(), undefined);
+  assert.equal(tracker.canFinish("blocked", `${deliveryA.deliveryId}, ${deliveryB.deliveryId}`), false);
+  assert.equal(tracker.accept({ ...snapshot, sequence: 2, producerObligations: 0 }), true);
+  assert.equal(tracker.deliveryFailureReason(), undefined);
+  assert.equal(tracker.accept({ ...snapshot, sequence: 3, producerObligations: 0, deliveries: [{ ...deliveryA, state: "delivery_failed" as const }, { ...deliveryB, state: "enqueued" as const }] }), true);
+  assert.equal(tracker.deliveryFailureReason(), undefined);
+  assert.equal(tracker.accept({ ...snapshot, sequence: 4, producerObligations: 0, deliveries: [{ ...deliveryA, state: "delivery_failed" as const }, { ...deliveryB, state: "delivery_unknown" as const }] }), true);
+  const reason = tracker.deliveryFailureReason();
+  assert.match(reason!, new RegExp(deliveryA.deliveryId));
+  assert.match(reason!, new RegExp(deliveryB.deliveryId));
+  assert.equal(tracker.canFinish("blocked", reason), true);
+  assert.equal(tracker.canFinish("done"), false);
+});
+
+test("delivery failure waits for queued turns, retry and compaction to drain", async () => {
+  const { ChildRuns, OwnedChildState, deliveryFor, resultEnvelope } = await import("../src/subagent-runs.ts");
+  const tracker = new OwnedChildState("owner", 100, "start");
+  tracker.bindSession("session");
+  const runs = new ChildRuns("owner", "session");
+  const task = { agent: "worker", task: "A", cwd: process.cwd() };
+  const ack = runs.admit("A", [task], process.cwd());
+  tracker.toolStart("A", task);
+  tracker.toolEnd("A", ack, false);
+  const delivery = deliveryFor(resultEnvelope(ack.children[0]!.identity, "A", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "A"));
+  tracker.accept({ version: 1, ownerRunId: "owner", ownerSessionId: "session", pid: 100, starttime: "start", sequence: 1, children: [], deliveries: [{ ...delivery, state: "delivery_failed" }], producerObligations: 0, batchDispatches: 0 });
+  const reason = `report delivery failure; unobserved IDs: ${delivery.deliveryId}`;
+  for (const field of ["queue", "retry", "compaction"] as const) {
+    tracker[field] = true;
+    assert.equal(tracker.deliveryFailureReason(), undefined, field);
+    assert.equal(tracker.canFinish("blocked", reason), false, field);
+    assert.equal(tracker.settled(), "wait", field);
+    tracker[field] = false;
+  }
+  assert.equal(tracker.deliveryFailureReason(), reason);
+  assert.equal(tracker.canFinish("blocked", reason), true);
+});
+
 test("blocked teardown after unexpected exit preserves the completed parent snapshot", async () => {
   const fs = await import("node:fs");
   const { RunSnapshots } = await import("../src/subagent-runs.ts");
