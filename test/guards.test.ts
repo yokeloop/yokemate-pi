@@ -4,6 +4,9 @@
 // node --test does not reach that layer.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { groupScopeVerdict, guardCall, stopDelivery } from "../src/guards.ts";
 
 const CWD = "/home/x/yokemate/work/ACME-1";
@@ -49,7 +52,23 @@ test("group scope blocks write, refspec, direct merge and MCP bypasses", () => {
   assert.match(groupScopeVerdict("mcp", { server: "github", tool: "merge_pull_request" }, CWD, env)!, /MCP/);
   assert.match(groupScopeVerdict("bash", { command: `tee '${CWD}/repo/x'` }, CWD, env)!, /shell writes/);
   assert.match(groupScopeVerdict("bash", { command: `git -C '${CWD}/repo' merge ACME-2` }, CWD, env)!, /integrate/);
+  assert.match(groupScopeVerdict("bash", { command: `python -c "open('/tmp/outside','w').write('x')"` }, CWD, env)!, /interpreter/);
+  assert.match(groupScopeVerdict("bash", { command: "git -C /tmp pull" }, CWD, env)!, /integrate|WorkScope/);
+  assert.match(groupScopeVerdict("bash", { command: `echo '${CWD}/repo ACME-2'; git -C /tmp push origin ACME-2` }, CWD, env)!, /WorkScope/);
+  assert.match(groupScopeVerdict("bash", { command: `git -C '${CWD}/repo' update-ref refs/heads/ACME-1 HEAD` }, CWD, env)!, /integrate/);
   assert.match(groupScopeVerdict("bash", { command: `git -C '${CWD}/repo' push -u origin ACME-2` }, CWD, { ...env, YOKEMATE_GROUP_ROLE: "parent", YOKEMATE_GROUP_SCOPE_PATHS: "[]", YOKEMATE_GROUP_SCOPE_BRANCHES: "[]" })!, /WorkScope|registered source branch/);
+});
+
+test("group scope resolves symlinks before allowing writes or git mutations", () => {
+  const root = mkdtempSync(join(tmpdir(), "group-scope-"));
+  const scope = join(root, "scope");
+  const outside = join(root, "outside");
+  mkdirSync(scope);
+  mkdirSync(outside);
+  symlinkSync(outside, join(scope, "escape"), "dir");
+  const env = { YOKEMATE_GROUP_ROLE: "member", YOKEMATE_GROUP_SCOPE_PATHS: JSON.stringify([scope]), YOKEMATE_GROUP_SCOPE_BRANCHES: JSON.stringify(["ACME-2"]) };
+  assert.match(groupScopeVerdict("write", { path: join(scope, "escape", "x") }, scope, env)!, /WorkScope/);
+  assert.match(groupScopeVerdict("bash", { command: `git -C '${join(scope, "escape")}' commit -m nope` }, scope, env)!, /WorkScope/);
 });
 
 test("the stop guard pushes a turn once per verdict, then only speaks", () => {

@@ -83,9 +83,17 @@ test("open reconciliation is truthful and revocation before spawn refuses", asyn
   assert.equal(spawned, false);
 });
 
-test("base drift after the fresh gate refuses before merge spawn", async () => {
+test("base drift after the fresh gate refuses and reports mismatch before merge spawn", async () => {
   let spawned = false;
+  let mismatch: MergeSnapshot | undefined;
   const changed = { ...snapshot("base-drift"), baseRefName: "release" };
-  await assert.rejects(() => coordinatorMerge({ ...scope("base-drift"), runId: "base-drift-run" }, { pr: snapshot("base-drift").url, expectedHead: HEAD, method: "merge" }, deps([snapshot("base-drift"), changed], async () => { spawned = true; return { exit: 0, output: "" }; })), /changed after fresh gate/);
+  await assert.rejects(() => coordinatorMerge({ ...scope("base-drift"), runId: "base-drift-run", onMismatch: async (observed) => { mismatch = observed; } }, { pr: snapshot("base-drift").url, expectedHead: HEAD, method: "merge" }, deps([snapshot("base-drift"), changed], async () => { spawned = true; return { exit: 0, output: "" }; })), /changed after fresh gate/);
   assert.equal(spawned, false);
+  assert.equal(mismatch?.baseRefName, "release");
+});
+
+test("durable pre-merge hook runs under the fresh gate before merge spawn", async () => {
+  const events: string[] = [];
+  await coordinatorMerge({ ...scope("intent"), runId: "intent-run", beforeMerge: async () => { events.push("intent"); } }, { pr: snapshot("intent").url, expectedHead: HEAD, method: "merge" }, deps([snapshot("intent"), snapshot("intent"), { ...snapshot("intent"), state: "MERGED", mergedAt: "now" }], async () => { events.push("merge"); return { exit: 0, output: "" }; }));
+  assert.deepEqual(events, ["intent", "merge"]);
 });

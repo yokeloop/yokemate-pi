@@ -11,7 +11,8 @@
 // guard must not paralyze the work it protects (same policy as bash-guard).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
@@ -65,22 +66,43 @@ export function groupScopeVerdict(toolName: string, input: Record<string, unknow
   const paths = JSON.parse(env.YOKEMATE_GROUP_SCOPE_PATHS ?? "[]") as string[];
   const branches = JSON.parse(env.YOKEMATE_GROUP_SCOPE_BRANCHES ?? "[]") as string[];
   if (!Array.isArray(paths) || !Array.isArray(branches) || paths.some((value) => typeof value !== "string" || !isAbsolute(value)) || branches.some((value) => typeof value !== "string" || !value)) return "group work scope is malformed";
+  const canonical = (value: string): string => {
+    let current = resolve(value);
+    const tail: string[] = [];
+    while (!existsSync(current) && dirname(current) !== current) { tail.unshift(basename(current)); current = dirname(current); }
+    return resolve(realpathSync(current), ...tail);
+  };
+  const canonicalScopes = paths.map(canonical);
   const inside = (parent: string, value: string) => value === parent || value.startsWith(parent + sep);
   if (["write", "edit", "notebook_edit"].includes(toolName)) {
     const value = input.path ?? input.notebook_path;
     const target = typeof value === "string" ? resolve(cwd, value) : "";
-    if (!target || !paths.some((scope) => inside(resolve(scope), target))) return "group write is outside the registered WorkScope";
+    if (!target || !canonicalScopes.some((scope) => inside(scope, canonical(target)))) return "group write is outside the registered WorkScope";
   }
   if (toolName === "mcp") return "group execution cannot use an unscoped MCP effect; use the registered group control tools";
   if (toolName !== "bash") return null;
   const command = String(input.command ?? "");
-  if (/\bgh\s+(?:pr\s+merge|api)\b|\b(?:curl|wget)\b|\b(?:pnpm\s+(?:run\s+)?ship-merge|node\b[^\n]*ship-merge)\b/.test(command)) return "group execution cannot bypass the trusted merge/effect handlers";
-  if (/(^|[;&|]\s*)(?:sudo\s+)?(?:rm|mv|cp|mkdir|touch|tee)\b|\bsed\b[^\n;&|]*\s-(?:-in-place|[A-Za-z]*i)\b|(^|[^0-9])>>?/.test(command)) return "group shell writes are unscoped; use Write/Edit inside the registered WorkScope";
-  if (/\bgit\b[^\n;&|]*\s(?:merge|rebase|cherry-pick)\b/.test(command)) return "group branches integrate only through the registered group handlers";
-  const mutatingGit = /\bgit\b[^\n;&|]*\s(?:add|am|apply|commit|restore|reset|checkout|switch|push)\b/.test(command);
-  if (mutatingGit && !paths.some((scope) => inside(resolve(scope), resolve(cwd)) || command.includes(scope))) return "group git mutation is outside the registered WorkScope";
-  if (/\bgit\b[^\n;&|]*\spush\b/.test(command)) {
-    if (groupRole === "parent" || /\s--(?:delete|mirror|all|force)(?:\s|$)/.test(command) || !branches.some((branch) => new RegExp(`(?:^|\\s)${branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`).test(command)) || /\S+:\S+/.test(command)) return "group push must name only the registered source branch; integration and external refs are parent-owned effects";
+  if (!command.trim()) return "group shell command is empty";
+  if (/[`]|\$\(|<<|\b(?:eval|exec|env|xargs|find\b[^\n]*-exec|python\d*|node|perl|ruby|php|lua|bash|zsh|fish|dash|sh)\b/.test(command)) return "group shell cannot execute an unscoped interpreter or command expansion";
+  if (/\bgh\s+(?:pr\s+merge|api)\b|\b(?:curl|wget|http|httpie|nc|ncat|socat|ssh|scp|rsync)\b|\bpnpm\s+(?:run\s+)?ship-merge\b/.test(command)) return "group execution cannot bypass the trusted merge/effect handlers";
+  if (/(^|[;&|]\s*)(?:sudo\s+)?(?:rm|mv|cp|mkdir|touch|tee|install|truncate|dd)\b|\bsed\b[^\n;&|]*\s-(?:-in-place|[A-Za-z]*i)\b|(^|[^0-9])>>?/.test(command)) return "group shell writes are unscoped; use Write/Edit inside the registered WorkScope";
+  const segments = command.split(/\s*(?:&&|\|\||[;|\n])\s*/).filter(Boolean);
+  for (const segment of segments) {
+    const gitAt = segment.search(/(?:^|\s)git(?:\s|$)/);
+    if (gitAt < 0) continue;
+    const git = segment.slice(gitAt).trim();
+    const directory = /(?:^|\s)-C\s+(?:'([^']+)'|"([^"]+)"|(\S+))/.exec(git);
+    const effectiveCwd = resolve(cwd, directory?.[1] ?? directory?.[2] ?? directory?.[3] ?? ".");
+    const operation = /(?:^|\s)(add|am|apply|commit|restore|reset|checkout|switch|push|pull|merge|rebase|cherry-pick|update-ref|branch|tag|worktree)(?:\s|$)/.exec(git)?.[1];
+    if (!operation) continue;
+    if (["merge", "rebase", "cherry-pick", "pull", "update-ref"].includes(operation)) return "group branches integrate only through the registered group handlers";
+    if (!canonicalScopes.some((scope) => inside(scope, canonical(effectiveCwd)))) return "group git mutation is outside the registered WorkScope";
+    if (operation === "push") {
+      const tail = git.slice(git.search(/(?:^|\s)push(?:\s|$)/) + git.match(/(?:^|\s)push(?:\s|$)/)![0].length).trim();
+      const tokens = tail.match(/'[^']*'|"[^"]*"|\S+/g)?.map((token) => token.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
+      const positional = tokens.filter((token) => !token.startsWith("-") && token !== "origin");
+      if (groupRole === "parent" || tokens.some((token) => /^--(?:delete|mirror|all|force)/.test(token)) || positional.length !== 1 || !branches.includes(positional[0]!) || positional[0]!.includes(":")) return "group push must name only the registered source branch; integration and external refs are parent-owned effects";
+    }
   }
   return null;
 }

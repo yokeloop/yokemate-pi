@@ -6,7 +6,7 @@ import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 export interface CoordinatorMergeRequest { pr: string; expectedHead: string; method: "merge" | "squash" | "rebase" }
 export interface MergeSnapshot { url: string; state: string; headRefName: string; headRefOid: string; baseRefName: string; mergedAt?: string }
 export interface CoordinatorMergeResult { repo: string; pr: string; head: string; state: "merged" | "open" | "unknown"; reason?: string; repeated?: boolean }
-export interface CoordinatorMergeScope { root: string; runId: string; ticket: string; part: PreparedPart; live(): boolean }
+export interface CoordinatorMergeScope { root: string; runId: string; ticket: string; part: PreparedPart; live(): boolean; onMismatch?(snapshot: MergeSnapshot): Promise<void>; beforeMerge?(snapshot: MergeSnapshot): Promise<void> }
 export interface CoordinatorMergeDeps {
   snapshot(cwd: string, pr: string): Promise<MergeSnapshot>;
   gate(root: string, ticket: string, part: PreparedPart): Promise<ReturnType<typeof verifyGate>>;
@@ -136,13 +136,13 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
   const attempt = underMutex(lockKey, async () => {
     assertMandatoryBoundary("workflow.live-owner", scope.live(), "ship coordinator authority was revoked before fresh merge validation");
     const before = await deps.snapshot(scope.part.path, request.pr);
-    if (before.url !== request.pr || before.baseRefName !== scope.part.base || repositoryFromPr(before.url) !== repositoryFromPr(request.pr)) throw new Error("PR identity or target changed before merge");
+    if (before.url !== request.pr || before.baseRefName !== scope.part.base || repositoryFromPr(before.url) !== repositoryFromPr(request.pr)) { await scope.onMismatch?.(before); throw new Error("PR identity or target changed before merge"); }
     if (before.state === "MERGED") {
       if (before.headRefOid !== request.expectedHead || before.headRefName !== scope.part.branch || !before.mergedAt) throw new Error("merged PR does not match the prepared ticket head");
       return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "merged" as const };
     }
-    if (before.state !== "OPEN" || before.headRefName !== scope.part.branch) return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "unknown" as const, reason: `PR is ${before.state} on ${before.headRefName}` };
-    if (before.headRefOid !== request.expectedHead) throw new Error(`PR head moved from ${request.expectedHead} to ${before.headRefOid}`);
+    if (before.state !== "OPEN" || before.headRefName !== scope.part.branch) { await scope.onMismatch?.(before); return { repo: scope.part.repo, pr: before.url, head: before.headRefOid, state: "unknown" as const, reason: `PR is ${before.state} on ${before.headRefName}` }; }
+    if (before.headRefOid !== request.expectedHead) { await scope.onMismatch?.(before); throw new Error(`PR head moved from ${request.expectedHead} to ${before.headRefOid}`); }
     const verdict = await deps.gate(scope.root, scope.ticket, scope.part);
     if (!verdict.ok) {
       assertMandatoryBoundary("workflow.quality-gates", false, `gate: ${verdict.reason}`);
@@ -151,8 +151,10 @@ export function coordinatorMerge(scope: CoordinatorMergeScope, request: Coordina
     assertMandatoryBoundary("workflow.quality-gates", true);
     if (verdict.heads[scope.part.repo] !== before.headRefOid) throw new Error(`fresh gate head for ${scope.part.repo} is ${verdict.heads[scope.part.repo] ?? "missing"}, PR head is ${before.headRefOid}`);
     const fresh = await deps.snapshot(scope.part.path, request.pr);
-    if (fresh.url !== request.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.part.base || fresh.headRefName !== scope.part.branch || fresh.headRefOid !== before.headRefOid) throw new Error("PR identity, base, state, or head changed after fresh gate");
+    if (fresh.url !== request.pr || fresh.state !== "OPEN" || fresh.baseRefName !== scope.part.base || fresh.headRefName !== scope.part.branch || fresh.headRefOid !== before.headRefOid) { await scope.onMismatch?.(fresh); throw new Error("PR identity, base, state, or head changed after fresh gate"); }
     if (verdict.heads[scope.part.repo] !== fresh.headRefOid) throw new Error("fresh PR head no longer matches the gate verdict");
+    if (!scope.live()) throw new Error("ship coordinator authority was revoked before merge spawn");
+    await scope.beforeMerge?.(fresh);
     if (!scope.live()) throw new Error("ship coordinator authority was revoked before merge spawn");
     const merge = deps.merge(scope.part.path, { ...request, expectedHead: fresh.headRefOid });
     const merged = await merge;
