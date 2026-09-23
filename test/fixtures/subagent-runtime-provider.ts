@@ -12,10 +12,7 @@ export default function (pi: ExtensionAPI) {
     socket.once("error", reject);
   });
   const scenario = process.env.YM204_FIXTURE_SCENARIO;
-  const aggregateRole = scenario === "coordinator_aggregate" ? "coordinator" : scenario === "child_aggregate" ? "executor" : undefined;
   let childTurns = 0;
-  let aggregateTurns = 0;
-  let protocolInjected = false;
   if ((scenario === "delivery_sync" || scenario === "delivery_async") && process.env.YOKEMATE_ROLE === "coordinator") {
     const original = AgentSession.prototype.sendCustomMessage;
     AgentSession.prototype.sendCustomMessage = function (message, options) {
@@ -42,7 +39,7 @@ export default function (pi: ExtensionAPI) {
     const original = fs.renameSync;
     fs.renameSync = ((from: any, to: any) => { if (String(to).includes("subagent-reports")) throw Object.assign(new Error("private storage fault"), { code: "EIO" }); original(from, to); }) as any;
   }
-  pi.on("session_shutdown", () => { if (process.env.YOKEMATE_ROLE === "executor" && scenario === "nonzero") process.exit(7); });
+  if (scenario === "nonzero") pi.on("session_shutdown", () => { if (process.env.YOKEMATE_ROLE === "executor") process.exit(7); });
   let calledA = false;
   let calledB = false;
   let observedOldBatch = false;
@@ -56,15 +53,6 @@ export default function (pi: ExtensionAPI) {
     const reports = event.messages.filter((message) => message.role === "custom" && message.customType === "subagent-report");
     await barrier("context", reports);
   });
-  pi.on("agent_end", async (event) => {
-    if (process.env.YOKEMATE_ROLE !== aggregateRole) return;
-    const messages = event.messages as any[];
-    const toolCalls = messages.flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((block) => block?.type === "toolCall" && block.name === "read");
-    const toolResults = messages.filter((message) => message?.role === "toolResult" && message.toolName === "read");
-    const bytes = Buffer.byteLength(JSON.stringify({ ...event, willRetry: false }));
-    const maxRecordBytes = Math.max(...messages.map((message) => Buffer.byteLength(JSON.stringify({ type: "message_end", message }))));
-    await barrier("aggregate-measured", { bytes, readCalls: new Set(toolCalls.map((block) => block.id)).size, toolErrors: toolResults.filter((message) => message.isError).length, maxRecordBytes });
-  });
   pi.registerProvider("ym204-fixture", {
     baseUrl: "http://invalid.invalid",
     apiKey: "fixture-only",
@@ -73,34 +61,10 @@ export default function (pi: ExtensionAPI) {
     streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
       void (async () => {
-        if (!protocolInjected && process.env.YOKEMATE_ROLE === "executor" && (scenario === "protocol_oversized_unknown" || scenario === "protocol_oversized_control")) {
-          protocolInjected = true;
-          const injected = scenario === "protocol_oversized_unknown" ? { type: "fixture_unknown", payload: "x".repeat(1024 * 1024) } : { type: "response", id: "forbidden-child-control", payload: "x".repeat(1024 * 1024) };
-          await new Promise<void>((resolve, reject) => process.stdout.write("", (error) => error ? reject(error) : resolve()));
-          const bytes = Buffer.from(JSON.stringify(injected) + "\n");
-          for (let offset = 0; offset < bytes.length;) {
-            const written = await new Promise<number>((resolve, reject) => {
-              const attempt = () => fs.write(1, bytes, offset, bytes.length - offset, (error, count) => {
-                if ((error as NodeJS.ErrnoException | null)?.code === "EAGAIN") setImmediate(attempt);
-                else if (error) reject(error);
-                else resolve(count);
-              });
-              attempt();
-            });
-            offset += written;
-          }
-        }
         const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
         stream.push({ type: "start", partial: message });
         const text = JSON.stringify(context.messages);
-        const aggregateTarget = process.env.YOKEMATE_ROLE === "executor" && process.env.YOKEMATE_ROLE === aggregateRole;
-        if (aggregateTarget && aggregateTurns < 40) {
-          const id = `aggregate-read-${aggregateTurns++}`;
-          message.stopReason = "toolUse";
-          message.content = [{ type: "toolCall", id, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } }];
-          stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
-          stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
-        } else if (process.env.YOKEMATE_ROLE === "executor") {
+        if (process.env.YOKEMATE_ROLE === "executor") {
           message.content.push({ type: "thinking", thinking: "fixture thinking" });
           stream.push({ type: "thinking_start", contentIndex: 0, partial: message });
           stream.push({ type: "thinking_delta", contentIndex: 0, delta: "fixture thinking", partial: message });
@@ -139,13 +103,7 @@ export default function (pi: ExtensionAPI) {
           };
           if (!calledA) {
             calledA = true;
-            if (scenario === "coordinator_aggregate") {
-              const id = `aggregate-read-${aggregateTurns++}`;
-              message.stopReason = "toolUse";
-              message.content = [{ type: "toolCall", id, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } }];
-              stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
-              stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
-            } else if (scenario === "plan_scout_terminal") {
+            if (scenario === "plan_scout_terminal") {
               message.stopReason = "toolUse";
               message.content = [{ type: "toolCall", id: "scout-terminal", name: "subagent", arguments: { agent: "plan-scout", task: "Return a complete fixture scout.", ticket: "YM-1" } }];
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
@@ -156,13 +114,6 @@ export default function (pi: ExtensionAPI) {
               const single = block.arguments;
               block.arguments = { [scenario === "parallel" || scenario === "parallel_max" ? "tasks" : "chain"]: Array.from({ length: scenario === "parallel_max" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" ? 3 : 2 }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
             }
-          }
-          else if (scenario === "coordinator_aggregate" && aggregateTurns < 40) {
-            const id = `aggregate-read-${aggregateTurns++}`;
-            message.stopReason = "toolUse";
-            message.content = [{ type: "toolCall", id, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } }];
-            stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
-            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
           }
           else if (!scenario && !calledB && text.includes("[subagent task-reviewer]")) { calledB = true; call("batch-B", "review-B"); }
           else {

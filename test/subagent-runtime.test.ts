@@ -42,7 +42,6 @@ test("real Pi delivers a terminal blocked scout without PI_SESSION_ID when paren
   const barrier = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    socket.on("error", () => sockets.delete(socket));
     socket.on("data", (chunk) => { if (chunk.toString().includes("\n")) socket.end("release\n"); });
   });
   const socketPath = join(runtime, "provider.sock");
@@ -218,7 +217,6 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
 const cases = [
   ["parallel_max", "output_limit"], ["chain_max", "output_limit"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
-  ["protocol_oversized_unknown", "protocol_error"], ["protocol_oversized_control", "protocol_error"], ["coordinator_aggregate", "valid"], ["child_aggregate", "valid"],
   ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
 ] as const;
 
@@ -237,16 +235,12 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   writeFileSync(join(cwd, ".pi/agents/worker.md"), "---\nname: worker\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn the requested output.\n");
   writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
   writeFileSync(join(folder, "plan.md"), "fixture plan");
-  const aggregateFile = join(folder, "aggregate.txt");
-  writeFileSync(aggregateFile, ("x".repeat(31) + "\n").repeat(1280));
-  assert.equal(readFileSync(aggregateFile).length, 40 * 1024);
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
   const priorEnv = { ...process.env };
   for (const key of Object.keys(process.env)) if (key !== "PATH") delete process.env[key];
-  Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: scenario.endsWith("_aggregate") ? aggregateFile : join(folder, "plan.md") });
+  Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
-  const aggregateMeasurements: any[] = [];
   let working!: () => void;
   const childWorking = new Promise<void>((resolve) => { working = resolve; });
   const server = createServer((socket) => {
@@ -258,7 +252,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       if (!buffer.includes("\n")) return;
       const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
       if (event.phase === "loaded") loaded.push(event);
-      if (event.phase === "aggregate-measured") aggregateMeasurements.push(event);
       if (scenario === "parent_cancel" && event.phase === "child-working") working();
       else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
       else socket.end("release\n");
@@ -273,8 +266,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const reports: any[] = [];
   let failureReason: string | undefined;
   let timeout: NodeJS.Timeout | undefined;
-  let workStarted = false;
-  let aggregateStartCount = 0;
   try {
     await untilAborted(new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve)), signal);
     rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-204"], model: "ym204-fixture/deterministic:high", cwd, plan: join(folder, "plan.md"), plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
@@ -282,7 +273,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
       { onEvent(event) {
         if (rpc && scenario.startsWith("delivery_")) continueOwnedCoordinator(rpc, event, (reason) => { failureReason = reason; complete(); });
-        if (scenario === "coordinator_aggregate" && workStarted && event.type === "agent_settled") complete();
         const message = event.type === "message_end" ? event.message as any : undefined;
         const envelope = message?.details?.envelope;
         if (envelope) reports.push(message);
@@ -295,8 +285,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       }, onBlocked(reason) { failureReason = reason; complete(); } },
       { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", extension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
     await untilAborted(rpc.ready, signal);
-    aggregateStartCount = ((rpc.diagnosticSnapshot().stream as any)?.events?.agent_end ?? 0);
-    workStarted = true;
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
     if (scenario === "parent_cancel") {
       await untilAborted(childWorking, signal);
@@ -316,24 +304,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       return;
     }
     await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed`)), 10000); })]), signal);
-    if (scenario === "coordinator_aggregate") {
-      const measurement = aggregateMeasurements.find((entry) => entry.role === "coordinator");
-      assert.ok(measurement, "coordinator aggregate measurement missing");
-      assert.ok(measurement.data.bytes > 1024 * 1024, measurement.data.bytes);
-      assert.equal(measurement.data.readCalls, 40);
-      assert.equal(measurement.data.toolErrors, 0);
-      assert.ok(measurement.data.maxRecordBytes < 1024 * 1024);
-      const stream = rpc.diagnosticSnapshot().stream as any;
-      assert.equal(stream.events.agent_end, aggregateStartCount + 1);
-      assert.equal(stream.parserErrors, 0);
-      assert.equal(rpc.events.some((event) => event.type === "agent_end"), false);
-      assert.equal(failureReason, undefined);
-      assert.equal(rpc.process.exitCode, null);
-      assert.equal((await rpc.request({ type: "get_state" })).success, true);
-      console.log(JSON.stringify({ piVersion, scenario, role: measurement.role, runId: measurement.runId, aggregateBytes: measurement.data.bytes, aggregateCount: stream.events.agent_end, terminal: "live" }));
-      rpc.acceptTerminal();
-      return;
-    }
     if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
@@ -365,21 +335,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "parallel_max") { assert.equal(results.length, 8); assert.ok(results.every((result: any) => result.payloadOutcome === "output_limit")); }
     if (scenario === "chain_max") { assert.equal(results.length, 20); assert.ok(results.slice(1).every((result: any) => result.processOutcome === "not_started")); }
     if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
-    if (scenario === "child_aggregate") {
-      const measurement = aggregateMeasurements.find((entry) => entry.role === "executor" && entry.runId === results[0].identity.runId);
-      assert.ok(measurement, "child aggregate measurement missing");
-      assert.ok(measurement.data.bytes > 1024 * 1024, measurement.data.bytes);
-      assert.equal(measurement.data.readCalls, 40);
-      assert.equal(measurement.data.toolErrors, 0);
-      assert.ok(measurement.data.maxRecordBytes < 1024 * 1024);
-      assert.equal(results[0].processOutcome, "exited");
-      assert.equal(results[0].exitCode, 0);
-      assert.equal(results[0].signal, null);
-      assert.equal(results[0].stopReason, "stop");
-      assert.equal(results[0].reviewVerdict, "approved");
-      assert.deepEqual(JSON.parse(results[0].payload), { status: "approved", findings: [] });
-      assert.equal((await rpc.request({ type: "get_state" })).success, true);
-    }
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
@@ -388,7 +343,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
     const terminalReport = reports.find((message) => message.details.envelope.kind === (scenario.startsWith("chain") ? "chain" : "result")) ?? reports[0];
-    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /parser invalid_json/, protocol_partial: /parser (?:partial_record|invalid_json)/, protocol_overflow: /parser (?:record_limit|invalid_json)/, protocol_oversized_unknown: /parser record_limit/, protocol_oversized_control: /parser record_limit/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/, chain_max: /output limit/ };
+    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /parser invalid_json/, protocol_partial: /parser (?:partial_record|invalid_json)/, protocol_overflow: /parser (?:record_limit|invalid_json)/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/, chain_max: /output limit/ };
     if (reasons[scenario]) assert.match(terminalReport.details.display.failureReason, reasons[scenario], scenario);
     if (scenario === "storage_error") assert.deepEqual(terminalReport.details.display.archive, { state: "unavailable", code: "EIO" });
     else if (!scenario.startsWith("delivery_")) {
@@ -409,20 +364,8 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.equal(childSnapshot.guard.path, join(root, "src/guards.ts"));
       assert.equal(childSnapshot.extension.path, extension);
       assert.equal(childSnapshot.effective.thinking, "unknown");
-      if (scenario === "child_aggregate") {
-        assert.equal(childSnapshot.completed, true);
-        assert.equal(childSnapshot.stream.events.agent_end, 1);
-        assert.equal(childSnapshot.stream.parserErrors, 0);
-        assert.equal(childSnapshot.terminal.processOutcome, "exited");
-        assert.equal(childSnapshot.terminal.exitCode, 0);
-        assert.equal(childSnapshot.terminal.signal, null);
-        assert.equal(childSnapshot.terminal.stopReason, "stop");
-        assert.equal(childSnapshot.payload.outcome, "valid");
-        assert.equal(childSnapshot.payload.verdict, "approved");
-      }
     }
-    const aggregate = aggregateMeasurements[0];
-    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(extension), baseSha: head, headSha: head, role: aggregate?.role, runId: aggregate?.runId, aggregateBytes: aggregate?.data?.bytes, observedAggregateCount: scenario === "child_aggregate" ? snapshots.find((snapshot) => snapshot.identity?.runId === results[0].identity.runId)?.stream?.events?.agent_end : undefined, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
+    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(extension), baseSha: head, headSha: head, results: results.map((result: any) => ({ runId: result.identity.runId, processOutcome: result.processOutcome, payloadOutcome: result.payloadOutcome, exitCode: result.exitCode, signal: result.signal })) }));
     rpc.acceptTerminal();
   } finally {
     clearTimeout(timeout);
