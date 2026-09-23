@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { RUNTIME_SETTING_KEYS, RUNTIME_SETTINGS_MATRIX, RUNTIME_SETTING_SURFACES } from "../src/guard-policy.ts";
+import { runSupervisedFile } from "../scripts/test-runner.ts";
+import { MANIFEST_ADAPTER_FILES } from "../scripts/test-suite.ts";
 
 type Adapter = { file: string; name: string };
 const entry = "runtime-settings-entrypoints.test.ts";
@@ -18,15 +19,15 @@ const adapters: Adapter[] = [
   { file: "mode-tab.test.ts", name: "generic duplicate guards and ticketless name series are surface independent" },
 ];
 
-test("public regression manifest consumes exact passed case IDs for every runtime setting cell", { timeout: 360000 }, () => {
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
+test("public regression manifest consumes exact passed case IDs for every runtime setting cell", { timeout: 600000 }, async () => {
+  assert.deepEqual([...new Set(adapters.map((adapter) => adapter.file))].sort(), [...MANIFEST_ADAPTER_FILES].sort());
+  const started = Date.now();
   const passed = new Set<string>();
-  for (const file of [...new Set(adapters.map((adapter) => adapter.file))]) {
+  for (const file of MANIFEST_ADAPTER_FILES) {
+    const remaining = Math.max(1_000, 600_000 - (Date.now() - started));
+    const result = await runSupervisedFile(new URL(file, import.meta.url).pathname, { fileTimeoutMs: remaining, prefix: `manifest:${file}`, env: { NODE_TEST_CONTEXT: undefined } });
+    assert.equal(result.code, 0, `${file}\n${result.stdout}\n${result.stderr}`);
     const names = adapters.filter((adapter) => adapter.file === file).map((adapter) => adapter.name);
-    const pattern = `^(?:${names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})$`;
-    const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "--test", `--test-name-pattern=${pattern}`, new URL(file, import.meta.url).pathname], { encoding: "utf8", timeout: 300000, env });
-    assert.equal(result.status, 0, `${file}\n${result.stdout}\n${result.stderr}`);
     for (const name of names) {
       const line = result.stdout.split("\n").find((value) => value.includes(` - ${name}`) && /^ok\s/.test(value));
       assert.ok(line && !line.includes("# SKIP"), `${file}: ${name} did not execute\n${result.stdout}`);

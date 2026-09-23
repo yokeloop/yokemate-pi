@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,21 +105,22 @@ function selectedFiles(arguments_: readonly string[]): { files: string[]; target
   return { files: [...new Set(selected)], targeted: true };
 }
 
-function summarize(results: readonly SupervisedFileResult[], mode: "full" | "targeted", started: number, maxRuntimeChains: number, admissionMs: number): void {
+function summarize(results: readonly SupervisedFileResult[], mode: "full" | "targeted", started: number, maxRuntimeChains: number, admissionMs: number, fileCount = results.length): void {
   const failures = results.filter((result) => result.code !== 0);
   const scenarioIds = new Set<string>();
   for (const result of results) {
     for (const match of result.stdout.matchAll(/RUNTIME_CASE\s+(\S+)|^\s*# Subtest:\s*(.+)$/gm)) scenarioIds.add(match[1] ?? `${path.basename(result.file)}:${match[2]}`);
   }
   let sha = "unknown";
-  try { sha = fs.readFileSync(path.join(repositoryRoot, ".git"), "utf8").trim(); } catch {}
+  try { sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8", timeout: 10_000 }).trim(); } catch {}
   const packageVersion = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json"), "utf8")).version;
-  process.stdout.write(`TEST_SUITE_SUMMARY ${JSON.stringify({ mode, sha, version: packageVersion, files: results.length, uniqueScenarioIds: scenarioIds.size, totalMs: Math.round(performance.now() - started), admissionMs: Math.round(admissionMs), maxRuntimeChains, failures: failures.map((result) => ({ file: path.basename(result.file), code: result.code, signal: result.signal })), cleanup: failures.some((result) => /failed cleanup/.test(result.stderr)) ? "failed" : "clean" })}\n`);
+  const totalMs = started > 1_000_000_000_000 ? Date.now() - started : performance.now() - started;
+  process.stdout.write(`TEST_SUITE_SUMMARY ${JSON.stringify({ mode, sha, version: packageVersion, files: fileCount, uniqueScenarioIds: scenarioIds.size, activeMs: Math.round(totalMs), admissionMs: Math.round(admissionMs), cleanupMs: 0, totalMs: Math.round(totalMs + admissionMs), maxRuntimeChains, failures: failures.map((result) => ({ file: path.basename(result.file), code: result.code, signal: result.signal })), cleanup: failures.some((result) => /failed cleanup/.test(result.stderr)) ? "failed" : "clean" })}\n`);
 }
 
-async function runRuntimePhase(files: readonly string[], mode: "full" | "targeted", suiteStarted: number): Promise<number> {
+async function runRuntimePhase(files: readonly string[], mode: "full" | "targeted", suiteStarted: number, lightCount: number): Promise<number> {
   const runtime = await runFiles(files, 2, suiteStarted + 720_000);
-  summarize(runtime.results, mode, suiteStarted, runtime.maxConcurrency, 0);
+  summarize(runtime.results, mode, suiteStarted, runtime.maxConcurrency, Number(process.env.YOKEMATE_TEST_ADMISSION_WAIT_MS ?? 0), lightCount + files.length);
   return runtime.results.some((result) => result.code !== 0) ? 1 : 0;
 }
 
@@ -160,6 +161,7 @@ export async function runSuite(arguments_: readonly string[] = []): Promise<numb
     "--runtime-phase",
     selection.targeted ? "targeted" : "full",
     String(wallStarted),
+    String(light.length),
     ...runtime,
   ];
   const admissionStarted = performance.now();
@@ -180,7 +182,8 @@ async function main(): Promise<void> {
   if (process.argv[2] === "--runtime-phase") {
     const mode = process.argv[3] === "targeted" ? "targeted" : "full";
     const wallStarted = Number(process.argv[4]);
-    process.exitCode = await runRuntimePhase(process.argv.slice(5), mode, wallStarted);
+    const lightCount = Number(process.argv[5]);
+    process.exitCode = await runRuntimePhase(process.argv.slice(6), mode, wallStarted, lightCount);
     return;
   }
   process.exitCode = await runSuite(process.argv.slice(2));

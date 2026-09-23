@@ -314,6 +314,7 @@ def main():
     args = parse_arguments()
     if args.mode == "runtime":
         root = args.admission_root or f"/tmp/yokemate-tests-{os.getuid()}"
+        admission_started = time.monotonic()
         try:
             descriptor, owner_path, record = acquire_runtime_admission(root, args.admission_timeout)
         except TimeoutError as error:
@@ -323,6 +324,7 @@ def main():
             print(str(error), file=sys.stderr)
             return 1
         os.environ[ADMISSION_ENV] = "1"
+        os.environ["YOKEMATE_TEST_ADMISSION_WAIT_MS"] = str(round((time.monotonic() - admission_started) * 1000))
         try:
             code, clean = supervise(args.command, args.active_timeout or 720.0, args.cleanup_timeout, absolute_timeout=args.absolute_timeout)
             finish_admission(descriptor, owner_path, record, clean)
