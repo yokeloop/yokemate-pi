@@ -9,6 +9,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { reportContent, sha256, type ReportDelivery, type ReportEnvelope } from "../src/subagent-runs.ts";
 import { openDb } from "../src/db.ts";
 import { acknowledgeFixtureReports, createFixtureEngine, loadFixtureExtension, shutdownFixture, withFixtureEnvironment } from "./fixtures/subagent-fixture-engine.ts";
+import { closeOwnedServer, waitForEvent } from "./fixtures/runtime-resources.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const extension = join(root, ".pi/extensions/subagent/index.ts");
@@ -124,7 +125,6 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
   const socketPath = join(engine.runtimeDir, "cancel.sock");
   const sockets = new Set<Socket>();
   const events: any[] = [];
-  const waiters: Array<() => void> = [];
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
@@ -136,12 +136,12 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
         if (newline < 0) break;
         events.push({ ...JSON.parse(buffer.slice(0, newline)), socket });
         buffer = buffer.slice(newline + 1);
-        for (const wake of waiters.splice(0)) wake();
+        server.emit("fixture-event");
       }
     });
   });
   const waitEvent = async (predicate: (event: any) => boolean) => {
-    while (!events.some(predicate)) await new Promise<void>((resolve) => waiters.push(resolve));
+    while (!events.some(predicate)) await waitForEvent(server, "fixture-event", { timeoutMs: 10_000, closeEvents: ["close"], errorEvents: ["error"], label: "cancellation checkpoint" });
     return events.find(predicate)!;
   };
   await new Promise<void>((resolve) => server.listen(socketPath, resolve));
@@ -209,8 +209,7 @@ test("ordinary ACK UUID cancellation proves TERM and KILL cleanup without closin
       await shutdownFixture(fixture);
     });
   } finally {
-    for (const socket of sockets) socket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await closeOwnedServer(server, sockets);
   }
 });
 

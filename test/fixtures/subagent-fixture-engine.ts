@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { sha256 } from "../../src/subagent-runs.ts";
+import { RuntimeResources } from "./runtime-resources.ts";
 
 const fixtureNames = ["subagent-json-relay.mjs", "subagent-report-child.js", "runtime-settings-child.mjs", "subagent-widget-child.js", "subagent-runtime-provider.ts"] as const;
 const environmentQueue: Array<() => void> = [];
@@ -95,6 +96,7 @@ function awaitImportText(file: string): string {
 export function createFixtureEngine(options: { label: string; sourceRoot?: string; agents: Record<string, string>; dependencyRoot?: string; gitRepository?: boolean }): FixtureEngine {
   const sourceRoot = fs.realpathSync(options.sourceRoot ?? path.resolve(import.meta.dirname, "../.."));
   const root = fs.mkdtempSync(path.join(tmpdir(), `ym245-${options.label}-`));
+  try {
   fs.cpSync(path.join(sourceRoot, "src"), path.join(root, "src"), { recursive: true });
   fs.cpSync(path.join(sourceRoot, ".pi/extensions/subagent"), path.join(root, ".pi/extensions/subagent"), { recursive: true });
   fs.mkdirSync(path.join(root, "test/fixtures"), { recursive: true });
@@ -122,12 +124,12 @@ export function createFixtureEngine(options: { label: string; sourceRoot?: strin
   if (options.gitRepository) {
     repository = path.join(root, "repository");
     fs.mkdirSync(repository);
-    execFileSync("git", ["init", "-b", "main", repository], { stdio: "pipe" });
-    execFileSync("git", ["-C", repository, "config", "user.name", "Fixture"], { stdio: "pipe" });
-    execFileSync("git", ["-C", repository, "config", "user.email", "fixture@example.invalid"], { stdio: "pipe" });
+    execFileSync("git", ["init", "-b", "main", repository], { stdio: "pipe", timeout: 30_000 });
+    execFileSync("git", ["-C", repository, "config", "user.name", "Fixture"], { stdio: "pipe", timeout: 30_000 });
+    execFileSync("git", ["-C", repository, "config", "user.email", "fixture@example.invalid"], { stdio: "pipe", timeout: 30_000 });
     fs.writeFileSync(path.join(repository, "fixture.txt"), "fixture\n");
-    execFileSync("git", ["-C", repository, "add", "fixture.txt"], { stdio: "pipe" });
-    execFileSync("git", ["-C", repository, "commit", "-m", "Create fixture"], { stdio: "pipe" });
+    execFileSync("git", ["-C", repository, "add", "fixture.txt"], { stdio: "pipe", timeout: 30_000 });
+    execFileSync("git", ["-C", repository, "commit", "-m", "Create fixture"], { stdio: "pipe", timeout: 30_000 });
   }
   const engine: FixtureEngine = {
     root,
@@ -144,14 +146,36 @@ export function createFixtureEngine(options: { label: string; sourceRoot?: strin
   for (const target of [engine.root, engine.agentDir, engine.sessionDir, engine.homeDir, engine.tmpDir, engine.runtimeDir, path.dirname(engine.extensionPath), ...Object.values(resources), ...(repository ? [repository] : [])]) assertContained(root, target);
   assert.equal(fs.realpathSync(engine.extensionPath).startsWith(`${fs.realpathSync(root)}${path.sep}`), true);
   return engine;
+  } catch (error) {
+    fs.rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
-async function acquireEnvironment(): Promise<void> {
+async function acquireEnvironment(signal?: AbortSignal, timeoutMs = 30_000): Promise<void> {
   if (!environmentBusy) {
     environmentBusy = true;
     return;
   }
-  await new Promise<void>((resolve) => environmentQueue.push(resolve));
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
+      const index = environmentQueue.indexOf(granted);
+      if (index >= 0) environmentQueue.splice(index, 1);
+      if (error !== undefined) reject(error);
+      else resolve();
+    };
+    const granted = () => finish();
+    const aborted = () => finish(signal?.reason ?? new Error("fixture environment acquisition aborted"));
+    const timer = setTimeout(() => finish(new Error("fixture environment acquisition timed out")), timeoutMs);
+    environmentQueue.push(granted);
+    if (signal?.aborted) aborted();
+    else signal?.addEventListener("abort", aborted, { once: true });
+  });
 }
 
 function releaseEnvironment(): void {
@@ -160,15 +184,15 @@ function releaseEnvironment(): void {
   else environmentBusy = false;
 }
 
-export async function withFixtureEnvironment<T>(engine: FixtureEngine, overrides: Record<string, string | undefined>, body: () => Promise<T>): Promise<T> {
-  await acquireEnvironment();
+export async function withFixtureEnvironment<T>(engine: FixtureEngine, overrides: Record<string, string | undefined>, body: () => Promise<T>, resources?: RuntimeResources): Promise<T> {
+  await acquireEnvironment(resources?.signal);
   const previous = { ...process.env };
   const cwd = process.cwd();
   let bodyError: unknown;
   let value: T | undefined;
   try {
     for (const key of Object.keys(process.env)) delete process.env[key];
-    for (const key of ["PATH", "NODE_TEST_CONTEXT"] as const) if (previous[key] !== undefined) process.env[key] = previous[key];
+    for (const key of ["PATH", "NODE_TEST_CONTEXT", "YOKEMATE_TEST_RESOURCE_ROOT", "YOKEMATE_TEST_RESOURCE_REGISTRY", "YOKEMATE_TEST_ABSOLUTE_DEADLINE", "YOKEMATE_TEST_ADMISSION_HELD"] as const) if (previous[key] !== undefined) process.env[key] = previous[key];
     Object.assign(process.env, {
       HOME: engine.homeDir,
       TMPDIR: engine.tmpDir,
@@ -186,20 +210,22 @@ export async function withFixtureEnvironment<T>(engine: FixtureEngine, overrides
   } catch (error) {
     bodyError = error;
   }
-  let shutdownError: unknown;
-  try {
-    for (const fixture of [...engine.loaded].reverse()) await shutdownFixture(fixture, bodyError ? { expectedDeliveryState: "terminal" } : undefined);
-  } catch (error) {
-    shutdownError = error;
+  const shutdownErrors: unknown[] = [];
+  for (const fixture of [...engine.loaded].reverse()) {
+    try { await shutdownFixture(fixture, bodyError ? { expectedDeliveryState: "terminal" } : undefined); }
+    catch (error) { shutdownErrors.push(error); }
   }
-  process.chdir(cwd);
-  for (const key of Object.keys(process.env)) delete process.env[key];
-  Object.assign(process.env, previous);
-  if (!shutdownError) fs.rmSync(engine.root, { recursive: true, force: true });
+  try { process.chdir(cwd); }
+  catch (error) { shutdownErrors.push(error); }
+  try {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, previous);
+  } catch (error) { shutdownErrors.push(error); }
+  if (!shutdownErrors.length) fs.rmSync(engine.root, { recursive: true, force: true });
   releaseEnvironment();
-  if (bodyError && shutdownError) throw new AggregateError([bodyError, shutdownError], `fixture body failed: ${String(bodyError)}; shutdown failed: ${String(shutdownError)}`);
-  if (shutdownError) throw shutdownError;
-  if (bodyError) throw bodyError;
+  const errors = [...(bodyError !== undefined ? [bodyError] : []), ...shutdownErrors];
+  if (errors.length > 1) throw new AggregateError(errors, `fixture body or cleanup failed: ${errors.map(String).join("; ")}`);
+  if (errors.length === 1) throw errors[0];
   return value as T;
 }
 
@@ -225,11 +251,17 @@ export async function loadFixtureExtension(engine: FixtureEngine, options: { ses
     ui: { notify: () => undefined, setWidget: () => undefined, ...(options.ui ?? {}) },
     modelRegistry: { getAll: () => [], hasConfiguredAuth: () => true },
   } as unknown as ExtensionContext;
-  for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
   const fixture: LoadedFixture = { engine, loader, extension, tool: extension.tools.get("subagent")?.definition, ctx, sent, entries };
-  assert.ok(fixture.tool);
   engine.loaded.push(fixture);
-  return fixture;
+  try {
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
+    assert.ok(fixture.tool);
+    return fixture;
+  } catch (error) {
+    try { await shutdownFixture(fixture, { expectedDeliveryState: "terminal" }); }
+    catch (shutdownError) { throw new AggregateError([error, shutdownError], "fixture startup and shutdown failed"); }
+    throw error;
+  }
 }
 
 function deliveryStates(fixture: LoadedFixture): Map<string, string> {
@@ -241,15 +273,16 @@ function deliveryStates(fixture: LoadedFixture): Map<string, string> {
   return states;
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs: number, label: string, signal?: AbortSignal): Promise<void> {
   const started = Date.now();
   while (!predicate()) {
+    if (signal?.aborted) throw signal.reason ?? new Error(`${label} aborted`);
     if (Date.now() - started > timeoutMs) throw new Error(`${label} timed out`);
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
-export async function acknowledgeFixtureReports(fixture: LoadedFixture, reports: readonly SentFixtureMessage[], timeoutMs = 5000): Promise<void> {
+export async function acknowledgeFixtureReports(fixture: LoadedFixture, reports: readonly SentFixtureMessage[], timeoutMs = 5000, signal?: AbortSignal): Promise<void> {
   assert.ok(reports.length > 0);
   const selected = reports.filter(({ message }) => message.customType === "subagent-report");
   assert.equal(selected.length, reports.length);
@@ -274,7 +307,7 @@ export async function acknowledgeFixtureReports(fixture: LoadedFixture, reports:
   });
   const messages = selected.map(({ message }) => ({ role: "custom", timestamp: Date.now(), ...message }));
   for (const handler of fixture.extension.handlers.get("context") ?? []) await handler({ type: "context", messages } as never, fixture.ctx);
-  await waitFor(() => [...ids].every((id) => deliveryStates(fixture).get(id) === "observed"), timeoutMs, "fixture report ACK");
+  await waitFor(() => [...ids].every((id) => deliveryStates(fixture).get(id) === "observed"), timeoutMs, "fixture report ACK", signal);
   for (const archive of archives) {
     const bytes = fs.readFileSync(archive.path);
     assert.equal(sha256(bytes), archive.hash);

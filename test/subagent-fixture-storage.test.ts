@@ -202,7 +202,7 @@ function createPersistentEngine(sourceRef?: string): PersistentEngine {
     fs.cpSync(path.join(root, ".pi/extensions/subagent"), path.join(outer, ".pi/extensions/subagent"), { recursive: true });
     fs.mkdirSync(path.join(outer, "test/fixtures"), { recursive: true });
     fs.copyFileSync(path.join(root, "test/subagent-report-loader.test.ts"), path.join(outer, "test/subagent-report-loader.test.ts"));
-    for (const name of ["subagent-json-relay.mjs", "subagent-report-child.js", "runtime-settings-child.mjs", "subagent-widget-child.js", "coordinator-report-child.ts", "subagent-fixture-engine.ts"]) fs.copyFileSync(path.join(root, "test/fixtures", name), path.join(outer, "test/fixtures", name));
+    for (const name of ["subagent-json-relay.mjs", "subagent-report-child.js", "runtime-settings-child.mjs", "subagent-widget-child.js", "coordinator-report-child.ts", "subagent-fixture-engine.ts", "runtime-resources.ts", "bounded-runtime-case.ts"]) fs.copyFileSync(path.join(root, "test/fixtures", name), path.join(outer, "test/fixtures", name));
   }
   fs.mkdirSync(path.join(outer, ".pi/agents"), { recursive: true });
   fs.mkdirSync(path.join(outer, "agent/extensions"), { recursive: true });

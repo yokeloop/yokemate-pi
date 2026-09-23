@@ -189,6 +189,12 @@ def supervise(command, timeout, cleanup_timeout, resource_root=None, absolute_ti
         direct_code = child.poll()
         owned = descendants(os.getpid(), root_identity, known)
         leftovers = [identity for pid, identity in owned.items() if pid != child.pid or direct_code is None]
+        settle_deadline = min(absolute_deadline, time.monotonic() + 0.25)
+        while direct_code is not None and leftovers and time.monotonic() < settle_deadline:
+            reap_identities({identity["pid"]: identity for identity in leftovers})
+            time.sleep(0.02)
+            owned = descendants(os.getpid(), root_identity, known)
+            leftovers = [identity for pid, identity in owned.items() if pid != child.pid]
         cleanup_needed = timed_out or interrupted["signal"] is not None or direct_code is None or bool(leftovers)
         remaining = max(0.1, min(cleanup_timeout, absolute_deadline - time.monotonic()))
         survivors = terminate_owned_tree(os.getpid(), root_identity, known, remaining) if cleanup_needed else []
@@ -207,7 +213,7 @@ def supervise(command, timeout, cleanup_timeout, resource_root=None, absolute_ti
             return 124, clean
         if not clean or leftovers:
             if leftovers:
-                print("resource failure: descendants remained after file exit", file=sys.stderr)
+                print("resource failure: descendants remained after file exit: " + json.dumps(leftovers, sort_keys=True), file=sys.stderr)
             return 1, clean
         return direct_code if direct_code is not None else 1, clean
     finally:
