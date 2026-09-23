@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@earendil-works/pi-coding-agent@0.85.1':
-    hash: cf08e79c08e6b2d36dff488e7d38940a478cba7810186430eb5c2e1f10026413
+    hash: db5b6aa83147f6078286cfa757a77f580dbca802f6a755b3022d1a70737ed5b5
     path: patches/@earendil-works__pi-coding-agent@0.85.1.patch
   pi-mcp-adapter@2.20.1:
     hash: 5560b8dc3c8b63e02b7ea377a5c91c76478b806e12ce9c092d7bba7063f5eceb
@@ -24,7 +24,7 @@ importers:
         version: 0.85.1(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)
       '@earendil-works/pi-coding-agent':
         specifier: 0.85.1
-        version: 0.85.1(patch_hash=cf08e79c08e6b2d36dff488e7d38940a478cba7810186430eb5c2e1f10026413)(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)
+        version: 0.85.1(patch_hash=db5b6aa83147f6078286cfa757a77f580dbca802f6a755b3022d1a70737ed5b5)(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)
       '@earendil-works/pi-tui':
         specifier: 0.85.1
         version: 0.85.1
@@ -1699,7 +1699,7 @@ snapshots:
       - ws
       - zod
 
-  '@earendil-works/pi-coding-agent@0.85.1(patch_hash=cf08e79c08e6b2d36dff488e7d38940a478cba7810186430eb5c2e1f10026413)(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)':
+  '@earendil-works/pi-coding-agent@0.85.1(patch_hash=db5b6aa83147f6078286cfa757a77f580dbca802f6a755b3022d1a70737ed5b5)(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)':
     dependencies:
       '@earendil-works/chord': 0.85.1
       '@earendil-works/pi-agent-core': 0.85.1(@modelcontextprotocol/sdk@1.30.0(zod@4.6.2))(ws@8.21.3)(zod@4.6.2)
