@@ -10,6 +10,18 @@ function exactProfile(bytes: number, tail: string): string {
   return prefix + "x".repeat(bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)) + suffix;
 }
 
+async function writeStdoutRecord(event: unknown): Promise<void> {
+  const record = Buffer.from(`${JSON.stringify(event)}\n`);
+  let offset = 0;
+  while (offset < record.length) {
+    try { offset += fs.writeSync(1, record, offset, record.length - offset); }
+    catch (error) {
+      if (!["EAGAIN", "EWOULDBLOCK", "ENOBUFS"].includes(String((error as NodeJS.ErrnoException).code))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   const barrier = (phase: string, data: unknown = {}) => new Promise<void>((resolve, reject) => {
     const socket = connect(process.env.YM204_FIXTURE_SOCKET!);
@@ -19,6 +31,8 @@ export default function (pi: ExtensionAPI) {
   });
   const scenario = process.env.YM204_FIXTURE_SCENARIO;
   let childTurns = 0;
+  let aggregateTurns = 0;
+  let aggregateSequence = 0;
   let reportSends = 0;
 let cancelIssued = false;
 let repeatedCancelIssued = false;
@@ -64,6 +78,15 @@ let cancelledRunId: string | undefined;
     const file = realpathSync(import.meta.filename);
     await barrier("loaded", { pid: process.pid, file, hash: createHash("sha256").update(readFileSync(file)).digest("hex"), sessionId: ctx.sessionManager.getSessionId(), model: ctx.model?.id, thinking: ctx.thinkingLevel, commands: pi.getCommands().map((command) => ({ name: command.name, path: command.sourceInfo.path })), tools: pi.getAllTools().map((tool) => ({ name: tool.name, path: tool.sourceInfo.path })) });
   });
+  pi.on("agent_end", async (event) => {
+    if (!["coordinator_aggregate", "child_aggregate"].includes(scenario ?? "")) return;
+    const serializedMessages = JSON.stringify(event.messages);
+    const serializedEvent = JSON.stringify({ ...event, willRetry: false });
+    const bytes = Buffer.byteLength(serializedEvent);
+    if (bytes <= 1024 * 1024) return;
+    aggregateSequence++;
+    await barrier("aggregate-raw", { sequence: aggregateSequence, count: event.messages.length, bytes: Buffer.byteLength(serializedMessages), sha256: createHash("sha256").update(serializedMessages).digest("hex"), rawEventBytes: bytes, rawEventHash: createHash("sha256").update(serializedEvent).digest("hex") });
+  });
   pi.on("context", async (event) => {
     if (process.env.YOKEMATE_ROLE !== "coordinator" && !(scenario === "snapshot_probe" && process.env.YOKEMATE_ROLE !== "executor")) return;
     const reports = event.messages.filter((message) => message.role === "custom" && message.customType === "subagent-report");
@@ -80,6 +103,21 @@ let cancelledRunId: string | undefined;
         const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
         stream.push({ type: "start", partial: message });
         const text = JSON.stringify(context.messages);
+        const aggregateRun = scenario === "coordinator_aggregate" && process.env.YOKEMATE_ROLE === "coordinator" || scenario === "child_aggregate" && process.env.YOKEMATE_ROLE === "executor";
+        if (aggregateRun) {
+          aggregateTurns++;
+          if (aggregateTurns <= 40) {
+            message.stopReason = "toolUse";
+            message.content = [{ type: "toolCall", id: `aggregate-read-${aggregateTurns}`, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } } as any];
+            stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+            stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
+          } else {
+            message.content = [{ type: "text", text: scenario === "child_aggregate" ? '{"status":"approved","findings":[]}' : "coordinator aggregate complete" }];
+          }
+          stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+          stream.end();
+          return;
+        }
         if (process.env.YOKEMATE_ROLE === "executor") {
           message.content.push({ type: "thinking", thinking: "fixture thinking" });
           stream.push({ type: "thinking_start", contentIndex: 0, partial: message });
@@ -128,6 +166,8 @@ let cancelledRunId: string | undefined;
           if (scenario === "invalid" || (scenario === "chain" && text.includes("step-2"))) message.content = [{ type: "text", text: "{}" }];
           if (scenario === "output_limit") message.content = [{ type: "text", text: JSON.stringify({ status: "approved", findings: [], padding: "x".repeat(51 * 1024) }) }];
           if (scenario === "protocol_invalid") fs.writeSync(1, "{private malformed}\n");
+          if (scenario === "protocol_oversized_unknown") await writeStdoutRecord({ type: "future_event", content: "x".repeat(1024 * 1024) });
+          if (scenario === "protocol_oversized_control") await writeStdoutRecord({ type: "response", id: "oversized", success: true, data: "x".repeat(1024 * 1024) });
           if (scenario === "old_final" && childTurns === 1) {
             message.stopReason = "toolUse";
             message.content.push({ type: "toolCall", id: "read-fixture", name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } });
@@ -168,7 +208,7 @@ let cancelledRunId: string | undefined;
               message.content = [{ type: "toolCall", id: "scout-terminal", name: "subagent", arguments: { agent: "plan-scout", task: "Return a complete fixture scout.", ticket: "YM-1" } }];
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
               stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
-            } else call("batch-A", "review-A");
+            } else call("batch-A", scenario === "child_aggregate" ? "aggregate-child" : "review-A");
             if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max" || scenario === "public_cancel_parallel" || scenario === "public_cancel_chain") {
               const block = message.content[0] as any;
               const single = block.arguments;
