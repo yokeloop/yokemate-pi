@@ -36,3 +36,201 @@ jobs:
       - run: pnpm install --frozen-lockfile --prod=false
       - run: python3 scripts/test-supervisor.py suite -- node --experimental-strip-types --no-warnings scripts/test-runner.ts test/research-mcp-loader.test.ts
         timeout-minutes: 13
+
+  ym284-measurements:
+    if: github.event_name == 'pull_request' && github.head_ref == 'YM-284'
+    needs: [checks, pi-loader-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.34.5 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Measure base and implementation
+        run: |
+          cat > "$RUNNER_TEMP/measurement-procedure.sh" <<'PROCEDURE'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          B=3092fd492a83e7b694fd9802bd11768d1ee4b833
+          M=$(git rev-parse HEAD)
+          RESULTS=${YM284_RESULTS:?YM284_RESULTS is required}
+          ROOT=${YM284_ROOT:?YM284_ROOT is required}
+          REPOSITORY=$(git rev-parse --show-toplevel)
+          SUPERVISOR=$REPOSITORY/scripts/test-supervisor.py
+          mkdir -p "$RESULTS" "$ROOT"
+          printf '%s\n' "B=$B" "M=$M" "repository=$REPOSITORY" > "$RESULTS/identities.txt"
+          {
+            uname -a
+            node --version
+            pnpm --version
+            python3 --version
+            nproc
+            node -e 'console.log(`availableParallelism=${require("node:os").availableParallelism()}`)'
+            awk '/MemTotal|MemAvailable/ { print }' /proc/meminfo
+          } > "$RESULTS/environment.txt"
+          git status --short > "$RESULTS/source-status.txt"
+
+          cleanup() {
+            set +e
+            for worktree in baseline-1 baseline-2 after-1 after-2; do
+              git worktree remove --force "$ROOT/$worktree" >/dev/null 2>&1 || true
+            done
+            git worktree prune >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT INT TERM
+          cleanup
+          for worktree in baseline-1 baseline-2; do git worktree add --detach "$ROOT/$worktree" "$B"; done
+          for worktree in after-1 after-2; do git worktree add --detach "$ROOT/$worktree" "$M"; done
+          for worktree in baseline-1 baseline-2 after-1 after-2; do
+            pnpm --dir "$ROOT/$worktree" install --frozen-lockfile --prod=false > "$RESULTS/install-$worktree.log" 2>&1
+          done
+
+          cat > "$RESULTS/sampler.py" <<'PY'
+          import json, pathlib, sys, time
+          root = int(sys.argv[1])
+          peak_count = 0
+          peak_rss_kb = 0
+          while pathlib.Path(f"/proc/{root}").exists():
+              table = {}
+              rss = {}
+              for entry in pathlib.Path("/proc").iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      raw = (entry / "stat").read_text()
+                      tail = raw[raw.rfind(")") + 2:].split()
+                      pid = int(entry.name)
+                      table[pid] = int(tail[1])
+                      fields = (entry / "status").read_text().splitlines()
+                      rss[pid] = int(next((line.split()[1] for line in fields if line.startswith("VmRSS:")), "0"))
+                  except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError):
+                      pass
+              owned = {root}
+              changed = True
+              while changed:
+                  changed = False
+                  for pid, parent in table.items():
+                      if pid not in owned and parent in owned:
+                          owned.add(pid)
+                          changed = True
+              peak_count = max(peak_count, len(owned))
+              peak_rss_kb = max(peak_rss_kb, sum(rss.get(pid, 0) for pid in owned))
+              time.sleep(0.2)
+          print(json.dumps({"peakProcessCount": peak_count, "peakTreeRssKb": peak_rss_kb}, sort_keys=True))
+          PY
+
+          run_attempt() {
+            local label=$1 version=$2 worktree=$3
+            local started ended status sampler
+            started=$(date +%s%3N)
+            if [[ $version == baseline ]]; then
+              python3 "$SUPERVISOR" suite --absolute-timeout 1500 --cleanup-timeout 30 -- bash -lc "cd '$worktree' && pnpm test" > "$RESULTS/$label.tap" 2>&1 &
+            else
+              pnpm --dir "$worktree" test > "$RESULTS/$label.tap" 2>&1 &
+            fi
+            local child=$!
+            python3 "$RESULTS/sampler.py" "$child" > "$RESULTS/$label.resources.json" &
+            sampler=$!
+            set +e
+            wait "$child"
+            status=$?
+            wait "$sampler"
+            set -e
+            ended=$(date +%s%3N)
+            python3 - "$label" "$version" "$status" "$started" "$ended" > "$RESULTS/$label.result.json" <<'PY'
+          import json, sys
+          label, version, status, started, ended = sys.argv[1:]
+          print(json.dumps({"label": label, "version": version, "status": int(status), "startedMs": int(started), "endedMs": int(ended), "durationMs": int(ended) - int(started)}, sort_keys=True))
+          PY
+            ps -eo pid=,ppid=,args= | grep -F "$worktree" | grep -v -F grep > "$RESULTS/$label.survivors.txt" || true
+            [[ $status == 0 && ! -s "$RESULTS/$label.survivors.txt" ]]
+          }
+
+          run_pair() {
+            local label=$1 version=$2 first=$3 second=$4
+            local gate="$ROOT/$label.gate" started ended left right
+            rm -f "$gate"
+            mkfifo "$gate"
+            (IFS= read -r -n 1 < "$gate"; run_attempt "$label-a" "$version" "$first") &
+            left=$!
+            (IFS= read -r -n 1 < "$gate"; run_attempt "$label-b" "$version" "$second") &
+            right=$!
+            started=$(date +%s%3N)
+            printf 'xx' > "$gate"
+            rm -f "$gate"
+            set +e
+            wait "$left"; local left_status=$?
+            wait "$right"; local right_status=$?
+            set -e
+            ended=$(date +%s%3N)
+            python3 - "$label" "$version" "$left_status" "$right_status" "$started" "$ended" > "$RESULTS/$label.pair.json" <<'PY'
+          import json, sys
+          label, version, left, right, started, ended = sys.argv[1:]
+          print(json.dumps({"label": label, "version": version, "leftStatus": int(left), "rightStatus": int(right), "startedMs": int(started), "endedMs": int(ended), "makespanMs": int(ended) - int(started)}, sort_keys=True))
+          PY
+            [[ $left_status == 0 && $right_status == 0 ]]
+          }
+
+          export YOKEMATE_TEST_ADMISSION_ROOT="$ROOT/admission"
+          run_version() {
+            local round=$1 version=$2
+            local first="$ROOT/$version-1" second="$ROOT/$version-2"
+            run_attempt "round-$round-$version-single" "$version" "$first" || true
+            run_pair "round-$round-$version-pair" "$version" "$first" "$second" || true
+          }
+          run_version 1 baseline
+          run_version 1 after
+          run_version 2 after
+          run_version 2 baseline
+          run_version 3 baseline
+          run_version 3 after
+
+          python3 - "$RESULTS" > "$RESULTS/comparison.json" <<'PY'
+          import glob, json, pathlib, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+          results = [json.loads(pathlib.Path(path).read_text()) for path in glob.glob(str(root / "*.result.json"))]
+          pairs = [json.loads(pathlib.Path(path).read_text()) for path in glob.glob(str(root / "*.pair.json"))]
+          successful_singles = {version: sorted(item["durationMs"] for item in results if item["version"] == version and item["label"].endswith("single") and item["status"] == 0) for version in ("baseline", "after")}
+          pair_times = {version: sorted(item["makespanMs"] for item in pairs if item["version"] == version and item["leftStatus"] == 0 and item["rightStatus"] == 0) for version in ("baseline", "after")}
+          comparison = {"attempts": results, "pairs": pairs, "successfulSinglesMs": successful_singles, "successfulPairMakespansMs": pair_times}
+          comparison["singleMediansMs"] = {key: statistics.median(value) if len(value) == 3 else None for key, value in successful_singles.items()}
+          comparison["pairMediansMs"] = {key: statistics.median(value) if len(value) == 3 else None for key, value in pair_times.items()}
+          if all(value is not None for value in comparison["singleMediansMs"].values()):
+              comparison["singleRatio"] = comparison["singleMediansMs"]["after"] / comparison["singleMediansMs"]["baseline"]
+              comparison["singleImprovementPercent"] = (1 - comparison["singleRatio"]) * 100
+          else:
+              comparison["singleRatio"] = None
+              comparison["singleImprovementPercent"] = None
+          comparison["singleCriterion"] = comparison["singleRatio"] is not None and comparison["singleRatio"] <= 0.9 and all(value <= 750000 for value in successful_singles["after"])
+          if len(pair_times["baseline"]) == 3:
+              comparison["pairComparison"] = "median"
+              comparison["pairCriterion"] = len(pair_times["after"]) == 3 and comparison["pairMediansMs"]["after"] <= comparison["pairMediansMs"]["baseline"]
+          else:
+              comparison["pairComparison"] = "censored-baseline"
+              comparison["pairCriterion"] = len(pair_times["after"]) == 3 and all(value <= 1500000 for value in pair_times["after"])
+          print(json.dumps(comparison, indent=2, sort_keys=True))
+          if not comparison["singleCriterion"] or not comparison["pairCriterion"]:
+              raise SystemExit(1)
+          PY
+
+          git -C "$ROOT/baseline-1" ls-files -z | LC_ALL=C sort -z | xargs -0 -I{} sha256sum "$ROOT/baseline-1/{}" > "$RESULTS/baseline-files.sha256"
+          git -C "$ROOT/after-1" ls-files -z | LC_ALL=C sort -z | xargs -0 -I{} sha256sum "$ROOT/after-1/{}" > "$RESULTS/after-files.sha256"
+          PROCEDURE
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          sha256sum "$RUNNER_TEMP/measurement-procedure.sh" | tee "$RUNNER_TEMP/measurement-procedure.sha256"
+          export YM284_RESULTS="$RUNNER_TEMP/YM-284-results"
+          export YM284_ROOT="$RUNNER_TEMP/YM-284-work"
+          mkdir -p "$YM284_RESULTS"
+          cp "$RUNNER_TEMP/measurement-procedure.sh" "$RUNNER_TEMP/measurement-procedure.sha256" "$YM284_RESULTS/"
+          timeout --signal=TERM --kill-after=40s 10800s bash "$RUNNER_TEMP/measurement-procedure.sh"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: YM-284-measurements-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/YM-284-results
