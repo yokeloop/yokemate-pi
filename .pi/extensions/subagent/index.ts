@@ -2106,6 +2106,13 @@ export default function (pi: ExtensionAPI) {
 					return finalizeShip(ENGINE_ROOT, run.identity.ticket);
 				},
 			}, { root: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../.."), sessionId, runtimeId, pid: process.pid, starttime: processStarttime(process.pid) ?? "", cwd: ctx.cwd, pane: process.env.HERDR_PANE_ID });
+			await new Promise<void>((resolve, reject) => {
+				const server = controlServer!;
+				const listening = () => { server.removeListener("error", failed); resolve(); };
+				const failed = (error: Error) => { server.removeListener("listening", listening); reject(error); };
+				server.once("listening", listening);
+				server.once("error", failed);
+			});
 		} catch (error) { ctx.ui.notify(`coordinator control is not up: ${(error as Error).message}`, "warning"); }
 	});
 	pi.registerCommand("break-glass", {
