@@ -120,9 +120,13 @@ export function validateGroupManifest(manifest: GroupExecutionManifest, tree?: T
   }
   const requirementIds = manifest.requirements.map((requirement) => requirement.id);
   unique(requirementIds, "requirement id");
-  const declaredRequirements = new Set(manifest.members.flatMap((member) => member.requirements));
-  if (requirementIds.some((id) => !declaredRequirements.has(id)) || [...declaredRequirements].some((id) => !requirementIds.includes(id))) throw new Error("group manifest requirement ownership is incomplete");
-  for (const requirement of manifest.requirements) if (!members.includes(requirement.sourceTicket) || !members.includes(requirement.owner)) throw new Error(`${requirement.id}: requirement references an unknown member`);
+  const declaredRequirements = manifest.members.flatMap((member) => member.requirements.map((id) => ({ id, member: member.ticket })));
+  if (requirementIds.some((id) => !declaredRequirements.some((item) => item.id === id)) || declaredRequirements.some((item) => !requirementIds.includes(item.id))) throw new Error("group manifest requirement ownership is incomplete");
+  for (const requirement of manifest.requirements) {
+    if (!members.includes(requirement.sourceTicket) || !members.includes(requirement.owner)) throw new Error(`${requirement.id}: requirement references an unknown member`);
+    const owners = declaredRequirements.filter((item) => item.id === requirement.id).map((item) => item.member);
+    if (owners.length !== 1 || owners[0] !== requirement.owner) throw new Error(`${requirement.id}: requirement must be declared by its one exact owner`);
+  }
   const repositories = manifest.repositories.map((repository) => repository.repo);
   unique(repositories, "repository");
   if (repositories.some((repo) => !/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(repo))) throw new Error("group manifest repository is not canonical");
@@ -171,10 +175,25 @@ export function bindGroupRevision(input: { rootIdentity: string; ownerProject: s
 export function validateCompatibility(report: CompatibilityReport, revision: BoundGroupRevision): void {
   if (report.inputHash !== revision.revisionHash) throw new Error("compatibility report input hash is stale");
   if (report.conflicts.length) throw new Error("compatibility report contains conflicts");
-  const coveredRequirements = new Set(report.requirements.filter((item) => item.coveredBy && item.evidence).map((item) => item.id));
-  for (const requirement of revision.manifest.requirements) if (!coveredRequirements.has(requirement.id)) throw new Error(`${requirement.id}: requirement is not covered by compatibility evidence`);
-  const coveredContracts = new Set(report.contracts.filter((item) => item.providers.length && item.consumers.length && item.evidence).map((item) => item.id));
-  for (const contract of revision.manifest.contracts) if (!coveredContracts.has(contract.id)) throw new Error(`${contract.id}: contract is not covered by compatibility evidence`);
+  const members = new Set(revision.manifest.members.map((member) => member.ticket));
+  const expectedRequirements = new Map(revision.manifest.requirements.map((item) => [item.id, item.owner]));
+  if (report.requirements.length !== expectedRequirements.size || new Set(report.requirements.map((item) => item.id)).size !== report.requirements.length) {
+    const missing = [...expectedRequirements.keys()].find((id) => !report.requirements.some((item) => item.id === id));
+    throw new Error(`${missing ?? "compatibility"}: compatibility requirement scope differs from the manifest`);
+  }
+  for (const item of report.requirements) {
+    const coveredMember = item.coveredBy.split(/[\s:]/, 1)[0]!;
+    if (!item.evidence || !members.has(coveredMember) || expectedRequirements.get(item.id) !== coveredMember) throw new Error(`${item.id}: compatibility requirement owner differs from the manifest`);
+  }
+  const expectedContracts = new Map(revision.manifest.contracts.map((item) => [item.id, { providers: [...item.providers].sort(), consumers: [...item.consumers].sort() }]));
+  if (report.contracts.length !== expectedContracts.size || new Set(report.contracts.map((item) => item.id)).size !== report.contracts.length) {
+    const missing = [...expectedContracts.keys()].find((id) => !report.contracts.some((item) => item.id === id));
+    throw new Error(`${missing ?? "compatibility"}: compatibility contract scope differs from the manifest`);
+  }
+  for (const item of report.contracts) {
+    const expected = expectedContracts.get(item.id);
+    if (!expected || !item.evidence || JSON.stringify([...item.providers].sort()) !== JSON.stringify(expected.providers) || JSON.stringify([...item.consumers].sort()) !== JSON.stringify(expected.consumers)) throw new Error(`${item.id}: compatibility contract participants differ from the manifest`);
+  }
   const parentWork = new Set(report.parentWork.filter((item) => item.evidence).map((item) => item.ticket));
   for (const member of revision.manifest.members) if ((member.parent !== null || member.ticket === revision.manifest.root) && !parentWork.has(member.ticket)) throw new Error(`${member.ticket}: parent/root own-work declaration is not covered`);
 }

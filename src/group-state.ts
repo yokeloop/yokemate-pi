@@ -85,10 +85,10 @@ export function createPlanningGroup(db: DatabaseSync, input: { id?: string; root
   return row.id;
 }
 
-export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; treeHash: string; members: string[]; owners: GroupClaimOwner[]; tickets?: Record<string, string>; ownerLive?: (owner: GroupClaimOwner) => boolean | undefined }): void {
+export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; treeHash: string; members: string[]; owners: GroupClaimOwner[]; tickets?: Record<string, string>; ownerLive?: (owner: GroupClaimOwner) => boolean | undefined; inTransaction?: boolean }): void {
   const members = [...new Set(input.members)].sort();
   if (!members.length || members.some((member) => !member)) throw new Error("group claims require a complete nonempty member set");
-  db.exec("BEGIN IMMEDIATE");
+  if (!input.inTransaction) db.exec("BEGIN IMMEDIATE");
   try {
     const owners = canonicalJson(input.owners);
     for (const member of members) {
@@ -105,9 +105,9 @@ export function reserveMemberClaims(db: DatabaseSync, input: { groupId: string; 
     for (const member of members) db.prepare(`INSERT INTO member_claim (member_identity,ticket,kind,group_id,tree_hash,owners_json,state)
       VALUES (?, ?, 'group', ?, ?, ?, 'reserved')
       ON CONFLICT(member_identity) DO UPDATE SET ticket=excluded.ticket,tree_hash=excluded.tree_hash,owners_json=excluded.owners_json,state='reserved',updated_at=datetime('now')`).run(member, input.tickets?.[member] ?? member.slice(Math.max(member.lastIndexOf(":"), member.lastIndexOf("#")) + 1), input.groupId, input.treeHash, owners);
-    db.exec("COMMIT");
+    if (!input.inTransaction) db.exec("COMMIT");
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch {}
+    if (!input.inTransaction) try { db.exec("ROLLBACK"); } catch {}
     throw error;
   }
 }

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { processStarttime } from "../src/coordinator-control.ts";
-import { availableRuntimeCapacity, releaseRuntimeCapacity, reserveRuntimeCapacity } from "../src/runtime-capacity.ts";
+import { availableRuntimeCapacity, releaseRuntimeCapacity, reserveRuntimeCapacity, subscribeRuntimeCapacity } from "../src/runtime-capacity.ts";
 
 test("shared runtime capacity serializes independent owners and releases exact leases", () => {
   const root = mkdtempSync(join(tmpdir(), "runtime-capacity-"));
@@ -17,6 +17,24 @@ test("shared runtime capacity serializes independent owners and releases exact l
   releaseRuntimeCapacity(db, "detached:a");
   reserveRuntimeCapacity(db, { ownerId: "detached:b", pid: process.pid, starttime, units: 2 }, 3);
   assert.equal(availableRuntimeCapacity(db, 3, "detached"), 1);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("capacity release wakes another runtime through the shared broker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runtime-capacity-wake-"));
+  const db = join(root, "state.db");
+  const starttime = processStarttime(process.pid)!;
+  reserveRuntimeCapacity(db, { ownerId: "running:a", pid: process.pid, starttime, units: 1 }, 1);
+  let first!: () => void;
+  let second!: () => void;
+  let calls = 0;
+  const listening = new Promise<void>((resolve) => { first = resolve; });
+  const observed = new Promise<void>((resolve) => { second = resolve; });
+  const close = subscribeRuntimeCapacity(db, "other-runtime", () => { if (++calls === 1) first(); else second(); });
+  await listening;
+  releaseRuntimeCapacity(db, "running:a");
+  await observed;
+  close();
   rmSync(root, { recursive: true, force: true });
 });
 

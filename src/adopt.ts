@@ -23,7 +23,7 @@ import { prepareGroupWorkScopes } from "./group-scope.ts";
 import { bindGroupRevision, validateCompatibility, type CompatibilityReport, type GroupExecutionManifest } from "./group-plan.ts";
 import type { PlanBinding } from "./plan-binding.ts";
 import type { TaskTree } from "./group-tree.ts";
-import { restorePersistedGroupFacts } from "./group-state.ts";
+import { reserveMemberClaims, restorePersistedGroupFacts } from "./group-state.ts";
 
 /** The ticket's plan in knowledge/<org>/<project>/ai/<slug>/, by the slug's
  *  key prefix. Old slugs are lowercase (`acme-326-…` for ACME-326), so the match
@@ -133,12 +133,14 @@ export function adopt(
       try {
         db.prepare("INSERT INTO task_group (id,root_identity,root_ticket,owner_project,active_revision,phase,resume_phase,blocker) VALUES (?,?,?,?,?,'blocked','planned','recovered group facts require reconciliation')").run(artifact.groupId, artifact.rootIdentity, key, artifact.manifest.ownerProject, artifact.revisionHash);
         db.prepare("INSERT INTO group_revision (group_id,revision_hash,tree_hash,manifest_json,bindings_json,compatibility_json,approach_receipt_id) VALUES (?,?,?,?,?,?,?)").run(artifact.groupId, artifact.revisionHash, artifact.tree.treeHash, JSON.stringify(artifact.manifest), JSON.stringify(artifact.bindings), JSON.stringify(artifact.compatibility), artifact.approachReceiptId);
+        const tickets = Object.fromEntries(artifact.tree.nodes.map((node) => [node.identity, node.ticket]));
+        reserveMemberClaims(db, { groupId: artifact.groupId, treeHash: artifact.tree.treeHash, members: artifact.tree.nodes.map((node) => node.identity), tickets, owners: [], inTransaction: true });
         for (const node of artifact.tree.nodes) {
           const planned = artifact.manifest.members.find((member) => member.ticket === node.ticket);
           if (!planned) throw new Error(`${node.ticket}: durable group member is absent from the manifest`);
           db.prepare("INSERT INTO group_member (group_id,revision_hash,member_identity,ticket,parent_identity,prior_state_json,stage,execution) VALUES (?,?,?,?,?,?,'planned','queued')").run(artifact.groupId, artifact.revisionHash, node.identity, node.ticket, node.parentIdentity, JSON.stringify({ recovered: true }));
-          db.prepare("INSERT INTO member_claim (member_identity,ticket,kind,group_id,revision_hash,tree_hash,owners_json,state) VALUES (?,?,'group',?,?,?,?, 'suspended')").run(node.identity, node.ticket, artifact.groupId, artifact.revisionHash, artifact.tree.treeHash, "[]");
         }
+        db.prepare("UPDATE member_claim SET revision_hash=?,state='suspended',updated_at=datetime('now') WHERE group_id=? AND tree_hash=?").run(artifact.revisionHash, artifact.groupId, artifact.tree.treeHash);
         db.exec("COMMIT");
       } catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
       group = { id: artifact.groupId, active_revision: artifact.revisionHash, phase: "blocked" };

@@ -62,6 +62,7 @@ test("revision hash is stable without self-reference and compatibility binds to 
 
 test("missing requirements, parent, contracts, repo union and start cycles block activation", () => {
   assert.throws(() => validateGroupManifest({ ...manifest, requirements: manifest.requirements.slice(0, 1) }, tree), /requirement ownership/);
+  assert.throws(() => validateGroupManifest({ ...manifest, members: manifest.members.map((member) => ({ ...member, requirements: member.ticket === "YM-2" ? [...member.requirements, "R1"] : member.requirements })) }, tree), /one exact owner/);
   assert.throws(() => validateGroupManifest({ ...manifest, members: manifest.members.map((member) => member.ticket === "YM-2" ? { ...member, parent: "YM-9" } : member) }, tree), /parent is missing/);
   assert.throws(() => validateGroupManifest({ ...manifest, contracts: [{ ...manifest.contracts[0]!, consumers: ["YM-9"] }] }, tree), /unknown provider or consumer/);
   assert.throws(() => validateGroupManifest({ ...manifest, repositories: [{ repo: "other/repo", role: "app" }] }, tree), /repository union/);
@@ -76,7 +77,9 @@ test("acceptance obligations do not become start dependencies", () => {
 test("semantic compatibility requires evidence for every requirement, contract and parent work", () => {
   const revision = bindGroupRevision({ rootIdentity: "youtrack-yokeloop:YM-1", ownerProject: manifest.ownerProject, tree, manifest, bindings });
   assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), requirements: [] }, revision), /R1/);
+  assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), requirements: compatibility(revision.revisionHash).requirements.map((item) => item.id === "R1" ? { ...item, coveredBy: "YM-2 step 1" } : item) }, revision), /owner differs/);
   assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), contracts: [] }, revision), /C1/);
+  assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), contracts: compatibility(revision.revisionHash).contracts.map((item) => ({ ...item, providers: ["YM-1"] })) }, revision), /participants differ/);
   assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), parentWork: [] }, revision), /YM-1/);
   assert.throws(() => validateCompatibility({ ...compatibility(revision.revisionHash), conflicts: ["mismatch"] }, revision), /conflicts/);
 });

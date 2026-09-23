@@ -59,7 +59,12 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const invocation = options.invocation ?? piInvocation(coordinatorInvocationArgs(prepared), prepared.resourcesPath);
   const log = openLog(prepared.cwd, `coordinator-${identity.runId}.log`);
   log?.(`[start ${new Date().toISOString()}] ${invocation.command} ${invocation.args.join(" ")}\n`);
-  const env: NodeJS.ProcessEnv = { ...process.env, ...runtimeEnv(identity), YOKEMATE_SUBAGENT_JSON_CONTRACT: "1" };
+  const groupScope = prepared.group ? {
+    YOKEMATE_GROUP_ROLE: prepared.group.role,
+    YOKEMATE_GROUP_SCOPE_PATHS: JSON.stringify(prepared.group.role === "parent" ? [] : prepared.parts.map((part) => part.worktree).filter((value): value is string => Boolean(value))),
+    YOKEMATE_GROUP_SCOPE_BRANCHES: JSON.stringify(prepared.group.role === "parent" ? [] : prepared.parts.map((part) => part.branch)),
+  } : {};
+  const env: NodeJS.ProcessEnv = { ...process.env, ...runtimeEnv(identity), ...groupScope, YOKEMATE_SUBAGENT_JSON_CONTRACT: "1" };
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
   const snapshots = new RunSnapshots(prepared.resourcesPath);

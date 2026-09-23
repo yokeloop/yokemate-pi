@@ -590,6 +590,14 @@ export function openDb(path: string): DatabaseSync {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS runtime_capacity_subscriber (
+      subscriber_id TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      starttime TEXT NOT NULL,
+      socket_path TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS group_fact_lineage (
       group_id TEXT NOT NULL,
       revision_hash TEXT NOT NULL,

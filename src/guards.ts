@@ -59,6 +59,32 @@ export function stopDelivery(
   return { content: reason, triggerTurn: reason !== last };
 }
 
+export function groupScopeVerdict(toolName: string, input: Record<string, unknown>, cwd: string, env: NodeJS.ProcessEnv): string | null {
+  const groupRole = env.YOKEMATE_GROUP_ROLE;
+  if (!groupRole) return null;
+  const paths = JSON.parse(env.YOKEMATE_GROUP_SCOPE_PATHS ?? "[]") as string[];
+  const branches = JSON.parse(env.YOKEMATE_GROUP_SCOPE_BRANCHES ?? "[]") as string[];
+  if (!Array.isArray(paths) || !Array.isArray(branches) || paths.some((value) => typeof value !== "string" || !isAbsolute(value)) || branches.some((value) => typeof value !== "string" || !value)) return "group work scope is malformed";
+  const inside = (parent: string, value: string) => value === parent || value.startsWith(parent + sep);
+  if (["write", "edit", "notebook_edit"].includes(toolName)) {
+    const value = input.path ?? input.notebook_path;
+    const target = typeof value === "string" ? resolve(cwd, value) : "";
+    if (!target || !paths.some((scope) => inside(resolve(scope), target))) return "group write is outside the registered WorkScope";
+  }
+  if (toolName === "mcp") return "group execution cannot use an unscoped MCP effect; use the registered group control tools";
+  if (toolName !== "bash") return null;
+  const command = String(input.command ?? "");
+  if (/\bgh\s+(?:pr\s+merge|api)\b|\b(?:curl|wget)\b|\b(?:pnpm\s+(?:run\s+)?ship-merge|node\b[^\n]*ship-merge)\b/.test(command)) return "group execution cannot bypass the trusted merge/effect handlers";
+  if (/(^|[;&|]\s*)(?:sudo\s+)?(?:rm|mv|cp|mkdir|touch|tee)\b|\bsed\b[^\n;&|]*\s-(?:-in-place|[A-Za-z]*i)\b|(^|[^0-9])>>?/.test(command)) return "group shell writes are unscoped; use Write/Edit inside the registered WorkScope";
+  if (/\bgit\b[^\n;&|]*\s(?:merge|rebase|cherry-pick)\b/.test(command)) return "group branches integrate only through the registered group handlers";
+  const mutatingGit = /\bgit\b[^\n;&|]*\s(?:add|am|apply|commit|restore|reset|checkout|switch|push)\b/.test(command);
+  if (mutatingGit && !paths.some((scope) => inside(resolve(scope), resolve(cwd)) || command.includes(scope))) return "group git mutation is outside the registered WorkScope";
+  if (/\bgit\b[^\n;&|]*\spush\b/.test(command)) {
+    if (groupRole === "parent" || /\s--(?:delete|mirror|all|force)(?:\s|$)/.test(command) || !branches.some((branch) => new RegExp(`(?:^|\\s)${branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|$)`).test(command)) || /\S+:\S+/.test(command)) return "group push must name only the registered source branch; integration and external refs are parent-owned effects";
+  }
+  return null;
+}
+
 export default function guards(pi: ExtensionAPI) {
   // Raw read-only handle, not openDb: a guard runs no DDL. Closed on the way
   // out — report-guard.ts leaves that to the process exit, an extension lives on.
@@ -90,6 +116,8 @@ export default function guards(pi: ExtensionAPI) {
     }
     try {
       const settings = readRuntimeSettings(ROOT);
+      const groupRefusal = groupScopeVerdict(event.toolName, event.input as Record<string, unknown>, ctx.cwd, process.env);
+      if (groupRefusal) return { block: true, reason: groupRefusal };
       if (process.env.YOKEMATE_MODE === "do" && event.toolName === "bash")
         assertMandatoryBoundary("workflow.assigned-scope", typeof ctx.cwd === "string" && isAbsolute(ctx.cwd), "package operation needs an absolute host cwd; use cd '<assigned worktree>' && npm test");
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
@@ -112,6 +140,7 @@ export default function guards(pi: ExtensionAPI) {
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
       if (e instanceof RuntimeSettingsError || e instanceof WorkflowBoundaryError) return { block: true, reason: e.message };
+      if (process.env.YOKEMATE_GROUP_ROLE) return { block: true, reason: `group scope guard failure: ${(e as Error).message}` };
       if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }

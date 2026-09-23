@@ -87,7 +87,7 @@ import { prepareGroupWorkScopes, refreshQueuedMemberWorkScopes, resolveGroupWork
 import { integrateCoordinationMember, integrateMemberPart, type ReviewerEvidence } from "../../../src/group-integration.ts";
 import { acceptGroupCandidate, bindGroupRework, prepareGroupReview, type GroupCandidate, type ObligationEvidence } from "../../../src/group-review.ts";
 import { shipGroup } from "../../../src/group-ship.ts";
-import { availableRuntimeCapacity, releaseRuntimeCapacity, reserveRuntimeCapacity } from "../../../src/runtime-capacity.ts";
+import { availableRuntimeCapacity, releaseRuntimeCapacity, reserveRuntimeCapacity, subscribeRuntimeCapacity } from "../../../src/runtime-capacity.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -965,11 +965,30 @@ export default function (pi: ExtensionAPI) {
 	const authorityByCycle = new Map<string, DoAuthorityStore>();
 	const groupRuntimes = new Map<string, { runtime: GroupRuntime; db: DatabaseSync }>();
 	const wakeGroupRuntimes = (): void => { for (const entry of groupRuntimes.values()) entry.runtime.resume(); };
-	const approvedGroupBindings = new Map<string, { groupId: string; root: string; revisionHash: string }>();
-	const currentGroupBinding = (ticket: string) => {
+	const unsubscribeRuntimeCapacity = subscribeRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `runtime:${process.pid}:${randomUUID()}`, wakeGroupRuntimes);
+	let runtimeCapacitySubscribed = true;
+	type GroupExecutionBinding = { kind: "group"; groupId: string; root: string; revisionHash: string; executionHash: string };
+	const approvedGroupBindings = new Map<string, GroupExecutionBinding>();
+	const currentGroupBinding = (ticket: string): GroupExecutionBinding | undefined => {
 		const db = openDb(path.join(ENGINE_ROOT, "yokemate.db"));
-		try { return db.prepare("SELECT id AS groupId,root_ticket AS root,active_revision AS revisionHash FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { groupId: string; root: string; revisionHash: string } | undefined; }
-		finally { db.close(); }
+		try {
+			const group = db.prepare("SELECT id AS groupId,root_ticket AS root,active_revision AS revisionHash FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { groupId: string; root: string; revisionHash: string } | undefined;
+			if (!group) return undefined;
+			const revision = db.prepare("SELECT manifest_json,bindings_json,tree_hash FROM group_revision WHERE group_id=? AND revision_hash=?").get(group.groupId, group.revisionHash) as { manifest_json: string; bindings_json: string; tree_hash: string } | undefined;
+			if (!revision) throw new Error(`${ticket}: active group revision is missing`);
+			const bindings = JSON.parse(revision.bindings_json) as PlanBinding[];
+			for (const binding of bindings) assertPlanBinding(binding, readCandidatePlanSnapshot(ENGINE_ROOT, binding.ticket, binding.path));
+			const rootBinding = bindings.find((binding) => binding.ticket === group.root);
+			if (!rootBinding) throw new Error(`${ticket}: root group plan binding is missing`);
+			const artifactPath = path.join(path.dirname(rootBinding.path), `${group.root}-group-${group.revisionHash}.json`);
+			const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8")) as { rootIdentity: string; tree: TaskTree; manifest: GroupExecutionManifest; bindings: PlanBinding[]; compatibility: CompatibilityReport; revisionHash: string };
+			const rebound = bindGroupRevision({ rootIdentity: artifact.rootIdentity, ownerProject: artifact.manifest.ownerProject, tree: artifact.tree, manifest: artifact.manifest, bindings: artifact.bindings });
+			if (artifact.revisionHash !== group.revisionHash || rebound.revisionHash !== group.revisionHash || artifact.tree.treeHash !== revision.tree_hash || canonicalHash(artifact.manifest) !== canonicalHash(JSON.parse(revision.manifest_json)) || canonicalHash(artifact.bindings) !== canonicalHash(bindings)) throw new Error(`${ticket}: durable group execution binding differs from the active revision`);
+			validateCompatibility(artifact.compatibility, rebound);
+			const claims = db.prepare("SELECT member_identity,ticket,kind,group_id,revision_hash,tree_hash FROM member_claim WHERE group_id=? ORDER BY member_identity").all(group.groupId) as unknown as Record<string, unknown>[];
+			if (claims.length !== bindings.length || claims.some((claim) => claim.kind !== "group" || claim.group_id !== group.groupId || claim.revision_hash !== group.revisionHash || claim.tree_hash !== revision.tree_hash)) throw new Error(`${ticket}: active group claims are missing or stale`);
+			return { kind: "group", ...group, executionHash: canonicalHash({ manifest: JSON.parse(revision.manifest_json), bindings, claims }) };
+		} finally { db.close(); }
 	};
 	const bindGroupApproval = (ticket: string) => { const binding = currentGroupBinding(ticket); if (binding) approvedGroupBindings.set(ticket, binding); else approvedGroupBindings.delete(ticket); };
 	const assertGroupApproval = (ticket: string) => {
@@ -1461,7 +1480,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 	const workflowConsumerFacts = (kind: string, metadata: WorkflowConsumerMetadata, ticket?: string): Record<string, unknown> => ({ consumerKind: kind, ...(ticket ? { ticket } : {}), ...(safeWorkflowId(metadata.requestId) ? { requestId: safeWorkflowId(metadata.requestId) } : {}), ...(safeWorkflowId(metadata.toolCallId) ? { toolCallId: safeWorkflowId(metadata.toolCallId) } : {}), ...(safeWorkflowId(metadata.listRunId) ? { listRunId: safeWorkflowId(metadata.listRunId) } : {}), ...(safeWorkflowId(metadata.keyRunId) ? { keyRunId: safeWorkflowId(metadata.keyRunId) } : {}) });
-	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string; pane?: string }, settings: RuntimeSettings | undefined, lane?: { context: KeyRunContext; doBinding?: PlanBinding; review?: { store: ReviewReworkStore; operationId: string } }, metadata: WorkflowConsumerMetadata = {}, groupDelegation?: { runtime: GroupRuntime; groupId: string; revisionHash: string; member: string; parentRunId: string }) => {
+	const startOneCoordinator = async (request: CoordinatorRequest, ctx: ExtensionContext, origin: { YOKEMATE_MODE?: string; YOKEMATE_TICKET?: string; YOKEMATE_ROLE?: "coordinator" | "executor"; sessionId?: string; cwd?: string; pane?: string }, settings: RuntimeSettings | undefined, lane?: { context: KeyRunContext; doBinding?: PlanBinding; review?: { store: ReviewReworkStore; operationId: string } }, metadata: WorkflowConsumerMetadata = {}, groupDelegation?: { runtime: GroupRuntime; groupId: string; revisionHash: string; root: string; member: string; parentRunId: string }) => {
 		const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 		validateCoordinatorRequest(request);
 		let checks = coordinatorChecks(settings ?? readRuntimeSettings(ENGINE_ROOT));
@@ -1472,6 +1491,7 @@ export default function (pi: ExtensionAPI) {
 		if (workflowCapture) assertWorkflowCapture(workflowCapture);
 		settings = lane?.context.settings ?? readRuntimeSettings(ENGINE_ROOT);
 		checks = coordinatorChecks(settings);
+		if (groupDelegation) assertGroupApproval(groupDelegation.root);
 		const currentRefusal = groupDelegation ? undefined : checks.checkCaller(origin, request);
 		if (currentRefusal) throw new Error(currentRefusal);
 		if (request.mode === "ship" && !lane) {
@@ -1545,7 +1565,31 @@ export default function (pi: ExtensionAPI) {
 				}
 				rpcByRun.delete(ownedRun.identity.runId);
 			})();
+			if (request.mode === "ship") {
+				const topologyDb = openDb(path.join(root, "yokemate.db"));
+				try {
+					const group = topologyDb.prepare("SELECT id,active_revision FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('accepted','shipping') ORDER BY updated_at DESC LIMIT 1").get(request.tickets[0]) as { id: string; active_revision: string } | undefined;
+					if (group) {
+						try { assertCurrentGroupTopology(topologyDb, group.id, group.active_revision, await discoverTaskTreeForTicket(topologyDb, request.tickets[0]!, { trackers: trackers() })); }
+						catch (error) {
+							topologyDb.exec("BEGIN IMMEDIATE");
+							try {
+								topologyDb.prepare("UPDATE group_acceptance SET state='superseded' WHERE group_id=? AND revision_hash=? AND state='current'").run(group.id, group.active_revision);
+								topologyDb.prepare("UPDATE task_group SET phase='blocked',resume_phase='planning',blocker='tracker topology changed after acceptance',updated_at=datetime('now') WHERE id=? AND active_revision=?").run(group.id, group.active_revision);
+								topologyDb.exec("COMMIT");
+							} catch (writeError) { try { topologyDb.exec("ROLLBACK"); } catch {} throw writeError; }
+							persistPortableGroupFacts(topologyDb, group.id, `${request.tickets[0]} group ship topology superseded`);
+							throw error;
+						}
+					}
+				} finally { topologyDb.close(); }
+			}
 			const prepared = request.mode === "do" ? prepareDo(root, request, origin, settings, groupDelegation ? { groupId: groupDelegation.groupId, revisionHash: groupDelegation.revisionHash, member: groupDelegation.member } : undefined) : await prepareShip(root, request);
+			if (prepared.mode === "do" && prepared.group?.role === "parent") {
+				releaseRuntimeCapacity(capacityPath, `running:coordinator:${ownedRun.identity.runId}`);
+				releaseRuntimeCapacity(capacityPath, `detached:coordinator:${ownedRun.identity.runId}`);
+				if (coordinatorUnits.delete(ownedRun.identity.runId)) activeUnits = Math.max(0, activeUnits - 1);
+			}
 			if (ownedRun.state === "blocked") throw new Error("coordinator was cancelled during preparation");
 			if (doBinding) {
 				const current = prepared.group?.role === "rework" ? readCandidatePlanSnapshot(root, request.tickets[0]!, prepared.plan!) : readRecordedPlanBinding(root, request.tickets[0]!);
@@ -1588,7 +1632,7 @@ export default function (pi: ExtensionAPI) {
 				const parentWorkspace = process.env.HERDR_WORKSPACE_ID ?? origin.pane.split(":")[0]!;
 				const agentName = `${prepared.group.root.toLowerCase()}-group-do-${ownedRun.identity.runId.slice(0, 8)}`;
 				const env = Object.entries(runtimeEnv(ownedRun.identity)).filter((entry): entry is [string, string] => typeof entry[1] === "string").map(([key, value]) => `${key}=${value}`);
-				env.push(`YOKEMATE_PARENT_PANE=${origin.pane}`);
+				env.push(`YOKEMATE_PARENT_PANE=${origin.pane}`, "YOKEMATE_GROUP_ROLE=parent", "YOKEMATE_GROUP_SCOPE_PATHS=[]", "YOKEMATE_GROUP_SCOPE_BRANCHES=[]");
 				const opened = await openModeSurfaceAsync("tab", origin.pane, parentWorkspace, prepared.cwd, `${prepared.group.root} group do`, env);
 				groupDoSurfaces.set(ownedRun.identity.runId, { ...opened, agentName });
 				try {
@@ -2403,7 +2447,19 @@ export default function (pi: ExtensionAPI) {
 							const accepted = db.prepare("SELECT candidate_hash,candidate_json FROM group_acceptance WHERE group_id=? AND revision_hash=? AND state='current'").get(run.prepared.group.groupId, run.prepared.group.revisionHash) as { candidate_hash: string; candidate_json: string } | undefined;
 							const part = parts[0]!;
 							const acceptedPart = accepted ? (JSON.parse(accepted.candidate_json) as GroupCandidate).parts.find((candidatePart) => candidatePart.repo === part.repo && candidatePart.pr === part.pr) : undefined;
-							if (!accepted || !acceptedPart || acceptedPart.headSha !== part.observedHead || request.expectedHead !== acceptedPart.headSha || acceptedPart.baseRef !== part.base) throw new Error("group merge head is not the exact accepted candidate head");
+							if (!accepted || !acceptedPart) throw new Error("group merge is outside the exact accepted candidate");
+							const baseLine = part.remote && part.base ? execFileSync("git", ["ls-remote", part.remote, `refs/heads/${part.base}`], { cwd: part.path, encoding: "utf8" }).trim() : "";
+							const currentBase = baseLine.split(/\s+/)[0] ?? "";
+							if (acceptedPart.headSha !== part.observedHead || request.expectedHead !== acceptedPart.headSha || acceptedPart.baseRef !== part.base || currentBase !== acceptedPart.baseSha) {
+								db.exec("BEGIN IMMEDIATE");
+								try {
+									db.prepare("UPDATE group_acceptance SET state='superseded' WHERE group_id=? AND revision_hash=? AND state='current'").run(run.prepared.group.groupId, run.prepared.group.revisionHash);
+									db.prepare("UPDATE task_group SET phase='review',resume_phase=NULL,blocker='accepted candidate changed before ship',updated_at=datetime('now') WHERE id=? AND active_revision=? AND phase IN ('accepted','shipping')").run(run.prepared.group.groupId, run.prepared.group.revisionHash);
+									db.exec("COMMIT");
+								} catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+								persistPortableGroupFacts(db, run.prepared.group.groupId, `${run.identity.ticket} group ship candidate superseded`);
+								throw new Error("group merge candidate or external base changed; assemble and accept a fresh candidate");
+							}
 							const moved = db.prepare("UPDATE task_group SET phase='shipping',resume_phase=NULL,blocker=NULL,updated_at=datetime('now') WHERE id=? AND active_revision=? AND phase='accepted'").run(run.prepared.group.groupId, run.prepared.group.revisionHash);
 							const phase = db.prepare("SELECT phase FROM task_group WHERE id=?").get(run.prepared.group.groupId) as { phase: string } | undefined;
 							if (moved.changes === 0 && phase?.phase !== "shipping") throw new Error(`group cannot ship from ${phase?.phase ?? "missing"}`);
@@ -2636,6 +2692,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async (event) => {
 		shuttingDown = true;
+		if (runtimeCapacitySubscribed) { runtimeCapacitySubscribed = false; unsubscribeRuntimeCapacity(); }
 		const revoked = revokeAuthority(event.reason === "reload" ? "session_reload" : event.reason === "fork" ? "session_fork" : "session_shutdown");
 		workflowExtraction = undefined;
 		removeTerminalInputListener?.();
@@ -3305,7 +3362,7 @@ export default function (pi: ExtensionAPI) {
 					capacity: () => runtime.snapshot().active.length + availableRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), schedulerSettings.policy.guards.parallelConcurrencyLimit ? schedulerSettings.limits.maxConcurrency : Number.MAX_SAFE_INTEGER, "running"),
 					delegate: async (delegation) => {
 						refreshQueuedMemberWorkScopes(db, path.join(root, "work", rootTicket), { groupId, revisionHash, ticket: delegation.member });
-						const response = await startOneCoordinator({ mode: "do", tickets: [delegation.member] }, ctx, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: rootTicket, YOKEMATE_ROLE: "coordinator", sessionId: ctx.sessionManager.getSessionId(), cwd: process.cwd() }, schedulerSettings, undefined, {}, { runtime, groupId, revisionHash, member: delegation.member, parentRunId: ownerRunId });
+						const response = await startOneCoordinator({ mode: "do", tickets: [delegation.member] }, ctx, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: rootTicket, YOKEMATE_ROLE: "coordinator", sessionId: ctx.sessionManager.getSessionId(), cwd: process.cwd() }, schedulerSettings, undefined, {}, { runtime, groupId, revisionHash, root: rootTicket, member: delegation.member, parentRunId: ownerRunId });
 						if (typeof response.details?.runId !== "string") throw new Error(response.content?.[0]?.text ?? `${delegation.member}: coordinator launch failed`);
 						const runId = response.details.runId as string;
 						return { runId, cancel: async () => { await cancelCoordinator(runId, "parent_cancel_run", false); } };
