@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { createHash, randomUUID } from "node:crypto";
-import { JsonlAggregateValidator } from "./jsonl-aggregate.ts";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
@@ -135,9 +135,8 @@ export class ChildRuns {
 const RECORD_LIMIT = 1024 * 1024;
 const eventNames = new Set(["session", "entry_appended", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "auto_retry_start", "auto_retry_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished", "queue_update", "extension_error", "response", "extension_ui_request"]);
 export class JsonlObservation {
-  private prefix?: Buffer;
-  private prefixLength = 0;
-  private aggregate?: JsonlAggregateValidator;
+  private decoder = new StringDecoder("utf8");
+  private buffer = "";
   private recordBytes = 0;
   private recordHash = createHash("sha256");
   private dropping = false;
@@ -174,58 +173,26 @@ export class JsonlObservation {
       const bytes = chunk.subarray(start, end);
       this.recordBytes += bytes.length;
       this.recordHash.update(bytes);
-      this.consumeRecordBytes(bytes);
+      if (!this.dropping && this.recordBytes > RECORD_LIMIT) { this.error("record_limit"); this.dropping = true; this.buffer = ""; }
+      if (!this.dropping) this.buffer += this.decoder.write(bytes);
       if (newline < 0) break;
-      if (this.aggregate) {
-        if (this.aggregate.finish()) {
-          this.counts.agent_end = (this.counts.agent_end ?? 0) + 1;
-          this.lastEventAt = new Date().toISOString();
-        } else if (!this.dropping) this.error("record_limit");
-      } else if (!this.dropping) {
-        const line = (this.prefix ?? Buffer.alloc(0)).subarray(0, this.prefixLength).toString("utf8");
-        this.parse(line.endsWith("\r") ? line.slice(0, -1) : line);
+      if (!this.dropping) {
+        this.buffer += this.decoder.end();
+        this.parse(this.buffer.endsWith("\r") ? this.buffer.slice(0, -1) : this.buffer);
       }
       this.offset += this.recordBytes + 1;
-      this.resetRecord();
+      this.recordBytes = 0;
+      this.recordHash = createHash("sha256");
+      this.decoder = new StringDecoder("utf8");
+      this.buffer = "";
+      this.dropping = false;
       start = newline + 1;
     }
   }
   end(): void {
     if (this.recordBytes) this.error("partial_record");
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    this.aggregate = undefined;
-    this.dropping = false;
-  }
-  private consumeRecordBytes(bytes: Buffer): void {
-    if (!bytes.length || this.dropping) return;
-    if (this.aggregate) {
-      this.aggregate.write(bytes);
-      if (this.aggregate.rejected) { this.error("record_limit"); this.dropping = true; this.aggregate = undefined; }
-      return;
-    }
-    this.prefix ??= Buffer.allocUnsafe(RECORD_LIMIT);
-    const retained = Math.min(bytes.length, RECORD_LIMIT - this.prefixLength);
-    if (retained > 0) {
-      bytes.copy(this.prefix, this.prefixLength, 0, retained);
-      this.prefixLength += retained;
-    }
-    if (retained === bytes.length) return;
-    const validator = new JsonlAggregateValidator();
-    validator.write(this.prefix.subarray(0, this.prefixLength));
-    validator.write(bytes.subarray(retained));
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    if (validator.rejected) { this.error("record_limit"); this.dropping = true; }
-    else this.aggregate = validator;
-  }
-  private resetRecord(): void {
-    this.recordBytes = 0;
-    this.recordHash = createHash("sha256");
-    this.prefix = undefined;
-    this.prefixLength = 0;
-    this.aggregate = undefined;
-    this.dropping = false;
+    this.buffer = "";
+    this.decoder.end();
   }
   private parse(line: string): void {
     if (!line.trim()) return;
