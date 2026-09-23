@@ -735,10 +735,13 @@ export default function (pi: ExtensionAPI) {
 		batchDispatches: number;
 		failureProduced: number;
 		failureConsumed: number;
+		retry: boolean;
+		compaction: boolean;
 		revision: number;
 		listeners: Set<() => void>;
 	}
 	let ownedGeneration: OwnedGeneration | undefined;
+	let nextOwnedGenerationSerial = 0;
 	const ownedGenerationByRunId = new Map<string, OwnedGeneration>();
 	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
 	let nextScoutSequence = 0;
@@ -2260,7 +2263,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
 				ownedReadyRunId = identity.runId;
-				ownedGeneration = { serial: sessionGeneration, ownerRunId: identity.runId!, ownerSessionId: runs.ownerSessionId, runs, fenced: false, producerObligations: 0, batchDispatches: 0, failureProduced: 0, failureConsumed: 0, revision: 0, listeners: new Set() };
+				ownedGeneration = { serial: ++nextOwnedGenerationSerial, ownerRunId: identity.runId!, ownerSessionId: runs.ownerSessionId, runs, fenced: false, producerObligations: 0, batchDispatches: 0, failureProduced: 0, failureConsumed: 0, retry: false, compaction: false, revision: 0, listeners: new Set() };
 				emitChildState();
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
 			} catch (error) {
@@ -2377,6 +2380,11 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
+	pi.on("agent_start", () => { const generation = currentOwnedGeneration(); if (generation) generation.retry = false; });
+	pi.on("agent_end", (event) => { const generation = currentOwnedGeneration(); if (generation) generation.retry = (event as { willRetry?: boolean }).willRetry === true; });
+	pi.on("session_before_compact", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = true; });
+	pi.on("session_compact", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = false; });
+	pi.on("session_compact_failed", () => { const generation = currentOwnedGeneration(); if (generation) generation.compaction = false; });
 	pi.on("turn_start", (_event, ctx) => {
 		latestCtx = ctx;
 		const signal = ctx.signal;
@@ -2514,7 +2522,7 @@ export default function (pi: ExtensionAPI) {
 	const settleBatch = (batchId: string, lifecycle = runs): void => {
 		const batch = lifecycle?.batch(batchId);
 		if (!batch) return;
-		const batchKey = `${batch.ownerRunId}\0${batch.ownerSessionId}\0${batchId}`;
+		const batchKey = deliveryFor(batch).deliveryId;
 		if (sentBatches.has(batchKey)) return;
 		sentBatches.add(batchKey);
 		sendReport(batch);
@@ -2800,17 +2808,25 @@ export default function (pi: ExtensionAPI) {
 		label: "Coordinator finish",
 		description: "Finish this owned background coordinator with a verified outcome.",
 		parameters: Type.Object({ outcome: StringEnum(["done", "blocked"] as const), summary: Type.String(), reason: Type.Optional(Type.String()), passedTickets: Type.Optional(Type.Array(Type.String())) }),
-		async execute(_id, params): Promise<any> {
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<any> {
 			const runId = process.env.YOKEMATE_RUN_ID;
 			if (!runId || process.env.YOKEMATE_ROLE !== "coordinator" || ownedReadyRunId !== runId)
 				return { content: [{ type: "text", text: "coordinator_finish is available only to its owned RPC coordinator" }], isError: true };
 			if (params.outcome === "blocked" && !params.reason)
 				return { content: [{ type: "text", text: "blocked needs a reason" }], isError: true };
 			if (finishingCoordinatorRunId) return { content: [{ type: "text", text: "coordinator is already finishing" }], isError: true };
-			if (runs?.active().length || batches.size > 0) return { content: [{ type: "text", text: "coordinator still has active child batches" }], isError: true };
-			const pending = [...deliveries.values()].map(({ delivery }) => delivery).filter((delivery) => delivery.state !== "observed");
-			if (pending.length && !(params.outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && params.reason?.includes(delivery.deliveryId)))) return { content: [{ type: "text", text: `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}` }], isError: true };
+			const finishBlock = (): string | undefined => {
+				const generation = currentOwnedGeneration();
+				if (!generation) return "coordinator owned generation is unavailable";
+				if (generation.runs.active().length || generation.producerObligations || generation.batchDispatches || generation.retry || generation.compaction || ctx.hasPendingMessages?.()) return "coordinator still has active child batches";
+				const pending = [...deliveries.values()].filter((entry) => entry.generation === generation && entry.delivery.state !== "observed").map((entry) => entry.delivery);
+				if (pending.length && !(params.outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && params.reason?.includes(delivery.deliveryId)))) return `coordinator still has pending report delivery: ${pending.map((delivery) => delivery.deliveryId).join(", ")}`;
+			};
+			let blocked = finishBlock();
+			if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
 			await new Promise<void>((resolve) => setImmediate(resolve));
+			blocked = finishBlock();
+			if (blocked) return { content: [{ type: "text", text: blocked }], isError: true };
 			const run = coordinators.get(runId);
 			if (!run) {
 				if (params.outcome === "done" && process.env.YOKEMATE_MODE === "ship") {
@@ -2850,6 +2866,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<any> {
 			latestCtx = ctx;
 			const admittedGeneration = sessionGeneration;
+			const invocationGeneration = currentOwnedGeneration();
+			const invocationRuns = runs;
 			if (finishingCoordinatorRunId && process.env.YOKEMATE_ROLE === "coordinator") return { content: [{ type: "text", text: "coordinator is finishing" }], isError: true };
 			if (!params.cancelRun && shuttingDown) return { content: [{ type: "text", text: "parent session is shutting down; only cancellation remains available" }], isError: true };
 			if (!params.cancelRun && process.env.YOKEMATE_PLAN_RUN_ID && stoppedPlanRuns.has(process.env.YOKEMATE_PLAN_RUN_ID)) return { content: [{ type: "text", text: "plan run is stopped; only cancellation and conversation remain available" }], isError: true };
@@ -3061,10 +3079,11 @@ export default function (pi: ExtensionAPI) {
 				return { envelope: envelope!, output };
 			};
 			const launch = async (mode: "single" | "parallel" | "chain", tasks: { agent: string; task: string; cwd?: string; ticket?: string; review?: { baseSha: string; headSha: string }; acceptedInputId?: number; writerRevisionOf?: string }[]) => {
+				const launchRuns = invocationGeneration?.runs ?? runs!;
 				tasks = await Promise.all(tasks.map(async (task) => {
 					if (task.agent !== "plan-writer" || task.acceptedInputId) return task;
 					const ticket = task.ticket ?? process.env.YOKEMATE_TICKET;
-					const current = ticket ? runs!.currentScout(ticket) : undefined;
+					const current = ticket ? launchRuns.currentScout(ticket) : undefined;
 					if (current?.artifact?.state === "accepted") return { ...task, ticket, acceptedInputId: current.artifact.acceptanceId };
 					const runId = process.env.YOKEMATE_PLAN_RUN_ID;
 					if (!ticket || !runId || process.env.YOKEMATE_MODE !== "plan") return task;
@@ -3075,19 +3094,19 @@ export default function (pi: ExtensionAPI) {
 				const writerScopes = tasks.map((task) => task.agent === "plan-writer"
 					? resolvePlanWriterScope(ENGINE_ROOT, task.ticket ?? process.env.YOKEMATE_TICKET ?? "")
 					: undefined);
-				if (shuttingDown || sessionGeneration !== admittedGeneration) throw new Error("parent session changed before subagent admission");
+				if (shuttingDown || sessionGeneration !== admittedGeneration || (invocationGeneration ? invocationGeneration.fenced || ownedGeneration !== invocationGeneration || currentOwnedGeneration() !== invocationGeneration || runs !== invocationRuns || launchRuns !== invocationRuns : process.env.YOKEMATE_ROLE === "coordinator" && !!ownedReadyRunId)) throw new Error("parent session changed before subagent admission");
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
-				const admissionGeneration = currentOwnedGeneration();
-				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertChildAdmission);
+				const admissionGeneration = invocationGeneration;
+				const ack = launchRuns.admit(toolCallId, tasks, ctx.cwd, assertChildAdmission);
 				if (admissionGeneration) for (const child of ack.children) ownedGenerationByRunId.set(child.identity.runId, admissionGeneration);
 				for (const [index, child] of ack.children.entries()) {
 					const scope = writerScopes[index];
 					if (scope) planWriterScopes.set(child.identity.runId, scope);
 				}
 				for (const [index, child] of ack.children.entries()) await admitPlanWriter(child.identity, tasks[index]!.task, tasks[index]!.task, false);
-				if (mode === "chain") for (const child of ack.children.slice(1)) runs!.defer(child.identity);
+				if (mode === "chain") for (const child of ack.children.slice(1)) launchRuns.defer(child.identity);
 				const admittedAt = Date.now();
 				for (const [index, { identity }] of ack.children.entries()) {
 					if (identity.agent === "plan-scout") scoutSequenceByRunId.set(identity.runId, 2 * ++nextScoutSequence);
@@ -3111,7 +3130,7 @@ export default function (pi: ExtensionAPI) {
 				activeUnits += units;
 				batches.add(toolCallId);
 				batchModes.set(toolCallId, mode);
-				const dispatchRuns = runs!;
+				const dispatchRuns = launchRuns;
 				const dispatchGeneration = admissionGeneration;
 				if (dispatchGeneration) dispatchGeneration.batchDispatches += 1;
 				let resolveCompletion!: () => void;

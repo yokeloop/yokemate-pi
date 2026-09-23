@@ -315,6 +315,53 @@ test("owned loader uses steer and fences terminal reviewer replacement until mat
   });
 });
 
+test("local coordinator finish rechecks exact generation queue, retry and compaction readiness", async () => {
+  const engine = createFixtureEngine({ label: "owned-local-finish", agents: { worker: "---\nname: worker\ndescription: finish fixture\n---\nReturn output.\n" } });
+  const owner = "77777777-7777-4777-8777-777777777777";
+  await withFixtureEnvironment(engine, { YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: owner }, async () => {
+    const fixture = await loadFixtureExtension(engine, { sessionId: "owned-local-finish-session" });
+    fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+    const ready = fixture.extension.commands.get("yokemate-coordinator-ready")!;
+    const payload = Buffer.from(JSON.stringify({ identity: { runId: owner, role: "coordinator", cwd: engine.root }, prepared: { cwd: engine.root } })).toString("base64");
+    await ready.handler(payload, fixture.ctx as any);
+    const finish = fixture.extension.tools.get("coordinator_finish")!.definition;
+    const params = { outcome: "blocked" as const, summary: "fixture", reason: "fixture" };
+    const queued = await finish.execute("finish-queued", params, undefined, () => undefined, { ...fixture.ctx, hasPendingMessages: () => true } as any) as any;
+    assert.equal(queued.isError, true);
+    assert.match(queued.content[0].text, /active child batches/);
+    for (const handler of fixture.extension.handlers.get("session_before_compact") ?? []) await handler({ type: "session_before_compact" } as never, fixture.ctx);
+    const compacting = await finish.execute("finish-compacting", params, undefined, () => undefined, { ...fixture.ctx, hasPendingMessages: () => false } as any) as any;
+    assert.equal(compacting.isError, true);
+    for (const handler of fixture.extension.handlers.get("session_compact") ?? []) await handler({ type: "session_compact" } as never, fixture.ctx);
+    for (const handler of fixture.extension.handlers.get("agent_end") ?? []) await handler({ type: "agent_end", willRetry: true } as never, fixture.ctx);
+    const retrying = await finish.execute("finish-retrying", params, undefined, () => undefined, { ...fixture.ctx, hasPendingMessages: () => false } as any) as any;
+    assert.equal(retrying.isError, true);
+    for (const handler of fixture.extension.handlers.get("agent_start") ?? []) await handler({ type: "agent_start" } as never, fixture.ctx);
+    await ready.handler(payload, fixture.ctx as any);
+    const accepted = await finish.execute("finish-ready", params, undefined, () => undefined, { ...fixture.ctx, hasPendingMessages: () => false } as any);
+    assert.equal("isError" in accepted && accepted.isError, false);
+    assert.equal(accepted.terminate, true);
+    await shutdownFixture(fixture);
+  });
+});
+
+test("owned replacement rejects a launch paused before admission", async () => {
+  const engine = createFixtureEngine({ label: "owned-pre-admission-replacement", agents: { worker: "---\nname: worker\ndescription: pre-admission fixture\n---\nReturn output.\n" } });
+  const owner = "66666666-6666-4666-8666-666666666666";
+  await withFixtureEnvironment(engine, { YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: owner, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["subagent-report-child.js"] }, async () => {
+    const fixture = await loadFixtureExtension(engine, { sessionId: "owned-pre-admission-session" });
+    fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+    const ready = fixture.extension.commands.get("yokemate-coordinator-ready")!;
+    const payload = Buffer.from(JSON.stringify({ identity: { runId: owner, role: "coordinator", cwd: engine.root }, prepared: { cwd: engine.root } })).toString("base64");
+    await ready.handler(payload, fixture.ctx as any);
+    const pending = fixture.tool.execute("pre-admission", { agent: "worker", task: "must not cross generation" }, undefined, () => undefined, fixture.ctx);
+    await ready.handler(payload, fixture.ctx as any);
+    await assert.rejects(() => pending, /parent session changed before subagent admission/);
+    assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
+    await shutdownFixture(fixture);
+  });
+});
+
 test("owned replacement fences late producer delivery from the previous generation", async () => {
   const engine = createFixtureEngine({ label: "owned-replacement", agents: { worker: "---\nname: worker\ndescription: replacement fixture\n---\nReturn after release.\n" } });
   const socketPath = join(engine.runtimeDir, "replacement.sock");
@@ -354,8 +401,15 @@ test("owned replacement fences late producer delivery from the previous generati
       assert.throws(() => process.kill(childPid, 0));
       const oldStates = fixture.entries.filter((entry) => entry.type === "yokemate-child-state" && entry.data.ownerRunId === firstOwner).map((entry) => entry.data);
       assert.ok(oldStates.some((state) => state.deliveries.length > 0 && state.deliveries.every((delivery: any) => delivery.state === "delivery_unknown")), JSON.stringify(oldStates.map((state) => ({ children: state.children.length, deliveries: state.deliveries.map((delivery: any) => delivery.state) }))));
-      await shutdownFixture(fixture, { expectedDeliveryState: "delivery_unknown" });
       assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
+      process.env.YOKEMATE_SUBAGENT_TEST_TARGET = engine.resources["subagent-report-child.js"];
+      const reused = await fixture.tool.execute("old-generation", { agent: "worker", task: "new generation reuses batch id" }, undefined, () => undefined, fixture.ctx);
+      assert.equal("isError" in reused && reused.isError, false);
+      await waitFor(() => fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length === 2);
+      const replacementReports = fixture.sent.filter((entry) => entry.message.customType === "subagent-report");
+      assert.deepEqual(replacementReports.map((entry) => entry.message.details.envelope.kind).sort(), ["batch", "result"]);
+      await acknowledgeFixtureReports(fixture, replacementReports);
+      await shutdownFixture(fixture, { expectedDeliveryState: "terminal" });
       assert.equal(fixture.sent.filter((entry) => entry.message.customType === "yokemate-coordinator-ready").length, 2);
     });
   } finally {
