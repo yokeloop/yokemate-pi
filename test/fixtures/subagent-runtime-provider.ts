@@ -3,6 +3,7 @@ import fs, { realpathSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 function exactProfile(bytes: number, tail: string): string {
   const prefix = "# Scout\n\n## Facts and sources\n- Протокол проверен.\n\n";
@@ -20,17 +21,30 @@ export default function (pi: ExtensionAPI) {
   const scenario = process.env.YM204_FIXTURE_SCENARIO;
   let childTurns = 0;
   let reportSends = 0;
-let cancelIssued = false;
-let repeatedCancelIssued = false;
-let cancelledRunId: string | undefined;
-  if ((scenario === "delivery_sync" || scenario === "delivery_async") && process.env.YOKEMATE_ROLE === "coordinator") {
+  let providerCalls = 0;
+  let contextCalls = 0;
+  if (scenario === "owned_busy_report_boundary" && process.env.YOKEMATE_ROLE === "coordinator") {
+    pi.registerTool({
+      name: "fixture_hold",
+      label: "Fixture hold",
+      description: "Hold the current tool batch on the fixture barrier.",
+      parameters: Type.Object({ phase: Type.String() }),
+      async execute(_id, params) {
+        await barrier(params.phase, { providerCalls });
+        return { content: [{ type: "text", text: `${params.phase} released` }], details: { phase: params.phase } };
+      },
+    });
+  }
+  if (scenario?.startsWith("delivery_") && process.env.YOKEMATE_ROLE === "coordinator") {
     const original = AgentSession.prototype.sendCustomMessage;
     AgentSession.prototype.sendCustomMessage = function (message, options) {
-      if (message.customType === "subagent-report" && ++reportSends === 1) {
-        if (scenario === "delivery_sync") throw new Error("fixture synchronous transport error");
-        return Promise.reject(new Error("fixture asynchronous transport error"));
-      }
-      return original.call(this, message, options);
+      if (message.customType !== "subagent-report") return original.call(this, message, options);
+      reportSends++;
+      const target = scenario.endsWith("_batch") ? reportSends === 2 : scenario.endsWith("_both") ? true : reportSends === 1;
+      if (!target) return original.call(this, message, options);
+      if (scenario === "delivery_async_after_observed") return original.call(this, message, options).then(async () => { await barrier("async-fault-after-observed", { reportSends }); throw new Error("fixture asynchronous transport error"); });
+      if (scenario.startsWith("delivery_sync")) throw new Error("fixture synchronous transport error");
+      return Promise.reject(new Error("fixture asynchronous transport error"));
     };
   }
   if (scenario === "spawn_error" && process.env.YOKEMATE_ROLE === "coordinator") {
@@ -67,7 +81,11 @@ let cancelledRunId: string | undefined;
   pi.on("context", async (event) => {
     if (process.env.YOKEMATE_ROLE !== "coordinator" && !(scenario === "snapshot_probe" && process.env.YOKEMATE_ROLE !== "executor")) return;
     const reports = event.messages.filter((message) => message.role === "custom" && message.customType === "subagent-report");
-    await barrier("context", reports);
+    contextCalls++;
+    await barrier("context", scenario === undefined || scenario === "owned_busy_report_boundary" || scenario === "owned_active_child_yield" ? { ordinal: contextCalls, providerCalls, reports } : reports);
+  });
+  pi.on("turn_end", async () => {
+    if (process.env.YOKEMATE_ROLE === "coordinator" && (scenario === "owned_busy_report_boundary" || scenario === "owned_active_child_yield")) await barrier("turn-end-provider", { providerCalls, contextCalls });
   });
   pi.registerProvider("ym204-fixture", {
     baseUrl: "http://invalid.invalid",
@@ -77,6 +95,7 @@ let cancelledRunId: string | undefined;
     streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
       void (async () => {
+        providerCalls++;
         const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() };
         stream.push({ type: "start", partial: message });
         const text = JSON.stringify(context.messages);
@@ -150,7 +169,19 @@ let cancelledRunId: string | undefined;
           };
           if (!calledA) {
             calledA = true;
-            if (scenario === "snapshot_probe") {
+            if (scenario === "owned_busy_report_boundary") {
+              message.stopReason = "toolUse";
+              message.content = [
+                { type: "toolCall", id: "busy-child", name: "subagent", arguments: { agent: "task-reviewer", task: "owned busy report", cwd: process.env.YM204_FIXTURE_REVIEW_CWD, review: { baseSha: process.env.YM204_FIXTURE_BASE, headSha: process.env.YM204_FIXTURE_HEAD } } },
+                { type: "toolCall", id: "busy-tool", name: "fixture_hold", arguments: { phase: "coordinator-tool-held" } },
+              ];
+              for (let index = 0; index < message.content.length; index++) {
+                stream.push({ type: "toolcall_start", contentIndex: index, partial: message });
+                stream.push({ type: "toolcall_end", contentIndex: index, toolCall: message.content[index] as any, partial: message });
+              }
+            } else if (scenario === "owned_active_child_yield") {
+              call("active-child", "owned active yield");
+            } else if (scenario === "snapshot_probe") {
               message.stopReason = "toolUse";
               const single = { agent: "worker", task: "return deterministic snapshot probe" };
               message.content = [{ type: "toolCall", id: "snapshot-probe", name: "subagent", arguments: process.env.YM245_PRESERVATION === "1" ? { tasks: [single, { ...single, task: "return held-delivery snapshot probe" }] } : single }];
@@ -169,39 +200,29 @@ let cancelledRunId: string | undefined;
               stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
               stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
             } else call("batch-A", "review-A");
-            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max" || scenario === "public_cancel_parallel" || scenario === "public_cancel_chain") {
+            if (scenario === "parallel" || scenario === "chain" || scenario === "chain_long" || scenario === "parallel_max" || scenario === "chain_max") {
               const block = message.content[0] as any;
               const single = block.arguments;
-              const parallel = scenario === "parallel" || scenario === "parallel_max" || scenario === "public_cancel_parallel";
-              const length = scenario === "parallel_max" || scenario === "public_cancel_parallel" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" || scenario === "public_cancel_chain" ? 3 : 2;
+              const parallel = scenario === "parallel" || scenario === "parallel_max";
+              const length = scenario === "parallel_max" ? 8 : scenario === "chain_max" ? 20 : scenario === "chain" ? 3 : 2;
               block.arguments = { [parallel ? "tasks" : "chain"]: Array.from({ length }, (_, i) => ({ ...single, agent: scenario === "chain_long" ? "worker" : single.agent, task: `step-${i + 1}${i ? " {previous}" : ""}` })) };
             }
           }
-          else if (scenario?.startsWith("public_cancel") && !cancelIssued && text.includes('"kind":"ack"')) {
-            const runIds = [...text.matchAll(/"runId":"([0-9a-f-]{36})"/g)].map((match) => match[1]!);
-            const runId = scenario === "public_cancel_parallel" ? runIds.at(-1) : scenario === "public_cancel_chain" ? runIds[1] : runIds[0];
-            if (!runId) throw new Error("public cancellation fixture did not observe child ACK runId");
-            cancelIssued = true;
-            cancelledRunId = runId;
+          else if ((scenario === "owned_busy_report_boundary" || scenario === "owned_active_child_yield") && text.includes("[subagent task-reviewer]")) {
+            await barrier("owned-report-provider", { providerCalls, context: contextCalls });
+            message.content = [{ type: "text", text: "Observed owned report." }];
+          }
+          else if (scenario === "owned_busy_report_boundary") {
             message.stopReason = "toolUse";
-            message.content = [{ type: "toolCall", id: "cancel-child", name: "subagent", arguments: { cancelRun: runId } }];
+            message.content = [{ type: "toolCall", id: `unexpected-busy-${providerCalls}`, name: "fixture_hold", arguments: { phase: "unexpected-before-report" } }];
             stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
             stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
           }
-          else if (scenario !== "public_cancel" && scenario?.startsWith("public_cancel") && cancelIssued && text.includes('"status":"cancellation_requested"')) {
-            await barrier("public-cancel-result", context.messages);
-            message.content = [{ type: "text", text: "continued after deferred public cancellation" }];
-          }
-          else if (scenario?.startsWith("public_cancel") && cancelIssued && !repeatedCancelIssued && text.includes('"status":"cancelled"')) {
-            repeatedCancelIssued = true;
+          else if (scenario === "owned_active_child_yield") {
             message.stopReason = "toolUse";
-            message.content = [{ type: "toolCall", id: "repeat-cancel-child", name: "subagent", arguments: { cancelRun: cancelledRunId } }];
+            message.content = [{ type: "toolCall", id: `unexpected-active-${providerCalls}`, name: "read", arguments: { path: process.env.YM204_FIXTURE_READ_FILE } }];
             stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
             stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] as any, partial: message });
-          }
-          else if (scenario?.startsWith("public_cancel") && repeatedCancelIssued && text.includes('"status":"already_terminal"')) {
-            await barrier("public-cancel-result", context.messages);
-            message.content = [{ type: "text", text: "continued after public cancellation" }];
           }
           else if (!scenario && !calledB && text.includes("[subagent task-reviewer]")) { calledB = true; call("batch-B", "review-B"); }
           else {

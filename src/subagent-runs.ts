@@ -239,9 +239,9 @@ export class ChildRuns {
     for (const identity of identities) {
       if (identity.agent === "plan-writer") {
         if (identity.ticket && pendingScoutTickets.has(identity.ticket)) throw new Error(`plan-writer cannot share admission with an unsettled scout for ${identity.ticket}`);
-        if (validate) validate(identity);
-        else this.assertPlanWriterAdmission(identity);
+        if (!validate) this.assertPlanWriterAdmission(identity);
       }
+      validate?.(identity);
     }
     this.batches.set(batchId, Object.freeze([...identities]));
     identities.forEach((identity, index) => {
@@ -397,6 +397,13 @@ export class ChildRuns {
   }
   isCurrentScout(identity: ChildIdentity): boolean { return identity.agent === "plan-scout" && !!identity.ticket && this.currentScouts.get(identity.ticket)?.runId === identity.runId; }
   currentScout(ticket: string): ResultEnvelope | undefined { const result = this.currentScouts.get(ticket)?.result; return result ? structuredClone(result) : undefined; }
+  result(runId: string): ResultEnvelope | undefined { const result = this.children.get(runId)?.result; return result ? structuredClone(result) : undefined; }
+  terminalReviewers(scope: Pick<ChildIdentity, "ownerRunId" | "ownerSessionId" | "cwd" | "review">): ChildIdentity[] {
+    if (!scope.review) return [];
+    return [...this.children.values()]
+      .filter((child) => child.identity.agent === "task-reviewer" && !!(child.claim || child.result) && child.identity.ownerRunId === scope.ownerRunId && child.identity.ownerSessionId === scope.ownerSessionId && child.identity.cwd === scope.cwd && child.identity.review?.baseSha === scope.review!.baseSha && child.identity.review?.headSha === scope.review!.headSha)
+      .map((child) => copyIdentity(child.identity));
+  }
   assertPlanWriterAdmission(identity: ChildIdentity): ResultEnvelope {
     if (identity.agent !== "plan-writer" || !identity.ticket) throw new Error("plan-writer requires an explicit ticket binding");
     const result = this.currentScout(identity.ticket);
@@ -1002,6 +1009,8 @@ export interface ChildStateSnapshot {
   sequence: number;
   children: LaunchAck["children"];
   deliveries: ReportDelivery[];
+  producerObligations?: number;
+  batchDispatches?: number;
 }
 export function deliveryFor(envelope: ReportEnvelope): ReportDelivery {
   const identity = envelope.kind === "result" ? envelope.identity : envelope;
@@ -1012,6 +1021,22 @@ export function deliveryFor(envelope: ReportEnvelope): ReportDelivery {
 export function reportContent(envelope: ReportEnvelope, delivery: ReportDelivery): string {
   const prefix = envelope.kind === "result" ? `[subagent ${envelope.identity.agent}${failedEnvelope(envelope) ? " failed" : ""}]` : envelope.kind === "batch" ? "[subagent batch complete]" : "[subagent chain]";
   return `${prefix} ${JSON.stringify({ version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope })}`;
+}
+export interface ObservedReviewScope { ownerRunId: string; ownerSessionId: string; cwd: string; baseSha: string; headSha: string }
+export function matchingObservedReview(runs: ChildRuns, identity: ChildIdentity, scope: ObservedReviewScope, entries: Iterable<{ delivery: ReportDelivery; envelope: ReportEnvelope }>): ResultEnvelope | undefined {
+  let canonicalCwd: string;
+  try { canonicalCwd = realpathSync(scope.cwd); } catch { return; }
+  if (identity.agent !== "task-reviewer" || !identity.review || identity.ownerRunId !== scope.ownerRunId || identity.ownerSessionId !== scope.ownerSessionId || identity.cwd !== canonicalCwd || identity.review.baseSha !== scope.baseSha || identity.review.headSha !== scope.headSha) return;
+  const stored = runs.result(identity.runId);
+  if (!stored || JSON.stringify(stored.identity) !== JSON.stringify(identity)) return;
+  for (const entry of entries) {
+    if (entry.delivery.state !== "observed" || !entry.delivery.runIds.includes(identity.runId)) continue;
+    const canonical = deliveryFor(entry.envelope);
+    if (canonical.deliveryId !== entry.delivery.deliveryId || canonical.envelopeHash !== entry.delivery.envelopeHash || canonical.batchId !== entry.delivery.batchId || JSON.stringify(canonical.runIds) !== JSON.stringify(entry.delivery.runIds)) continue;
+    const candidate = entry.envelope.kind === "result" ? entry.envelope : entry.envelope.results.find((result) => result.identity.runId === identity.runId);
+    if (!candidate || JSON.stringify(candidate) !== JSON.stringify(stored) || JSON.stringify(candidate.identity) !== JSON.stringify(identity)) continue;
+    return structuredClone(stored);
+  }
 }
 export class OwnedChildState {
   private runId: string;
@@ -1075,7 +1100,7 @@ export class OwnedChildState {
   }
   accept(value: unknown): boolean {
     const next = value as ChildStateSnapshot;
-    if (!next || next.version !== 1 || next.ownerRunId !== this.runId || next.pid !== this.pid || next.starttime !== this.starttime || !Number.isSafeInteger(next.sequence) || next.sequence < 1 || !Array.isArray(next.children) || !Array.isArray(next.deliveries)) { this.invalid = true; return false; }
+    if (!next || next.version !== 1 || next.ownerRunId !== this.runId || next.pid !== this.pid || next.starttime !== this.starttime || !Number.isSafeInteger(next.sequence) || next.sequence < 1 || !Array.isArray(next.children) || !Array.isArray(next.deliveries) || !Number.isSafeInteger(next.producerObligations ?? 0) || (next.producerObligations ?? 0) < 0 || !Number.isSafeInteger(next.batchDispatches ?? 0) || (next.batchDispatches ?? 0) < 0) { this.invalid = true; return false; }
     if (!this.sessionId) { this.provisional = next; return false; }
     if (next.ownerSessionId !== this.sessionId) { this.invalid = true; return false; }
     if (next.sequence <= (this.snapshot?.sequence ?? 0)) return false;
@@ -1107,18 +1132,20 @@ export class OwnedChildState {
     return true;
   }
   pendingIds(): string[] { return this.snapshot?.deliveries.filter((delivery) => delivery.state !== "observed").map((delivery) => delivery.deliveryId) ?? []; }
-  busyCount(): number { return !this.snapshot || this.invalid || !this.sessionId ? 1 : this.snapshot.children.length + this.inFlight.size + this.pendingIds().length; }
+  busyCount(): number { return !this.snapshot || this.invalid || !this.sessionId ? 1 : this.snapshot.children.length + this.inFlight.size + (this.snapshot.producerObligations ?? 0) + (this.snapshot.batchDispatches ?? 0) + this.pendingIds().length; }
   canFinish(outcome: "done" | "blocked", reason?: string): boolean {
-    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size) return false;
+    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0)) return false;
     const pending = this.snapshot.deliveries.filter((delivery) => delivery.state !== "observed");
     if (!pending.length) return true;
     return outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && reason?.includes(delivery.deliveryId));
   }
   verificationCount(outcome: "done" | "blocked", reason?: string): number { return this.canFinish(outcome, reason) ? 0 : Math.max(1, this.busyCount()); }
   deliveryFailureReason(): string | undefined {
-    if (!this.deliveryError && !this.snapshot?.deliveries.some((delivery) => delivery.state === "delivery_failed")) return;
-    const reason = `report delivery failure; unobserved IDs: ${this.pendingIds().join(", ")}`;
-    return this.pendingIds().length && this.canFinish("blocked", reason) ? reason : undefined;
+    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0)) return;
+    const pending = this.snapshot.deliveries.filter((delivery) => delivery.state !== "observed");
+    if (!pending.length || !pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state))) return;
+    const reason = `report delivery failure; unobserved IDs: ${pending.map((delivery) => delivery.deliveryId).join(", ")}`;
+    return this.canFinish("blocked", reason) ? reason : undefined;
   }
   settled(): "wait" | "nudge" | "blocked" {
     if (this.busyCount() || this.retry || this.compaction || this.queue) return "wait";

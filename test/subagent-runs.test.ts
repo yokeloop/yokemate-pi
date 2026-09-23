@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { boundBatchResult, ChildRuns, deliveryFor, reportContent, resultEnvelope, reviewerVerdict, sha256, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
+import { boundBatchResult, ChildRuns, deliveryFor, matchingObservedReview, reportContent, resultEnvelope, reviewerVerdict, sha256, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
 import { buildReportDisplay } from "../src/subagent-report.ts";
 
 const cwd = process.cwd();
@@ -413,6 +413,59 @@ test("result, chain and follow-up batch canonical contracts remain distinct and 
   const followUpDelivery = deliveryFor(followUp);
   assert.equal(reportContent(chain, chainDelivery), `[subagent chain] ${JSON.stringify({ version: 1, deliveryId: chainDelivery.deliveryId, envelopeHash: chainDelivery.envelopeHash, envelope: chain })}`);
   assert.equal(reportContent(followUp, followUpDelivery), `[subagent batch complete] ${JSON.stringify({ version: 1, deliveryId: followUpDelivery.deliveryId, envelopeHash: followUpDelivery.envelopeHash, envelope: followUp })}`);
+});
+
+test("matching observed review evidence is identity- and revision-exact across result and aggregate copies", () => {
+  const runs = new ChildRuns("owner", "session");
+  const ack = runs.admit("review", [task], cwd);
+  const identity = ack.children[0]!.identity;
+  const finding = { severity: "blocking", lens: 1, file: "src/x.ts", line: 1, problem: "problem", evidence: "evidence", fix: "fix" };
+  const result = resultEnvelope(identity, task.task, clean, JSON.stringify({ status: "changes_required", findings: [finding] }));
+  assert.equal(runs.settle(result), true);
+  const batch = runs.batch("review")!;
+  const resultDelivery = { ...deliveryFor(result), state: "observed" as const };
+  const batchDelivery = { ...deliveryFor(batch), state: "observed" as const };
+  const scope = { ownerRunId: "owner", ownerSessionId: "session", cwd, baseSha: headSha, headSha };
+  assert.deepEqual(matchingObservedReview(runs, identity, scope, [{ delivery: resultDelivery, envelope: result }, { delivery: batchDelivery, envelope: batch }]), result);
+  assert.deepEqual(matchingObservedReview(runs, identity, scope, [{ delivery: batchDelivery, envelope: batch }]), result);
+  assert.equal(matchingObservedReview(runs, identity, { ...scope, ownerSessionId: "foreign" }, [{ delivery: resultDelivery, envelope: result }]), undefined);
+  assert.equal(matchingObservedReview(runs, identity, { ...scope, headSha: "0".repeat(40) }, [{ delivery: resultDelivery, envelope: result }]), undefined);
+  assert.equal(matchingObservedReview(runs, { ...identity, taskHash: "0".repeat(64) }, scope, [{ delivery: resultDelivery, envelope: result }]), undefined);
+  assert.equal(matchingObservedReview(runs, identity, scope, [{ delivery: { ...resultDelivery, envelopeHash: "0".repeat(64) }, envelope: result }]), undefined);
+  const invalid = { ...result, payloadOutcome: "invalid_reviewer_json" as const, reviewVerdict: null, payload: "{}" };
+  const invalidRuns = new ChildRuns("owner", "session");
+  const invalidIdentity = invalidRuns.admit("invalid", [task], cwd).children[0]!.identity;
+  const invalidResult = { ...invalid, identity: invalidIdentity, actualTaskHash: invalidIdentity.taskHash };
+  invalidRuns.settle(invalidResult);
+  const invalidDelivery = { ...deliveryFor(invalidResult), state: "observed" as const };
+  assert.equal(matchingObservedReview(invalidRuns, invalidIdentity, scope, [{ delivery: invalidDelivery, envelope: invalidResult }])?.reviewVerdict, null);
+  const cancelledRuns = new ChildRuns("owner", "session");
+  const cancelledIdentity = cancelledRuns.admit("cancelled", [task], cwd).children[0]!.identity;
+  const cancelledResult = resultEnvelope(cancelledIdentity, task.task, { processOutcome: "cancelled", exitCode: null, signal: null }, "");
+  cancelledRuns.settle(cancelledResult);
+  const cancelledDelivery = { ...deliveryFor(cancelledResult), state: "observed" as const };
+  assert.equal(matchingObservedReview(cancelledRuns, cancelledIdentity, scope, [{ delivery: cancelledDelivery, envelope: cancelledResult }])?.reviewVerdict, null);
+});
+
+test("review admission validation remains atomic when prior evidence is not observed", () => {
+  const runs = new ChildRuns("owner", "session");
+  const prior = runs.admit("prior", [task], cwd).children[0]!.identity;
+  const result = resultEnvelope(prior, task.task, clean, approved);
+  runs.settle(result);
+  const delivery = deliveryFor(result);
+  assert.throws(() => runs.admit("replacement", [{ ...task, task: "rephrased" }], cwd, (identity) => {
+    if (identity.agent !== "task-reviewer") return;
+    const scope = { ownerRunId: identity.ownerRunId, ownerSessionId: identity.ownerSessionId, cwd: identity.cwd, baseSha: identity.review!.baseSha, headSha: identity.review!.headSha };
+    if (runs.terminalReviewers(identity).some((candidate) => !matchingObservedReview(runs, candidate, scope, [{ delivery, envelope: result }]))) throw new Error("terminal review is not observed");
+  }), /not observed/);
+  assert.equal(runs.batches.has("replacement"), false);
+  assert.equal(runs.children.size, 1);
+  const observed = { ...delivery, state: "observed" as const };
+  assert.doesNotThrow(() => runs.admit("replacement-observed", [{ ...task, task: "rephrased" }], cwd, (identity) => {
+    if (identity.agent !== "task-reviewer") return;
+    const scope = { ownerRunId: identity.ownerRunId, ownerSessionId: identity.ownerSessionId, cwd: identity.cwd, baseSha: identity.review!.baseSha, headSha: identity.review!.headSha };
+    if (runs.terminalReviewers(identity).some((candidate) => !matchingObservedReview(runs, candidate, scope, [{ delivery: observed, envelope: result }]))) throw new Error("terminal review is not observed");
+  }));
 });
 
 test("ordinary lifecycle reserves before dispatch and cancellation keeps the first terminal claim", async () => {

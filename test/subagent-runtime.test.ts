@@ -101,6 +101,117 @@ test("real runtime keeps merge and ship finalization on owned parent control ope
   assert.ok(source.indexOf("requestShipFinalize(ENGINE_ROOT, runId") < source.indexOf("outcome proposed"));
 });
 
+async function runOwnedBoundaryScenario(scenario: "owned_busy_report_boundary" | "owned_active_child_yield", signal: AbortSignal): Promise<void> {
+  const ownerId = `owner-${scenario.replaceAll("_", "-")}`;
+  const sandbox = mkdtempSync(join(tmpdir(), `ym283-${scenario}-`));
+  const cwd = join(sandbox, "cwd");
+  const agentDir = join(sandbox, "agent");
+  const runtimeExtension = join(sandbox, ".pi/extensions/subagent/index.ts");
+  mkdirSync(join(cwd, ".pi/agents"), { recursive: true });
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  mkdirSync(join(sandbox, ".pi/agents"), { recursive: true });
+  cpSync(join(root, "src"), join(sandbox, "src"), { recursive: true });
+  cpSync(join(root, ".pi/extensions/subagent"), join(sandbox, ".pi/extensions/subagent"), { recursive: true });
+  symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
+  symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
+  writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
+  writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  const readFixture = join(sandbox, "read-fixture.txt");
+  writeFileSync(readFixture, "fixture");
+  const priorEnv = { ...process.env };
+  for (const key of Object.keys(process.env)) if (!["PATH", "NODE_TEST_CONTEXT"].includes(key)) delete process.env[key];
+  Object.assign(process.env, { HOME: sandbox, PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: readFixture });
+  const phases: any[] = [];
+  const sockets = new Set<Socket>();
+  const held = new Map<string, Socket[]>();
+  const waiters: Array<() => void> = [];
+  const wake = () => { for (const waiter of waiters.splice(0)) waiter(); };
+  const waitPhase = async (phase: string) => {
+    while (!phases.some((entry) => entry.phase === phase)) await untilAborted(new Promise<void>((resolve) => waiters.push(resolve)), signal);
+    return phases.find((entry) => entry.phase === phase)!;
+  };
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const message = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        phases.push(message);
+        if ((message.phase === "child-working" && scenario === "owned_active_child_yield") || message.phase === "coordinator-tool-held") held.set(message.phase, [...held.get(message.phase) ?? [], socket]);
+        else socket.end("release\n");
+        wake();
+      }
+    });
+  });
+  const events: RpcEvent[] = [];
+  let rpc: ReturnType<typeof startCoordinatorRpc> | undefined;
+  let enqueued!: () => void;
+  let observed!: () => void;
+  const enqueuedState = new Promise<void>((resolve) => { enqueued = resolve; });
+  const observedState = new Promise<void>((resolve) => { observed = resolve; });
+  try {
+    await untilAborted(new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve)), signal);
+    rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-283"], model: "ym204-fixture/deterministic:high", cwd, plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
+      { runId: ownerId, parentSessionId: "fixture-parent", mode: "do", ticket: "YM-283", project: [], role: "coordinator", cwd, model: "ym204-fixture/deterministic:high" },
+      { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
+      { onEvent(event) {
+        events.push(event);
+        const state = event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state" ? (event.entry as any).data : undefined;
+        if (state?.deliveries.some((delivery: any) => delivery.state === "enqueued")) enqueued();
+        if (state?.deliveries.length >= 2 && state.deliveries.every((delivery: any) => delivery.state === "observed")) observed();
+      } },
+      { invocation: { command: process.execPath, args: [cli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(root, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: 50 });
+    await untilAborted(rpc.ready, signal);
+    await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
+    await waitPhase("child-working");
+    if (scenario === "owned_busy_report_boundary") {
+      await waitPhase("coordinator-tool-held");
+      await untilAborted(enqueuedState, signal);
+      assert.equal(events.some((event) => event.type === "tool_execution_end" && event.toolCallId === "busy-tool"), false);
+      const deliveryState = events.filter((event) => event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state").map((event) => (event.entry as any).data).findLast((state) => state.deliveries.some((delivery: any) => delivery.state === "enqueued"));
+      assert.ok(deliveryState);
+      for (const socket of held.get("coordinator-tool-held") ?? []) socket.end("release\n");
+    } else {
+      await waitPhase("turn-end-provider");
+      assert.equal(phases.filter((entry) => entry.phase === "context").length, 1);
+      assert.equal(phases.some((entry) => entry.phase === "unexpected-before-report"), false);
+      for (const socket of held.get("child-working") ?? []) socket.end("release\n");
+    }
+    const providerReport = await waitPhase("owned-report-provider");
+    await untilAborted(observedState, signal);
+    const reportContext = phases.find((entry) => entry.phase === "context" && entry.data.reports.some((report: any) => report.details?.envelope?.kind === "result"));
+    assert.ok(reportContext);
+    assert.equal(reportContext.data.ordinal, 2);
+    assert.equal(providerReport.data.providerCalls, 2);
+    assert.equal(phases.some((entry) => entry.phase === "unexpected-before-report"), false);
+    const toolEnd = events.findIndex((event) => event.type === "tool_execution_end" && event.toolCallId === (scenario === "owned_busy_report_boundary" ? "busy-tool" : "active-child"));
+    const reportMessage = events.findIndex((event) => event.type === "message_end" && (event.message as any)?.customType === "subagent-report");
+    assert.ok(toolEnd >= 0 && reportMessage > toolEnd);
+    const loaded = phases.filter((entry) => entry.phase === "loaded");
+    assert.ok(loaded.every((entry) => entry.data.file === provider));
+    assert.equal(loaded.find((entry) => entry.role === "coordinator")?.data.tools.find((tool: any) => tool.name === "subagent")?.path, runtimeExtension);
+    console.log(JSON.stringify({ piVersion, scenario, extension: fileProvenance(runtimeExtension), provider: fileProvenance(provider), owner: ownerId, baseSha: head, headSha: head, contexts: phases.filter((entry) => entry.phase === "context").map((entry) => ({ ordinal: entry.data.ordinal, reports: entry.data.reports.map((report: any) => report.details?.deliveryId) })), observed: true }));
+    rpc.acceptTerminal();
+  } finally {
+    for (const group of held.values()) for (const socket of group) socket.end("release\n");
+    await rpc?.stop();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, priorEnv);
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
+test("owned_busy_report_boundary", { timeout: 30000 }, (t) => runBoundedRuntimeCase(t, (signal) => runOwnedBoundaryScenario("owned_busy_report_boundary", signal)));
+test("owned_active_child_yield", { timeout: 30000 }, (t) => runBoundedRuntimeCase(t, (signal) => runOwnedBoundaryScenario("owned_active_child_yield", signal)));
+
 test("real Pi correlates delayed A batch after B admission and keeps B owned", { timeout: 30000 }, async () => {
   const sandbox = mkdtempSync(join(tmpdir(), "ym204-runtime-"));
   const cwd = join(sandbox, "cwd");
@@ -127,7 +238,6 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
   let oldBatch = false;
   let tearingDown = false;
   let bWorking = false;
-  let settledWithB = false;
   let releaseB = false;
   let pendingB = false;
   let observedB = false;
@@ -136,7 +246,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
   const pendingBarrier = new Promise<void>((resolve) => { resolvePending = resolve; });
   const observedBarrier = new Promise<void>((resolve) => { resolveObserved = resolve; });
   const reached = new Promise<void>((resolve) => { wake = resolve; });
-  const check = () => { if (oldBatch && bWorking && settledWithB) wake?.(); };
+  const check = () => { if (oldBatch && bWorking) wake?.(); };
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
@@ -147,7 +257,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
       if (newline < 0) return;
       const message = JSON.parse(buffer.slice(0, newline));
       phases.push(message);
-      if (message.phase === "context" && releaseB && !pendingB && message.data.some((report: any) => report.details?.envelope?.identity?.batchId === "batch-B")) {
+      if (message.phase === "context" && releaseB && !pendingB && message.data.reports.some((report: any) => report.details?.envelope?.identity?.batchId === "batch-B")) {
         pendingB = true;
         held.set("B-delivery", socket);
         resolvePending();
@@ -162,7 +272,7 @@ test("real Pi correlates delayed A batch after B admission and keeps B owned", {
     rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-204"], model: "ym204-fixture/deterministic:high", cwd, plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
       { runId: "runtime-owner", parentSessionId: "fixture-parent", mode: "do", ticket: "YM-204", project: [], role: "coordinator", cwd, model: "ym204-fixture/deterministic:high" },
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
-      { onEvent(event) { events.push(event); if (event.type === "agent_settled" && oldBatch) { settledWithB = true; check(); }
+      { onEvent(event) { events.push(event);
         const state = event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state" ? (event.entry as any).data : undefined;
         if (rpc && !observedB && !tearingDown) continueOwnedCoordinator(rpc, event, (reason) => assert.fail(`unexpected parent blocked: ${reason}`));
         if (state && releaseB && state.children.length === 0 && state.deliveries.filter((delivery: any) => delivery.batchId === "batch-B").length === 2 && state.deliveries.every((delivery: any) => delivery.state === "observed")) { observedB = true; resolveObserved(); } } },
@@ -234,7 +344,7 @@ const cases = [
   ["read_heavy_24", "valid"], ["read_heavy_32", "valid"], ["read_heavy_parallel", "valid"],
   ["parallel_max", "valid"], ["chain_max", "valid"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
   ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
-  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["public_cancel", "incomplete"], ["public_cancel_parallel", "valid"], ["public_cancel_chain", "valid"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"],
+  ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"], ["delivery_sync_batch", "delivery_failed"], ["delivery_sync_both", "delivery_failed"], ["delivery_async_batch", "delivery_failed"], ["delivery_async_both", "delivery_failed"], ["delivery_async_after_observed", "valid"],
 ] as const;
 
 async function runFaultScenario(scenario: typeof cases[number][0], outcome: typeof cases[number][1], signal: AbortSignal): Promise<void> {
@@ -281,7 +391,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
   const observedPhases: string[] = [];
-  let cancellationReleased = false;
+  let asyncFaultSocket: Socket | undefined;
   let working!: () => void;
   const childWorking = new Promise<void>((resolve) => { working = resolve; });
   const server = createServer((socket) => {
@@ -296,8 +406,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       observedPhases.push(event.phase);
       if (event.phase === "loaded") loaded.push(event);
       if (scenario === "parent_cancel" && event.phase === "child-working") working();
-      else if (scenario.startsWith("public_cancel") && event.phase === "child-working" && !cancellationReleased) return;
-      else if (scenario.startsWith("public_cancel") && event.phase === "public-cancel-result") { cancellationReleased = true; for (const candidate of sockets) candidate.end("release\n"); }
+      else if (event.phase === "async-fault-after-observed") { asyncFaultSocket = socket; return; }
       else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
       else socket.end("release\n");
     });
@@ -307,6 +416,8 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const delivered = new Promise<void>((resolve) => { complete = resolve; });
   let markAsyncUpdated!: () => void;
   const asyncUpdated = new Promise<void>((resolve) => { markAsyncUpdated = resolve; });
+  let markLateAsyncError!: () => void;
+  const lateAsyncError = new Promise<void>((resolve) => { markLateAsyncError = resolve; });
   let batch: any;
   const reports: any[] = [];
   let failureReason: string | undefined;
@@ -318,14 +429,15 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
       { onEvent(event) {
         if (rpc && scenario.startsWith("delivery_")) continueOwnedCoordinator(rpc, event, (reason) => { failureReason = reason; complete(); });
+        if (scenario === "delivery_async_after_observed" && event.type === "extension_error" && event.event === "send_message") markLateAsyncError();
         const message = event.type === "message_end" ? event.message as any : undefined;
         const envelope = message?.details?.envelope;
         if (envelope) reports.push(message);
         if (envelope?.kind === "batch") batch = envelope;
         if (event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state") {
           const state = (event.entry as any).data;
-          if (scenario === "delivery_async" && state.deliveries.length === 2 && state.deliveries.some((delivery: any) => delivery.state === "delivery_failed") && state.deliveries.every((delivery: any) => ["observed", "delivery_failed", "delivery_unknown"].includes(delivery.state))) markAsyncUpdated();
-          if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) complete();
+          if (scenario.startsWith("delivery_async") && scenario !== "delivery_async_after_observed" && state.deliveries.length === 2 && state.deliveries.some((delivery: any) => delivery.state === "delivery_failed") && state.deliveries.every((delivery: any) => ["observed", "delivery_failed", "delivery_unknown"].includes(delivery.state))) markAsyncUpdated();
+          if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) { asyncFaultSocket?.end("release\n"); complete(); }
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
       { invocation: { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(sandbox, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
@@ -365,16 +477,21 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     }
     const deliveryTimeout = scenario === "chain_max" || scenario.includes("read_heavy") ? 45000 : 10000;
     await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed; phases=${observedPhases.join(",")}`)), deliveryTimeout); })]), signal);
-    if (scenario.startsWith("delivery_")) {
+    if (scenario === "delivery_async_after_observed") {
+      await untilAborted(lateAsyncError, signal);
+      assert.equal(failureReason, undefined);
+      assert.deepEqual(rpc.childState.pendingIds(), []);
+      assert.equal(rpc.childState.canFinish("done"), true);
+      assert.ok(rpc.events.some((event) => event.type === "extension_error" && event.event === "send_message"));
+    } else if (scenario.startsWith("delivery_")) {
       assert.match(failureReason!, /report delivery failure; unobserved IDs:/);
       assert.equal(rpc.childState.canFinish("done"), false);
       assert.equal(rpc.childState.canFinish("blocked", failureReason), true);
       assert.equal(rpc.events.filter((event) => event.type === "tool_execution_start" && event.toolName === "subagent").length, 1);
-      assert.equal(rpc.childState.pendingIds().length, 1);
-      if (scenario === "delivery_async") {
+      assert.equal(rpc.childState.pendingIds().length, scenario.endsWith("_both") ? 2 : 1);
+      if (scenario.startsWith("delivery_async")) {
         assert.ok(rpc.events.some((event) => event.type === "extension_error" && event.event === "send_message"));
         await untilAborted(asyncUpdated, signal);
-        assert.equal(rpc.childState.pendingIds().length, 1);
         for (const deliveryId of rpc.childState.pendingIds()) {
           const archived = JSON.parse(readFileSync(join(sandbox, ".pi/subagent-reports", deliveryId, "diagnostics.json"), "utf8"));
           assert.match(archived.diagnostics.delivery.state, /^delivery_(?:failed|unknown)$/);
@@ -419,22 +536,6 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "chain_long") assert.equal(results[1].payload, "tail received");
     if (scenario === "parallel") assert.equal(new Set(results.map((result: any) => result.identity.runId)).size, 2);
     if (scenario === "signal") { assert.equal(results[0].signal, "SIGKILL"); assert.equal(results[0].exitCode, null); }
-    if (scenario.startsWith("public_cancel")) {
-      const cancelled = results.filter((result: any) => result.processOutcome === "cancelled");
-      assert.equal(cancelled.length, 1);
-      assert.equal(cancelled[0].cancellationInitiator, "tool_cancel");
-      if (scenario === "public_cancel_parallel") {
-        assert.equal(results.length, 8);
-        assert.ok(results.slice(0, -1).every((result: any) => result.processOutcome === "exited"));
-      }
-      if (scenario === "public_cancel_chain") {
-        assert.equal(results.length, 3);
-        assert.equal(results[1].processOutcome, "cancelled");
-        assert.equal(results[2].processOutcome, "not_started");
-      }
-      assert.ok(observedPhases.includes("public-cancel-result"));
-      assert.ok(rpc.events.some((event) => event.type === "tool_execution_start" && event.toolName === "subagent" && (event.args as any)?.cancelRun));
-    }
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
     if (["spawn_error", "write_cleanup_error"].includes(scenario)) assert.equal(results[0].processOutcome, "spawn_error");
     if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
@@ -483,7 +584,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       const snapshots = fs.readdirSync(snapshotDir).filter((file) => file.endsWith(".json")).map((file) => JSON.parse(fs.readFileSync(join(snapshotDir, file), "utf8")));
       const ownedSnapshots = snapshots.filter((snapshot) => snapshot.ownerRunId === `owner-${scenario.replaceAll("_", "-")}`);
       assert.doesNotMatch(JSON.stringify(ownedSnapshots), /private thinking|private fixture|private malformed|private-partial|private diagnostic fault/);
-      if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario) && !scenario.startsWith("public_cancel") && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
+      if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
         const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
         assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
         assert.equal(childSnapshot.resources.guard.path, join(sandbox, "src/guards.ts"));

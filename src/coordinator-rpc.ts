@@ -264,10 +264,6 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
 }
 
 export function continueOwnedCoordinator(rpc: CoordinatorRpc, event: RpcEvent, reportBlocked: (reason: string) => void): void {
-  if (event.type === "extension_error" && event.event === "send_message") {
-    const deliveryIds = rpc.childState.uncertainDeliveryIds();
-    if (deliveryIds.length) void rpc.request({ type: "prompt", message: `/yokemate-delivery-error ${Buffer.from(JSON.stringify({ runId: rpc.childState.ownerRunId(), deliveryIds })).toString("base64")}` }).catch(() => {});
-  }
   const deliveryFailure = rpc.childState.deliveryFailureReason();
   if (deliveryFailure) { reportBlocked(deliveryFailure); return; }
   if (event.type !== "agent_settled") return;
