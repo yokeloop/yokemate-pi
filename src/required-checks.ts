@@ -22,11 +22,13 @@ export function requiredJobs(files: { path: string; text: string }[]): RequiredJ
   const required: RequiredJob[] = [];
   for (const file of files) {
     if (!/\.ya?ml$/.test(file.path)) continue;
-    const doc = parse(file.text) as { name?: unknown; on?: Triggers; jobs?: Record<string, { name?: unknown } | null> } | null;
+    const doc = parse(file.text) as { name?: unknown; on?: Triggers; jobs?: Record<string, { name?: unknown; if?: unknown } | null> } | null;
     if (!doc || !runsOnSynchronize(doc.on)) continue;
     const workflow = typeof doc.name === "string" ? doc.name : file.path;
-    for (const [id, job] of Object.entries(doc.jobs ?? {}))
+    for (const [id, job] of Object.entries(doc.jobs ?? {})) {
+      if (job?.if !== undefined) continue;
       required.push({ workflow, job: typeof job?.name === "string" ? job.name : id });
+    }
   }
   return required;
 }

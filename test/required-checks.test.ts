@@ -11,7 +11,7 @@ test("the notify workflow is not a required check", () => {
   assert.deepEqual(requiredJobs([workflow("telegram-notify.yml")]), []);
 });
 
-test("every job of the ci workflow is required", () => {
+test("every unconditional job of the ci workflow is required", () => {
   assert.deepEqual(requiredJobs([workflow("ci.yml"), workflow("telegram-notify.yml")]), [
     { workflow: "ci", job: "checks" },
     { workflow: "ci", job: "pi-loader-smoke" },
@@ -30,9 +30,9 @@ test("pull_request types without synchronize are not required", () => {
   assert.deepEqual(requiredJobs([{ path: "b.yml", text: "name: b\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n" }]), []);
 });
 
-test("a named job reports its name and an unnamed workflow reports its path", () => {
+test("a named job reports its name, an unnamed workflow reports its path, and conditional jobs stay optional", () => {
   assert.deepEqual(
-    requiredJobs([{ path: ".github/workflows/lint.yml", text: "on: pull_request\njobs:\n  lint:\n    name: Lint code\n    runs-on: ubuntu-latest\n" }]),
+    requiredJobs([{ path: ".github/workflows/lint.yml", text: "on: pull_request\njobs:\n  lint:\n    name: Lint code\n    runs-on: ubuntu-latest\n  diagnostic:\n    if: github.head_ref == 'diagnostic'\n    runs-on: ubuntu-latest\n" }]),
     [{ workflow: ".github/workflows/lint.yml", job: "Lint code" }],
   );
 });
