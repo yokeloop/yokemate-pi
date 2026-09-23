@@ -4,13 +4,14 @@ import { once } from "node:events";
 import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
+import { socketDir } from "../src/inbox.ts";
 
 async function waitForFile(file: string): Promise<void> {
   if (existsSync(file)) return;
@@ -87,6 +88,9 @@ test("failed coordinator starts release duplicate reservations and capacity befo
   try {
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
     cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
+    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
+    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test", "fixtures", "subagent-json-relay.mjs");
+    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
     const agentDir = join(dir, "agent");
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir),
@@ -156,7 +160,6 @@ test("failed coordinator starts release duplicate reservations and capacity befo
     const plan = record("YM-1");
     record("YM-2");
     await approve("/do YM-1 YM-2");
-    process.argv[1] = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
     const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"] } }, undefined, () => undefined, ctx);
     assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
     const { runId } = accepted.details as { runId: string };
@@ -226,6 +229,10 @@ test("coordinator requests reject malformed keys, duplicate batches and split a 
 test("spawn routes each key independently through its retained parent", async () => {
   const source = join(import.meta.dirname, "..");
   const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "spawn-batch-"));
+  const runtime = mkdtempSync(join(tmpdir(), "spawn-batch-runtime-"));
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime };
+  mkdirSync(socketDir(env, process.getuid!()), { recursive: true });
+  writeFileSync(join(socketDir(env, process.getuid!()), "main-pane.json"), JSON.stringify({ mode: "main", ticket: null, cwd: dir, pid: process.pid, starttime: processStarttime(process.pid), sessionId: "fixture-session", parentPane: null }));
   const requests: unknown[] = [];
   const parent = bindCoordinatorControl(dir, {
     launch: async (request) => {
@@ -234,18 +241,25 @@ test("spawn routes each key independently through its retained parent", async ()
     },
     status: () => ({ requestId: "unused", state: "refused" }),
     cancel: async () => {},
-  }, { root: dir, sessionId: "fixture-session", runtimeId: "fixture-runtime", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir });
+  }, { root: dir, sessionId: "fixture-session", runtimeId: "fixture-runtime", pid: process.pid, starttime: processStarttime(process.pid)!, cwd: dir, pane: "main-pane" }, env);
   try {
     await once(parent, "listening");
     cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
-    const out = await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"], {
-      cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, PI_SESSION_ID: "fixture-session" },
-    });
-    assert.deepEqual(out.stdout.trim().split("\n"), ["refused YM-1: already running", "YM-2 → reserved background run fixture-run-2"]);
-    assert.deepEqual(requests, [{ mode: "do", tickets: ["YM-1", "YM-2"], plan: "/explicit.md", model: "test/model" }]);
+    cpSync(join(source, "package.json"), join(dir, "package.json"));
+    for (const entry of ["node", "package"]) {
+      const command = entry === "package" ? "pnpm" : process.execPath;
+      const args = entry === "package" ? ["spawn", "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"] : ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"];
+      const out = await promisify(execFile)(command, args, { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "fixture-session", HERDR_PANE_ID: "main-pane" } });
+      assert.deepEqual(out.stdout.trim().split("\n").filter((line) => /^(?:refused )?YM-/.test(line)), ["refused YM-1: already running", "YM-2 → reserved background run fixture-run-2"]);
+    }
+    assert.deepEqual(requests, [
+      { mode: "do", tickets: ["YM-1", "YM-2"], plan: "/explicit.md", model: "test/model" },
+      { mode: "do", tickets: ["YM-1", "YM-2"], plan: "/explicit.md", model: "test/model" },
+    ]);
   } finally {
     await new Promise<void>((resolve, reject) => parent.close((error) => error ? reject(error) : resolve()));
     rmSync(dir, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
   }
 });
 

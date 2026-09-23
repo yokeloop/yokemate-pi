@@ -3,19 +3,27 @@ import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, open
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { sha256, type ChildIdentity } from "./subagent-runs.ts";
+import type { ScoutCandidateRow, WorkflowIncidentRow } from "./workflow-incident-state.ts";
 
 export type PublicationKind = "scout" | "plan";
-export type PublicationError = "auth" | "permission" | "rate_limit" | "size" | "unavailable" | "incomplete_listing" | "remote_conflict" | "unsafe_document" | "binding_changed" | "artifact_invalid";
-export interface PublicationRow {
+export type PublicationError = "auth" | "permission" | "rate_limit" | "size" | "unavailable" | "target_unavailable" | "target_changed" | "incomplete_listing" | "remote_conflict" | "unsafe_document" | "binding_changed" | "artifact_invalid";
+export interface PublicationOutcome {
+  kind: PublicationKind;
+  state: "complete" | "pending";
+  target: string;
+  revision: string;
+  publicationId?: number;
+  error?: PublicationError;
+}
+export interface ArtifactMetadata { artifact_path: string; content_hash: string; bytes: number }
+export interface PublicationRow extends ArtifactMetadata {
   id: number;
+  provenance_key?: string;
   target: string;
   target_hash: string;
   canonical_url: string | null;
   ticket: string;
   kind: PublicationKind;
-  content_hash: string;
-  artifact_path: string;
-  bytes: number;
   run_id: string;
   owner_run_id: string | null;
   owner_session_id: string | null;
@@ -28,6 +36,26 @@ export interface PublicationRow {
   complete: 0 | 1;
   error_code: PublicationError | null;
   side_effects_started: 0 | 1;
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  source_run_id: string | null;
+  failure_hash: string | null;
+  payload_hash: string | null;
+  skipped_json: string | null;
+  preserved_json: string | null;
+  incident_reason: string | null;
+}
+export interface PublicationProvenance {
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  source_run_id: string | null;
+  failure_hash: string | null;
+  payload_hash: string | null;
+  skipped_json: string | null;
+  preserved_json: string | null;
+  incident_reason: string | null;
 }
 export interface PublicationIdentityInput {
   target: string;
@@ -40,10 +68,21 @@ export interface PublicationIdentityInput {
   planPath?: string;
   scopeHash?: string;
 }
-
-export interface PublicationAcceptanceRow {
+export type ScoutInputSource = "normal-transport" | "engineer-accepted-input";
+export interface PublicationAcceptanceRow extends ArtifactMetadata {
   id: number;
-  publication_id: number;
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  source_run_id: string | null;
+  failure_hash: string | null;
+  payload_hash: string | null;
+  skipped_json: string | null;
+  preserved_json: string | null;
+  incident_reason: string | null;
+  continuation_id: string | null;
+  continuation_generation: number | null;
+  publication_id: number | null;
   ticket: string;
   run_id: string;
   owner_run_id: string;
@@ -51,26 +90,34 @@ export interface PublicationAcceptanceRow {
   batch_id: string;
   task_hash: string;
 }
-
-export interface PlanRecordRow {
+export interface PlanRecordRow extends ArtifactMetadata {
   id: number;
+  source_kind: ScoutInputSource;
+  incident_id: string | null;
+  candidate_id: string | null;
+  writer_run_id: string | null;
+  writer_task_hash: string | null;
+  writer_actual_task_hash: string | null;
   ticket: string;
-  publication_id: number;
+  publication_id: number | null;
   plan_path: string;
-  content_hash: string;
   scope_hash: string;
-  scout_publication: number;
+  scout_publication: number | null;
+  scout_acceptance: number | null;
   successful_record: 0 | 1;
   side_effects_started: 0 | 1;
 }
-
 export interface PlanRecordInput {
   ticket: string;
-  publicationId: number;
   planPath: string;
   contentHash: string;
   scopeHash: string;
-  scoutPublication: number;
+  artifactPath: string;
+  bytes: number;
+  scoutAcceptance: number;
+  publicationId?: number;
+  scoutPublication?: number;
+  writer?: { runId: string; taskHash: string; actualTaskHash: string };
 }
 
 const contained = (root: string, candidate: string): boolean => {
@@ -118,31 +165,108 @@ export function writePublicationArtifact(root: string, ticket: string, kind: Pub
   return target;
 }
 
-export function acceptPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput): PublicationRow {
+function acceptPublicationWithProvenance(db: DatabaseSync, root: string, input: PublicationIdentityInput, provenance: PublicationProvenance): PublicationRow {
   const contentHash = sha256(input.bytes);
   const artifact = writePublicationArtifact(root, input.ticket, input.kind, contentHash, input.bytes);
+  if (provenance.source_kind === "engineer-accepted-input" && (!provenance.incident_id || !provenance.candidate_id || !provenance.source_run_id || !provenance.failure_hash || !provenance.payload_hash || !provenance.skipped_json || !provenance.preserved_json || !provenance.incident_reason)) throw new Error("artifact_invalid");
+  const provenanceKey = provenance.source_kind === "normal-transport" ? "normal" : `incident:${provenance.incident_id}`;
   db.prepare(`INSERT INTO plan_publication
-    (target,target_hash,ticket,kind,content_hash,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(target,ticket,kind,content_hash) DO NOTHING`).run(
-    input.target, input.targetHash, input.ticket, input.kind, contentHash, artifact, input.bytes.length, input.runId,
+    (target,target_hash,ticket,kind,content_hash,provenance_key,artifact_path,bytes,run_id,owner_run_id,owner_session_id,batch_id,task_hash,plan_path,scope_hash,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(target,ticket,kind,content_hash,provenance_key) DO NOTHING`).run(
+    input.target, input.targetHash, input.ticket, input.kind, contentHash, provenanceKey, artifact, input.bytes.length, input.runId,
     input.child?.ownerRunId ?? null, input.child?.ownerSessionId ?? null, input.child?.batchId ?? null, input.child?.taskHash ?? null,
-    input.planPath ?? null, input.scopeHash ?? null,
+    input.planPath ?? null, input.scopeHash ?? null, provenance.source_kind, provenance.incident_id, provenance.candidate_id,
+    provenance.source_run_id, provenance.failure_hash, provenance.payload_hash, provenance.skipped_json, provenance.preserved_json, provenance.incident_reason,
   );
-  return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=?").get(input.target, input.ticket, input.kind, contentHash) as unknown as PublicationRow;
+  const row = db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=? AND provenance_key=?").get(input.target, input.ticket, input.kind, contentHash, provenanceKey) as unknown as PublicationRow;
+  if (row.target_hash !== input.targetHash || row.artifact_path !== artifact || row.bytes !== input.bytes.length || row.source_kind !== provenance.source_kind || row.incident_id !== provenance.incident_id || row.candidate_id !== provenance.candidate_id || row.failure_hash !== provenance.failure_hash) throw new Error("artifact_invalid");
+  return row;
 }
 
-export function acceptPublicationDelivery(db: DatabaseSync, publicationId: number, child: ChildIdentity): PublicationAcceptanceRow {
-  if (!child.ticket) throw new Error("artifact_invalid");
-  db.prepare(`INSERT INTO plan_publication_acceptance
-    (publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash)
-    VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_run_id,owner_session_id,batch_id,run_id,task_hash) DO NOTHING`).run(
-    publicationId, child.ticket, child.runId, child.ownerRunId, child.ownerSessionId, child.batchId, child.taskHash,
-  );
+const normalPublicationProvenance = (): PublicationProvenance => ({ source_kind: "normal-transport", incident_id: null, candidate_id: null, source_run_id: null, failure_hash: null, payload_hash: null, skipped_json: null, preserved_json: null, incident_reason: null });
+
+export function acceptPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput): PublicationRow {
+  return acceptPublicationWithProvenance(db, root, input, normalPublicationProvenance());
+}
+
+export function acceptRecoveredPublication(db: DatabaseSync, root: string, input: PublicationIdentityInput, acceptanceId: number): PublicationRow {
+  const acceptance = publicationAcceptanceById(db, acceptanceId);
+  if (!acceptance || acceptance.ticket !== input.ticket || acceptance.source_kind !== "engineer-accepted-input" || !acceptance.incident_id || !acceptance.candidate_id) throw new Error("artifact_invalid");
+  if (input.kind === "scout" && (sha256(input.bytes) !== acceptance.content_hash || input.bytes.length !== acceptance.bytes)) throw new Error("artifact_invalid");
+  if (input.kind === "plan") {
+    const record = db.prepare("SELECT id FROM plan_record WHERE ticket=? AND scout_acceptance=? AND content_hash=? AND successful_record=1").get(input.ticket, acceptance.id, sha256(input.bytes));
+    if (!record) throw new Error("artifact_invalid");
+  }
+  return acceptPublicationWithProvenance(db, root, input, acceptance);
+}
+
+function deliveryRow(db: DatabaseSync, child: ChildIdentity): PublicationAcceptanceRow | undefined {
   return db.prepare(`SELECT * FROM plan_publication_acceptance
     WHERE owner_run_id=? AND owner_session_id=? AND batch_id=? AND run_id=? AND task_hash=?`).get(
     child.ownerRunId, child.ownerSessionId, child.batchId, child.runId, child.taskHash,
-  ) as unknown as PublicationAcceptanceRow;
+  ) as unknown as PublicationAcceptanceRow | undefined;
+}
+
+type DeliveryProvenance =
+  | { source: "normal-transport" }
+  | { source: "engineer-accepted-input"; incident: WorkflowIncidentRow; candidate: ScoutCandidateRow; payloadHash: string; skipped: readonly string[]; preserved: readonly string[]; continuationId: string; continuationGeneration: number };
+
+function acceptDelivery(db: DatabaseSync, child: ChildIdentity, artifact: ArtifactMetadata, publicationId: number | undefined, provenance: DeliveryProvenance): PublicationAcceptanceRow {
+  if (child.agent !== "plan-scout" || !child.ticket) throw new Error("artifact_invalid");
+  if (provenance.source === "engineer-accepted-input" && (provenance.candidate.ticket !== child.ticket || provenance.incident.candidate_id !== provenance.candidate.id || provenance.incident.ticket !== child.ticket || provenance.candidate.run_id !== child.runId)) throw new Error("artifact_invalid");
+  db.prepare(`INSERT INTO plan_publication_acceptance
+    (publication_id,ticket,run_id,owner_run_id,owner_session_id,batch_id,task_hash,artifact_path,content_hash,bytes,source_kind,incident_id,candidate_id,source_run_id,failure_hash,payload_hash,skipped_json,preserved_json,incident_reason,continuation_id,continuation_generation)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_run_id,owner_session_id,batch_id,run_id,task_hash) DO NOTHING`).run(
+    publicationId ?? null, child.ticket, child.runId, child.ownerRunId, child.ownerSessionId, child.batchId, child.taskHash,
+    artifact.artifact_path, artifact.content_hash, artifact.bytes, provenance.source,
+    provenance.source === "engineer-accepted-input" ? provenance.incident.id : null,
+    provenance.source === "engineer-accepted-input" ? provenance.candidate.id : null,
+    provenance.source === "engineer-accepted-input" ? provenance.candidate.run_id : null,
+    provenance.source === "engineer-accepted-input" ? provenance.candidate.failed_envelope_hash : null,
+    provenance.source === "engineer-accepted-input" ? provenance.payloadHash : null,
+    provenance.source === "engineer-accepted-input" ? JSON.stringify(provenance.skipped) : null,
+    provenance.source === "engineer-accepted-input" ? JSON.stringify(provenance.preserved) : null,
+    provenance.source === "engineer-accepted-input" ? provenance.incident.reason : null,
+    provenance.source === "engineer-accepted-input" ? provenance.continuationId : null,
+    provenance.source === "engineer-accepted-input" ? provenance.continuationGeneration : null,
+  );
+  let row = deliveryRow(db, child);
+  if (!row || row.ticket !== child.ticket || row.run_id !== child.runId || row.artifact_path !== artifact.artifact_path || row.content_hash !== artifact.content_hash || row.bytes !== artifact.bytes || row.source_kind !== provenance.source) throw new Error("artifact_invalid");
+  if (provenance.source === "engineer-accepted-input" && (row.incident_id !== provenance.incident.id || row.candidate_id !== provenance.candidate.id || row.failure_hash !== provenance.candidate.failed_envelope_hash || row.payload_hash !== provenance.payloadHash || row.continuation_id !== provenance.continuationId || row.continuation_generation !== provenance.continuationGeneration)) throw new Error("artifact_invalid");
+  if (publicationId !== undefined) {
+    if (row.publication_id !== null && row.publication_id !== publicationId) throw new Error("artifact_invalid");
+    db.prepare("UPDATE plan_publication_acceptance SET publication_id=? WHERE id=? AND publication_id IS NULL").run(publicationId, row.id);
+    row = publicationAcceptanceById(db, row.id)!;
+  }
+  return row;
+}
+
+export function acceptScoutArtifact(db: DatabaseSync, root: string, child: ChildIdentity, bytes: Buffer): PublicationAcceptanceRow {
+  if (!child.ticket) throw new Error("artifact_invalid");
+  const contentHash = sha256(bytes);
+  const artifactPath = writePublicationArtifact(root, child.ticket, "scout", contentHash, bytes);
+  return acceptDelivery(db, child, { artifact_path: artifactPath, content_hash: contentHash, bytes: bytes.length }, undefined, { source: "normal-transport" });
+}
+
+export function acceptPublicationDelivery(db: DatabaseSync, publicationId: number, child: ChildIdentity): PublicationAcceptanceRow {
+  const publication = publicationById(db, publicationId);
+  if (!publication || publication.kind !== "scout" || publication.ticket !== child.ticket) throw new Error("artifact_invalid");
+  const existing = deliveryRow(db, child);
+  if (existing?.source_kind === "engineer-accepted-input") {
+    if (publication.source_kind !== existing.source_kind || publication.incident_id !== existing.incident_id || publication.candidate_id !== existing.candidate_id || publication.source_run_id !== existing.source_run_id || publication.failure_hash !== existing.failure_hash || publication.payload_hash !== existing.payload_hash || publication.content_hash !== existing.content_hash || publication.artifact_path !== existing.artifact_path || publication.bytes !== existing.bytes) throw new Error("artifact_invalid");
+    if (existing.publication_id !== null && existing.publication_id !== publicationId) throw new Error("artifact_invalid");
+    db.prepare("UPDATE plan_publication_acceptance SET publication_id=COALESCE(publication_id,?) WHERE id=?").run(publicationId, existing.id);
+    return publicationAcceptanceById(db, existing.id)!;
+  }
+  return acceptDelivery(db, child, publication, publicationId, { source: "normal-transport" });
+}
+
+export function acceptRecoveredScoutArtifact(db: DatabaseSync, root: string, incident: WorkflowIncidentRow, candidate: ScoutCandidateRow, payloadHash: string, skipped: readonly string[], preserved: readonly string[], continuationId = incident.planning_identity, continuationGeneration = candidate.generation + 1): PublicationAcceptanceRow {
+  const bytes = readPublicationArtifact(root, candidate);
+  if (sha256(bytes) !== candidate.content_hash || payloadHash !== candidate.content_hash) throw new Error("artifact_invalid");
+  const child: ChildIdentity = { ownerRunId: candidate.owner_run_id, ownerSessionId: candidate.owner_session_id, batchId: candidate.batch_id, runId: candidate.run_id, agent: "plan-scout", taskHash: candidate.task_hash, cwd: candidate.cwd, ticket: candidate.ticket };
+  return acceptDelivery(db, child, candidate, undefined, { source: "engineer-accepted-input", incident, candidate, payloadHash, skipped, preserved, continuationId, continuationGeneration });
 }
 
 export function publicationAcceptanceById(db: DatabaseSync, id: number): PublicationAcceptanceRow | undefined {
@@ -153,20 +277,26 @@ export function recordPublicationBlock(db: DatabaseSync, ticket: string, runId: 
   db.prepare("INSERT OR IGNORE INTO plan_publication_block (ticket,run_id,reason) VALUES (?,?,?)").run(ticket, runId, reason);
 }
 
+export function revokePendingPlanRecords(db: DatabaseSync, ticket: string): void {
+  db.prepare("UPDATE plan_record SET scout_acceptance=NULL,updated_at=datetime('now') WHERE ticket=? AND successful_record=0 AND scout_acceptance IS NOT NULL").run(ticket);
+}
+
 export function publicationById(db: DatabaseSync, id: number): PublicationRow | undefined {
   return db.prepare("SELECT * FROM plan_publication WHERE id=?").get(id) as unknown as PublicationRow | undefined;
 }
 
-export function publicationFor(db: DatabaseSync, target: string, ticket: string, kind: PublicationKind, contentHash: string): PublicationRow | undefined {
-  return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=?").get(target, ticket, kind, contentHash) as unknown as PublicationRow | undefined;
+export function publicationFor(db: DatabaseSync, target: string, ticket: string, kind: PublicationKind, contentHash: string, provenanceKey = "normal"): PublicationRow | undefined {
+  return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind=? AND content_hash=? AND provenance_key=?").get(target, ticket, kind, contentHash, provenanceKey) as unknown as PublicationRow | undefined;
 }
 
 export function latestScout(db: DatabaseSync, target: string, ticket: string): PublicationRow | undefined {
   return db.prepare("SELECT * FROM plan_publication WHERE target=? AND ticket=? AND kind='scout' ORDER BY id DESC LIMIT 1").get(target, ticket) as unknown as PublicationRow | undefined;
 }
 
-export function readPublicationArtifact(root: string, row: PublicationRow): Buffer {
-  const base = realpathSync(join(root, ".pi", "plan-publications"));
+export function readPublicationArtifact(root: string, row: ArtifactMetadata): Buffer {
+  const basePath = join(root, ".pi", "plan-publications");
+  if (!existsSync(basePath)) throw new Error("artifact_invalid");
+  const base = realpathSync(basePath);
   const candidate = resolve(row.artifact_path);
   if (!contained(base, candidate) || !existsSync(candidate)) throw new Error("artifact_invalid");
   const stat = lstatSync(candidate);
@@ -187,22 +317,53 @@ export function markPublicationResult(db: DatabaseSync, rowId: number, result: {
   db.prepare("UPDATE plan_publication SET complete=?,error_code=?,canonical_url=COALESCE(canonical_url,?),updated_at=datetime('now') WHERE id=?")
     .run(result.complete ? 1 : 0, result.error ?? null, result.canonicalUrl ?? null, rowId);
   const row = publicationById(db, rowId);
-  if (!row) return;
-  const prefix = `plan publication pending: ${row.target} ${row.kind}`;
-  if (result.complete) db.prepare("UPDATE work SET next=NULL WHERE ticket=? AND next LIKE ?").run(row.ticket, `${prefix}%`);
-  else db.prepare("UPDATE work SET next=? WHERE ticket=?").run(`${prefix} ${result.error ?? "unavailable"}`, row.ticket);
+  if (row && result.complete) db.prepare("UPDATE work SET next=NULL WHERE ticket=? AND next LIKE 'plan publication pending:%'").run(row.ticket);
 }
 
 export function acceptPlanRecord(db: DatabaseSync, input: PlanRecordInput): PlanRecordRow {
+  const acceptance = publicationAcceptanceById(db, input.scoutAcceptance);
+  if (!acceptance || acceptance.ticket !== input.ticket) throw new Error("artifact_invalid");
+  if (acceptance.source_kind === "engineer-accepted-input" && (!acceptance.incident_id || !acceptance.candidate_id || !input.writer)) throw new Error("artifact_invalid");
+  if (acceptance.source_kind === "normal-transport" && (acceptance.incident_id || acceptance.candidate_id)) throw new Error("artifact_invalid");
+  const planPublication = input.publicationId === undefined ? undefined : publicationById(db, input.publicationId);
+  if (input.publicationId !== undefined && (!planPublication || planPublication.ticket !== input.ticket || planPublication.kind !== "plan" || planPublication.content_hash !== input.contentHash)) throw new Error("artifact_invalid");
+  const scoutPublication = input.scoutPublication === undefined ? undefined : publicationById(db, input.scoutPublication);
+  if (input.scoutPublication !== undefined && (!scoutPublication || scoutPublication.ticket !== input.ticket || scoutPublication.kind !== "scout" || scoutPublication.content_hash !== acceptance.content_hash || acceptance.publication_id !== input.scoutPublication)) throw new Error("artifact_invalid");
   db.prepare(`INSERT INTO plan_record
-    (ticket,publication_id,plan_path,content_hash,scope_hash,scout_publication)
-    VALUES (?,?,?,?,?,?) ON CONFLICT(ticket,publication_id,plan_path,content_hash,scope_hash,scout_publication) DO NOTHING`).run(
-    input.ticket, input.publicationId, input.planPath, input.contentHash, input.scopeHash, input.scoutPublication,
+    (ticket,publication_id,plan_path,content_hash,scope_hash,artifact_path,bytes,scout_publication,scout_acceptance,source_kind,incident_id,candidate_id,writer_run_id,writer_task_hash,writer_actual_task_hash)
+    VALUES (?,NULL,?,?,?,?,?,NULL,?,?,?,?,?,?,?) ON CONFLICT(ticket,plan_path,content_hash,scope_hash,scout_acceptance) WHERE scout_acceptance IS NOT NULL DO NOTHING`).run(
+    input.ticket, input.planPath, input.contentHash, input.scopeHash, input.artifactPath, input.bytes, input.scoutAcceptance,
+    acceptance.source_kind, acceptance.incident_id, acceptance.candidate_id, input.writer?.runId ?? null, input.writer?.taskHash ?? null, input.writer?.actualTaskHash ?? null,
   );
-  return db.prepare(`SELECT * FROM plan_record
-    WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=?`).get(
-    input.ticket, input.publicationId, input.planPath, input.contentHash, input.scopeHash, input.scoutPublication,
-  ) as unknown as PlanRecordRow;
+  let row = db.prepare(`SELECT * FROM plan_record
+    WHERE ticket=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_acceptance=?`).get(
+    input.ticket, input.planPath, input.contentHash, input.scopeHash, input.scoutAcceptance,
+  ) as unknown as PlanRecordRow | undefined;
+  if (!row || row.artifact_path !== input.artifactPath || row.bytes !== input.bytes || row.source_kind !== acceptance.source_kind || row.incident_id !== acceptance.incident_id || row.candidate_id !== acceptance.candidate_id) throw new Error("artifact_invalid");
+  if (input.writer && (row.writer_run_id !== input.writer.runId || row.writer_task_hash !== input.writer.taskHash || row.writer_actual_task_hash !== input.writer.actualTaskHash)) throw new Error("artifact_invalid");
+  if (input.publicationId !== undefined) {
+    if (row.publication_id !== null && row.publication_id !== input.publicationId) throw new Error("artifact_invalid");
+    const desiredScout = input.scoutPublication ?? row.scout_publication;
+    const collision = desiredScout === null ? undefined : db.prepare(`SELECT id FROM plan_record
+      WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=? AND id<>? LIMIT 1`).get(
+      row.ticket, input.publicationId, row.plan_path, row.content_hash, row.scope_hash, desiredScout, row.id,
+    );
+    db.prepare("UPDATE plan_record SET publication_id=?,scout_publication=CASE WHEN ? THEN NULL ELSE scout_publication END WHERE id=? AND publication_id IS NULL").run(input.publicationId, collision ? 1 : 0, row.id);
+    row = planRecordById(db, row.id)!;
+  }
+  if (input.scoutPublication !== undefined) {
+    if (row.scout_publication !== null && row.scout_publication !== input.scoutPublication) throw new Error("artifact_invalid");
+    const collision = row.publication_id === null ? undefined : db.prepare(`SELECT id FROM plan_record
+      WHERE ticket=? AND publication_id=? AND plan_path=? AND content_hash=? AND scope_hash=? AND scout_publication=? AND id<>? LIMIT 1`).get(
+      row.ticket, row.publication_id, row.plan_path, row.content_hash, row.scope_hash, input.scoutPublication, row.id,
+    );
+    if (!collision) db.prepare("UPDATE plan_record SET scout_publication=? WHERE id=? AND scout_publication IS NULL").run(input.scoutPublication, row.id);
+  }
+  row = planRecordById(db, row.id)!;
+  if (row.successful_record && row.publication_id !== null) {
+    db.prepare("UPDATE plan_publication SET plan_path=?,scope_hash=?,updated_at=datetime('now') WHERE id=? AND kind='plan' AND plan_path IS NULL AND scope_hash IS NULL").run(row.plan_path, row.scope_hash, row.publication_id);
+  }
+  return row;
 }
 
 export function planRecordById(db: DatabaseSync, id: number): PlanRecordRow | undefined {
@@ -220,6 +381,8 @@ export function markSuccessfulRecord(db: DatabaseSync, recordId: number): void {
     scope_hash=(SELECT scope_hash FROM plan_record WHERE id=?),
     updated_at=datetime('now')
     WHERE id=(SELECT publication_id FROM plan_record WHERE id=?) AND kind='plan' AND plan_path IS NULL AND scope_hash IS NULL`).run(recordId, recordId, recordId);
+  const row = planRecordById(db, recordId);
+  if (row) db.prepare("UPDATE work SET next=NULL WHERE ticket=? AND next LIKE 'plan publication pending:%'").run(row.ticket);
 }
 
 export function markSideEffectsStarted(db: DatabaseSync, recordId: number): boolean {

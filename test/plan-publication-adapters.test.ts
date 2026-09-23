@@ -19,10 +19,10 @@ test("target resolver accepts same YouTrack server rows and rejects ambiguous or
     assert.equal(youtrack.type, "youtrack");
     assert.equal(youtrack.target, "youtrack-acme:ACME-7");
     db.prepare("UPDATE project SET tracker='github' WHERE repo='two'").run();
-    assert.throws(() => resolvePublicationTarget(db, "ACME-7"), /conflicting/);
+    assert.throws(() => resolvePublicationTarget(db, "ACME-7"), /remote_conflict/);
     db.prepare("DELETE FROM project").run();
     db.prepare("INSERT INTO project(org,repo,path,tracker,tracker_key,model) VALUES(?,?,?,?,?,?)").run("local", "name", "/clone", "github", "GH", "m");
-    assert.throws(() => resolvePublicationTarget(db, "GH-2", () => "git@gitlab.example:owner/repo.git"), /github.com/);
+    assert.throws(() => resolvePublicationTarget(db, "GH-2", () => "git@gitlab.example:owner/repo.git"), /target_unavailable/);
     const github = resolvePublicationTarget(db, "GH-2", () => "git@github.com:Actual/Remote.git");
     assert.equal(github.type, "github");
     assert.equal(github.target, "github:Actual/Remote#2");

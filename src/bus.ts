@@ -1,6 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readRuntimeSettings } from "./guard-policy.ts";
+import { processStarttime } from "./coordinator-control.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import {
   allowTarget,
   bindInbox,
@@ -19,6 +21,7 @@ export default function bus(pi: ExtensionAPI) {
   let inbox: Inbox | undefined;
 
   const onReport = (r: Report): void => {
+    assertMandatoryBoundary("workflow.target-identity", !!r.mode && (!r.ticket || /^[A-Z][A-Z0-9]*-\d+$/.test(r.ticket)), "invalid bus report identity");
     pi.sendMessage(
       {
         customType: "yokemate-report",
@@ -38,6 +41,9 @@ export default function bus(pi: ExtensionAPI) {
     const dir = socketDir(process.env, process.getuid!());
     try {
       ensureDir(dir, process.getuid!());
+      const starttime = processStarttime(process.pid);
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (!starttime || !sessionId) throw new Error("pane identity is unavailable");
       inbox = await bindInbox(
         dir,
         pane,
@@ -46,6 +52,9 @@ export default function bus(pi: ExtensionAPI) {
           ticket: process.env.YOKEMATE_TICKET ?? null,
           cwd: ctx.cwd,
           pid: process.pid,
+          starttime,
+          sessionId,
+          parentPane: process.env.YOKEMATE_PARENT_PANE ?? null,
         },
         onReport,
       );

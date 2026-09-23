@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { coordinatorArtifactId, DIAGNOSTICS_FILE_LIMIT, REPORT_DIRECTORY_LIMIT, REPORT_FILE_LIMIT, REPORT_RETENTION_MS, SubagentReportStore } from "../src/subagent-report-store.ts";
-import { sha256 } from "../src/subagent-runs.ts";
+import { RunSnapshots, sha256 } from "../src/subagent-runs.ts";
 
 function sandbox() {
   const root = fs.mkdtempSync(path.join(tmpdir(), "ym217-store-"));
@@ -13,6 +13,10 @@ function sandbox() {
 }
 
 const id = (value: string) => sha256(value);
+const sizedFacts = (bytes: number) => {
+  const child = { actualTaskHash: id("diagnostic-budget") };
+  return { children: Array.from({ length: Math.ceil(bytes / (JSON.stringify(child).length + 1)) }, () => child) };
+};
 
 test("store preserves canonical bytes, structured diagnostics and private permissions", () => {
   const box = sandbox();
@@ -30,6 +34,55 @@ test("store preserves canonical bytes, structured diagnostics and private permis
     assert.equal(fs.statSync(box.reports).mode & 0o777, 0o700);
     assert.equal(fs.statSync(result.archive.reportPath!).mode & 0o777, 0o600);
     assert.equal(fs.statSync(result.archive.diagnosticsPath!).mode & 0o777, 0o600);
+  } finally { box.cleanup(); }
+});
+
+test("D02 diagnostic writes and updates project facts without raw or unknown nested extras", () => {
+  const box = sandbox();
+  try {
+    const store = new SubagentReportStore(box.reports);
+    const key = id("projection");
+    const raw = "SAFE SENTINEL task prompt tool secret-like content";
+    const extras = { requestedTask: raw, prompt: raw, toolArguments: { input: raw }, secret: raw, unknown: { nested: raw } };
+    const identity = { ownerRunId: "owner", ownerSessionId: "session", runId: "run", batchId: "batch", agent: "plan-writer", taskHash: id(raw), ticket: "YM-1", acceptedInputId: 1, ...extras };
+    const stream = { stdoutBytes: 12, stdoutHash: id("stdout"), events: { message_end: 1 }, parserErrors: 0, parserErrorCounters: { invalid_json: 0, invalid_event: 0, record_limit: 0, partial_record: 0 }, parsedBytes: 11, malformedBytes: 0, ignoredBytes: 0, framingBytes: 1, partialBytes: 0, partialHash: id(""), assistantMessageSeen: true, assistantMessageEndCount: 1, assistantTextBearingCount: 0, textDeltaEvents: 1, textDeltaBytes: 2, finalEventPresent: true, finalTextPresent: false, finalNonWhitespace: false, finalTextBytes: 0, finalTextHash: id(""), activeTools: 0, retry: false, compaction: false, summaryRetry: false, phase: "text" };
+    const writerResult = { state: "verified", source: "reconciled", binding: { ticket: "YM-1", path: "/safe/YM-1-plan.md", repositories: ["org/repo"], scopeHash: id("scope"), contentHash: id("content") }, artifactBytes: 42 };
+    const metadata = { identity, taskHash: id(raw), actualTaskHash: id(raw), launch: { path: "/local/pi", hash: id("pi"), ...extras },
+      terminal: { processOutcome: "cancelled", exitCode: 143, signal: "SIGTERM", ...extras }, stream,
+      stderr: { class: "unknown", bytes: 42, hash: id("stderr"), ...extras },
+      payload: { outcome: "valid", bytes: 0, hash: id(""), retainedBytes: 19, retainedHash: id("/safe/YM-1-plan.md"), truncated: false }, writerResult,
+      scoutCandidate: { id: id("candidate"), hash: id(raw), bytes: 42, failureHash: id("failure"), ...extras },
+      deliveries: { [id("delivery")]: { state: "delivery_failed", envelopeHash: id("envelope"), ...extras } }, ...extras };
+    const facts = { identity, children: [{ identity, processOutcome: "cancelled", actualTaskHash: id(raw), payloadOutcome: "valid", planResult: writerResult, metadata, ...extras }],
+      process: { ...metadata, exitCode: 143 }, terminal: { outcome: "blocked", summary: raw, reason: raw, verification: { state: "blocked", reason: raw }, ...extras },
+      delivery: { deliveryId: id("delivery"), state: "delivery_failed", ...extras }, ...extras };
+    assert.equal(store.writeReport(key, raw, facts).ok, true);
+    for (const state of ["delivery_failed", "observed"]) {
+      assert.equal(store.updateDiagnostics(key, { ...facts, delivery: { ...facts.delivery, state } }).ok, true);
+      const stored = store.readReport(key)!;
+      assert.equal(stored.report.toString(), raw);
+      assert.doesNotMatch(JSON.stringify(stored.diagnostics), /SAFE SENTINEL|requestedTask|toolArguments|\"unknown\":|secret|prompt/);
+      const projected = stored.diagnostics.diagnostics as any;
+      assert.equal(projected.children[0].identity.taskHash, id(raw));
+      assert.equal(projected.children[0].metadata.launch.hash, id("pi"));
+      assert.equal(projected.children[0].metadata.scoutCandidate.failureHash, id("failure"));
+      assert.equal(projected.children[0].planResult.source, "reconciled");
+      assert.equal(projected.children[0].metadata.writerResult.binding.contentHash, id("content"));
+      assert.equal(projected.children[0].metadata.stream.finalTextBytes, 0);
+      assert.equal(projected.children[0].metadata.payload.truncated, false);
+      assert.equal(projected.process.exitCode, 143);
+      assert.equal(projected.delivery.state, state);
+      assert.equal(projected.terminal.outcome, "blocked");
+    }
+    const snapshots = new RunSnapshots(box.root);
+    assert.equal(snapshots.write("owner", "run", metadata, true).state, "available");
+    const snapshot = fs.readFileSync(path.join(snapshots.directory, "owner-run.json"), "utf8");
+    assert.doesNotMatch(snapshot, /SAFE SENTINEL|requestedTask|toolArguments|secret|prompt/);
+    const projectedSnapshot = JSON.parse(snapshot) as any;
+    assert.equal(projectedSnapshot.writerResult.source, "reconciled");
+    assert.equal(projectedSnapshot.writerResult.contentHash, id("content"));
+    assert.equal(projectedSnapshot.stream.textDeltaBytes, 2);
+    assert.equal(projectedSnapshot.payload.truncated, false);
   } finally { box.cleanup(); }
 });
 
@@ -76,7 +129,7 @@ test("limits, symlinks, unknown objects and live locks fail closed without parti
   try {
     const store = new SubagentReportStore(box.reports, { pid: 123, processStarttime: (pid) => pid === 123 ? "self" : pid === 999 ? "live" : undefined });
     assert.equal(store.writeReport(id("large-report"), Buffer.alloc(REPORT_FILE_LIMIT + 1), {}).code, "storage_limit");
-    assert.equal(store.writeReport(id("large-diagnostics"), "ok", { value: "x".repeat(DIAGNOSTICS_FILE_LIMIT) }).code, "storage_limit");
+    assert.equal(store.writeReport(id("large-diagnostics"), "ok", sizedFacts(DIAGNOSTICS_FILE_LIMIT)).code, "storage_limit");
     assert.equal(fs.readdirSync(box.reports).filter((name) => name.startsWith(".tmp-")).length, 0);
     fs.writeFileSync(path.join(box.reports, ".lock"), JSON.stringify({ pid: 999, starttime: "live" }));
     assert.equal(store.writeReport(id("busy"), "busy", {}).code, "storage_busy");
@@ -108,8 +161,8 @@ test("diagnostics updates evict older artifacts to reserve temporary disk budget
   try {
     const store = new SubagentReportStore(box.reports);
     const keys = Array.from({ length: 17 }, (_, index) => id(`budget-${index}`));
-    for (const key of keys) assert.equal(store.writeReport(key, Buffer.alloc(REPORT_FILE_LIMIT - 1), { value: "x".repeat(900_000) }).ok, true);
-    assert.equal(store.updateDiagnostics(keys.at(-1)!, { value: "y".repeat(1_500_000) }).ok, true);
+    for (const key of keys) assert.equal(store.writeReport(key, Buffer.alloc(REPORT_FILE_LIMIT - 1), sizedFacts(900_000)).ok, true);
+    assert.equal(store.updateDiagnostics(keys.at(-1)!, sizedFacts(1_500_000)).ok, true);
     assert.ok(store.readReport(keys.at(-1)!));
     assert.ok(fs.readdirSync(box.reports).filter((name) => /^[a-f0-9]{64}$/.test(name)).length < keys.length);
   } finally { box.cleanup(); }

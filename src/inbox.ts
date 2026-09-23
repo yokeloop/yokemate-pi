@@ -10,6 +10,7 @@ import {
 import * as net from "node:net";
 import { join, resolve } from "node:path";
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 export const TIMEOUT_MS = 2000;
 export const ROOT = resolve(new URL("..", import.meta.url).pathname);
@@ -28,6 +29,9 @@ export interface Sidecar {
   ticket: string | null;
   cwd: string;
   pid: number;
+  starttime: string;
+  sessionId: string;
+  parentPane: string | null;
 }
 
 export function socketDir(env: InboxEnv, uid: number): string {
@@ -73,6 +77,7 @@ export interface Report {
 export type Delivery = { ok: true } | { ok: false; reason: string };
 
 export function deliver(sock: string, report: Report, timeoutMs = TIMEOUT_MS): Promise<Delivery> {
+  assertMandatoryBoundary("workflow.target-identity", !!sock && !!report.mode && (!report.ticket || /^[A-Z][A-Z0-9]*-\d+$/.test(report.ticket)), "invalid report target identity");
   return new Promise((resolve) => {
     const socket = net.createConnection(sock);
     let settled = false;
@@ -142,6 +147,7 @@ export function bindInbox(
   onReport: (r: Report) => void,
   timeoutMs = TIMEOUT_MS,
 ): Promise<Inbox> {
+  assertMandatoryBoundary("workflow.live-owner", !!pane && sidecar.pid > 0 && !!sidecar.cwd, "inbox owner identity is incomplete");
   const sock = socketPath(dir, pane);
   const server = net.createServer((conn) => {
     let buf = "";
@@ -155,6 +161,7 @@ export function bindInbox(
       let report: Report;
       try {
         report = JSON.parse(line) as Report;
+        assertMandatoryBoundary("workflow.target-identity", !!report.mode && (!report.ticket || /^[A-Z][A-Z0-9]*-\d+$/.test(report.ticket)), "invalid inbox report identity");
       } catch {
         conn.end('{"ok":false}\n');
         return;

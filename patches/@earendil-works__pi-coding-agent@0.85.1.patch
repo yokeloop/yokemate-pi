@@ -1,0 +1,130 @@
+diff --git a/dist/core/agent-session.js b/dist/core/agent-session.js
+index 66e874efd252470d00d3cdaad2e2b4b6121de15b..c2999b5551d1c772f20c1e256d3cdff6744fba94 100644
+--- a/dist/core/agent-session.js
++++ b/dist/core/agent-session.js
+@@ -2009,7 +2009,14 @@ export class AgentSession {
+         };
+         runner.bindCore({
+             sendMessage: (message, options) => {
+-                this.sendCustomMessage(message, options).catch((err) => {
++                const { yokemateSendId, onYokemateSendError, ...sendOptions } = options ?? {};
++                this.sendCustomMessage(message, sendOptions).catch((err) => {
++                    if (yokemateSendId && onYokemateSendError) {
++                        try {
++                            onYokemateSendError(yokemateSendId);
++                        }
++                        catch { }
++                    }
+                     runner.emitError({
+                         extensionPath: "<runtime>",
+                         event: "send_message",
+diff --git a/dist/core/extensions/types.d.ts b/dist/core/extensions/types.d.ts
+index 94ca0722daa6a65691587e52a6fb269417337152..586aeaa40206d94c517f5ec71870ebbf0da32c9a 100644
+--- a/dist/core/extensions/types.d.ts
++++ b/dist/core/extensions/types.d.ts
+@@ -968,10 +968,7 @@ export interface ExtensionAPI {
+     /** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
+     registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
+     /** Send a custom message to the session. */
+-    sendMessage<T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: {
+-        triggerTurn?: boolean;
+-        deliverAs?: "steer" | "followUp" | "nextTurn";
+-    }): void;
++    sendMessage<T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: SendMessageOptions): void;
+     /**
+      * Send a user message to the agent. Always triggers a turn.
+      * When the agent is streaming, use deliverAs to specify how to queue the message.
+@@ -1182,10 +1179,13 @@ export interface ExtensionShortcut {
+     extensionPath: string;
+ }
+ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+-export type SendMessageHandler = <T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: {
++export interface SendMessageOptions {
+     triggerTurn?: boolean;
+     deliverAs?: "steer" | "followUp" | "nextTurn";
+-}) => void;
++    yokemateSendId?: string;
++    onYokemateSendError?: (sendId: string) => void;
++}
++export type SendMessageHandler = <T = unknown>(message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">, options?: SendMessageOptions) => void;
+ export type SendUserMessageHandler = (content: string | (TextContent | ImageContent)[], options?: {
+     deliverAs?: "steer" | "followUp";
+     expandPromptTemplates?: boolean;
+diff --git a/dist/modes/json-event.d.ts b/dist/modes/json-event.d.ts
+index d4f306ea3918aa07a981f948c8a3cb4f687f5708..595cc56d0dfab49d0509a646ff9effeec359de59 100644
+--- a/dist/modes/json-event.d.ts
++++ b/dist/modes/json-event.d.ts
+@@ -13,6 +13,10 @@ type ToJsonAssistantMessageEvent<T> = T extends {
+ type MessageUpdateEvent = Extract<AgentSessionEvent, {
+     type: "message_update";
+ }>;
++export declare const YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1;
++export interface YokemateJsonEventOptions {
++    yokemateSubagentJsonContract?: 1;
++}
+ type JsonMessageUpdateEvent = {
+     type: "message_update";
+     usage: Usage;
+@@ -28,7 +32,7 @@ export type JsonAgentSessionEvent = Exclude<AgentSessionEvent, {
+  * `message_end` provides the final authoritative message. Cumulative usage,
+  * tool-call ids, and tool names remain available because their size is constant.
+  */
+-export declare function toJsonEvent(event: MessageUpdateEvent): JsonMessageUpdateEvent;
+-export declare function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent;
++export declare function toJsonEvent(event: MessageUpdateEvent, options?: YokemateJsonEventOptions): JsonMessageUpdateEvent;
++export declare function toJsonEvent(event: AgentSessionEvent, options?: YokemateJsonEventOptions): JsonAgentSessionEvent | Record<string, unknown>;
+ export {};
+ //# sourceMappingURL=json-event.d.ts.map
+\ No newline at end of file
+diff --git a/dist/modes/json-event.js b/dist/modes/json-event.js
+index b2671b8e69be943b5c2918a972082eac84b38948..daff5cd1705ff543d98baefde258fdfd07c7e70e 100644
+--- a/dist/modes/json-event.js
++++ b/dist/modes/json-event.js
+@@ -1,3 +1,8 @@
++import { createHash } from "node:crypto";
++
++export const YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1;
++const YOKEMATE_RECORD_LIMIT = 1024 * 1024;
++
+ function toJsonAssistantMessageEvent(event) {
+     if (event.type === "toolcall_start") {
+         const toolCall = event.partial.content[event.contentIndex];
+@@ -13,7 +18,23 @@ function toJsonAssistantMessageEvent(event) {
+     const { partial: _partial, ...deltaEvent } = event;
+     return deltaEvent;
+ }
+-export function toJsonEvent(event) {
++export function toJsonEvent(event, options) {
++    if (event.type === "agent_end" && options?.yokemateSubagentJsonContract === 1 && Array.isArray(event.messages)) {
++        const serializedEvent = JSON.stringify(event);
++        if (Buffer.byteLength(serializedEvent) > YOKEMATE_RECORD_LIMIT) {
++            const serializedMessages = JSON.stringify(event.messages);
++            const { messages: _messages, ...rest } = event;
++            return {
++                ...rest,
++                messagesSummary: {
++                    version: 1,
++                    count: event.messages.length,
++                    bytes: Buffer.byteLength(serializedMessages),
++                    sha256: createHash("sha256").update(serializedMessages).digest("hex"),
++                },
++            };
++        }
++    }
+     if (event.type !== "message_update") {
+         return event;
+     }
+diff --git a/dist/modes/print-mode.js b/dist/modes/print-mode.js
+index beea0e8287b6c403ba7b1855c3f0dd6161afdd72..1553cf3c52c1db50453633f2d53071acce569c26 100644
+--- a/dist/modes/print-mode.js
++++ b/dist/modes/print-mode.js
+@@ -83,7 +83,8 @@ export async function runPrintMode(runtimeHost, options) {
+         unsubscribeBackpressure?.();
+         unsubscribe = session.subscribe((event) => {
+             if (mode === "json") {
+-                writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
++                const yokemateSubagentJsonContract = process.env.YOKEMATE_SUBAGENT_JSON_CONTRACT === "1" ? 1 : undefined;
++                writeRawStdout(`${JSON.stringify(toJsonEvent(event, { yokemateSubagentJsonContract }))}\n`);
+             }
+         });
+         unsubscribeBackpressure =

@@ -13,6 +13,7 @@
 //        pnpm where plan [KEY …]        → /plan can run before a ticket exists
 
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import { parseKeyList, parseShipArgs } from "./ship-args.ts";
 
 export const MODES = ["plan", "review", "do", "ship", "worklog", "note", "research"] as const;
@@ -38,6 +39,11 @@ export interface ModeEnv {
  * ticket's plan while wearing another ticket's name.
  */
 export function decide(env: ModeEnv, mode: Mode, ticket?: string, settings: RuntimeSettings = readRuntimeSettings()): Decision {
+  const ticketParts = ticket ? ticket.split(mode === "plan" ? " " : mode === "do" || mode === "ship" ? "+" : "\0") : [];
+  const validTarget = mode === "worklog"
+    ? ticketParts.every((part) => /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(part))
+    : ticketParts.every((part) => /^[A-Z][A-Z0-9]*-\d+$/.test(part));
+  assertMandatoryBoundary("workflow.target-identity", MODES.includes(mode) && validTarget, "invalid mode target identity");
   const { policy } = settings;
   const here = env.YOKEMATE_MODE;
   if (!here) return { kind: "launch" };

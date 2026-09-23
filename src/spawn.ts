@@ -1,6 +1,6 @@
 import { readRuntimeSettings } from "./guard-policy.ts";
 import { resolve } from "node:path";
-import { processStarttime, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
+import { currentControlOrigin, requestCoordinator, resolveCoordinatorParent } from "./coordinator-control.ts";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const fail = (message: string): never => { console.error(message); process.exit(1); };
@@ -19,7 +19,7 @@ const sessionId = process.env.PI_SESSION_ID ?? fail("PI_SESSION_ID is required t
 try {
   readRuntimeSettings(root);
   const parent = resolveCoordinatorParent(root);
-  const reply = await requestCoordinator(root, { mode: "do", tickets, plan, model }, { sessionId, pid: process.pid, starttime: processStarttime(process.pid) ?? fail("cannot read CLI process starttime"), cwd: root, pane: process.env.HERDR_PANE_ID, parentPane: process.env.YOKEMATE_PARENT_PANE, mode: process.env.YOKEMATE_MODE, ticket: process.env.YOKEMATE_TICKET, role: process.env.YOKEMATE_ROLE }, parent);
+  const reply = await requestCoordinator(root, { mode: "do", tickets, plan, model }, currentControlOrigin(root, sessionId), parent);
   for (const result of reply.results ?? []) console.log(result.state === "accepted" ? `${result.key} → reserved background run ${result.keyRunId}` : `refused ${result.key}: ${result.reason}`);
   if (reply.state !== "accepted" && !reply.results?.length) console.error(reply.reason ?? "coordinator launch refused");
   if (reply.state !== "accepted" || !(reply.results?.some((result) => result.state === "accepted") ?? reply.runId)) process.exitCode = 1;

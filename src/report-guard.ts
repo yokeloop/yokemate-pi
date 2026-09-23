@@ -10,6 +10,7 @@
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { RuntimeSettingsError, resolveRuntimeSettings, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary, WorkflowBoundaryError } from "./workflow-boundaries.ts";
 
 export interface GuardEnv {
   YOKEMATE_MODE?: string;
@@ -25,8 +26,12 @@ export function stopVerdict(
 ): string | null {
   const { policy } = settings;
   if (env.YOKEMATE_ROLE === "coordinator" || !policy.guards.doCompletion || env.YOKEMATE_MODE !== "do" || !env.YOKEMATE_TICKET) return null;
+  assertMandatoryBoundary("workflow.target-identity", /^[A-Z][A-Z0-9]*-\d+$/.test(env.YOKEMATE_TICKET), "invalid do report ticket identity");
   const stage = readStage(env.YOKEMATE_TICKET);
-  if (stage === "review" || stage === "accepted") return null;
+  if (stage === "review" || stage === "accepted") {
+    assertMandatoryBoundary("workflow.ready-pr-report", true);
+    return null;
+  }
   return (
     `The ticket's stage is still ${stage ?? "unrecorded"}. When every PR is open and green, record the result ` +
     `yourself from the task folder root: pnpm record-report ${env.YOKEMATE_TICKET} ` +
@@ -50,7 +55,9 @@ if (import.meta.filename === process.argv[1]) {
       settings,
     );
   } catch (error) {
-    reason = error instanceof RuntimeSettingsError ? `${error.message}. ${stopVerdict(process.env, () => undefined, resolveRuntimeSettings(undefined)) ?? "Optional settings were not read."}` : null;
+    reason = error instanceof RuntimeSettingsError
+      ? `${error.message}. ${stopVerdict(process.env, () => undefined, resolveRuntimeSettings(undefined)) ?? "Optional settings were not read."}`
+      : error instanceof WorkflowBoundaryError ? error.message : null;
   }
   if (reason) console.log(JSON.stringify({ decision: "block", reason }));
   process.exit(0);

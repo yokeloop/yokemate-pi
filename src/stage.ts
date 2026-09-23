@@ -20,6 +20,7 @@ import { logMove } from "./move-log.ts";
 import { ticketUrl } from "./ticket-url.ts";
 import { applyMove, type From, type MoveEnv } from "./transitions.ts";
 import { readRuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const DATA = dataRoot(ROOT);
@@ -33,6 +34,8 @@ const argv = process.argv.slice(2).filter((a) => a !== "--");
 const force = argv.includes("--force");
 const rest = argv.filter((a) => a !== "--force");
 const ticket = rest[0] ?? fail(`usage: stage <TICKET> <${STAGES.join("|")}> [plan-path] [--force]`);
+try { assertMandatoryBoundary("workflow.target-identity", /^[A-Z][A-Z0-9]*-\d+$/.test(ticket), "invalid stage ticket identity"); }
+catch (error) { fail((error as Error).message); }
 const stage = rest[1] as Stage;
 if (!STAGES.includes(stage)) fail(`unknown stage ${rest[1] ?? ""} — known: ${STAGES.join(", ")}`);
 const planAbs = rest[2] ? resolve(rest[2]) : undefined;

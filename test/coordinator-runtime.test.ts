@@ -89,6 +89,52 @@ test("list reservations precede starts and whole lifetimes share bounded capacit
   assert.deepEqual(registry.aggregate(run.identity.listRunId)?.results.map((entry) => entry.key), ["A-1", "B-1", "C-1"]);
 });
 
+test("blocked plan recovery records a separate generation without rewriting the terminal aggregate", () => {
+  const registry = new ListRunRegistry();
+  const run = registry.admit({ mode: "plan", keys: ["YM-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({}) });
+  registry.publishImmediate(run.identity.listRunId);
+  const key = run.entries[0]!.keyRunId;
+  assert.equal(registry.settle(run.identity.listRunId, key, { outcome: "blocked", reason: "transport" }), true);
+  const before = registry.aggregate(run.identity.listRunId)!;
+  const recovery = registry.admitRecovery(key, 2);
+  assert.equal(recovery.recoveryRunId, `${key}:2`);
+  assert.equal(registry.settleRecovery(key, { outcome: "recorded", facts: { planOnly: true } }), true);
+  assert.equal(registry.recovery(key)?.state, "recorded");
+  assert.deepEqual(registry.aggregate(run.identity.listRunId), before);
+});
+
+test("blocked plan recovery cancellation is terminal for the recovery generation only", () => {
+  const registry = new ListRunRegistry();
+  const run = registry.admit({ mode: "plan", keys: ["YM-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings: resolveRuntimeSettings({}) });
+  registry.publishImmediate(run.identity.listRunId);
+  const key = run.entries[0]!.keyRunId;
+  registry.settle(run.identity.listRunId, key, { outcome: "blocked", reason: "transport" });
+  const aggregate = registry.aggregate(run.identity.listRunId)!;
+  registry.admitRecovery(key, 2);
+  assert.equal(registry.cancel(key, "parent cancelled recovery"), true);
+  assert.equal(registry.recovery(key)?.state, "cancelled");
+  assert.equal(registry.settleRecovery(key, { outcome: "recorded" }), false);
+  assert.deepEqual(registry.aggregate(run.identity.listRunId), aggregate);
+});
+
+test("whole-list cancellation cannot pump a queued sibling between terminal settlements", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 3, maxConcurrency: 1, maxDetached: 3 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1", "C-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  const starts: string[] = [];
+  registry.start(run.identity.listRunId, async (context) => {
+    starts.push(context.key);
+    context.active();
+    return new Promise(() => {});
+  });
+  registry.publishImmediate(run.identity.listRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(starts, ["A-1"]);
+  assert.equal(registry.cancel(run.identity.listRunId, "parent cancellation"), true);
+  assert.deepEqual(starts, ["A-1"]);
+  assert.ok(run.entries.every((entry) => entry.terminal?.outcome === "cancelled"));
+});
+
 test("durable plan recording releases its lifetime slot before auto-do admission", async () => {
   const registry = new ListRunRegistry();
   const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 } });
@@ -160,6 +206,36 @@ test("list children retain parent list and key identity", async () => {
   registry.publishImmediate(run.identity.listRunId);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(contexts.map(({ listRunId, parentRunId, keyRunId }) => ({ listRunId, parentRunId, keyRunId })), run.entries.map((entry) => ({ listRunId: run.identity.listRunId, parentRunId: run.identity.listRunId, keyRunId: entry.keyRunId })));
+});
+
+test("startup outcomes are retained across queue, refusal, fast terminal and late waiters", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings, rejectKey: (key) => key === "B-1" ? "refused by fixture" : undefined });
+  const refused = await registry.waitForStartup(run.entries[1]!.keyRunId);
+  assert.deepEqual(refused, { state: "refused", reason: "refused by fixture" });
+  registry.publishImmediate(run.identity.listRunId);
+  registry.start(run.identity.listRunId, async (context) => {
+    context.startup({ state: "started", runId: context.keyRunId, facts: { ack: true } });
+    return { outcome: "blocked", reason: "fast terminal" };
+  });
+  const started = await registry.waitForStartup(run.entries[0]!.keyRunId);
+  assert.equal(started.state, "started");
+  assert.equal(started.runId, run.entries[0]!.keyRunId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await registry.waitForStartup(run.entries[0]!.keyRunId), started);
+});
+
+test("cancellation and pre-start failure settle startup once and fence late ACK", async () => {
+  const registry = new ListRunRegistry();
+  const settings = resolveRuntimeSettings({ subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 } });
+  const run = registry.admit({ mode: "do", keys: ["A-1", "B-1"], parentSessionId: "session", parentRuntimeId: "runtime", settings });
+  registry.publishImmediate(run.identity.listRunId);
+  assert.equal(registry.cancel(run.entries[1]!.keyRunId, "stopped before startup"), true);
+  assert.deepEqual(await registry.waitForStartup(run.entries[1]!.keyRunId), { state: "cancelled", reason: "stopped before startup" });
+  assert.equal(registry.settleStartup(run.entries[1]!.keyRunId, { state: "started", runId: "late" }), false);
+  registry.start(run.identity.listRunId, async () => { throw new Error("handshake failed"); });
+  assert.deepEqual(await registry.waitForStartup(run.entries[0]!.keyRunId), { state: "failed", reason: "handshake failed" });
 });
 
 test("duplicate off keeps independent atomic reservations and release does not hide siblings", () => {

@@ -10,9 +10,11 @@
 // Every deny says what to do instead. On an internal error the guard allows:
 // a broken guard must not paralyze the work it protects.
 
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { dataRoot as dataRootOf } from "./data-root.ts";
 import { RuntimeSettingsError, readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
+import { assertMandatoryBoundary, WorkflowBoundaryError } from "./workflow-boundaries.ts";
 
 export interface GuardEvent {
   tool_name?: string;
@@ -185,16 +187,174 @@ function inYokemateTree(cmd: string, own?: { root: string; home?: string }): boo
   return variants.some((v) => cmd.includes(v));
 }
 
+interface PackageScope { root: string; cwd?: string; ticket?: string; project?: string }
+interface PackageSegment { words: string[]; dynamic: boolean; substitution: boolean; next: string }
+
+const ENGINE_OPERATIONS = new Set(["where", "ready", "gate", "record-report", "pr-link", "ship", "review", "spawn", "close-mode"]);
+const PACKAGE_MANAGER = /^(?:.*\/)?(?:npm|pnpm)$/;
+const PACKAGE_TEXT = /\b(?:npm|pnpm)\b/;
+const PACKAGE_DATA = new Set(["echo", "printf", "grep", "rg", "git"]);
+
+function packageSegments(command: string): { segments: PackageSegment[]; unsupported: boolean } {
+  const segments: PackageSegment[] = [];
+  let words: string[] = [], word = "", started = false, dynamic = false, substitution = false, unsupported = false;
+  let quote = "";
+  const endWord = () => { if (started) words.push(word); word = ""; started = false; };
+  const end = (next: string) => { endWord(); segments.push({ words, dynamic, substitution, next }); words = []; dynamic = false; substitution = false; };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    if (quote !== "'" && (c === "`" || (c === "$" && command[i + 1] === "("))) substitution = true;
+    if (c === "\\" && quote !== "'") {
+      started = true;
+      const next = command[++i];
+      if (next === undefined) unsupported = true;
+      else if (next !== "\n") {
+        if (quote === '"' && !['$', '`', '"', "\\"].includes(next)) word += "\\";
+        word += next;
+      }
+    } else if (quote) {
+      if (c === quote) quote = "";
+      else { word += c; if (quote === '"' && /[$`]/.test(c)) dynamic = true; }
+    } else if (c === "'" || c === '"') { quote = c; started = true; }
+    else if (c === "#" && !started) { while (i + 1 < command.length && command[i + 1] !== "\n") i++; }
+    else if (c === ";" || c === "\n" || c === "&" || c === "|") {
+      const op = (c === "&" || c === "|") && command[i + 1] === c ? c + command[++i] : c;
+      if (op === "&" || op === "|") unsupported = true;
+      end(op);
+    } else if (/\s/.test(c)) endWord();
+    else {
+      if (/[()<>{}]/.test(c)) unsupported = true;
+      if (/[$`*?\[~]/.test(c)) dynamic = true;
+      word += c; started = true;
+    }
+  }
+  if (quote) unsupported = true;
+  end("");
+  return { segments, unsupported };
+}
+
+function packageTargetVerdict(command: string, own?: PackageScope): Verdict | null {
+  let allowed = "the assigned root/work/<TICKET>/<repo>";
+  const deny = (detail: string): Verdict => ({ decision: "deny", reason: `workflow.assigned-scope: package target refused: ${detail}. Use cd '${allowed}' && npm test, npm --prefix '${allowed}' test, or pnpm --dir '${allowed}' test; for pnpm install without an owned workspace add --ignore-workspace. Use literal paths and separate unsupported shell forms.` });
+  try {
+    const { segments, unsupported } = packageSegments(command);
+    const detected = (s: PackageSegment) => PACKAGE_MANAGER.test(s.words[0] ?? "") ||
+      (s.substitution && PACKAGE_TEXT.test(s.words.join(" "))) ||
+      (!PACKAGE_DATA.has(s.words[0] ?? "") && s.words.some((w) => PACKAGE_MANAGER.test(w.replace(/^[({]+|[)}]+$/g, "")))) ||
+      (!PACKAGE_DATA.has(s.words[0] ?? "") && s.words.some((w) => RUNNER.test(isAbsolute(w) ? basename(w) : w)) && s.words.some((w) => PACKAGE_TEXT.test(w))) ||
+      (unsupported && segments.some((p) => /^(?:sh|bash|zsh|eval)$/.test(isAbsolute(p.words[0] ?? "") ? basename(p.words[0]!) : p.words[0] ?? "")) && s.words.some((w) => PACKAGE_TEXT.test(w)));
+    if (!segments.some(detected)) return null;
+    if (!own || typeof own.cwd !== "string" || !isAbsolute(own.cwd) || !/^[A-Z][A-Z0-9]*-\d+$/.test(own.ticket ?? "")) return deny("missing or malformed host cwd/ticket");
+    const projects: unknown = JSON.parse(own.project ?? "null");
+    if (!Array.isArray(projects) || !projects.length || !projects.every((p) => typeof p === "string" && /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\/[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(p))) return deny("missing or malformed assigned projects");
+    const root = realpathSync(own.root);
+    const parts = projects.map((p: string) => join(root, "work", own.ticket!, p.split("/")[1]!));
+    if (new Set(parts).size !== parts.length) return deny("ambiguous assigned repository names");
+    allowed = parts[0]!;
+    const inside = (parent: string, path: string) => path === parent || path.startsWith(parent + sep);
+    let logicalCwd: string | undefined = resolve(own.cwd);
+    let cwd: string | undefined = realpathSync(logicalCwd);
+    if (!inside(root, cwd) || !statSync(cwd).isDirectory()) return deny("host cwd outside engine scope");
+    if (unsupported || (segments.some((s) => s.words[0] === "cd") && segments.some((s) => s.next === "||"))) return deny("unsupported package shell syntax");
+    const nearest = (start: string, file: string): string | undefined => {
+      for (let dir = start; ; dir = dirname(dir)) {
+        if (existsSync(join(dir, file))) return dir;
+        if (dirname(dir) === dir) return undefined;
+      }
+    };
+    let changedCwd = false, changedEnvironment = false;
+    for (const segment of segments) {
+      const words = [...segment.words];
+      if (!words.length) continue;
+      if (words[0] === "cd") {
+        changedCwd = true;
+        logicalCwd = !segment.dynamic && words.length === 2 && cwd && logicalCwd && segment.next === "&&" && !words[1]!.startsWith("-")
+          ? resolve(logicalCwd, words[1]!) : undefined;
+        cwd = logicalCwd ? realpathSync(logicalCwd) : undefined;
+        if (cwd && !statSync(cwd).isDirectory()) cwd = undefined;
+      } else if (detected(segment)) {
+        if (!/^(npm|pnpm)$/.test(words[0]!) || segment.dynamic || changedEnvironment) return deny("unsupported or dynamic package invocation");
+        const manager = words.shift()!;
+        let target = cwd, explicit = false, operation = "", script = "", ignoreWorkspace = false;
+        let i = 0;
+        for (; i < words.length; i++) {
+          const w = words[i]!;
+          const pathFlag = manager === "npm" ? /^--prefix(?:=(.*))?$/ : /^(?:--dir|-C)(?:=(.*))?$/;
+          const match = w.match(pathFlag);
+          if (match) {
+            const path = match[1] ?? words[++i];
+            if (!path || path.startsWith("-") || explicit || (!cwd && !isAbsolute(path))) return deny("ambiguous package directory option");
+            target = resolve(cwd ?? root, path); explicit = true; continue;
+          }
+          if (w === "--" && operation) { i++; break; }
+          if (w.startsWith("-")) {
+            if (!["--silent", "-s", "--if-present", "--ignore-scripts", "--frozen-lockfile", "--prod=false", "--offline", "--no-audit", "--no-fund", "--no", "--ignore-workspace"].includes(w)) return deny(`unsupported package option ${w}`);
+            if (w === "--ignore-workspace") ignoreWorkspace = true;
+            continue;
+          }
+          if (!operation) {
+            operation = w;
+            if (!["run", "run-script", "install", "ci", "exec"].includes(w)) script = w;
+          } else if ((operation === "run" || operation === "run-script") && !script) script = w;
+          else if (operation === "exec") {
+            if (manager === "npm") return deny("npm exec requires -- before the local tool; use npm exec --no -- <tool>");
+            break;
+          }
+          else if (!script) return deny("unsupported install arguments");
+          if (manager === "pnpm" && script) { i++; break; }
+        }
+        if (!target || !operation || ((operation === "run" || operation === "run-script") && !script)) return deny("unknown package cwd or operation");
+        target = realpathSync(target);
+        if (!statSync(target).isDirectory()) return deny("package cwd is not a directory");
+        const pkg = nearest(target, "package.json");
+        if (!pkg) return deny("no package manifest");
+        const manifest = realpathSync(join(pkg, "package.json"));
+        JSON.parse(readFileSync(manifest, "utf8"));
+        if (!["run", "run-script", "install", "ci", "exec", "test", "build", "typecheck", "lint", "dev", "start", "serve", "preview"].includes(operation) && !ENGINE_OPERATIONS.has(operation)) return deny("unsupported package operation; use run <script> for other script names");
+        const part = parts.find((p) => inside(p, target) && inside(p, pkg));
+        if (!part) {
+          if (pkg !== root || manifest !== join(root, "package.json") || !ENGINE_OPERATIONS.has(script)) return deny(`resolved package ${pkg} is not assigned`);
+        } else {
+          if (realpathSync(part) !== part || !inside(part, manifest)) return deny("symlink escapes assigned part");
+          if (operation === "install" || operation === "ci") {
+            if (manager === "pnpm" && !ignoreWorkspace) {
+              const workspace = nearest(target, "pnpm-workspace.yaml");
+              if (!workspace || !inside(part, realpathSync(join(workspace, "pnpm-workspace.yaml")))) return deny("pnpm install needs --ignore-workspace or a part-owned workspace");
+            }
+            if (manager === "npm" && !explicit) {
+              for (let dir = dirname(pkg); ; dir = dirname(dir)) {
+                const file = join(dir, "package.json");
+                if (existsSync(file) && JSON.parse(readFileSync(file, "utf8")).workspaces && !inside(part, realpathSync(file))) return deny("ancestor npm workspace; select the part with --prefix");
+                if (dir === dirname(dir)) break;
+              }
+            }
+          }
+          if (operation === "exec") {
+            const bin = words[i];
+            if (!bin || !/^[A-Za-z0-9_.-]+$/.test(bin) || PACKAGE_MANAGER.test(bin) || RUNNER.test(bin) || ["env", "command", "sudo", "xargs"].includes(bin)) return deny("exec needs a direct local tool, not a package manager or shell wrapper");
+            if (!inside(part, realpathSync(join(pkg, "node_modules", ".bin", bin)))) return deny("exec requires a worktree-local binary");
+          }
+        }
+      } else if (["export", "source", ".", "eval", "pushd", "popd"].includes(words[0]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) changedEnvironment = true;
+      if (changedCwd && segment.next !== "&&" && segment.next !== "") cwd = undefined;
+    }
+    return null;
+  } catch (e) {
+    return deny(`target determination failed (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
 export function judge(
   mode: string | undefined,
   toolName: string,
   input: { command?: string; file_path?: string; notebook_path?: string },
-  own?: { root: string; dataRoot: string; ticket?: string; home?: string },
+  own?: { root: string; dataRoot: string; ticket?: string; home?: string; cwd?: string; project?: string },
   settings: RuntimeSettings = readRuntimeSettings(),
 ): Verdict | null {
+  const paneled = mode !== undefined && mode !== "";
+  assertMandatoryBoundary("workflow.assigned-scope", !!toolName && (!paneled || !!own?.root && !!own.dataRoot), "guard call has no owned scope");
   const { policy } = settings;
   const coding = mode === "do" || mode === "ship";
-  const paneled = mode !== undefined && mode !== "";
   const onStand = coding || mode === "review";
 
   if (toolName === "Write" || toolName === "Edit" || toolName === "NotebookEdit") {
@@ -231,6 +391,11 @@ export function judge(
 
   if (toolName !== "Bash") return null;
   const cmd = input.command ?? "";
+
+  if (mode === "do") {
+    const target = packageTargetVerdict(cmd, own);
+    if (target) return target;
+  }
 
   const unquoted = outsideQuotes(cmd);
   if (mode === "ship" && SHIP_MERGE_BYPASS.some((pattern) => pattern.test(unquoted) || pattern.test(cmd)))
@@ -302,6 +467,8 @@ if (import.meta.filename === process.argv[1]) {
         dataRoot: dataRootOf(root),
         ticket: process.env.YOKEMATE_TICKET,
         home: process.env.HOME,
+        cwd: process.cwd(),
+        project: process.env.YOKEMATE_PROJECT,
       });
       if (v)
         console.log(
@@ -314,7 +481,7 @@ if (import.meta.filename === process.argv[1]) {
           }),
         );
     } catch (e) {
-      if (e instanceof RuntimeSettingsError)
+      if (e instanceof RuntimeSettingsError || (process.env.YOKEMATE_MODE === "do" && e instanceof WorkflowBoundaryError))
         console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: e.message } }));
     }
     process.exit(0);

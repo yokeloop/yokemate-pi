@@ -1,6 +1,7 @@
 const scenario = process.env.YM217_REPORT_SCENARIO || "success";
 const payload = scenario === "review"
   ? JSON.stringify({ status: "changes_required", findings: [{ severity: "blocking", lens: 1, file: "src/a.ts", line: 1, problem: "problem", evidence: "evidence", fix: "fix" }] })
+  : scenario === "isolation" ? JSON.stringify({ args: process.argv.slice(2), agentDir: process.env.PI_CODING_AGENT_DIR, sessionDir: process.env.PI_CODING_AGENT_SESSION_DIR, role: process.env.YOKEMATE_ROLE })
   : "line one\nline two\ncanonical tail";
 const message = {
   role: "assistant",

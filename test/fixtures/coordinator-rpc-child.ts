@@ -31,9 +31,10 @@ process.stdin.on("data", (chunk) => {
     } else if (command.type === "prompt") {
       send({ type: "work_prompt" });
       send({ type: "extension_ui_request", id: "w1", method: "setWidget", widgetKey: "subagent-running", widgetLines: ["task-reviewer 0:05 review"] });
-      send({ type: "response", id: command.id, success: true });
+      if (scenario === "same-chunk-work-terminal") process.stdout.write(`${JSON.stringify({ type: "response", id: command.id, success: true })}\n${JSON.stringify({ type: "terminal_probe" })}\n`);
+      else send({ type: "response", id: command.id, success: true });
       if (scenario === "exit-no-descendants") { process.stderr.write("private coordinator sentinel"); process.exit(9); }
-      setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
+      if (scenario !== "same-chunk-work-terminal") setTimeout(() => send({ type: "message_end", message: { details: { kind: "nested-report", delayed: true } } }), 25);
     } else if (command.type === "close_stdin" && scenario === "closed-stdin") {
       closeSync(0);
       send({ type: "stdin_closed" });

@@ -42,7 +42,7 @@ export interface ReportAdmissionDisplay {
 export interface ReportDiagnosticFacts {
   cancellationInitiator?: string;
   spawnError?: { class?: string };
-  stream?: { parserErrors?: number; lastParserError?: { kind?: string; offset?: number } };
+  stream?: { parserErrors?: number; firstParserError?: { kind?: string; offset?: number }; lastParserError?: { kind?: string; offset?: number }; activeTools?: number; retry?: boolean; compaction?: boolean; summaryRetry?: boolean };
 }
 
 const DISPLAY_BASE_BUDGET = 2048;
@@ -94,10 +94,13 @@ export function reportFailureReason(result: ResultEnvelope, facts: ReportDiagnos
   if (result.processOutcome === "spawn_error") return boundedScalars(`spawn ${facts.spawnError?.class ?? "error"}`, 160, 512);
   if (result.processOutcome === "not_started") return "not started";
   if (result.exitCode !== null && result.exitCode !== 0) return `exit ${result.exitCode}`;
-  const parser = facts.stream?.lastParserError;
-  if (parser?.kind) return boundedScalars(`parser ${parser.kind}${Number.isSafeInteger(parser.offset) ? ` at ${parser.offset}` : ""}${facts.stream?.parserErrors ? ` (${facts.stream.parserErrors})` : ""}`, 160, 512);
+  const stream = result.diagnostics?.stream ?? facts.stream;
+  const parser = stream?.firstParserError ?? stream?.lastParserError;
+  if (parser?.kind) return boundedScalars(`protocol_error: ${parser.kind}${Number.isSafeInteger(parser.offset) ? ` at byte ${parser.offset}` : ""}${stream?.parserErrors ? ` (${stream.parserErrors} parser errors)` : ""}`, 160, 512);
   if (result.payloadOutcome === "output_limit") return result.outputLimit ? `output limit: ${result.outputLimit}` : "output limit";
+  if (result.planResult?.state === "rejected") return `${result.payloadOutcome} / ${result.planResult.reason}`;
   if (result.payloadOutcome === "missing_final") return "missing final";
+  if (result.payloadOutcome === "invalid_plan_result") return "invalid plan result";
   if (result.payloadOutcome === "invalid_reviewer_json") return "invalid reviewer JSON";
   if (result.payloadOutcome === "protocol_error") return "protocol error";
   if (result.stopReason && result.stopReason !== "stop") return boundedScalars(`stop ${result.stopReason}`, 160, 512);
@@ -164,7 +167,7 @@ export function buildReportDisplay(
     kind: envelope.kind,
     ...(starts.length && terminalAt !== undefined ? { durationMs: Math.max(0, terminalAt - Math.min(...starts)) } : {}),
     ...(envelope.kind === "result" && firstAdmission ? { taskExcerpt: firstAdmission.taskExcerpt, ordinal: firstAdmission.ordinal } : {}),
-    ...(envelope.kind === "result" ? { brief: reportBrief(envelope.payload) } : {}),
+    ...(envelope.kind === "result" ? { brief: envelope.recovery ? `transport failed; recovery candidate ${envelope.recovery.candidateId}; publication ${envelope.publication?.state ?? "not-started"}` : envelope.planResult?.state === "verified" && envelope.planResult.source === "reconciled" ? "reconciled; review required" : reportBrief(envelope.payload) } : {}),
     ...(firstFailure ? { failureReason: reportFailureReason(firstFailure, diagnostics.get(firstFailure.identity.runId)) } : {}),
     ...(diagnosticCode ? { diagnosticCode } : {}),
     ...(envelope.kind === "result" ? {} : { members }),
@@ -201,7 +204,12 @@ function isResultEnvelope(value: unknown): value is ResultEnvelope {
   if (!["exited", "signaled", "spawn_error", "cancelled", "not_started"].includes(String(value.processOutcome))) return false;
   if (value.exitCode !== null && typeof value.exitCode !== "number") return false;
   if (value.signal !== null && typeof value.signal !== "string") return false;
-  if (!["pending", "valid", "missing_final", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete"].includes(String(value.payloadOutcome))) return false;
+  if (!["pending", "valid", "missing_final", "invalid_plan_result", "invalid_reviewer_json", "protocol_error", "output_limit", "incomplete"].includes(String(value.payloadOutcome))) return false;
+  if (value.planResult !== undefined) {
+    if (!isRecord(value.planResult) || !["verified", "rejected"].includes(String(value.planResult.state))) return false;
+    if (value.planResult.state === "verified" && (!isRecord(value.planResult.binding) || !["final", "reconciled"].includes(String(value.planResult.source)) || typeof value.planResult.binding.path !== "string" || !/^[a-f0-9]{64}$/.test(String(value.planResult.binding.contentHash)))) return false;
+    if (value.planResult.state === "rejected" && typeof value.planResult.reason !== "string") return false;
+  }
   return typeof value.payload === "string" && (value.reviewVerdict === null || value.reviewVerdict === "approved" || value.reviewVerdict === "changes_required");
 }
 
@@ -268,6 +276,18 @@ function payloadLine(result: ResultEnvelope): string {
 function addResultBody(container: Container, result: ResultEnvelope, padding: number, theme: Parameters<MessageRenderer>[2]): void {
   container.addChild(new Text(theme.fg("dim", processLine(result)), padding, 0));
   container.addChild(new Text(theme.fg("dim", payloadLine(result)), padding, 0));
+  const stream = result.diagnostics?.stream;
+  if (stream?.firstParserError) {
+    const first = stream.firstParserError;
+    const last = stream.lastParserError ?? first;
+    const counters = Object.entries(stream.parserErrorCounters).filter(([, count]) => count > 0).map(([kind, count]) => `${kind}=${count}`).join(", ");
+    container.addChild(new Text(theme.fg("dim", `parser: first ${first.kind} at byte ${first.offset} · last ${last.kind} at byte ${last.offset}${counters ? ` · ${counters}` : ""}`), padding, 0));
+  }
+  if (stream && (stream.activeTools || stream.retry || stream.compaction || stream.summaryRetry)) container.addChild(new Text(theme.fg("dim", `incomplete: tools=${stream.activeTools} · retry=${stream.retry} · compaction=${stream.compaction} · summaryRetry=${stream.summaryRetry}`), padding, 0));
+  if (result.planResult) container.addChild(new Text(theme.fg("dim", `writer: ${result.planResult.state}${result.planResult.state === "verified" ? ` · ${result.planResult.source}${result.planResult.source === "reconciled" ? "; review required" : ""}` : ` · ${result.planResult.reason}`}`), padding, 0));
+  if (result.artifact) container.addChild(new Text(theme.fg("dim", `artifact: ${result.artifact.state}${result.artifact.state === "blocked" ? ` · ${result.artifact.reason}` : ""}`), padding, 0));
+  if (result.publication) container.addChild(new Text(theme.fg("dim", `publication: ${result.publication.state}${result.publication.error ? ` · ${result.publication.error}` : ""}`), padding, 0));
+  if (result.diagnostics?.snapshotStorage?.state === "unavailable") container.addChild(new Text(theme.fg("dim", `storage: unavailable · ${result.diagnostics.snapshotStorage.code ?? "unknown"}`), padding, 0));
   if (result.processOutcome !== "not_started" && result.payload) {
     container.addChild(new Spacer(1));
     container.addChild(new Text(result.payload, padding, 0));
@@ -299,7 +319,7 @@ function addBatchBody(container: Container, envelope: BatchEnvelope, display: Su
       statusOf(result),
       duration,
       member?.taskExcerpt,
-      result.reviewVerdict ? reportBrief(result.payload) : undefined,
+      failedEnvelope(result) ? reportFailureReason(result) : result.reviewVerdict ? reportBrief(result.payload) : undefined,
     ].filter(Boolean).join(" · ");
     container.addChild(new Text(theme.fg("dim", line), padding, 0));
   }
@@ -311,7 +331,7 @@ function compactText(message: { content: unknown; details?: unknown }, display: 
   if (envelope?.kind === "result") {
     const ordinal = display?.ordinal === undefined ? "#—" : `#${display.ordinal}`;
     const reason = display?.diagnosticCode === "unknown_agent" ? "unknown agent" : display?.failureReason;
-    return [safeAgent(envelope.identity.agent), `result ${short(envelope.identity.runId)} ${ordinal}`, statusOf(envelope), duration, display?.taskExcerpt, reason ?? display?.brief, hint].filter(Boolean).join(" · ");
+    return [safeAgent(envelope.identity.agent), envelope.identity.ticket, `result ${short(envelope.identity.runId)} ${ordinal}`, statusOf(envelope), duration, display?.taskExcerpt, reason ?? display?.brief, hint].filter(Boolean).join(" · ");
   }
   if (envelope) {
     const failed = envelope.results.filter(failedEnvelope).length;
@@ -352,7 +372,7 @@ export const subagentReportRenderer: MessageRenderer = (message, options, theme)
   const padding = Math.max(0, options.outputPad);
   const container = new Container();
   const identity = envelope?.kind === "result"
-    ? `${safeAgent(envelope.identity.agent)} ${envelope.identity.runId} ${statusOf(envelope)}`
+    ? `${safeAgent(envelope.identity.agent)} ${envelope.identity.ticket ?? "—"} ${envelope.identity.runId} ${statusOf(envelope)}`
     : envelope
       ? [`subagent ${envelope.kind} ${envelope.batchId} (${envelope.results.length})`, aggregateStatus(envelope), display?.durationMs === undefined ? "—" : formatElapsed(display.durationMs)].join(" · ")
       : display?.kind === "coordinator" && details
