@@ -369,6 +369,9 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       const summary = wire.summaries[0];
       assert.ok(summary.bytes < 1024 * 1024);
       assert.ok(wire.maxNonAggregateRecordBytes < 1024 * 1024);
+      assert.equal(wire.readTools.ends, 40);
+      assert.equal(wire.readTools.errors, 0);
+      assert.deepEqual(new Set(wire.readTools.callIds), new Set(Array.from({ length: 40 }, (_, index) => `aggregate-read-${index + 1}`)));
       assert.deepEqual(summary.messagesSummary, { version: 1, count: raw.data.count, bytes: raw.data.bytes, sha256: raw.data.sha256 });
       assert.deepEqual(aggregateSummaryEvent.messagesSummary, summary.messagesSummary);
       const stream = (rpc.diagnosticSnapshot() as any).stream;
@@ -457,6 +460,9 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.equal(wire.summaries.length, 1);
       assert.ok(wire.summaries[0].bytes < 1024 * 1024);
       assert.ok(wire.maxNonAggregateRecordBytes < 1024 * 1024);
+      assert.equal(wire.readTools.ends, 40);
+      assert.equal(wire.readTools.errors, 0);
+      assert.deepEqual(new Set(wire.readTools.callIds), new Set(Array.from({ length: 40 }, (_, index) => `aggregate-read-${index + 1}`)));
       assert.deepEqual(wire.summaries[0].messagesSummary, { version: 1, count: raw.data.count, bytes: raw.data.bytes, sha256: raw.data.sha256 });
       assert.equal(result.processOutcome, "exited");
       assert.equal(result.exitCode, 0);
@@ -472,9 +478,12 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       const batchReport = reports.find((message) => message.details.envelope.kind === "batch");
       assert.ok(resultReport);
       assert.ok(batchReport);
-      assert.equal(batchReport.details.envelope.results[0].identity.runId, raw.runId);
-      assert.equal(batchReport.details.envelope.results[0].processOutcome, result.processOutcome);
-      assert.equal(batchReport.details.envelope.results[0].payloadOutcome, result.payloadOutcome);
+      const resultEnvelope = resultReport.details.envelope;
+      const batchResult = batchReport.details.envelope.results[0];
+      assert.deepEqual(resultEnvelope.identity, batchResult.identity);
+      for (const field of ["actualTaskHash", "processOutcome", "exitCode", "signal", "stopReason", "payloadOutcome", "reviewVerdict", "payload"] as const) assert.deepEqual(resultEnvelope[field], batchResult[field], field);
+      assert.equal(batchResult.identity.runId, raw.runId);
+      assert.equal(batchResult.identity.batchId, result.identity.batchId);
       assert.equal(typeof resultReport.details.deliveryId, "string");
       assert.equal(typeof resultReport.details.envelopeHash, "string");
       assert.equal(typeof batchReport.details.deliveryId, "string");

@@ -23,6 +23,9 @@ if (target) {
   let records = 0;
   let maxRecordBytes = 0;
   let maxNonAggregateRecordBytes = 0;
+  let readToolEnds = 0;
+  let readToolErrors = 0;
+  const readToolCallIds = [];
   const summaries = [];
   let child;
 
@@ -38,6 +41,7 @@ if (target) {
     records,
     maxRecordBytes,
     maxNonAggregateRecordBytes,
+    readTools: { ends: readToolEnds, errors: readToolErrors, callIds: readToolCallIds },
     summaries,
     partialBytes: recordBytes,
     partialHash: recordHash.copy().digest("hex"),
@@ -81,6 +85,11 @@ if (target) {
           aggregate = true;
           summaries.push({ sequence: records, bytes: lineBytes, hash: createHash("sha256").update(line).digest("hex"), messagesSummary: event.messagesSummary, willRetry: event.willRetry });
           writeFacts("-checkpoint");
+        }
+        if (event?.type === "tool_execution_end" && event.toolName === "read") {
+          readToolEnds++;
+          if (event.isError === true) readToolErrors++;
+          if (typeof event.toolCallId === "string" && readToolCallIds.length < 41) readToolCallIds.push(event.toolCallId);
         }
       } catch {}
     }
