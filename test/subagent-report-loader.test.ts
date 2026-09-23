@@ -319,7 +319,7 @@ test("owned replacement fences late producer delivery from the previous generati
   const engine = createFixtureEngine({ label: "owned-replacement", agents: { worker: "---\nname: worker\ndescription: replacement fixture\n---\nReturn after release.\n" } });
   const socketPath = join(engine.runtimeDir, "replacement.sock");
   const sockets = new Set<Socket>();
-  let release!: Socket;
+  let childPid = 0;
   let childStarted!: () => void;
   const started = new Promise<void>((resolve) => { childStarted = resolve; });
   const server = createServer((socket) => {
@@ -329,14 +329,14 @@ test("owned replacement fences late producer delivery from the previous generati
     socket.on("data", (chunk) => {
       buffer += chunk.toString();
       if (!buffer.includes("\n")) return;
-      release = socket;
+      childPid = JSON.parse(buffer.slice(0, buffer.indexOf("\n"))).pid;
       childStarted();
     });
   });
   await new Promise<void>((resolve) => server.listen(socketPath, resolve));
   try {
     const firstOwner = "11111111-1111-4111-8111-111111111111";
-    const secondOwner = "22222222-2222-4222-8222-222222222222";
+    const secondOwner = firstOwner;
     await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: firstOwner, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] }, async () => {
       const fixture = await loadFixtureExtension(engine, { sessionId: "owned-replacement-session" });
       fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
@@ -351,10 +351,164 @@ test("owned replacement fences late producer delivery from the previous generati
       assert.equal("isError" in launch && launch.isError, false);
       await started;
       await readyOwner(secondOwner);
-      release.end("release\n");
-      await shutdownFixture(fixture);
+      assert.throws(() => process.kill(childPid, 0));
+      const oldStates = fixture.entries.filter((entry) => entry.type === "yokemate-child-state" && entry.data.ownerRunId === firstOwner).map((entry) => entry.data);
+      assert.ok(oldStates.some((state) => state.deliveries.length > 0 && state.deliveries.every((delivery: any) => delivery.state === "delivery_unknown")), JSON.stringify(oldStates.map((state) => ({ children: state.children.length, deliveries: state.deliveries.map((delivery: any) => delivery.state) }))));
+      await shutdownFixture(fixture, { expectedDeliveryState: "delivery_unknown" });
       assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
       assert.equal(fixture.sent.filter((entry) => entry.message.customType === "yokemate-coordinator-ready").length, 2);
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("owned turn boundary releases for a ready sibling and waits again for remaining work", async () => {
+  const engine = createFixtureEngine({ label: "owned-sibling-boundary", agents: { worker: "---\nname: worker\ndescription: sibling boundary fixture\n---\nReturn after release.\n" } });
+  const socketPath = join(engine.runtimeDir, "sibling-boundary.sock");
+  const sockets = new Set<Socket>();
+  const started: Socket[] = [];
+  let wake!: () => void;
+  const changed = () => new Promise<void>((resolve) => { wake = resolve; });
+  let nextChange = changed();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.includes("\n")) return;
+      const message = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      started.push(socket);
+      wake();
+      nextChange = changed();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  try {
+    const owner = "33333333-3333-4333-8333-333333333333";
+    await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: owner, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] }, async () => {
+      const fixture = await loadFixtureExtension(engine, { sessionId: "owned-sibling-session" });
+      fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+      const ready = fixture.extension.commands.get("yokemate-coordinator-ready")!;
+      await ready.handler(Buffer.from(JSON.stringify({ identity: { runId: owner, role: "coordinator", cwd: engine.root }, prepared: { cwd: engine.root } })).toString("base64"), fixture.ctx as any);
+      await fixture.tool.execute("siblings", { tasks: [{ agent: "worker", task: "first sibling" }, { agent: "worker", task: "second sibling" }] }, undefined, () => undefined, fixture.ctx);
+      while (started.length < 2) await nextChange;
+      const controller = new AbortController();
+      const invokeTurnEnd = () => Promise.all((fixture.extension.handlers.get("turn_end") ?? []).map((handler) => handler({ type: "turn_end" } as never, { ...fixture.ctx, signal: controller.signal } as any)));
+      let released = false;
+      const waiting = invokeTurnEnd().then(() => { released = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, false);
+      started[0]!.end("release\n");
+      await waitFor(() => fixture.sent.filter((entry) => entry.message.customType === "subagent-report" && entry.message.details.envelope.kind === "result").length === 1);
+      await waiting;
+      assert.equal(released, true);
+      await invokeTurnEnd();
+      const firstResult = fixture.sent.find((entry) => entry.message.customType === "subagent-report" && entry.message.details.envelope.kind === "result")!;
+      await acknowledgeFixtureReports(fixture, [firstResult]);
+      let waitingAgainReleased = false;
+      const waitingAgain = invokeTurnEnd().then(() => { waitingAgainReleased = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(waitingAgainReleased, false);
+      started[1]!.end("release\n");
+      await waitingAgain;
+      await waitFor(() => fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length === 3);
+      await acknowledgeFixtureReports(fixture, fixture.sent.filter((entry) => entry.message.customType === "subagent-report"));
+      await shutdownFixture(fixture);
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("owned turn boundary abort releases the waiter without starting another delivery turn", async () => {
+  const engine = createFixtureEngine({ label: "owned-abort-boundary", agents: { worker: "---\nname: worker\ndescription: abort boundary fixture\n---\nReturn after release.\n" } });
+  const socketPath = join(engine.runtimeDir, "abort-boundary.sock");
+  const sockets = new Set<Socket>();
+  let started!: () => void;
+  const childStarted = new Promise<void>((resolve) => { started = resolve; });
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.once("data", () => started());
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  try {
+    const owner = "55555555-5555-4555-8555-555555555555";
+    await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: owner, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] }, async () => {
+      const fixture = await loadFixtureExtension(engine, { sessionId: "owned-abort-session" });
+      fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+      const ready = fixture.extension.commands.get("yokemate-coordinator-ready")!;
+      await ready.handler(Buffer.from(JSON.stringify({ identity: { runId: owner, role: "coordinator", cwd: engine.root }, prepared: { cwd: engine.root } })).toString("base64"), fixture.ctx as any);
+      await fixture.tool.execute("abort-child", { agent: "worker", task: "held until abort" }, undefined, () => undefined, fixture.ctx);
+      await childStarted;
+      const controller = new AbortController();
+      let released = false;
+      const waiting = Promise.all((fixture.extension.handlers.get("turn_end") ?? []).map((handler) => handler({ type: "turn_end" } as never, { ...fixture.ctx, signal: controller.signal } as any))).then(() => { released = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, false);
+      controller.abort();
+      await waiting;
+      assert.equal(released, true);
+      assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
+      await shutdownFixture(fixture, { expectedDeliveryState: "delivery_unknown" });
+      assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
+    });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("owned turn boundary stays held through chain progression until the chain report is ready", async () => {
+  const engine = createFixtureEngine({ label: "owned-chain-boundary", agents: { worker: "---\nname: worker\ndescription: chain boundary fixture\n---\nReturn after release.\n" } });
+  const socketPath = join(engine.runtimeDir, "chain-boundary.sock");
+  const sockets = new Set<Socket>();
+  const started: Array<{ task: string; socket: Socket }> = [];
+  const waiters: Array<() => void> = [];
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (!buffer.includes("\n")) return;
+      const message = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+      started.push({ task: message.task, socket });
+      for (const waiter of waiters.splice(0)) waiter();
+    });
+  });
+  const waitStarted = async (count: number) => { while (started.length < count) await new Promise<void>((resolve) => waiters.push(resolve)); };
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  try {
+    const owner = "44444444-4444-4444-8444-444444444444";
+    await withFixtureEnvironment(engine, { RUNTIME_SETTINGS_TEST_SOCKET: socketPath, YOKEMATE_MODE: "do", YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: owner, YOKEMATE_SUBAGENT_TEST_TARGET: engine.resources["runtime-settings-child.mjs"] }, async () => {
+      const fixture = await loadFixtureExtension(engine, { sessionId: "owned-chain-session" });
+      fixture.loader.getExtensions().runtime.getCommands = (() => [{ name: "skill:do-worker" }]) as any;
+      const ready = fixture.extension.commands.get("yokemate-coordinator-ready")!;
+      await ready.handler(Buffer.from(JSON.stringify({ identity: { runId: owner, role: "coordinator", cwd: engine.root }, prepared: { cwd: engine.root } })).toString("base64"), fixture.ctx as any);
+      await fixture.tool.execute("chain-boundary", { chain: [{ agent: "worker", task: "chain first" }, { agent: "worker", task: "chain second {previous}" }] }, undefined, () => undefined, fixture.ctx);
+      await waitStarted(1);
+      const controller = new AbortController();
+      let released = false;
+      const waiting = Promise.all((fixture.extension.handlers.get("turn_end") ?? []).map((handler) => handler({ type: "turn_end" } as never, { ...fixture.ctx, signal: controller.signal } as any))).then(() => { released = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, false);
+      started[0]!.socket.end("release\n");
+      await waitStarted(2);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, false);
+      assert.equal(fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length, 0);
+      started[1]!.socket.end("release\n");
+      await waiting;
+      await waitFor(() => fixture.sent.filter((entry) => entry.message.customType === "subagent-report").length >= 2);
+      const reports = fixture.sent.filter((entry) => entry.message.customType === "subagent-report");
+      assert.deepEqual(reports.map((entry) => entry.message.details.envelope.kind).sort(), ["batch", "chain"]);
+      await acknowledgeFixtureReports(fixture, reports);
+      await shutdownFixture(fixture);
     });
   } finally {
     for (const socket of sockets) socket.destroy();

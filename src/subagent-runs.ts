@@ -1134,14 +1134,14 @@ export class OwnedChildState {
   pendingIds(): string[] { return this.snapshot?.deliveries.filter((delivery) => delivery.state !== "observed").map((delivery) => delivery.deliveryId) ?? []; }
   busyCount(): number { return !this.snapshot || this.invalid || !this.sessionId ? 1 : this.snapshot.children.length + this.inFlight.size + (this.snapshot.producerObligations ?? 0) + (this.snapshot.batchDispatches ?? 0) + this.pendingIds().length; }
   canFinish(outcome: "done" | "blocked", reason?: string): boolean {
-    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0)) return false;
+    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0) || this.retry || this.compaction || this.queue) return false;
     const pending = this.snapshot.deliveries.filter((delivery) => delivery.state !== "observed");
     if (!pending.length) return true;
     return outcome === "blocked" && pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state) && reason?.includes(delivery.deliveryId));
   }
   verificationCount(outcome: "done" | "blocked", reason?: string): number { return this.canFinish(outcome, reason) ? 0 : Math.max(1, this.busyCount()); }
   deliveryFailureReason(): string | undefined {
-    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0)) return;
+    if (!this.snapshot || this.invalid || this.snapshot.children.length || this.inFlight.size || (this.snapshot.producerObligations ?? 0) || (this.snapshot.batchDispatches ?? 0) || this.retry || this.compaction || this.queue) return;
     const pending = this.snapshot.deliveries.filter((delivery) => delivery.state !== "observed");
     if (!pending.length || !pending.every((delivery) => ["delivery_failed", "delivery_unknown"].includes(delivery.state))) return;
     const reason = `report delivery failure; unobserved IDs: ${pending.map((delivery) => delivery.deliveryId).join(", ")}`;

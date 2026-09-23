@@ -321,6 +321,29 @@ test("delivery failure becomes terminal only after every producer and delivery i
   assert.equal(tracker.canFinish("done"), false);
 });
 
+test("delivery failure waits for queued turns, retry and compaction to drain", async () => {
+  const { ChildRuns, OwnedChildState, deliveryFor, resultEnvelope } = await import("../src/subagent-runs.ts");
+  const tracker = new OwnedChildState("owner", 100, "start");
+  tracker.bindSession("session");
+  const runs = new ChildRuns("owner", "session");
+  const task = { agent: "worker", task: "A", cwd: process.cwd() };
+  const ack = runs.admit("A", [task], process.cwd());
+  tracker.toolStart("A", task);
+  tracker.toolEnd("A", ack, false);
+  const delivery = deliveryFor(resultEnvelope(ack.children[0]!.identity, "A", { processOutcome: "exited", exitCode: 0, signal: null, stopReason: "stop" }, "A"));
+  tracker.accept({ version: 1, ownerRunId: "owner", ownerSessionId: "session", pid: 100, starttime: "start", sequence: 1, children: [], deliveries: [{ ...delivery, state: "delivery_failed" }], producerObligations: 0, batchDispatches: 0 });
+  const reason = `report delivery failure; unobserved IDs: ${delivery.deliveryId}`;
+  for (const field of ["queue", "retry", "compaction"] as const) {
+    tracker[field] = true;
+    assert.equal(tracker.deliveryFailureReason(), undefined, field);
+    assert.equal(tracker.canFinish("blocked", reason), false, field);
+    assert.equal(tracker.settled(), "wait", field);
+    tracker[field] = false;
+  }
+  assert.equal(tracker.deliveryFailureReason(), reason);
+  assert.equal(tracker.canFinish("blocked", reason), true);
+});
+
 test("blocked teardown after unexpected exit preserves the completed parent snapshot", async () => {
   const fs = await import("node:fs");
   const { RunSnapshots } = await import("../src/subagent-runs.ts");

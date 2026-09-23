@@ -88,7 +88,7 @@ interface OrdinaryProcess {
 	killTimer?: NodeJS.Timeout;
 }
 const ordinaryProcesses = new Map<string, OrdinaryProcess>();
-let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
+let requestOrdinaryCancellation: (runId: string, initiator: string, ownerRunId: string, ownerSessionId: string, lifecycle?: ChildRuns) => Promise<CancellationResult> = async (runId) => cancellationResult(runId, "unknown", "unknown", false);
 // Ребёнок попадает в реестр только после await внутри runSingleAgent, а пачка
 // тул-коллов одного хода исполняется в один тик — по одному лишь размеру
 // реестра все они прошли бы потолок. Единица работы считается сразу, синхронно
@@ -586,7 +586,7 @@ async function runSingleAgent(
 			if (proc.pid && starttime && lifecycle.attachProcess(identity, proc.pid, starttime)) ordinaryProcesses.set(identity.runId, { identity, process: proc, pid: proc.pid, starttime, closed: false, termSent: false, killSent: false });
 			diagnostic.save(false);
 			onSpawn?.(proc);
-			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId); };
+			const abort = () => { void requestOrdinaryCancellation(identity.runId, "tool_abort_signal", identity.ownerRunId, identity.ownerSessionId, lifecycle); };
 			proc.stdout.on("data", (data: Buffer) => { observation.write(data); checkpointProgress(); });
 			proc.stderr.on("data", (data: Buffer) => { stderrBytes += data.length; stderrHash.update(data); currentResult.stderr = "child stderr observed"; });
 			proc.on("error", (error) => { spawnError = error; diagnostic.metadata.spawnError = errorMetadata(error); });
@@ -739,8 +739,7 @@ export default function (pi: ExtensionAPI) {
 		listeners: Set<() => void>;
 	}
 	let ownedGeneration: OwnedGeneration | undefined;
-	const ownedGenerations = new Map<string, OwnedGeneration>();
-	const ownedGenerationKey = (ownerRunId: string, ownerSessionId: string): string => `${ownerRunId}\0${ownerSessionId}`;
+	const ownedGenerationByRunId = new Map<string, OwnedGeneration>();
 	const batchCompletions = new Map<string, { promise: Promise<void>; resolve(): void }>();
 	let nextScoutSequence = 0;
 	const scoutSequenceByRunId = new Map<string, number>();
@@ -897,10 +896,8 @@ export default function (pi: ExtensionAPI) {
 	};
 	const ownedGenerationFor = (envelope: ReportEnvelope): OwnedGeneration | undefined => {
 		const identities = envelope.kind === "result" ? [envelope.identity] : envelope.results.map((result) => result.identity);
-		const ownerRunId = identities[0]?.ownerRunId;
-		const ownerSessionId = identities[0]?.ownerSessionId;
-		const generation = ownerRunId && ownerSessionId ? ownedGenerations.get(ownedGenerationKey(ownerRunId, ownerSessionId)) : undefined;
-		if (!generation || !identities.length || identities.some((identity) => identity.ownerRunId !== generation.ownerRunId || identity.ownerSessionId !== generation.ownerSessionId || !generation.runs.owns(identity.runId, identity.ownerRunId, identity.ownerSessionId))) return;
+		const generation = identities.length ? ownedGenerationByRunId.get(identities[0]!.runId) : undefined;
+		if (!generation || identities.some((identity) => ownedGenerationByRunId.get(identity.runId) !== generation || identity.ownerRunId !== generation.ownerRunId || identity.ownerSessionId !== generation.ownerSessionId || !generation.runs.owns(identity.runId, identity.ownerRunId, identity.ownerSessionId))) return;
 		return generation;
 	};
 	const beginProducer = (generation: OwnedGeneration | undefined): (() => void) => {
@@ -2253,11 +2250,17 @@ export default function (pi: ExtensionAPI) {
 					assertPlanBinding(payload.prepared.doBinding, readRecordedPlanBinding(ENGINE_ROOT, payload.prepared.doBinding.ticket));
 					ownedBinding = payload.prepared.doBinding;
 				}
-				fenceOwnedGeneration("owner_replaced");
+				const replaced = ownedGeneration;
+				if (replaced) {
+					fenceOwnedGeneration("owner_replaced", replaced);
+					const active = replaced.runs.shutdownActive();
+					const completions = [...new Set(active.map((child) => child.identity.batchId))].map((batchId) => batchCompletions.get(batchId)?.promise).filter((promise): promise is Promise<void> => !!promise);
+					await Promise.all(active.map((child) => requestOrdinaryCancellation(child.identity.runId, "owner_replaced", replaced.ownerRunId, replaced.ownerSessionId, replaced.runs)));
+					await Promise.all(completions);
+				}
 				runs = new ChildRuns(identity.runId!, ctx.sessionManager.getSessionId());
 				ownedReadyRunId = identity.runId;
 				ownedGeneration = { serial: sessionGeneration, ownerRunId: identity.runId!, ownerSessionId: runs.ownerSessionId, runs, fenced: false, producerObligations: 0, batchDispatches: 0, failureProduced: 0, failureConsumed: 0, revision: 0, listeners: new Set() };
-				ownedGenerations.set(ownedGenerationKey(identity.runId!, runs.ownerSessionId), ownedGeneration);
 				emitChildState();
 				pi.sendMessage({ customType: "yokemate-coordinator-ready", content: "ready", display: false, details: { runId: identity.runId, ok: true } }, { deliverAs: "followUp", triggerTurn: false });
 			} catch (error) {
@@ -2366,6 +2369,7 @@ export default function (pi: ExtensionAPI) {
 		diagnostics.clear();
 		recorderFences.clear();
 		ownedGeneration = undefined;
+		ownedGenerationByRunId.clear();
 		ownedReadyRunId = undefined;
 		runs = undefined;
 		runningAgents.clear();
@@ -2389,8 +2393,7 @@ export default function (pi: ExtensionAPI) {
 		renderRunningWidget();
 	});
 
-	const fenceOwnedGeneration = (code: string): void => {
-		const generation = ownedGeneration;
+	const fenceOwnedGeneration = (code: string, generation = ownedGeneration): void => {
 		if (!generation || generation.fenced) return;
 		generation.fenced = true;
 		for (const entry of deliveries.values()) {
@@ -2705,9 +2708,9 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId) => {
-		if (!runs) return cancellationResult(runId, "unknown", "unknown", false);
-		const lifecycle = runs;
+	requestOrdinaryCancellation = async (runId, initiator, ownerRunId, ownerSessionId, ownedLifecycle) => {
+		const lifecycle = ownedLifecycle ?? runs;
+		if (!lifecycle) return cancellationResult(runId, "unknown", "unknown", false);
 		if (lifecycle.children.has(runId) && !lifecycle.owns(runId, ownerRunId, ownerSessionId)) return cancellationResult(runId, "ordinary", "not_owned", false, "ordinary run belongs to another owner");
 		const request = lifecycle.requestCancel(runId, initiator);
 		if (request.result.targetKind === "unknown") return request.result;
@@ -3076,7 +3079,9 @@ export default function (pi: ExtensionAPI) {
 				const units = mode === "chain" ? 1 : tasks.length;
 				const admission = subagentAdmission(settings, mode, units, activeUnits);
 				if (admission) throw new Error(admission);
+				const admissionGeneration = currentOwnedGeneration();
 				const ack = runs!.admit(toolCallId, tasks, ctx.cwd, assertChildAdmission);
+				if (admissionGeneration) for (const child of ack.children) ownedGenerationByRunId.set(child.identity.runId, admissionGeneration);
 				for (const [index, child] of ack.children.entries()) {
 					const scope = writerScopes[index];
 					if (scope) planWriterScopes.set(child.identity.runId, scope);
@@ -3107,7 +3112,7 @@ export default function (pi: ExtensionAPI) {
 				batches.add(toolCallId);
 				batchModes.set(toolCallId, mode);
 				const dispatchRuns = runs!;
-				const dispatchGeneration = currentOwnedGeneration();
+				const dispatchGeneration = admissionGeneration;
 				if (dispatchGeneration) dispatchGeneration.batchDispatches += 1;
 				let resolveCompletion!: () => void;
 				const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
