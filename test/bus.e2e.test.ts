@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RuntimeResources, stopOwnedProcess } from "./fixtures/runtime-resources.ts";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const PANE = "wT:p1";
@@ -20,7 +21,10 @@ function hasPi(): boolean {
 test("a report says delivered and reaches the pi session as a custom message", async (t) => {
   if (!hasPi()) return t.skip("pi not in PATH");
 
-  const tmp = mkdtempSync(join(tmpdir(), "bus-e2e-"));
+  const resources = new RuntimeResources();
+  t.after(() => resources.cleanup());
+  const tmp = mkdtempSync(join(process.env.YOKEMATE_TEST_RESOURCE_ROOT ?? tmpdir(), "bus-e2e-"));
+  resources.path(tmp);
   const pi = spawn("pi", ["--mode", "rpc", "--no-session", "-e", "src/bus.ts"], {
     cwd: REPO_ROOT,
     env: {
@@ -32,6 +36,7 @@ test("a report says delivered and reaches the pi session as a custom message", a
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  resources.child(pi);
   let out = "";
   let err = "";
   pi.stdout.on("data", (c) => (out += c.toString("utf8")));
@@ -75,7 +80,8 @@ test("a report says delivered and reaches the pi session as a custom message", a
     assert.match(content, new RegExp(MARKER));
     assert.match(content, /YM-0/);
   } finally {
-    pi.kill("SIGKILL");
+    await stopOwnedProcess(pi);
     rmSync(tmp, { recursive: true, force: true });
+    await resources.cleanup();
   }
 });

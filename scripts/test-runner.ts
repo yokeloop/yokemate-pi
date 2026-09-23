@@ -118,8 +118,20 @@ function summarize(results: readonly SupervisedFileResult[], mode: "full" | "tar
   process.stdout.write(`TEST_SUITE_SUMMARY ${JSON.stringify({ mode, sha, version: packageVersion, files: fileCount, uniqueScenarioIds: scenarioIds.size, activeMs: Math.round(totalMs), admissionMs: Math.round(admissionMs), cleanupMs: 0, totalMs: Math.round(totalMs + admissionMs), maxRuntimeChains, failures: failures.map((result) => ({ file: path.basename(result.file), code: result.code, signal: result.signal })), cleanup: failures.some((result) => /failed cleanup/.test(result.stderr)) ? "failed" : "clean" })}\n`);
 }
 
+const RUNTIME_PRIORITY_FILES = [
+  "runtime-settings-manifest.test.ts",
+  "subagent-runtime.test.ts",
+  "workflow-input-pipeline.test.ts",
+  "subagent-fixture-storage.test.ts",
+] as const;
+
+export function scheduleRuntimeFiles(files: readonly string[]): string[] {
+  const priority = new Map<string, number>(RUNTIME_PRIORITY_FILES.map((file, index) => [file, index]));
+  return [...files].sort((left, right) => (priority.get(path.basename(left)) ?? priority.size) - (priority.get(path.basename(right)) ?? priority.size));
+}
+
 async function runRuntimePhase(files: readonly string[], mode: "full" | "targeted", suiteStarted: number, lightCount: number): Promise<number> {
-  const runtime = await runFiles(files, 2, suiteStarted + 720_000);
+  const runtime = await runFiles(scheduleRuntimeFiles(files), 2, suiteStarted + 720_000);
   summarize(runtime.results, mode, suiteStarted, runtime.maxConcurrency, Number(process.env.YOKEMATE_TEST_ADMISSION_WAIT_MS ?? 0), lightCount + files.length);
   return runtime.results.some((result) => result.code !== 0) ? 1 : 0;
 }

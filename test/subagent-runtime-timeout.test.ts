@@ -82,6 +82,18 @@ test("waitForEvent rejects an early close and removes every listener", async () 
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
+test("RuntimeResources starts its cleanup budget after a long body", async () => {
+  const resources = new RuntimeResources(undefined, 40);
+  let cleaned = false;
+  resources.add("late cleanup", async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    cleaned = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await resources.cleanup();
+  assert.equal(cleaned, true);
+});
+
 test("RuntimeResources destroys a held peer and proves server close", async () => {
   const resources = new RuntimeResources(undefined, 3000);
   const server = createServer();

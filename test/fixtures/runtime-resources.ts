@@ -120,14 +120,14 @@ export async function closeOwnedServer(server: Server, sockets: Iterable<Socket>
 
 export class RuntimeResources {
   readonly signal: AbortSignal;
-  readonly deadline: number;
   private readonly controller = new AbortController();
   private readonly cleanups: Cleanup[] = [];
+  private readonly cleanupTimeoutMs: number;
   private cleanupPromise?: Promise<void>;
 
   constructor(parentSignal?: AbortSignal, cleanupTimeoutMs = 30_000) {
     this.signal = this.controller.signal;
-    this.deadline = Date.now() + cleanupTimeoutMs;
+    this.cleanupTimeoutMs = cleanupTimeoutMs;
     if (parentSignal?.aborted) this.controller.abort(parentSignal.reason);
     else parentSignal?.addEventListener("abort", () => this.controller.abort(parentSignal.reason), { once: true });
   }
@@ -174,7 +174,7 @@ export class RuntimeResources {
     if (this.cleanupPromise) return this.cleanupPromise;
     this.cleanupPromise = (async () => {
       this.abort(new Error("runtime resource cleanup"));
-      const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? 30_000, this.deadline - Date.now()));
+      const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? this.cleanupTimeoutMs, this.cleanupTimeoutMs));
       const errors: unknown[] = [];
       const tasks = [...this.cleanups].reverse().map(async ({ label, run }) => {
         try { await run(); }

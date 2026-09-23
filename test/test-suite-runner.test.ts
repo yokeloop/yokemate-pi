@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 import { spawn } from "node:child_process";
 import { discoverTestFiles, LIGHT_TEST_FILES, MANIFEST_ADAPTER_FILES, partitionTestFiles, standardAdmissionRoot } from "../scripts/test-suite.ts";
-import { runSupervisedFile } from "../scripts/test-runner.ts";
+import { runSupervisedFile, scheduleRuntimeFiles } from "../scripts/test-runner.ts";
 
 const roots: string[] = [];
 after(() => { for (const root of roots) fs.rmSync(root, { recursive: true, force: true }); });
@@ -32,6 +32,15 @@ test("test discovery partitions every file exactly once and defaults unknown fil
   assert.ok(partition.runtime.some((file) => path.basename(file) === "unknown.test.ts"));
   assert.ok(partition.runtime.some((file) => path.basename(file) === "runtime-settings-manifest.test.ts"));
   for (const adapter of MANIFEST_ADAPTER_FILES) assert.ok(partition.manifestOwned.some((file) => path.basename(file) === adapter));
+});
+
+test("runtime scheduling starts both known long chains before shorter files", () => {
+  assert.deepEqual(scheduleRuntimeFiles(["z.test.ts", "subagent-runtime.test.ts", "a.test.ts", "runtime-settings-manifest.test.ts"]), [
+    "runtime-settings-manifest.test.ts",
+    "subagent-runtime.test.ts",
+    "z.test.ts",
+    "a.test.ts",
+  ]);
 });
 
 test("partition rejects missing and duplicate manifest adapters", () => {
