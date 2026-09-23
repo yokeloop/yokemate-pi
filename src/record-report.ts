@@ -104,6 +104,7 @@ export function recordReport(
     db.prepare(
       `UPDATE work SET stage = 'review', pr = ?, updated_at = datetime('now') WHERE id = ?`,
     ).run(parts.map((p) => p.pr).join(" "), work.id);
+    db.prepare("DELETE FROM member_claim WHERE kind='single' AND ticket=?").run(ticket);
   }, { settings });
   if (!out.ok) throw new Error(out.refuse);
   const recorded = db.prepare("SELECT stage FROM work WHERE ticket=?").get(ticket) as { stage?: string } | undefined;

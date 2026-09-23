@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
@@ -79,6 +79,14 @@ test("reserved planning claims block single execution before activation", () => 
   assert.throws(() => reserveMemberClaims(db, { groupId, treeHash: HASH_A, members: ["youtrack:yokeloop:YM-2"], tickets: { "youtrack:yokeloop:YM-2": "YM-2" }, owners: [{ runtimeId: "other", runId: "other", sessionId: "other" }] }), /live owner/);
 });
 
+test("suspended group ownership can be rebound only after every prior owner is proven dead", () => {
+  const { db, groupId } = prepared();
+  assert.equal(applyGroupMove(db, { groupId, revisionHash: HASH_B, expectedPhase: "planned", toPhase: "blocked", idempotencyKey: "stop", blocker: "stopped" }).ok, true);
+  const next = [{ runtimeId: "next", runId: "next", sessionId: "next" }];
+  assert.throws(() => reserveMemberClaims(db, { groupId, treeHash: HASH_A, members: ["youtrack:yokeloop:YM-1"], owners: next }), /cannot be proven dead/);
+  assert.doesNotThrow(() => reserveMemberClaims(db, { groupId, treeHash: HASH_A, members: ["youtrack:yokeloop:YM-1"], owners: next, ownerLive: () => false }));
+});
+
 test("single transitions cannot move a claimed group member", () => {
   const { db, groupId } = prepared();
   db.prepare("INSERT INTO work (ticket,url,stage) VALUES ('YM-2','https://t/YM-2','planned')").run();
@@ -102,20 +110,28 @@ test("canonical group hashes ignore object key insertion order", () => {
   assert.equal(canonicalHash({ b: 2, a: { d: 4, c: 3 } }), canonicalHash({ a: { c: 3, d: 4 }, b: 2 }));
 });
 
-test("portable facts restore confirmed outcomes but no process authority", () => {
+test("portable facts preserve lineage and restore external effects as unknown without process authority", () => {
   const { db, groupId } = prepared();
   db.prepare("UPDATE group_member SET execution='ready',stage='review' WHERE ticket='YM-2'").run();
   recordGroupEffect(db, { key: "done", groupId, revisionHash: HASH_B, type: "done", scope: { ticket: "YM-2" }, input: { state: "Done" }, state: "confirmed", outcome: { state: "Done" } });
   const directory = mkdtempSync(join(tmpdir(), "yokemate-group-facts-"));
   const path = join(directory, "facts.json");
   snapshotGroupFacts(db, groupId, path);
+  const stalePath = join(directory, "stale.json");
+  copyFileSync(path, stalePath);
   const facts = readGroupFactsSnapshot(path);
   assert.equal(facts.confirmedEffects.length, 1);
   assert.equal(Object.prototype.hasOwnProperty.call(facts, "claims"), false);
-  db.prepare("UPDATE group_member SET execution='queued',stage='planned' WHERE ticket='YM-2'").run();
-  assert.deepEqual(restoreGroupFacts(db, path, () => true), { restored: true });
-  const member = db.prepare("SELECT execution,stage FROM group_member WHERE ticket='YM-2'").get() as { execution: string; stage: string };
+  const target = prepared().db;
+  assert.deepEqual(restoreGroupFacts(target, path, () => true), { restored: true });
+  const member = target.prepare("SELECT execution,stage FROM group_member WHERE ticket='YM-2'").get() as { execution: string; stage: string };
   assert.deepEqual({ ...member }, { execution: "ready", stage: "review" });
+  assert.equal((target.prepare("SELECT state FROM group_effect WHERE effect_key='done'").get() as { state: string }).state, "unknown");
+  assert.deepEqual(restoreGroupFacts(target, path, () => true), { restored: true });
+  db.prepare("UPDATE group_member SET blocker='later' WHERE ticket='YM-2'").run();
+  snapshotGroupFacts(db, groupId, path);
+  assert.deepEqual(restoreGroupFacts(target, path, () => true), { restored: true });
+  assert.match(restoreGroupFacts(target, stalePath, () => true).blocker ?? "", /stale or diverged/);
   rmSync(directory, { recursive: true, force: true });
 });
 

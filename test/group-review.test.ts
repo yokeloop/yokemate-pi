@@ -39,6 +39,11 @@ test("prepares and accepts an exact assembled candidate", async () => {
   assert.deepEqual({ ...accepted }, { candidate_hash: candidate.candidateHash, state: "current" });
 });
 
+test("semantic candidate review is mandatory when the production dependency requires it", async () => {
+  const { db, groupId } = fixture();
+  await assert.rejects(() => prepareGroupReview(db, { groupId, revisionHash, obligations: [obligation], evidence: [evidence] }, { ...deps, verifyCandidate: async () => ({ ok: false, reason: "semantic evidence rejected" }) }), /semantic evidence rejected/);
+});
+
 test("one changed repository head makes the verdict stale", async () => {
   const { db, groupId } = fixture();
   const candidate = await prepareGroupReview(db, { groupId, revisionHash, obligations: [obligation], evidence: [evidence] }, deps);

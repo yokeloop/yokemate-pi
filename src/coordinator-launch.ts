@@ -174,8 +174,11 @@ export function markDoRunning(root: string, prepared: PreparedCoordinator, origi
   const ticket = prepared.tickets[0]!;
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "spawn", origin, ticket, () => {
+    const conflicting = db.prepare("SELECT kind,group_id FROM member_claim WHERE ticket=? AND state IN ('reserved','active','suspended') LIMIT 1").get(ticket) as { kind: string; group_id: string | null } | undefined;
+    if (conflicting) throw new Error(`${ticket}: claimed by ${conflicting.kind === "group" ? `group ${conflicting.group_id}` : "another single run"}`);
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES (?, ?, 'running') ON CONFLICT (ticket) DO UPDATE SET stage = 'running'").run(ticket, ticketUrl(db, ticket));
     db.prepare("UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(prepared.cwd, prepared.plan!, ticket);
+    db.prepare("INSERT INTO member_claim (member_identity,ticket,kind,owners_json,state) VALUES (?,?,'single',?,'active')").run(`single:${ticket}`, ticket, JSON.stringify([{ runtimeId: origin.runId ?? "unknown", runId: origin.runId ?? "unknown", sessionId: origin.sessionId ?? "unknown" }]));
   }, { allowFresh: true, expected: prepared.expected, settings: snapshot });
   if (!out.ok) fail(out.refuse);
 }

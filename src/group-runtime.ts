@@ -141,6 +141,10 @@ export class GroupRuntime {
     this.pump();
   }
 
+  resume(): void {
+    this.pump();
+  }
+
   memberDeferred(member: string, generation = this.generation): void {
     const active = this.active.get(member);
     if (!active || active.generation !== generation) return;

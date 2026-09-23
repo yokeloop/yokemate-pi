@@ -581,6 +581,23 @@ export function openDb(path: string): DatabaseSync {
     CREATE UNIQUE INDEX IF NOT EXISTS group_rework_current
       ON group_rework(group_id, revision_hash) WHERE state IN ('pending','running');
 
+    CREATE TABLE IF NOT EXISTS runtime_capacity_lease (
+      owner_id TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      starttime TEXT NOT NULL,
+      units INTEGER NOT NULL CHECK (units > 0),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS group_fact_lineage (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      sequence INTEGER NOT NULL,
+      snapshot_hash TEXT NOT NULL,
+      PRIMARY KEY (group_id, revision_hash),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS group_effect (
       effect_key TEXT PRIMARY KEY,
       group_id TEXT NOT NULL REFERENCES task_group(id),

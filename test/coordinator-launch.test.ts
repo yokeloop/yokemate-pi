@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
 import { socketDir } from "../src/inbox.ts";
+import { createPlanningGroup, reserveMemberClaims } from "../src/group-state.ts";
 
 async function waitForFile(file: string): Promise<void> {
   if (existsSync(file)) return;
@@ -46,6 +47,22 @@ test("do preparation resolves exact plan parts and CAS prevents stale running wr
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-1','u','review')").run();
     assert.throws(() => markDoRunning(dir, prepared, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator" }), /changed from absent to review/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("single do admission writes an atomic claim that group reservation cannot race", () => {
+  const dir = root();
+  try {
+    const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
+    const setup = openDb(join(dir, "yokemate.db"));
+    setup.prepare("UPDATE project SET tracker='github'").run();
+    setup.close();
+    const prepared = prepareDo(dir, { mode: "do", tickets: ["YM-1"], plan }, {});
+    markDoRunning(dir, prepared, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator", runId: "single", sessionId: "session" });
+    const db = openDb(join(dir, "yokemate.db"));
+    assert.equal((db.prepare("SELECT kind FROM member_claim WHERE ticket='YM-1'").get() as { kind: string }).kind, "single");
+    const groupId = createPlanningGroup(db, { id: "g", rootIdentity: "yt:YM-1", rootTicket: "YM-1", ownerProject: "org/repo" });
+    assert.throws(() => reserveMemberClaims(db, { groupId, treeHash: "a".repeat(64), members: ["yt:YM-1"], tickets: { "yt:YM-1": "YM-1" }, owners: [{ runtimeId: "group", runId: "group", sessionId: "session" }] }), /single run/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

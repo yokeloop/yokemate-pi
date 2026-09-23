@@ -9,6 +9,7 @@ export interface GroupCandidate { groupId: string; revisionHash: string; parts: 
 export interface GroupReviewDeps {
   verifyRepository(part: GroupCandidatePart): Promise<{ ok: boolean; reason?: string }>;
   verifyObligation(obligation: GroupAcceptanceObligation, evidence: ObligationEvidence): Promise<{ ok: boolean; reason?: string }>;
+  verifyCandidate?(candidate: GroupCandidate, obligations: GroupAcceptanceObligation[]): Promise<{ ok: boolean; reason?: string }>;
 }
 export interface GroupReworkBinding { groupId: string; revisionHash: string; candidateHash: string; reworkPlanBinding: PlanBinding }
 
@@ -39,7 +40,10 @@ export async function prepareGroupReview(db: DatabaseSync, input: { groupId: str
   }
   const obligationEvidence = input.obligations.map((obligation) => evidenceById.get(obligation.id)!);
   const candidateHash = canonicalHash({ version: 1, groupId: input.groupId, revisionHash: input.revisionHash, parts, obligationEvidence });
-  return { groupId: input.groupId, revisionHash: input.revisionHash, parts, obligationEvidence, candidateHash };
+  const candidate = { groupId: input.groupId, revisionHash: input.revisionHash, parts, obligationEvidence, candidateHash };
+  const semantic = await deps.verifyCandidate?.(candidate, input.obligations);
+  if (semantic && !semantic.ok) throw new Error(semantic.reason ?? "assembled group candidate semantic review failed");
+  return candidate;
 }
 
 export interface GroupReviewSource { runId: string; runtimeId: string; sessionId: string; candidateHash: string }
