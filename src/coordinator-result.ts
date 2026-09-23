@@ -18,7 +18,7 @@ function gh(cwd: string, args: string[]): unknown { return JSON.parse(execFileSy
 export interface RollupEntry { name?: string; context?: string; workflowName?: string; status?: string; conclusion?: string | null; state?: string }
 export interface GatePrSnapshot { url: string; state: string; headRefName: string; headRefOid: string; baseRefName: string; baseRefOid: string; statusCheckRollup: RollupEntry[] }
 export interface GatePartFacts {
-  repo: string; pr: GatePrSnapshot;
+  repo: string; branch: string; targetBranch?: string; pr: GatePrSnapshot;
   localHead: string | null;
   baseHead: string;
   baseInHead: boolean;
@@ -36,8 +36,9 @@ export function verifyGate(facts: GateFacts): GateVerdict {
   const heads: Record<string, string> = {};
   for (const part of facts.parts) {
     const { repo, pr, receipt } = part;
-    if (pr.state !== "OPEN" || pr.headRefName !== ticket) return { ok: false, reason: `${repo}: PR is not open on ${ticket}` };
-    if (part.localHead === null || part.localHead !== pr.headRefOid) return { ok: false, reason: `${repo}: PR head ${short(pr.headRefOid)} differs from local branch ${ticket} head ${short(part.localHead)}` };
+    if (pr.state !== "OPEN" || pr.headRefName !== part.branch) return { ok: false, reason: `${repo}: PR is not open on ${part.branch}` };
+    if (part.targetBranch && pr.baseRefName !== part.targetBranch) return { ok: false, reason: `${repo}: PR targets ${pr.baseRefName}, not ${part.targetBranch}` };
+    if (part.localHead === null || part.localHead !== pr.headRefOid) return { ok: false, reason: `${repo}: PR head ${short(pr.headRefOid)} differs from local branch ${part.branch} head ${short(part.localHead)}` };
     if (receipt === null) return { ok: false, reason: `${repo}: no ready receipt — run pnpm ready ${ticket}` };
     if (receipt.head !== pr.headRefOid) return { ok: false, reason: `${repo}: ready receipt is for ${short(receipt.head)} but the PR head is ${short(pr.headRefOid)} — run pnpm ready ${ticket}` };
     if (receipt.lockHash !== part.lockHash || receipt.manifestHash !== part.manifestHash) return { ok: false, reason: `${repo}: ready receipt was taken on a lockfile or package.json that differs from the committed head — run pnpm ready ${ticket}` };
@@ -71,17 +72,15 @@ function readReceipt(root: string, ticket: string): ReadyReceipt | null {
   try { return JSON.parse(readFileSync(join(root, "work", ticket, "ready.json"), "utf8")) as ReadyReceipt; } catch { return null; }
 }
 
-export function gatherGateFacts(root: string, ticket: string, parts: { repo: string; selector: string }[]): GateFacts {
-  const receipts = readReceipt(root, ticket);
+export function gatherScopedGateFacts(ticket: string, parts: { repo: string; selector: string; worktree: string; branch: string; targetBranch?: string; receiptPath?: string; receipt?: ReadyEntry | null; expectedScopeId?: string }[]): GateFacts {
   return {
     ticket,
-    parts: parts.map(({ repo, selector }) => {
-      const worktree = join(root, "work", ticket, repo.split("/")[1]!);
+    parts: parts.map(({ repo, selector, worktree, branch, targetBranch, receiptPath, receipt: suppliedReceipt, expectedScopeId }) => {
       if (!existsSync(worktree)) throw new Error(`${repo}: no worktree ${worktree}`);
       const pr = JSON.parse(run(worktree, "gh", ["pr", "view", selector, "--json", "url,state,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup"])) as GatePrSnapshot;
       pr.statusCheckRollup ??= [];
       let localHead: string | null;
-      try { localHead = run(worktree, "git", ["rev-parse", "--verify", "--quiet", `refs/heads/${ticket}`]).trim() || null; } catch { localHead = null; }
+      try { localHead = run(worktree, "git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).trim() || null; } catch { localHead = null; }
       const baseHead = run(worktree, "git", ["ls-remote", "origin", `refs/heads/${pr.baseRefName}`]).split(/\s/)[0] ?? "";
       let baseInHead: boolean;
       try { run(worktree, "git", ["merge-base", "--is-ancestor", baseHead, pr.headRefOid]); baseInHead = baseHead !== ""; } catch { baseInHead = false; }
@@ -90,9 +89,15 @@ export function gatherGateFacts(root: string, ticket: string, parts: { repo: str
       const files = listing.split("\n")
         .filter((path) => /\.ya?ml$/.test(path))
         .map((path) => ({ path, text: run(worktree, "git", ["show", `${pr.headRefOid}:${path}`]) }));
-      const receipt = receipts?.parts?.[repo] ?? null;
+      let receipt: ReadyEntry | null = suppliedReceipt ?? null;
+      if (receiptPath) {
+        try {
+          const value = JSON.parse(readFileSync(receiptPath, "utf8")) as { entry?: ReadyEntry; scopeId?: string };
+          receipt = expectedScopeId && value.scopeId !== expectedScopeId ? null : value.entry ?? null;
+        } catch {}
+      }
       return {
-        repo, pr, localHead, baseHead, baseInHead,
+        repo, branch, targetBranch, pr, localHead, baseHead, baseInHead,
         required: requiredJobs(files),
         manifestHash: blobHash(worktree, pr.headRefOid, "package.json"),
         lockHash: receipt ? blobHash(worktree, pr.headRefOid, receipt.lockfile) : null,
@@ -100,6 +105,11 @@ export function gatherGateFacts(root: string, ticket: string, parts: { repo: str
       };
     }),
   };
+}
+
+export function gatherGateFacts(root: string, ticket: string, parts: { repo: string; selector: string }[]): GateFacts {
+  const receipts = readReceipt(root, ticket);
+  return gatherScopedGateFacts(ticket, parts.map((part) => ({ ...part, worktree: join(root, "work", ticket, part.repo.split("/")[1]!), branch: ticket, receipt: receipts?.parts?.[part.repo] ?? null })));
 }
 
 export function verifyPreparedShipMerged(root: string, prepared: PreparedCoordinator): OutcomeVerification {
@@ -135,6 +145,30 @@ export function verifyCoordinatorOutcome(root: string, prepared: PreparedCoordin
     if (prepared.mode === "do") {
       const ticket = prepared.tickets[0]!;
       const db = openDb(join(root, "yokemate.db"));
+      if (prepared.group) {
+        if (prepared.group.role === "rework") {
+          const rework = db.prepare("SELECT state,reviewer_json FROM group_rework WHERE group_id=? AND revision_hash=? ORDER BY updated_at DESC LIMIT 1").get(prepared.group.groupId, prepared.group.revisionHash) as { state: string; reviewer_json: string | null } | undefined;
+          if (rework?.state !== "ready" || !rework.reviewer_json) return { ok: false, reason: `${ticket}: group rework is ${rework?.state ?? "missing"} without bound reviewer evidence` };
+          const allRows = db.prepare("SELECT repo,final_pr FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(prepared.group.groupId, prepared.group.revisionHash) as unknown as { repo: string; final_pr: string | null }[];
+          const rows = allRows.filter((row) => prepared.parts.some((part) => part.repo === row.repo));
+          if (rows.length !== prepared.parts.length || rows.some((row) => !row.final_pr)) return { ok: false, reason: `${ticket}: group rework final PR set is incomplete` };
+          const verdict = verifyGate(gatherScopedGateFacts(ticket, prepared.parts.map((part) => ({ repo: part.repo, selector: rows.find((row) => row.repo === part.repo)!.final_pr!, worktree: part.worktree!, branch: part.branch, targetBranch: part.targetBranch, receiptPath: join(part.worktree!, ".yokemate-ready.json"), expectedScopeId: part.scopeId }))));
+          return verdict.ok ? { ok: true, parts: rows.map((row) => row.repo) } : { ok: false, reason: verdict.reason };
+        }
+        if (prepared.group.role === "parent") {
+          const group = db.prepare("SELECT phase FROM task_group WHERE id=? AND active_revision=?").get(prepared.group.groupId, prepared.group.revisionHash) as { phase: string } | undefined;
+          if (group?.phase !== "review") return { ok: false, reason: `${prepared.group.root}: group is still ${group?.phase ?? "missing"}` };
+          const pending = db.prepare("SELECT repo FROM group_repository WHERE group_id=? AND revision_hash=? AND (final_pr IS NULL OR head_sha IS NULL OR ship_state!='ready') ORDER BY repo").all(prepared.group.groupId, prepared.group.revisionHash) as unknown as { repo: string }[];
+          return pending.length ? { ok: false, reason: `group assembly is incomplete: ${pending.map((row) => row.repo).join(", ")}` } : { ok: true, parts: prepared.parts.map((part) => part.repo) };
+        }
+        const member = db.prepare("SELECT member_identity,execution FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(prepared.group.groupId, prepared.group.revisionHash, ticket) as { member_identity: string; execution: string } | undefined;
+        if (!member || member.execution !== "running") return { ok: false, reason: `${ticket}: group member is ${member?.execution ?? "missing"}` };
+        if (prepared.group.ownWork === "coordination-only") return prepared.parts.length === 0 ? { ok: true, parts: [] } : { ok: false, reason: `${ticket}: coordination-only member has repository parts` };
+        const rows = db.prepare("SELECT repo,pr_identity,readiness_json FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(prepared.group.groupId, prepared.group.revisionHash, member.member_identity) as unknown as { repo: string; pr_identity: string | null; readiness_json: string | null }[];
+        if (rows.length !== prepared.parts.length || rows.some((row) => !row.pr_identity || !row.readiness_json || !(JSON.parse(row.readiness_json) as { ok?: boolean }).ok)) return { ok: false, reason: `${ticket}: group member readiness is incomplete` };
+        const verdict = verifyGate(gatherScopedGateFacts(ticket, prepared.parts.map((part) => ({ repo: part.repo, selector: rows.find((row) => row.repo === part.repo)!.pr_identity!, worktree: part.worktree!, branch: part.branch, targetBranch: part.targetBranch, receiptPath: join(part.worktree!, ".yokemate-ready.json"), expectedScopeId: part.scopeId }))));
+        return verdict.ok ? { ok: true, parts: rows.map((row) => row.repo) } : { ok: false, reason: verdict.reason };
+      }
       const work = db.prepare("SELECT id, stage FROM work WHERE ticket = ?").get(ticket) as { id: number; stage: string } | undefined;
       if (!work || work.stage !== "review") return { ok: false, reason: `${ticket} is still ${work?.stage ?? "unrecorded"}` };
       const rows = db.prepare("SELECT repo, branch, pr FROM part WHERE work_id = ? ORDER BY repo").all(work.id) as { repo: string; branch: string; pr: string }[];

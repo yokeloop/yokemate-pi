@@ -14,6 +14,7 @@ const required = [{ workflow: "ci", job: "checks" }, { workflow: "ci", job: "pi-
 function part(overrides: Partial<GatePartFacts> = {}, rollup: RollupEntry[] = [green("checks"), green("pi-loader-smoke"), notify]): GatePartFacts {
   return {
     repo: "org/repo",
+    branch: "YM-1",
     pr: { url: "https://github.com/org/repo/pull/1", state: "OPEN", headRefName: "YM-1", headRefOid: HEAD, baseRefName: "main", baseRefOid: BASE, statusCheckRollup: rollup },
     localHead: HEAD, baseHead: BASE, baseInHead: true, required,
     manifestHash: "m", lockHash: "l",

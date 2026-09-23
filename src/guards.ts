@@ -11,7 +11,8 @@
 // guard must not paralyze the work it protects (same policy as bash-guard).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { judge } from "./bash-guard.ts";
 import { dataRoot as dataRootOf } from "./data-root.ts";
@@ -59,6 +60,53 @@ export function stopDelivery(
   return { content: reason, triggerTurn: reason !== last };
 }
 
+export function groupScopeVerdict(toolName: string, input: Record<string, unknown>, cwd: string, env: NodeJS.ProcessEnv): string | null {
+  const groupRole = env.YOKEMATE_GROUP_ROLE;
+  if (!groupRole) return null;
+  const paths = JSON.parse(env.YOKEMATE_GROUP_SCOPE_PATHS ?? "[]") as string[];
+  const branches = JSON.parse(env.YOKEMATE_GROUP_SCOPE_BRANCHES ?? "[]") as string[];
+  if (!Array.isArray(paths) || !Array.isArray(branches) || paths.some((value) => typeof value !== "string" || !isAbsolute(value)) || branches.some((value) => typeof value !== "string" || !value)) return "group work scope is malformed";
+  const canonical = (value: string): string => {
+    let current = resolve(value);
+    const tail: string[] = [];
+    while (!existsSync(current) && dirname(current) !== current) { tail.unshift(basename(current)); current = dirname(current); }
+    return resolve(realpathSync(current), ...tail);
+  };
+  const canonicalScopes = paths.map(canonical);
+  const inside = (parent: string, value: string) => value === parent || value.startsWith(parent + sep);
+  if (["write", "edit", "notebook_edit"].includes(toolName)) {
+    const value = input.path ?? input.notebook_path;
+    const target = typeof value === "string" ? resolve(cwd, value) : "";
+    if (!target || !canonicalScopes.some((scope) => inside(scope, canonical(target)))) return "group write is outside the registered WorkScope";
+  }
+  if (toolName === "mcp") return "group execution cannot use an unscoped MCP effect; use the registered group control tools";
+  if (toolName !== "bash") return null;
+  const command = String(input.command ?? "");
+  if (!command.trim()) return "group shell command is empty";
+  if (/[`]|\$\(|<<|\b(?:eval|exec|env|xargs|find\b[^\n]*-exec|python\d*|node|perl|ruby|php|lua|bash|zsh|fish|dash|sh)\b/.test(command)) return "group shell cannot execute an unscoped interpreter or command expansion";
+  if (/\bgh\s+(?:pr\s+merge|api)\b|\b(?:curl|wget|http|httpie|nc|ncat|socat|ssh|scp|rsync)\b|\bpnpm\s+(?:run\s+)?ship-merge\b/.test(command)) return "group execution cannot bypass the trusted merge/effect handlers";
+  if (/(^|[;&|]\s*)(?:sudo\s+)?(?:rm|mv|cp|mkdir|touch|tee|install|truncate|dd)\b|\bsed\b[^\n;&|]*\s-(?:-in-place|[A-Za-z]*i)\b|(^|[^0-9])>>?/.test(command)) return "group shell writes are unscoped; use Write/Edit inside the registered WorkScope";
+  const segments = command.split(/\s*(?:&&|\|\||[;|\n])\s*/).filter(Boolean);
+  for (const segment of segments) {
+    const gitAt = segment.search(/(?:^|\s)git(?:\s|$)/);
+    if (gitAt < 0) continue;
+    const git = segment.slice(gitAt).trim();
+    const directory = /(?:^|\s)-C\s+(?:'([^']+)'|"([^"]+)"|(\S+))/.exec(git);
+    const effectiveCwd = resolve(cwd, directory?.[1] ?? directory?.[2] ?? directory?.[3] ?? ".");
+    const operation = /(?:^|\s)(add|am|apply|commit|restore|reset|checkout|switch|push|pull|merge|rebase|cherry-pick|update-ref|branch|tag|worktree)(?:\s|$)/.exec(git)?.[1];
+    if (!operation) continue;
+    if (["merge", "rebase", "cherry-pick", "pull", "update-ref"].includes(operation)) return "group branches integrate only through the registered group handlers";
+    if (!canonicalScopes.some((scope) => inside(scope, canonical(effectiveCwd)))) return "group git mutation is outside the registered WorkScope";
+    if (operation === "push") {
+      const tail = git.slice(git.search(/(?:^|\s)push(?:\s|$)/) + git.match(/(?:^|\s)push(?:\s|$)/)![0].length).trim();
+      const tokens = tail.match(/'[^']*'|"[^"]*"|\S+/g)?.map((token) => token.replace(/^(['"])(.*)\1$/, "$2")) ?? [];
+      const positional = tokens.filter((token) => !token.startsWith("-") && token !== "origin");
+      if (groupRole === "parent" || tokens.some((token) => /^--(?:delete|mirror|all|force)/.test(token)) || positional.length !== 1 || !branches.includes(positional[0]!) || positional[0]!.includes(":")) return "group push must name only the registered source branch; integration and external refs are parent-owned effects";
+    }
+  }
+  return null;
+}
+
 export default function guards(pi: ExtensionAPI) {
   // Raw read-only handle, not openDb: a guard runs no DDL. Closed on the way
   // out — report-guard.ts leaves that to the process exit, an extension lives on.
@@ -90,6 +138,8 @@ export default function guards(pi: ExtensionAPI) {
     }
     try {
       const settings = readRuntimeSettings(ROOT);
+      const groupRefusal = groupScopeVerdict(event.toolName, event.input as Record<string, unknown>, ctx.cwd, process.env);
+      if (groupRefusal) return { block: true, reason: groupRefusal };
       if (process.env.YOKEMATE_MODE === "do" && event.toolName === "bash")
         assertMandatoryBoundary("workflow.assigned-scope", typeof ctx.cwd === "string" && isAbsolute(ctx.cwd), "package operation needs an absolute host cwd; use cd '<assigned worktree>' && npm test");
       const call = guardCall(event.toolName, event.input as Record<string, unknown>, ctx.cwd);
@@ -112,6 +162,7 @@ export default function guards(pi: ExtensionAPI) {
       return ok ? undefined : { block: true, reason: v.reason };
     } catch (e) {
       if (e instanceof RuntimeSettingsError || e instanceof WorkflowBoundaryError) return { block: true, reason: e.message };
+      if (process.env.YOKEMATE_GROUP_ROLE) return { block: true, reason: `group scope guard failure: ${(e as Error).message}` };
       if (process.env.YOKEMATE_MODE === "ship" && event.toolName === "bash") return { block: true, reason: `ship merge guard failure: ${(e as Error).message}` };
       return undefined;
     }

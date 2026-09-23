@@ -6,6 +6,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { findPlan, parseAffected } from "./adopt.ts";
 import { dataRoot } from "./data-root.ts";
 import { openDb } from "./db.ts";
+import { resolveGroupWorkScope } from "./group-scope.ts";
 
 export interface ReadyPart { repo: string; worktree: string }
 export interface Recipe { manager: "pnpm" | "npm" | "yarn"; lockfile: string; command: string[] }
@@ -48,9 +49,9 @@ const defaultRun: ReadyDeps["run"] = (command, cwd) => {
   return { exit: out.status ?? 1, output: `${out.stdout ?? ""}${out.stderr ?? ""}${out.error ? out.error.message : ""}` };
 };
 
-type PartOutcome = { ok: true; entry: ReadyEntry } | { ok: false; reason: string; output: string };
+export type PartOutcome = { ok: true; entry: ReadyEntry } | { ok: false; reason: string; output: string };
 
-function readyPart(ticket: string, part: ReadyPart, run: ReadyDeps["run"]): PartOutcome {
+export function readyPart(ticket: string, part: ReadyPart, run: ReadyDeps["run"] = defaultRun, expectedBranch = ticket): PartOutcome {
   const blocked = (reason: string, output = ""): PartOutcome => ({ ok: false, reason: `${part.repo}: ${reason}`, output });
   const worktree = part.worktree;
   if (!existsSync(worktree)) return blocked(`no worktree ${worktree} — git worktree add first`);
@@ -58,7 +59,7 @@ function readyPart(ticket: string, part: ReadyPart, run: ReadyDeps["run"]): Part
   try { top = realpathSync(git(worktree, "rev-parse", "--show-toplevel")); } catch { return blocked(`${worktree} is not a repository worktree`); }
   if (top !== realpathSync(worktree)) return blocked(`${worktree} is not a repository worktree`);
   const branch = git(worktree, "rev-parse", "--abbrev-ref", "HEAD");
-  if (branch !== ticket) return blocked(`worktree is on ${branch}, not ${ticket}`);
+  if (branch !== expectedBranch) return blocked(`worktree is on ${branch}, not ${expectedBranch}`);
   const head = git(worktree, "rev-parse", "HEAD");
 
   const recipe = recipeFor(worktree);
@@ -126,9 +127,39 @@ export function readyTicket(root: string, ticket: string, deps: Partial<ReadyDep
   const dbPath = join(root, "yokemate.db");
   const db = existsSync(dbPath) ? openDb(dbPath) : null;
   const work = db?.prepare("SELECT stage, plan FROM work WHERE ticket = ?").get(ticket) as { stage: string; plan: string | null } | undefined;
-  if (work && work.stage !== "running" && work.stage !== "review") return refuse(`${ticket} is ${work.stage} — spawn or adopt first`);
-  if (!db || (!work && !existsSync(join(root, "work", ticket)))) return refuse(`${ticket} is unrecorded — spawn or adopt first`);
+  const groupId = process.env.YOKEMATE_GROUP_ID;
+  const revisionHash = process.env.YOKEMATE_GROUP_REVISION;
+  const groupMember = process.env.YOKEMATE_GROUP_MEMBER;
+  const scopedGroup = Boolean(db && groupId && revisionHash && groupMember === ticket);
+  if (!scopedGroup && work && work.stage !== "running" && work.stage !== "review") return refuse(`${ticket} is ${work.stage} — spawn or adopt first`);
+  if (!db || (!scopedGroup && !work && !existsSync(join(root, "work", ticket)))) return refuse(`${ticket} is unrecorded — spawn or adopt first`);
   try {
+    if (db && groupId && revisionHash && groupMember === ticket) {
+      const member = db.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(groupId, revisionHash, ticket) as { member_identity: string } | undefined;
+      if (!member) return refuse(`${ticket}: group member scope is missing`);
+      const rework = process.env.YOKEMATE_GROUP_ROLE === "rework";
+      const allRows = (rework
+        ? db.prepare("SELECT repo FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(groupId, revisionHash)
+        : db.prepare("SELECT repo FROM group_part WHERE group_id=? AND revision_hash=? AND member_identity=? ORDER BY repo").all(groupId, revisionHash, member.member_identity)) as unknown as { repo: string }[];
+      const reworkRow = rework ? db.prepare("SELECT plan_binding_json FROM group_rework WHERE group_id=? AND revision_hash=? AND state='running'").get(groupId, revisionHash) as { plan_binding_json: string } | undefined : undefined;
+      const reworkRepos = reworkRow ? (JSON.parse(reworkRow.plan_binding_json) as { repositories: string[] }).repositories : [];
+      const rows = rework ? allRows.filter((row) => reworkRepos.includes(row.repo)) : allRows;
+      if (!rows.length) return refuse(`${ticket}: coordination-only member has no repository readiness command`);
+      const receipt: ReadyReceipt = { ticket, parts: {} };
+      const parts: ReadyPart[] = [];
+      for (const row of rows) {
+        const kind = rework ? "integration" : ticket === process.env.YOKEMATE_GROUP_ROOT ? "root-own" : "member";
+        const scope = resolveGroupWorkScope(db, join(root, "work", process.env.YOKEMATE_GROUP_ROOT!), { groupId, revisionHash, memberIdentity: member.member_identity, kind, repo: row.repo });
+        const part = { repo: row.repo, worktree: scope.worktree! };
+        const outcome = readyPart(ticket, part, deps.run ?? defaultRun, scope.branch!);
+        if (!outcome.ok) return { ...outcome, parts };
+        receipt.parts[row.repo] = outcome.entry;
+        writeFileSync(scope.receiptPath!, JSON.stringify({ ticket, groupId, revisionHash, scopeId: scope.scopeId, repo: row.repo, entry: outcome.entry }, null, 2) + "\n");
+        parts.push(part);
+      }
+      writeFileSync(join(root, "work", process.env.YOKEMATE_GROUP_ROOT!, "members", ticket, "ready.json"), JSON.stringify(receipt, null, 2) + "\n");
+      return { ok: true, receipt, parts };
+    }
     const plan = work?.plan ?? findPlan(dataRoot(root), ticket);
     if (!plan || !existsSync(plan)) return refuse(`${ticket}: no readable plan`);
     const parts: ReadyPart[] = parseAffected(readFileSync(plan, "utf8")).map((planned) => {

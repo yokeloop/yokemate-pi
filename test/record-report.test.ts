@@ -67,11 +67,15 @@ test("record-report records a green gate", async () => {
     running(s);
     writeReceipt(s);
     writePr(s, "34", passing);
+    const before = openDb(join(s.root, "yokemate.db"));
+    before.prepare("INSERT INTO member_claim (member_identity,ticket,kind,owners_json,state) VALUES ('single:YM-9','YM-9','single','[]','active')").run();
+    before.close();
     const out = await withShim(s, () => recordReport(s.root, "YM-9", [part], env, { push: () => undefined }));
     assert.deepEqual(out, { repeat: false });
     const db = openDb(join(s.root, "yokemate.db"));
     assert.equal((db.prepare("SELECT stage FROM work WHERE ticket = 'YM-9'").get() as { stage: string }).stage, "review");
     assert.deepEqual(db.prepare("SELECT repo, pr FROM part").all().map((row) => ({ ...row })), [{ repo: "org/repo", pr: part.pr }]);
+    assert.equal(db.prepare("SELECT 1 FROM member_claim WHERE ticket='YM-9'").get(), undefined);
     const journal = readdirSync(join(s.root, "home", "journal")).map((name) => readFileSync(join(s.root, "home", "journal", name), "utf8")).join("");
     assert.match(journal, /YM-9 сделано: PR #34/);
   } finally { rmSync(s.root, { recursive: true, force: true }); }

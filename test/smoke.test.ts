@@ -1365,13 +1365,13 @@ test("plan applies grill-docs in Interview and Questions", () => {
   const interview = skill.slice(skill.indexOf("### Interview"), skill.indexOf("### The cut"));
   assert.match(interview, /read `\.\.\/grill-docs\/SKILL\.md` relative to this skill directory/i);
   assert.match(interview, /apply it before.*four fields/is);
-  const reconnaissance = skill.slice(skill.indexOf("1. **Reconnaissance**"), skill.indexOf("3. **Plan**"));
+  const reconnaissance = skill.slice(skill.indexOf("1. **Reconnaissance**"), skill.indexOf("4. **Plan**"));
   const accepted = reconnaissance.indexOf("accepted");
   const grill = reconnaissance.indexOf("../grill-docs/SKILL.md");
   assert.ok(accepted >= 0 && grill > accepted);
   assert.match(reconnaissance, /already answered.*only.*new material gaps/is);
   assert.match(reconnaissance, /no new material gaps.*plan-writer/is);
-  assert.match(skill, /3\. \*\*Plan\*\*.*4\. \*\*Record\*\*/s);
+  assert.match(skill, /3\. \*\*Approach\*\*.*4\. \*\*Plan\*\*.*5\. \*\*Record\*\*/s);
 });
 
 test("plan keeps knowledge ownership and record contract", () => {
@@ -1382,7 +1382,7 @@ test("plan keeps knowledge ownership and record contract", () => {
   assert.match(skill, /<yokemate>\/context\.md/);
   assert.match(skill, /grill-docs.*criteria.*permission/is);
   assert.match(skill, /Never delegate.*(?:scout|writer).*documentation write/is);
-  const plan = skill.slice(skill.indexOf("3. **Plan**"), skill.indexOf("4. **Record**"));
+  const plan = skill.slice(skill.indexOf("4. **Plan**"), skill.indexOf("5. **Record**"));
   assert.match(plan, /task.*final decisions.*term definitions.*resolved conflicts/is);
   assert.match(plan, /exact paths and sections.*actually written.*assumptions/is);
   assert.match(plan, /acceptedInputId.*immutable full scout bytes/is);
@@ -1402,7 +1402,7 @@ test("plan agents preserve documentation handoff boundaries", () => {
   assert.match(scout, /facts.*past decisions.*proposals/is);
   assert.match(scout, /read-only.*three.*do not create documentation/is);
   assert.match(scout, /do not invent.*questions.*documentation/is);
-  const handoff = plan.slice(plan.indexOf("3. **Plan**"), plan.indexOf("4. **Record**"));
+  const handoff = plan.slice(plan.indexOf("4. **Plan**"), plan.indexOf("5. **Record**"));
   assert.match(handoff, /task.*final decisions.*exact paths and sections/is);
   assert.match(handoff, /`acceptedInputId` separately.*immutable full scout bytes/is);
   assert.match(writer, /final answers.*documented decisions/is);

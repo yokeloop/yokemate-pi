@@ -605,11 +605,13 @@ test("ordinary public dispatch pins its snapshot and independently enforces all 
     await assert.rejects(() => dispatch(task), /Too many detached/);
     set({ detachedLimit: false }, { maxParallelTasks: 1, maxConcurrency: 1, maxDetached: 1 });
     const second = await dispatch(task);
-    await count(10);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(connections.length, 9);
     await assert.rejects(() => dispatch({ tasks: [task, task] }), /Too many parallel tasks/);
     set({}, { maxDetached: "invalid" });
     assert.match(text((await dispatch(task)).result), /subagent.maxDetached/);
     await finish(live, [8]);
+    await count(10);
     await finish(second, [9]);
     set({}, { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 2 });
     const shutdownStart = connections.length;

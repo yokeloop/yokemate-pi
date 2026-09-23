@@ -14,4 +14,6 @@ Run `pnpm where do $@` first for a bare ticket list. If the engineer named a pla
 - **run** — say this coordinator already runs these keys and stop.
 - **refuse: …** — print that line unchanged and stop.
 
+For an activated group root, the accepted launch opens one conversational root group-do surface while its member coordinators remain bounded background children. The durable scheduler preserves queued members under capacity, and only reviewed internal PRs target `<ROOT>`; root own-work uses `<ROOT>-own`. A child key cannot be launched singly while claimed by the group.
+
 The exact raw interactive command already created parent-owned single-use approval on the current recorded plan. The backend consumes it without a second do-confirm. Unambiguous natural-language approval is extracted from that same interactive input by the configured model, never from tool arguments or reports. Pass only the requested keys and explicit plan/model values; no receipt, hash, authority or continuation parameter exists. `--plan` must match the recorded binding. Show a refused receipt verbatim; do not repair it with another generic confirmation. Scope or plan changes require fresh explicit approval.

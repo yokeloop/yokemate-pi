@@ -130,7 +130,7 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
     };
     const extension = loaded.extensions[0]!;
     const tool = extension.tools.get("subagent")!.definition;
-    const ctx = { cwd: root, mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => "plan-session" }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { hasConfiguredAuth: () => true }, ui: { setWidget() {}, notify() {} } } as unknown as ExtensionContext;
+    const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "plan-session" }, model: { provider: "ym204-fixture", id: "deterministic" }, modelRegistry: { hasConfiguredAuth: () => true, complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: '{"kind":"approve","evidence":[{"start":0,"end":8,"text":"approved"}]}' }] }) }, ui: { setWidget() {}, notify() {} } } as unknown as ExtensionContext;
     for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
     shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
     await assert.rejects(() => tool.execute("missing", { agent: "plan-writer", task: "write", ticket: "YM-1" }, undefined, () => undefined, ctx), /acceptedInputId/);
@@ -139,6 +139,12 @@ for (const scenario of cases) test(`${scenario.name.startsWith("YM-221") ? scena
     assert.equal(sourceResult.artifact.state, "accepted");
     assert.equal(sourceResult.publication.state, "pending");
     const scout = { id: sourceResult.artifact.acceptanceId };
+    Object.assign(process.env, { YOKEMATE_MODE: "plan", YOKEMATE_ROLE: "coordinator" });
+    const approach = extension.tools.get("plan_approach")!.definition;
+    await approach.execute("approach", { approachText: "Use the fixture writer contract.", treeHash: sha256("YM-1"), acceptedScouts: [{ ticket: "YM-1", acceptanceId: scout.id, hash: sourceResult.artifact.hash }] }, undefined, () => undefined, ctx);
+    for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text: "approved" } as never, ctx);
+    delete process.env.YOKEMATE_MODE;
+    delete process.env.YOKEMATE_ROLE;
     const slug = scenario.spaced ? "work with spaces" : "work";
     let folder = join(root, "home/knowledge/org/repo/ai", `YM-1-${slug}`);
     mkdirSync(folder, { recursive: true });

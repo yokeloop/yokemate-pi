@@ -106,6 +106,7 @@ export function checkMove(
 }
 
 export type MoveOutcome = { ok: true; prev: From; repeat: boolean } | { ok: false; refuse: string };
+export interface GroupMoveScope { groupId: string; revisionHash: string; memberIdentity: string }
 
 /**
  * Check and write inside one BEGIN IMMEDIATE transaction, so the stage read
@@ -118,7 +119,7 @@ export function applyMove(
   env: MoveEnv,
   ticket: string,
   write: (prev: From) => void,
-  opts: { allowFresh?: boolean; expected?: From; settings?: RuntimeSettings } = {}
+  opts: { allowFresh?: boolean; expected?: From; settings?: RuntimeSettings; groupScope?: GroupMoveScope } = {}
 ): MoveOutcome {
   const settings = opts.settings ?? readRuntimeSettings();
   db.exec("BEGIN IMMEDIATE");
@@ -127,6 +128,14 @@ export function applyMove(
       | { stage: Stage }
       | undefined;
     const prev: From = row?.stage ?? "absent";
+    const claim = db.prepare(`SELECT group_id,revision_hash,member_identity,state
+      FROM member_claim WHERE kind='group' AND ticket=? AND state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as
+      | { group_id: string; revision_hash: string | null; member_identity: string; state: string }
+      | undefined;
+    if (claim && (!opts.groupScope || opts.groupScope.groupId !== claim.group_id || opts.groupScope.revisionHash !== claim.revision_hash || opts.groupScope.memberIdentity !== claim.member_identity)) {
+      db.exec("ROLLBACK");
+      return { ok: false, refuse: `${ticket} belongs to group ${claim.group_id}/${claim.revision_hash} (${claim.state})` };
+    }
     if (opts.expected !== undefined && prev !== opts.expected) {
       db.exec("ROLLBACK");
       return { ok: false, refuse: `${ticket} changed from ${opts.expected} to ${prev}` };

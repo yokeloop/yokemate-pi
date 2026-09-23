@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -15,17 +16,18 @@ import type { ChildIdentity } from "./subagent-runs.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
 import type { ReviewHandoffOutcome, ReviewInputGeneration, ReviewReworkExtraction, ReviewSurfaceIdentity } from "./review-rework.ts";
 import { cancellationResult, type CancellationResult } from "./subagent-runs.ts";
+import { PlanApproachStore, type PlanApproachProposal } from "./plan-approach.ts";
 
 export interface ControlOrigin { sessionId: string; runtimeId?: string; pid: number; starttime: string; cwd: string; pane?: string; parentPane?: string; mode?: string; ticket?: string; role?: string }
-export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "status" | "cancel" | PlanControlOperation | ReviewControlOperation; ticket?: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; raw?: string; generation?: ReviewInputGeneration | number; extraction?: ReviewReworkExtraction; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; toolCallId?: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number; candidateId?: string; failureHash?: string; writerRunId?: string }
+export interface ControlEnvelope { version: 1; operation: "attach-origin" | "launch" | "launch-plan" | "merge" | "ship-finalize" | "finish" | "status" | "cancel" | PlanControlOperation | ReviewControlOperation; ticket?: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; raw?: string; generation?: ReviewInputGeneration | number; extraction?: ReviewReworkExtraction; outcome?: "blocked" | "cancelled"; reason?: string; requestId: string; toolCallId?: string; originId?: string; origin?: ControlOrigin; targetSessionId?: string; targetRuntimeId?: string; request?: CoordinatorRequest; planRequest?: PlanLaunchRequest; mergeRequest?: CoordinatorMergeRequest; runId?: string; listRunId?: string; keyRunId?: string; targetRequestId?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number; candidateId?: string; failureHash?: string; writerRunId?: string; facts?: Record<string, unknown> }
 export interface ControlResult { key: string; keyRunId: string; state: "accepted" | "refused"; reservation?: "ready" | "queued"; reason?: string; identity?: unknown }
 export interface ControlReply { requestId: string; state: "received" | "accepted" | "refused" | "status"; reason?: string; runId?: string; listRunId?: string; keyRunId?: string; originId?: string; identity?: unknown; cancellation?: CancellationResult; merge?: CoordinatorMergeResult; finalization?: ShipFinalizeResult; results?: ControlResult[]; publicationId?: number; acceptanceId?: number; artifactAcceptance?: "accepted" | "superseded"; recordId?: number; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: PlanHandoff; target?: string; revision?: string; snapshotPath?: string; scoutPublication?: number; scoutAcceptance?: number; generation?: ReviewInputGeneration | number; rework?: ReviewHandoffOutcome; facts?: Record<string, unknown>; candidateId?: string; failureHash?: string; planningIdentity?: string }
-export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan" | "register-scout-candidate" | "read-scout-candidate" | "continue-scout-candidate" | "bind-recovered-scout" | "read-plan-writer-input" | "admit-plan-writer";
-export type ReviewControlOperation = "register-review" | "bind-review" | "review-started" | "review-input" | "review-extraction" | "review-record" | "review-status" | "review-ended";
+export type PlanControlOperation = "register-plan" | "bind-plan" | "plan-started" | "register-group-plan-scope" | "plan-approach-present" | "plan-input" | "plan-approach-extraction" | "group-plan-activated" | "publish-plan-scout" | "reject-plan-scout" | "prepare-plan-publication" | "plan-recorded" | "plan-finished" | "record-plan" | "register-scout-candidate" | "read-scout-candidate" | "continue-scout-candidate" | "bind-recovered-scout" | "read-plan-writer-input" | "admit-plan-writer";
+export type ReviewControlOperation = "register-review" | "bind-review" | "review-started" | "review-input" | "review-extraction" | "review-record" | "review-accept" | "review-status" | "review-ended";
 export type PlanHandoff = "plan-only" | "unavailable" | "started" | "refused";
 export interface PlanRecordOutcome { runId?: string; reason: string; facts?: Record<string, unknown>; publication?: "complete" | "pending"; publications?: PublicationOutcome[]; handoff?: PlanHandoff; target?: string; revision?: string }
 export type PlanCompletionContext = { kind: "registered"; runId: string; listRunId?: string } | { kind: "save-only"; admissionId: string } | { kind: "main" } | { kind: "problem"; packageKey: string };
-export interface ParentControl { publishPlanScout?(ticket: string, acceptanceId: number, child: ChildIdentity, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, context: PlanCompletionContext): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; binding: PlanBinding; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, context: PlanCompletionContext, acceptanceId: number, verifyCompletion: (binding: PlanBinding) => void, contentHash: string): Promise<PlanRecordOutcome>; planRecorded?(ticket: string, path: string, recordId: number, origin: ControlOrigin, context: PlanCompletionContext, verifyCompletion: (binding: PlanBinding) => void, prior: PlanRecordOutcome | undefined, contentHash: string): Promise<PlanRecordOutcome>; planFinished?(ticket: string, context: PlanCompletionContext, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin): Promise<void>; reviewStarted?(ticket: string, runId: string, origin: ControlOrigin, surface: ReviewSurfaceIdentity): Promise<void> | void; reviewInput?(ticket: string, runId: string, raw: string, origin: ControlOrigin): Promise<ReviewInputGeneration> | ReviewInputGeneration; reviewExtraction?(ticket: string, runId: string, extraction: ReviewReworkExtraction, generation: ReviewInputGeneration, origin: ControlOrigin): Promise<void> | void; reviewRecord?(ticket: string, runId: string, path: string, origin: ControlOrigin): Promise<ReviewHandoffOutcome>; reviewStatus?(ticket: string, runId: string, origin: ControlOrigin): Promise<ReviewHandoffOutcome | undefined> | ReviewHandoffOutcome | undefined; reviewEnded?(ticket: string, runId: string, reason: string, origin: ControlOrigin): Promise<void> | void; planRegistered?(ticket: string, runId: string, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): void; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<CancellationResult | void> }
+export interface ParentControl { groupPlanActivated?(ticket: string, context: Extract<PlanCompletionContext, { kind: "registered" }>, facts: Record<string, unknown>, origin: ControlOrigin, approach: { store: PlanApproachStore; proposal: PlanApproachProposal }): Promise<void> | void; publishPlanScout?(ticket: string, acceptanceId: number, child: ChildIdentity, origin: ControlOrigin): Promise<{ reason: string; publication: "complete" | "pending"; target: string; revision: string; publicationId?: number }>; preparePlanPublication?(ticket: string, path: string, contentHash: string, acceptanceId: number, origin: ControlOrigin, context: PlanCompletionContext): Promise<{ reason: string; recordId: number; snapshotPath: string; scoutAcceptance: number; revision: string; binding: PlanBinding; publicationId?: number; scoutPublication?: number; target?: string }>; recordPlan?(ticket: string, path: string, origin: ControlOrigin, context: PlanCompletionContext, acceptanceId: number, verifyCompletion: (binding: PlanBinding) => void, contentHash: string): Promise<PlanRecordOutcome>; planRecorded?(ticket: string, path: string, recordId: number, origin: ControlOrigin, context: PlanCompletionContext, verifyCompletion: (binding: PlanBinding) => void, prior: PlanRecordOutcome | undefined, contentHash: string): Promise<PlanRecordOutcome>; planFinished?(ticket: string, context: PlanCompletionContext, outcome: "blocked" | "cancelled", reason: string, origin: ControlOrigin, groupScope?: { groupId: string; treeHash: string }): Promise<void>; reviewStarted?(ticket: string, runId: string, origin: ControlOrigin, surface: ReviewSurfaceIdentity): Promise<void> | void; reviewInput?(ticket: string, runId: string, raw: string, origin: ControlOrigin): Promise<ReviewInputGeneration> | ReviewInputGeneration; reviewExtraction?(ticket: string, runId: string, extraction: ReviewReworkExtraction, generation: ReviewInputGeneration, origin: ControlOrigin): Promise<void> | void; reviewRecord?(ticket: string, runId: string, path: string, origin: ControlOrigin, facts?: Record<string, unknown>): Promise<ReviewHandoffOutcome>; reviewAccept?(ticket: string, runId: string, facts: Record<string, unknown>, origin: ControlOrigin): Promise<void> | void; reviewStatus?(ticket: string, runId: string, origin: ControlOrigin): Promise<ReviewHandoffOutcome | undefined> | ReviewHandoffOutcome | undefined; reviewEnded?(ticket: string, runId: string, reason: string, origin: ControlOrigin): Promise<void> | void; planRegistered?(ticket: string, runId: string, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): void; launchPlan?(request: PlanLaunchRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ listRunId: string; results: ControlResult[] }>; launch(request: CoordinatorRequest, origin: ControlOrigin, dispatch: { requestId: string; toolCallId?: string }): Promise<{ runId?: string; listRunId?: string; identity?: unknown; results?: ControlResult[]; afterAck?(): void }>; merge?(runId: string, request: CoordinatorMergeRequest, origin: ControlOrigin): Promise<CoordinatorMergeResult>; finalizeShip?(runId: string, origin: ControlOrigin): Promise<ShipFinalizeResult>; finish?(runId: string, outcome: "done" | "blocked", summary: string, reason: string | undefined, origin: ControlOrigin): Promise<void>; status(requestId: string, origin: ControlOrigin): ControlReply; cancel(runId: string, origin: ControlOrigin): Promise<CancellationResult | void> }
 export class PlanRecorderFences {
   private readonly fenced = new Set<string>();
   private readonly stopAgents = new Set<string>();
@@ -90,6 +92,9 @@ interface PlanRunState {
   recovery?: { candidateId: string; failureHash: string; generation: number; planningIdentity: string; state: "active" | "cancelled" | "recorded" };
   scoutChildren?: Map<number, ChildIdentity>;
   prepared?: PreparedPlanRecord;
+  groupScope?: { groupId: string; treeHash: string; ownerProject: string; members: Set<string> };
+  approachStore?: PlanApproachStore;
+  approachProposal?: PlanApproachProposal;
 }
 
 interface PreparedPlanRecord {
@@ -178,6 +183,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const planRuns = new Map<string, PlanRunState>();
   const reviewRuns = new Map<string, { ticket: string; launcher: ControlOrigin; expectedRuntimeId: string; pane?: string; surface?: "tab" | "split"; tabId?: string; worker?: ControlOrigin; ended?: boolean }>();
   const saveOnlyWorkers = new Map<string, SaveOnlyWorker>();
+  const saveOnlyApproaches = new Map<string, { store: PlanApproachStore; proposal: PlanApproachProposal }>();
   const problemPackages = new Map<string, { owner: ControlOrigin; tickets: Set<string> }>();
   const scoutAcceptances = new Map<string, number>();
   const scoutGenerations = new Map<string, number>();
@@ -223,6 +229,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
   const requestLists = new Map<string, string>();
   const runOrigins = new Map<string, string>();
   const fencePlanRun = (planRun: PlanRunState, terminal: "blocked" | "cancelled"): void => {
+    planRun.approachStore?.revoke();
     planRun.terminal = terminal;
     planRun.observer?.stop();
     planRun.observer = undefined;
@@ -246,7 +253,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     fencePlanRun(planRun, "cancelled");
     try {
       if (!parent.planFinished) throw new Error("plan finish handoff is unavailable");
-      await parent.planFinished(planRun.ticket, { kind: "registered", runId, ...(planRun.listRunId ? { listRunId: planRun.listRunId } : {}) }, "cancelled", "plan worker process ended before a terminal record", worker);
+      await parent.planFinished(planRun.ticket, { kind: "registered", runId, ...(planRun.listRunId ? { listRunId: planRun.listRunId } : {}) }, "cancelled", "plan worker process ended before a terminal record", worker, planRun.groupScope ? { groupId: planRun.groupScope.groupId, treeHash: planRun.groupScope.treeHash } : undefined);
     } catch {
       if (planRun.terminal === "cancelled") planRun.terminal = undefined;
     }
@@ -347,7 +354,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     if (!pane) return undefined;
     return { sessionId: pane.sessionId, pid: pane.pid, starttime: pane.starttime, cwd: canonicalRoot, pane: pane.pane, parentPane: pane.parentPane, mode: pane.mode, ticket: pane.ticket, role: origin.role };
   };
-  const registeredWorker = (planRun: PlanRunState | undefined, ticket: string, origin: ControlOrigin): boolean => !!planRun?.worker && planRun.ticket === ticket && origin.mode === "plan" && origin.ticket === ticket && origin.role === "coordinator" && origin.pane === planRun.pane && origin.sessionId === planRun.worker.sessionId && descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime);
+  const registeredWorker = (planRun: PlanRunState | undefined, ticket: string, origin: ControlOrigin): boolean => !!planRun?.worker && (planRun.ticket === ticket || planRun.groupScope?.members.has(ticket) === true) && origin.mode === "plan" && origin.ticket === planRun.ticket && origin.role === "coordinator" && origin.pane === planRun.pane && origin.sessionId === planRun.worker.sessionId && descendantOf(origin.pid, origin.starttime, planRun.worker.pid, planRun.worker.starttime);
   const verifyRecordedRetry = (ticket: string, binding: PlanBinding | undefined, requestedPath?: string, contentHash?: string): void => {
     try {
       const current = readRecordedPlanBinding(canonicalRoot, ticket);
@@ -355,7 +362,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       else if (!requestedPath || !contentHash || resolve(current.path) !== resolve(requestedPath) || current.contentHash !== contentHash) throw new Error("binding changed");
     } catch { throw new Error(binding ? "recorded plan retry binding changed" : "recorded plan retry binding is unavailable"); }
   };
-  const planOperations = new Set<PlanControlOperation>(["register-plan", "bind-plan", "plan-started", "publish-plan-scout", "reject-plan-scout", "prepare-plan-publication", "plan-recorded", "plan-finished", "record-plan"]);
+  const planOperations = new Set<PlanControlOperation>(["register-plan", "bind-plan", "plan-started", "register-group-plan-scope", "plan-approach-present", "plan-input", "plan-approach-extraction", "group-plan-activated", "publish-plan-scout", "reject-plan-scout", "prepare-plan-publication", "plan-recorded", "plan-finished", "record-plan"]);
   const handlePlanControl = async (envelope: ControlEnvelope, origin: ControlOrigin): Promise<ControlReply> => {
     const ticket = envelope.ticket;
     if (!ticket || !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error("invalid plan handoff ticket");
@@ -371,7 +378,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     const runIdPresented = envelope.runId !== undefined;
     if (runIdPresented && (!envelope.runId || !planRuns.has(envelope.runId))) throw new Error("invalid or inactive plan run id");
     const planRun = envelope.runId ? planRuns.get(envelope.runId) : undefined;
-    if (planRun && planRun.ticket !== ticket) throw new Error("plan run ticket mismatch");
+    if (planRun && planRun.ticket !== ticket && !planRun.groupScope?.members.has(ticket)) throw new Error("plan run ticket mismatch");
     const continuedRecovery = envelope.operation === "record-plan" && planRun?.terminal === "blocked" && planRun.recovery?.state === "active";
     const finishingRecording = envelope.operation === "plan-finished" && planRun?.terminal === "recording";
     if (planRun?.terminal && !continuedRecovery && !finishingRecording && !(["recording", "recorded"].includes(planRun.terminal) && (envelope.operation === "record-plan" || envelope.operation === "plan-recorded"))) throw new Error("plan run is no longer active");
@@ -388,6 +395,84 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (firstRegistration) watchPlanWorker(envelope.runId, planRun, planRun.worker);
       return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId };
     }
+    if (envelope.operation === "register-group-plan-scope") {
+      if (!planRun || !envelope.runId || !planRun.worker || !registeredWorker(planRun, planRun.ticket, origin) || !envelope.facts) throw new Error("invalid group plan scope owner");
+      const groupId = envelope.facts.groupId;
+      const treeHash = envelope.facts.treeHash;
+      const ownerProject = envelope.facts.ownerProject;
+      const members = envelope.facts.members;
+      if (typeof groupId !== "string" || typeof treeHash !== "string" || !/^[a-f0-9]{64}$/.test(treeHash) || typeof ownerProject !== "string" || !Array.isArray(members) || !members.length || members.some((member) => typeof member !== "string" || !/^[A-Z][A-Z0-9]*-\d+$/.test(member)) || members[0] !== planRun.ticket || new Set(members).size !== members.length) throw new Error("invalid group plan scope facts");
+      const state = new DatabaseSync(join(canonicalRoot, "yokemate.db"), { readOnly: true });
+      try {
+        const group = state.prepare("SELECT root_ticket FROM task_group WHERE id=? AND root_ticket=?").get(groupId, planRun.ticket);
+        const claimed = state.prepare("SELECT COUNT(*) count FROM member_claim WHERE group_id=? AND tree_hash=? AND state='reserved'").get(groupId, treeHash) as { count: number };
+        if (!group || claimed.count !== members.length) throw new Error("group plan scope claims are missing or stale");
+      } finally { state.close(); }
+      planRun.groupScope = { groupId, treeHash, ownerProject, members: new Set(members as string[]) };
+      return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, facts: { groupId, treeHash, ownerProject, members } };
+    }
+    if (envelope.operation === "plan-approach-present") {
+      if (!envelope.facts) throw new Error("invalid plan approach owner");
+      const { approachText, treeHash, acceptedScouts } = envelope.facts;
+      if (typeof approachText !== "string" || typeof treeHash !== "string" || !Array.isArray(acceptedScouts)) throw new Error("invalid plan approach facts");
+      const saveApproachKey = saveOnlyKey(origin, ticket);
+      const saveWorker = saveOnlyWorkers.get(saveApproachKey);
+      const registered = Boolean(planRun && envelope.runId && planRun.worker && registeredWorker(planRun, planRun.ticket, origin));
+      if (!registered && (!saveWorker || !ownerOrDescendant(origin, saveWorker.owner, ticket))) throw new Error("invalid plan approach owner");
+      const planRunId = envelope.runId ?? `save-only:${saveApproachKey}`;
+      const owner = { sessionId: origin.sessionId, runtimeId: origin.runtimeId ?? planRunId, planRunId };
+      const store = new PlanApproachStore(owner);
+      const proposal = store.present({ approachText, treeHash, acceptedScouts: acceptedScouts as any });
+      if (registered) {
+        planRun!.approachStore?.revoke();
+        planRun!.approachStore = store;
+        planRun!.approachProposal = proposal;
+      } else {
+        saveOnlyApproaches.get(saveApproachKey)?.store.revoke();
+        saveOnlyApproaches.set(saveApproachKey, { store, proposal });
+      }
+      return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, facts: { generation: proposal.generation, approachHash: proposal.approachHash, treeHash: proposal.treeHash } };
+    }
+    if (envelope.operation === "plan-input" || envelope.operation === "plan-approach-extraction") {
+      const saveApproachKey = saveOnlyKey(origin, ticket);
+      const saveWorker = saveOnlyWorkers.get(saveApproachKey);
+      const registered = Boolean(planRun && envelope.runId && planRun.worker && registeredWorker(planRun, planRun.ticket, origin));
+      const approach = registered && planRun?.approachStore && planRun.approachProposal ? { store: planRun.approachStore, proposal: planRun.approachProposal } : saveOnlyApproaches.get(saveApproachKey);
+      if (!approach || !registered && (!saveWorker || !ownerOrDescendant(origin, saveWorker.owner, ticket))) throw new Error("invalid plan approach input owner");
+      if (envelope.operation === "plan-input") {
+        if (typeof envelope.raw !== "string") throw new Error("invalid plan approach input");
+        const generation = approach.store.observeInput(envelope.raw, approach.store.owner);
+        return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, generation: generation.serial, facts: generation as unknown as Record<string, unknown> };
+      }
+      if (!envelope.facts) throw new Error("invalid plan approach extraction facts");
+      const generation = envelope.facts.generation;
+      const extraction = envelope.facts.extraction;
+      if (!generation || typeof generation !== "object" || !extraction || typeof extraction !== "object") throw new Error("invalid plan approach extraction facts");
+      if ((extraction as { kind?: string }).kind === "revoke") {
+        approach.store.revoke();
+        return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, facts: { state: "revoked" } };
+      }
+      const receipt = approach.store.approve(generation as any, extraction as any, approach.store.owner);
+      return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, facts: { receiptId: receipt.id } };
+    }
+    if (envelope.operation === "group-plan-activated") {
+      if (!planRun || !envelope.runId || !planRun.groupScope || !planRun.approachStore || !planRun.approachProposal || !envelope.facts || !registeredWorker(planRun, planRun.ticket, origin) || !parent.groupPlanActivated) throw new Error("invalid group plan activation owner");
+      const groupId = envelope.facts.groupId;
+      const revisionHash = envelope.facts.revisionHash;
+      if (groupId !== planRun.groupScope.groupId || typeof revisionHash !== "string" || !/^[a-f0-9]{64}$/.test(revisionHash)) throw new Error("group plan activation facts changed");
+      planRun.approachStore.assertCurrent({ treeHash: planRun.approachProposal.treeHash, acceptedScouts: planRun.approachProposal.acceptedScouts, approachHash: planRun.approachProposal.approachHash }, planRun.approachStore.owner);
+      const context = { kind: "registered" as const, runId: envelope.runId, ...(planRun.listRunId ? { listRunId: planRun.listRunId } : {}) };
+      await parent.groupPlanActivated(ticket, context, envelope.facts, origin, { store: planRun.approachStore, proposal: planRun.approachProposal });
+      const state = new DatabaseSync(join(canonicalRoot, "yokemate.db"), { readOnly: true });
+      try {
+        const row = state.prepare("SELECT active_revision,phase FROM task_group WHERE id=?").get(groupId) as { active_revision: string; phase: string } | undefined;
+        if (!row || row.active_revision !== revisionHash || row.phase !== "planned") throw new Error("group plan activation is not durable");
+      } finally { state.close(); }
+      planRun.terminal = "recorded";
+      planRun.observer?.stop();
+      planRun.observer = undefined;
+      return { requestId: envelope.requestId, state: "accepted", runId: envelope.runId, facts: envelope.facts };
+    }
 
     const problemWorker = origin.mode === "plan" && !origin.ticket && origin.role === "coordinator";
     const packageKey = problemKey(origin);
@@ -401,12 +486,14 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
     let saveOnly = saveOnlyWorkers.get(saveKey);
     if (saveOnly && !ownerLive(saveOnly.owner, ticket)) {
       saveOnlyWorkers.delete(saveKey);
+      saveOnlyApproaches.get(saveKey)?.store.revoke();
+      saveOnlyApproaches.delete(saveKey);
       saveOnly = undefined;
     }
-    const registeredWorker = !!planRun?.worker && origin.mode === "plan" && origin.role === "coordinator" && origin.ticket === ticket && origin.pane === planRun.pane && ownerOrDescendant(origin, planRun.worker, ticket);
+    const isRegisteredWorker = registeredWorker(planRun, ticket, origin);
     let context: PlanCompletionContext;
     if (planRun) {
-      if (!registeredWorker) throw new Error("plan operation is not from its registered live worker");
+      if (!isRegisteredWorker) throw new Error("plan operation is not from its registered live worker");
       context = { kind: "registered", runId: envelope.runId!, ...(planRun.listRunId ? { listRunId: planRun.listRunId } : {}) };
     } else if (main) context = { kind: "main" };
     else if (registeredProblemWorker && (envelope.operation === "publish-plan-scout" || envelope.operation === "reject-plan-scout" || packageState?.tickets.has(ticket))) context = { kind: "problem", packageKey };
@@ -425,7 +512,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (context.kind !== "registered" || !planRun || !envelope.outcome || !envelope.reason || !parent.planFinished) throw new Error("plan finish handoff is unavailable");
       if (planRun.terminal && !finishingRecording) throw new Error("plan run is no longer active");
       fencePlanRun(planRun, envelope.outcome);
-      await parent.planFinished(ticket, context, envelope.outcome, envelope.reason, origin);
+      await parent.planFinished(ticket, context, envelope.outcome, envelope.reason, origin, planRun.groupScope ? { groupId: planRun.groupScope.groupId, treeHash: planRun.groupScope.treeHash } : undefined);
       planRun.terminal = envelope.outcome;
       planRun.observer?.stop();
       planRun.observer = undefined;
@@ -521,7 +608,11 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
       if (!ownerStillValid) {
         requestGenerations.delete(acceptanceId);
         children.delete(acceptanceId);
-        if (context.kind === "save-only") saveOnlyWorkers.delete(saveKey);
+        if (context.kind === "save-only") {
+          saveOnlyWorkers.delete(saveKey);
+          saveOnlyApproaches.get(saveKey)?.store.revoke();
+          saveOnlyApproaches.delete(saveKey);
+        }
         throw new Error("plan scout owner is no longer live");
       }
       const currentGeneration = context.kind === "registered" ? planRun!.scoutGeneration : context.kind === "save-only" ? saveOnly!.scoutGeneration : scoutGenerations.get(scoutKey);
@@ -616,6 +707,8 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
 
     if (envelope.operation === "record-plan") {
       if (context.kind !== "registered" || !planRun || !envelope.path || !/^[a-f0-9]{64}$/.test(envelope.contentHash ?? "") || !parent.recordPlan || !Number.isSafeInteger(acceptanceId)) throw new Error("plan record requires a current accepted scout and content hash");
+      if (!planRun.approachStore || !planRun.approachProposal) throw new Error("plan record requires an approved current plan approach");
+      planRun.approachStore.assertCurrent({ treeHash: planRun.approachProposal.treeHash, acceptedScouts: planRun.approachProposal.acceptedScouts, approachHash: planRun.approachProposal.approachHash }, planRun.approachStore.owner);
       if (planRun.terminal === "recorded") {
         if (planRun.recordPath !== envelope.path || planRun.recordContentHash !== envelope.contentHash || planRun.recordAcceptance !== acceptanceId || !planRun.recordReply) throw new Error("recorded plan retry binding changed");
         verifyRecordedRetry(ticket, planRun.recordBinding);
@@ -666,6 +759,11 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
 
     if (envelope.operation === "plan-recorded") {
       if (!envelope.path || !/^[a-f0-9]{64}$/.test(envelope.contentHash ?? "") || !Number.isSafeInteger(envelope.recordId) || !parent.planRecorded) throw new Error("plan record handoff is unavailable");
+      const approach = context.kind === "registered" && planRun?.approachStore && planRun.approachProposal ? { store: planRun.approachStore, proposal: planRun.approachProposal } : context.kind === "save-only" ? saveOnlyApproaches.get(saveKey) : undefined;
+      if (["registered", "save-only"].includes(context.kind)) {
+        if (!approach) throw new Error("plan record requires an approved current plan approach");
+        approach.store.assertCurrent({ treeHash: approach.proposal.treeHash, acceptedScouts: approach.proposal.acceptedScouts, approachHash: approach.proposal.approachHash }, approach.store.owner);
+      }
       let recordContext = context;
       let recordSaveOnly = saveOnly;
       let recordPrepared: PreparedPlanRecord | undefined;
@@ -839,7 +937,7 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
           } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
           continue;
         }
-        if (["register-review", "bind-review", "review-started", "review-input", "review-extraction", "review-record", "review-status", "review-ended"].includes(envelope.operation)) {
+        if (["register-review", "bind-review", "review-started", "review-input", "review-extraction", "review-record", "review-accept", "review-status", "review-ended"].includes(envelope.operation)) {
           try {
             const ticket = envelope.ticket;
             if (!ticket || !/^[A-Z][A-Z0-9]*-\d+$/.test(ticket)) throw new Error("invalid review handoff ticket");
@@ -885,8 +983,12 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
               reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
             } else if (envelope.operation === "review-record") {
               if (reviewRun.ended || !descendant || !envelope.path || !parent.reviewRecord) throw new Error("review record is not from its registered live worker");
-              const rework = await parent.reviewRecord(ticket, envelope.runId, envelope.path, origin);
+              const rework = await parent.reviewRecord(ticket, envelope.runId, envelope.path, origin, envelope.facts);
               reply({ requestId: envelope.requestId, state: "accepted", runId: rework.runId, rework });
+            } else if (envelope.operation === "review-accept") {
+              if (reviewRun.ended || !exactWorker || !envelope.facts || !parent.reviewAccept) throw new Error("review acceptance is not from its registered runtime");
+              await parent.reviewAccept(ticket, envelope.runId, envelope.facts, origin);
+              reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
             } else if (envelope.operation === "review-status") {
               if (!descendant && !(main && sameProcess(reviewRun.launcher, origin))) throw new Error("review status is not owned by this origin");
               const rework = await parent.reviewStatus?.(ticket, envelope.runId, origin);
@@ -962,6 +1064,16 @@ export function bindCoordinatorControl(root: string, parent: ParentControl, iden
             if (!envelope.runId || !parent.finalizeShip) throw new Error("ship finalization request is incomplete");
             const finalization = await parent.finalizeShip(envelope.runId, origin);
             reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId, finalization });
+          } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
+          continue;
+        }
+        if (envelope.operation === "finish") {
+          try {
+            const summary = typeof envelope.facts?.summary === "string" ? envelope.facts.summary : "";
+            const outcome = envelope.facts?.outcome;
+            if (!envelope.runId || (outcome !== "done" && outcome !== "blocked") || !summary || !parent.finish) throw new Error("coordinator finish request is incomplete");
+            await parent.finish(envelope.runId, outcome, summary, envelope.reason, origin);
+            reply({ requestId: envelope.requestId, state: "accepted", runId: envelope.runId });
           } catch (error) { reply({ requestId: envelope.requestId, state: "refused", reason: (error as Error).message }); }
           continue;
         }
@@ -1111,19 +1223,25 @@ export async function requestShipFinalize(root: string, runId: string, origin: C
   return send(root, { version: 1, operation: "ship-finalize", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, runId }, env);
 }
 
+export async function requestCoordinatorFinish(root: string, runId: string, outcome: "done" | "blocked", summary: string, reason: string | undefined, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+  const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
+  if (attach.state !== "accepted" || !attach.originId) return attach;
+  return send(root, { version: 1, operation: "finish", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, runId, reason, facts: { outcome, summary } }, env);
+}
+
 export async function requestPlanLaunch(root: string, planRequest: PlanLaunchRequest, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation: "launch-plan", requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, planRequest }, env);
 }
 
-export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number; candidateId?: string; failureHash?: string; generation?: number; writerRunId?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
+export async function requestPlanControl(root: string, operation: PlanControlOperation, payload: { ticket: string; path?: string; pane?: string; runId?: string; raw?: string; outcome?: "blocked" | "cancelled"; reason?: string; publicationId?: number; acceptanceId?: number; recordId?: number; contentHash?: string; child?: ChildIdentity; scoutSequence?: number; candidateId?: string; failureHash?: string; generation?: number; writerRunId?: string; facts?: Record<string, unknown> }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env);
 }
 
-export async function requestReviewControl(root: string, operation: ReviewControlOperation, payload: { ticket: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; runId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; reason?: string }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env, timeoutMs = 30_000): Promise<ControlReply> {
+export async function requestReviewControl(root: string, operation: ReviewControlOperation, payload: { ticket: string; path?: string; pane?: string; surface?: "tab" | "split"; tabId?: string; workerRuntimeId?: string; runId?: string; raw?: string; generation?: ReviewInputGeneration; extraction?: ReviewReworkExtraction; reason?: string; facts?: Record<string, unknown> }, origin: ControlOrigin, target: Pick<ParentIdentity, "sessionId" | "runtimeId">, env: NodeJS.ProcessEnv = process.env, timeoutMs = 30_000): Promise<ControlReply> {
   const attach = await send(root, { version: 1, operation: "attach-origin", requestId: randomUUID(), origin, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId }, env, timeoutMs);
   if (attach.state !== "accepted" || !attach.originId) return attach;
   return send(root, { version: 1, operation, requestId: randomUUID(), originId: attach.originId, targetSessionId: target.sessionId, targetRuntimeId: target.runtimeId, ...payload }, env, timeoutMs);

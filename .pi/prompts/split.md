@@ -13,6 +13,8 @@ Run `pnpm where plan [KEY …]` before anything else, with every key before the 
 - `run` — this mode surface already runs plan; say so and stop.
 - `refuse: …` — print the refusal unchanged and stop.
 
+A root with native subtasks still uses exactly this one split; child tasks never receive their own surfaces. The plan worker must show and receive fresh approval of the complete approach before any writer dispatch.
+
 The same launcher defaults to a tab without `--split`. The engineer closes the conversational surface. No planning work runs in this launcher.
 
 A parent-owned advance receipt can continue only through the verified plan record handoff. Plain `/plan` and `/split plan` remain plan-only at either workflowApproval value; the pane cannot mint do authority.

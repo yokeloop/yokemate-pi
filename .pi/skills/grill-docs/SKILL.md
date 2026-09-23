@@ -13,7 +13,7 @@ Read the glossary, applicable ADRs, affected code, and the history of the affect
 
 Use the engineer's requested behavior as input. If it differs from the code, name the additional change needed to produce that behavior instead of disputing the answer. Present an applicable ADR as past context with its path, date, and ticket, never as a prohibition. Do not restore a rejected alternative later.
 
-Ask only about a material unresolved term, a conflict between the requested behavior and a documented decision, or a behavior boundary that changes the implementation within the given scope. Probe those gaps with concrete scenarios. Do not widen the scope or invent questions for documentation. When there are no open questions, ask no questions and continue to the plan writer.
+Ask only about a material unresolved term, a conflict between the requested behavior and a documented decision, or a behavior boundary that changes the implementation within the given scope. Probe those gaps with concrete scenarios. Do not widen the scope or invent questions for documentation. When there are no open questions, ask no questions; present the concise implementation approach and wait for its mandatory fresh interactive approval before the plan writer.
 
 ## Ask in the current surface
 

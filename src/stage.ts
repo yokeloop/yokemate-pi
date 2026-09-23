@@ -44,6 +44,9 @@ if (planAbs && !existsSync(planAbs)) fail(`plan not found: ${planAbs}`);
 const env = process.env as MoveEnv;
 const settings = (() => { try { return readRuntimeSettings(ROOT); } catch (e) { return fail((e as Error).message); } })();
 const db = openDb(join(ROOT, "yokemate.db"));
+const groupClaim = db.prepare(`SELECT group_id,revision_hash,state FROM member_claim
+  WHERE kind='group' AND ticket=? AND state IN ('reserved','active','suspended') LIMIT 1`).get(ticket) as { group_id: string; revision_hash: string | null; state: string } | undefined;
+if (groupClaim) fail(`${ticket} belongs to group ${groupClaim.group_id}/${groupClaim.revision_hash} (${groupClaim.state}); stage cannot manufacture a group lifecycle state`);
 
 // A move without a path leaves the recorded plan alone: not every stage comes
 // with one, and none of them retracts it. A ticket can reach a stage before it

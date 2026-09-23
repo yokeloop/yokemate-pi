@@ -188,6 +188,7 @@ function migrateIncidentColumns(db: DatabaseSync): void {
 export function openDb(path: string): DatabaseSync {
   const db = new DatabaseSync(path);
   db.exec(`
+    PRAGMA busy_timeout = 5000;
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
 
@@ -468,10 +469,189 @@ export function openDb(path: string): DatabaseSync {
     CREATE TRIGGER IF NOT EXISTS workflow_recovery_attempt_no_delete BEFORE DELETE ON workflow_recovery_attempt BEGIN SELECT RAISE(ABORT,'workflow recovery attempts are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_update BEFORE UPDATE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
     CREATE TRIGGER IF NOT EXISTS workflow_incident_event_no_delete BEFORE DELETE ON workflow_incident_event BEGIN SELECT RAISE(ABORT,'workflow incident events are append-only'); END;
+
+    CREATE TABLE IF NOT EXISTS task_group (
+      id TEXT PRIMARY KEY,
+      root_identity TEXT NOT NULL UNIQUE,
+      root_ticket TEXT NOT NULL,
+      owner_project TEXT NOT NULL,
+      active_revision TEXT,
+      phase TEXT NOT NULL CHECK (phase IN ('planning','planned','running','review','accepted','shipping','done','blocked')),
+      resume_phase TEXT CHECK (resume_phase IS NULL OR resume_phase IN ('planning','planned','running','review','accepted','shipping')),
+      blocker TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS group_revision (
+      group_id TEXT NOT NULL REFERENCES task_group(id),
+      revision_hash TEXT NOT NULL,
+      tree_hash TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      bindings_json TEXT NOT NULL,
+      compatibility_json TEXT NOT NULL,
+      approach_receipt_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, revision_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_member (
+      group_id TEXT NOT NULL REFERENCES task_group(id),
+      revision_hash TEXT NOT NULL,
+      member_identity TEXT NOT NULL,
+      ticket TEXT NOT NULL,
+      parent_identity TEXT,
+      plan_record_id INTEGER REFERENCES plan_record(id),
+      prior_state_json TEXT NOT NULL DEFAULT '{}',
+      stage TEXT NOT NULL CHECK (stage IN ('new','scouted','planned','running','review','accepted','integrated')),
+      execution TEXT NOT NULL CHECK (execution IN ('not_started','queued','running','ready','integrated','blocked')),
+      blocker TEXT,
+      result_json TEXT,
+      tracker_state TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, revision_hash, member_identity),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_part (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      member_identity TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      remote TEXT NOT NULL,
+      role TEXT NOT NULL,
+      source_ref TEXT,
+      target_ref TEXT,
+      pr_identity TEXT,
+      head_sha TEXT,
+      base_sha TEXT,
+      readiness_json TEXT,
+      reviewer_json TEXT,
+      merge_commit TEXT,
+      outcome TEXT,
+      PRIMARY KEY (group_id, revision_hash, member_identity, repo),
+      FOREIGN KEY (group_id, revision_hash, member_identity) REFERENCES group_member(group_id, revision_hash, member_identity)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_repository (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      remote TEXT NOT NULL,
+      role TEXT NOT NULL,
+      integration_branch TEXT NOT NULL,
+      external_base TEXT NOT NULL,
+      base_sha TEXT NOT NULL,
+      final_pr TEXT,
+      head_sha TEXT,
+      merge_commit TEXT,
+      ship_state TEXT NOT NULL DEFAULT 'pending' CHECK (ship_state IN ('pending','ready','merged','remaining','unknown','failed')),
+      PRIMARY KEY (group_id, revision_hash, repo),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_acceptance (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      candidate_hash TEXT NOT NULL,
+      candidate_json TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      review_source_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('current','superseded')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, revision_hash, candidate_hash),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS group_acceptance_current
+      ON group_acceptance(group_id, revision_hash) WHERE state = 'current';
+
+    CREATE TABLE IF NOT EXISTS group_rework (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      candidate_hash TEXT NOT NULL,
+      plan_binding_json TEXT NOT NULL,
+      reviewer_json TEXT,
+      state TEXT NOT NULL CHECK (state IN ('pending','running','ready','superseded')),
+      review_source_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (group_id, revision_hash, candidate_hash),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS group_rework_current
+      ON group_rework(group_id, revision_hash) WHERE state IN ('pending','running');
+
+    CREATE TABLE IF NOT EXISTS runtime_capacity_lease (
+      owner_id TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      starttime TEXT NOT NULL,
+      units INTEGER NOT NULL CHECK (units > 0),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS runtime_capacity_subscriber (
+      subscriber_id TEXT PRIMARY KEY,
+      pid INTEGER NOT NULL,
+      starttime TEXT NOT NULL,
+      socket_path TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS group_fact_lineage (
+      group_id TEXT NOT NULL,
+      revision_hash TEXT NOT NULL,
+      sequence INTEGER NOT NULL,
+      snapshot_hash TEXT NOT NULL,
+      PRIMARY KEY (group_id, revision_hash),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS group_effect (
+      effect_key TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL REFERENCES task_group(id),
+      revision_hash TEXT NOT NULL,
+      scope_json TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('integrate','ship','to_verify','done','cleanup')),
+      input_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('intent','unknown','confirmed','failed')),
+      outcome_json TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (group_id, revision_hash) REFERENCES group_revision(group_id, revision_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS group_move (
+      idempotency_key TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL REFERENCES task_group(id),
+      revision_hash TEXT,
+      from_phase TEXT NOT NULL,
+      to_phase TEXT NOT NULL,
+      outcome_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS member_claim (
+      member_identity TEXT PRIMARY KEY,
+      ticket TEXT,
+      kind TEXT NOT NULL CHECK (kind IN ('single','group')),
+      group_id TEXT REFERENCES task_group(id),
+      revision_hash TEXT,
+      tree_hash TEXT,
+      owners_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('reserved','active','suspended')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TRIGGER IF NOT EXISTS group_revision_no_update BEFORE UPDATE ON group_revision BEGIN SELECT RAISE(ABORT,'group revisions are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS group_revision_no_delete BEFORE DELETE ON group_revision BEGIN SELECT RAISE(ABORT,'group revisions are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS group_move_no_update BEFORE UPDATE ON group_move BEGIN SELECT RAISE(ABORT,'group moves are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS group_move_no_delete BEFORE DELETE ON group_move BEGIN SELECT RAISE(ABORT,'group moves are append-only'); END;
   `);
   migratePlanArtifacts(db);
   migratePublicationProvenance(db);
   migrateIncidentColumns(db);
+  addColumn(db, "member_claim", "ticket TEXT");
+  addColumn(db, "group_rework", "reviewer_json TEXT");
   // Columns added after the first passports existed. SQLite has no
   // ADD COLUMN IF NOT EXISTS, so ask the table what it already has.
   const have = new Set(

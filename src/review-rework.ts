@@ -7,7 +7,7 @@ export interface ReviewWorkerIdentity { sessionId: string; runtimeId: string; pi
 export interface ReviewSurfaceIdentity { surface: "tab" | "split"; paneId: string; tabId?: string }
 export interface ReviewReworkOwner { parent: ReviewParentIdentity; reviewRunId: string; ticket: string; worker: ReviewWorkerIdentity; surface: ReviewSurfaceIdentity }
 export interface ReviewInputGeneration { serial: number; revision: number; inputHash: string }
-export type ReviewReworkExtraction = { kind: "none" } | { kind: "rework" | "revoke"; evidence: { start: number; end: number; text: string }[] };
+export type ReviewReworkExtraction = { kind: "none" } | { kind: "accept" | "rework" | "revoke"; evidence: { start: number; end: number; text: string }[] };
 export interface ReviewHandoffOutcome { state: "started" | "refused" | "cancelled"; recorded: boolean; runId?: string; model?: string; reason?: string; stage?: string; plan?: string; contentHash?: string; close?: { state: "closed" | "failed"; reason?: string } }
 
 type Receipt = { generation: ReviewInputGeneration; state: "pending" | "bound" | "consumed" | "revoked"; binding?: PlanBinding; cycleId?: string };
@@ -23,6 +23,7 @@ export class ReviewReworkStore {
   private inputHash = "";
   private raw = "";
   private receipt?: Receipt;
+  private acceptance?: { generation: ReviewInputGeneration; state: "pending" | "consumed"; candidateHash?: string };
   private operation?: Operation;
   private readonly cycles = new Map<string, { operationId: string; generation: ReviewInputGeneration; binding: PlanBinding; started: boolean }>();
   private started = false;
@@ -37,6 +38,7 @@ export class ReviewReworkStore {
     this.raw = raw;
     this.inputHash = createHash("sha256").update(raw).digest("hex");
     if (this.receipt?.state !== "consumed") this.receipt = undefined;
+    if (this.acceptance?.state !== "consumed") this.acceptance = undefined;
     return this.generation();
   }
 
@@ -46,6 +48,17 @@ export class ReviewReworkStore {
 
   assertGeneration(generation: ReviewInputGeneration): void {
     if (!sameGeneration(generation, this.generation())) throw new Error("stale review verdict generation");
+  }
+
+  approveAcceptance(generation: ReviewInputGeneration): void {
+    this.assertGeneration(generation);
+    this.acceptance = { generation: { ...generation }, state: "pending" };
+  }
+
+  consumeAcceptance(generation: ReviewInputGeneration, candidateHash: string): void {
+    this.assertGeneration(generation);
+    if (!/^[a-f0-9]{64}$/.test(candidateHash) || !this.acceptance || this.acceptance.state !== "pending" || !sameGeneration(this.acceptance.generation, generation)) throw new Error("clean acceptance requires a fresh interactive verdict receipt");
+    this.acceptance = { generation: { ...generation }, state: "consumed", candidateHash };
   }
 
   approveRework(generation: ReviewInputGeneration): void {
@@ -173,7 +186,7 @@ export function validateReviewReworkExtraction(value: unknown, raw: string, tick
     if (!exactKeys(value, ["kind"])) return fail("extra fields");
     return { kind: "none" };
   }
-  if (!exactKeys(value, ["kind", "evidence"]) || !["rework", "revoke"].includes(String(value.kind))) return fail("invalid fields or kind");
+  if (!exactKeys(value, ["kind", "evidence"]) || !["accept", "rework", "revoke"].includes(String(value.kind))) return fail("invalid fields or kind");
   const keys = [...raw.matchAll(/(?:^|[^A-Z0-9-])([A-Z][A-Z0-9]*-\d+)(?=$|[^A-Z0-9-])/g)].map((match) => match[1]!);
   if (keys.some((key) => key !== ticket)) return fail("foreign explicit ticket");
   if (!Array.isArray(value.evidence) || value.evidence.length < 1 || value.evidence.length > 8) return fail("missing evidence");
@@ -183,7 +196,7 @@ export function validateReviewReworkExtraction(value: unknown, raw: string, tick
   return value as ReviewReworkExtraction;
 }
 
-export type ReviewReworkQuotes = { kind: "none" } | { kind: "rework" | "revoke"; evidence: { text: string }[] };
+export type ReviewReworkQuotes = { kind: "none" } | { kind: "accept" | "rework" | "revoke"; evidence: { text: string }[] };
 
 export function adaptReviewReworkQuotes(value: unknown, raw: string, ticket: string): ReviewReworkExtraction {
   const fail = (reason: string): never => { throw new Error(`review rework quotes: ${reason}`); };
@@ -192,7 +205,7 @@ export function adaptReviewReworkQuotes(value: unknown, raw: string, ticket: str
     if (!exactKeys(value, ["kind"])) return fail("extra fields");
     return { kind: "none" };
   }
-  if (!exactKeys(value, ["kind", "evidence"]) || value.kind !== "rework" && value.kind !== "revoke") return fail("invalid fields or kind");
+  if (!exactKeys(value, ["kind", "evidence"]) || value.kind !== "accept" && value.kind !== "rework" && value.kind !== "revoke") return fail("invalid fields or kind");
   if (!Array.isArray(value.evidence) || value.evidence.length < 1 || value.evidence.length > 8) return fail("invalid evidence count");
   const evidence = value.evidence.map((quote) => {
     if (!record(quote) || !exactKeys(quote, ["text"]) || typeof quote.text !== "string" || quote.text.length === 0) return fail("invalid quote");
@@ -204,7 +217,7 @@ export function adaptReviewReworkQuotes(value: unknown, raw: string, ticket: str
   return validateReviewReworkExtraction({ kind: value.kind, evidence }, raw, ticket);
 }
 
-export const REVIEW_REWORK_EXTRACTION_INSTRUCTION = `Classify only the current raw interactive engineer input in an owned review conversation. Return one JSON object and no tools. "rework" means a final present-tense verdict to send this ticket back for implementation after the remarks are agreed. Questions, quotations, negations, conditions, draft remarks, discussion and agreement with one item are "none". "revoke" means stop or a changed scope before handoff. The ticket comes from the registered review identity; do not require or invent a key. Schema: {"kind":"none"} or {"kind":"rework"|"revoke","evidence":[{"text":"literal substring"}]}. Supply 1 to 8 nonempty literal quotes from the unchanged raw input, each occurring exactly once. Copy quotes exactly, including punctuation and whitespace; do not normalize them. Do not calculate or return offsets. No extra fields.`;
+export const REVIEW_REWORK_EXTRACTION_INSTRUCTION = `Classify only the current raw interactive engineer input in an owned review conversation. Return one JSON object and no tools. "accept" means an unambiguous final clean verdict accepting the whole reviewed candidate. "rework" means a final present-tense verdict to send this ticket back for implementation after the remarks are agreed. Questions, quotations, negations, conditions, draft remarks, discussion and agreement with one item are "none". "revoke" means stop or a changed scope before handoff. The ticket comes from the registered review identity; do not require or invent a key. Schema: {"kind":"none"} or {"kind":"accept"|"rework"|"revoke","evidence":[{"text":"literal substring"}]}.  Supply 1 to 8 nonempty literal quotes from the unchanged raw input, each occurring exactly once. Copy quotes exactly, including punctuation and whitespace; do not normalize them. Do not calculate or return offsets. No extra fields.`;
 
 export function processIdentityMatches(pid: number, starttime: string): boolean {
   try {

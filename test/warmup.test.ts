@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { buildDigest } from "../src/warmup.ts";
+import { activateGroupRevision, createPlanningGroup, reserveMemberClaims } from "../src/group-state.ts";
 
 function isoDay(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -83,6 +84,26 @@ test("a work/ folder with a queue row carries no orphan mark", () => {
     const digest = buildDigest(root, join(root, "home"));
     assert.ok(digest.includes("BBB-1"));
     assert.ok(!digest.includes("нет в очереди"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("group root and durable member execution states remain distinct in the digest", () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, "yokemate.db"));
+    const treeHash = "a".repeat(64);
+    const revisionHash = "b".repeat(64);
+    const groupId = createPlanningGroup(db, { id: "g", rootIdentity: "yt:BBB-1", rootTicket: "BBB-1", ownerProject: "o/r" });
+    reserveMemberClaims(db, { groupId, treeHash, members: ["yt:BBB-1", "yt:BBB-2"], owners: [{ runtimeId: "r", runId: "x", sessionId: "s" }] });
+    activateGroupRevision(db, { groupId, revisionHash, treeHash, manifest: {}, bindings: {}, compatibility: {}, approachReceiptId: "a", members: [{ identity: "yt:BBB-1", ticket: "BBB-1", parentIdentity: null, execution: "queued" }, { identity: "yt:BBB-2", ticket: "BBB-2", parentIdentity: "yt:BBB-1", execution: "integrated", stage: "integrated" }] });
+    db.prepare("UPDATE task_group SET phase='running' WHERE id=?").run(groupId);
+    db.close();
+    const digest = buildDigest(root, join(root, "home"));
+    assert.match(digest, /BBB-1 group\/running revision b{12}/);
+    assert.match(digest, /BBB-1 planned\/queued/);
+    assert.match(digest, /BBB-2 integrated\/integrated/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

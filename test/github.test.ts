@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { openDb } from "../src/db.ts";
 import { ticketUrl } from "../src/ticket-url.ts";
 import {
+  fetchSubIssues,
   issueStates,
   issueUrl,
   mine,
@@ -88,6 +89,34 @@ test("viewerLogin caches", () => {
   assert.equal(viewerLogin(exec), "octocat");
   assert.equal(viewerLogin(exec), "octocat");
   assert.equal(calls.filter((c) => c.args[0] === "api").length, 1);
+});
+
+test("fetchSubIssues reads native parent and every child page", () => {
+  const calls: string[] = [];
+  const exec: GhExec = (args) => {
+    const endpoint = args[1]!;
+    calls.push(endpoint);
+    if (endpoint === "repos/octo/demo-app/issues/12") return JSON.stringify({ number: 12, title: "root", state: "open" });
+    if (endpoint.endsWith("/parent")) return JSON.stringify({ number: 2, title: "parent", state: "open" });
+    if (endpoint.includes("sub_issues")) return JSON.stringify([{ number: 13, title: "child", state: "closed" }]);
+    throw new Error("unexpected endpoint");
+  };
+  assert.deepEqual(fetchSubIssues(demoApp, 12, exec), {
+    issue: { number: 12, title: "root", state: "open" },
+    parent: { number: 2, title: "parent", state: "open" },
+    subtasks: [{ number: 13, title: "child", state: "closed" }],
+  });
+  assert.ok(calls.some((call) => call.includes("sub_issues?per_page=100&page=1")));
+});
+
+test("fetchSubIssues rejects repeated children and unavailable hierarchy", () => {
+  const duplicate: GhExec = (args) => {
+    if (args[1]!.endsWith("issues/12")) return JSON.stringify({ number: 12, title: "root", state: "open" });
+    if (args[1]!.endsWith("/parent")) { const error = new Error("404 not found"); throw error; }
+    return JSON.stringify([{ number: 13, title: "child", state: "open" }, { number: 13, title: "child", state: "open" }]);
+  };
+  assert.throws(() => fetchSubIssues(demoApp, 12, duplicate), /ambiguous_membership/);
+  assert.throws(() => fetchSubIssues(demoApp, 12, () => { throw new Error("403"); }), /incomplete_tree/);
 });
 
 test("validGithubPrefix", () => {

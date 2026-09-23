@@ -5,7 +5,7 @@ description: Internal — raised by a long-lived background coordinator, not typ
 
 # /do — execute a ticket
 
-You are the single executor of one ticket. You run in `yokemate/work/<TICKET>/`. The plan you were given is the whole scope: do not widen it, do not improve adjacent code, do not file tickets.
+You are the single executor of one ticket. If a trusted parent delegates this ticket as a member of an activated group, use only its runtime-resolved member scope and member plan: internal PRs target the root integration branch, root own-work uses `<ROOT>-own`, and your verified result becomes member `ready`, never the whole root `review`. You cannot integrate, widen the member set, or consume another user do permit. You run in `yokemate/work/<TICKET>/`. The plan you were given is the whole scope: do not widen it, do not improve adjacent code, do not file tickets.
 
 The engine-root runtime settings remove only their named optional refusals; they never widen this ticket's scope. Initial do authority belongs to the verified interactive parent, not to this worker or its tool arguments. Owned implement → independent review → fix → re-check continues within the same active cycle and unchanged recorded plan; a changed plan or scope requires new explicit approval.
 
@@ -29,6 +29,10 @@ pnpm where do <TICKET>
 The plan is one document for the whole ticket, however many repositories it touches, in the shape `PLAN-FORMAT.md` at the yokemate root defines; the contract between parts (export names, API shapes, versions) lives in its Cross-repository contract section. You read it fully.
 
 ## Pipeline
+
+When `YOKEMATE_GROUP_MEMBER` is set, this is a parent-delegated group member run: its immutable worktrees, branches, internal `<ROOT>` targets and scope receipts are already prepared and listed in the launch prompt. Skip ordinary worktree creation, never create `work/<MEMBER>/<repo>`, and do not change a target to an external base. `pnpm ready <MEMBER>` and `pnpm record-report <MEMBER>` resolve only those scoped worktrees and do not promote the child through the single-ticket lifecycle.
+
+When `YOKEMATE_GROUP_ROLE=rework`, change only the listed root integration worktrees and update the existing final PRs. Run `task-reviewer` on each complete changed integration diff from the prior candidate head to the new head, then call `group_rework_review` with every exact reviewer run before readiness and `record-report`. Do not restart members, create child PRs, or change external bases.
 
 Every part passes through the same stages, in order:
 

@@ -13,4 +13,6 @@ Before anything else run `pnpm where review <ticket>`, using the first ordinary 
 - `run` — this mode surface already runs review; say so and stop.
 - `refuse: …` — print the refusal unchanged and stop.
 
+For a group root, the review surface is one assembled candidate over every final repo/PR/head/base and acceptance obligation. A verdict is bound to that candidate hash; rework writes only root integration branches and never restarts integrated children.
+
 The launcher does no worker work, reads no tickets and edits no files.

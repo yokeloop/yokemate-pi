@@ -11,12 +11,15 @@ import { linkTeammates } from "./teammates.ts";
 import { readRuntimeSettings, type RuntimeSettings } from "./guard-policy.ts";
 import { applyMove, checkMove, type From, type MoveEnv } from "./transitions.ts";
 import { assertMandatoryBoundary } from "./workflow-boundaries.ts";
+import { resolveGroupWorkScope } from "./group-scope.ts";
+import { groupClaimForTicket } from "./group-state.ts";
 
 export type CoordinatorMode = "do" | "ship";
 export interface CoordinatorRequest { mode: CoordinatorMode; tickets: string[]; plan?: string; model?: string; note?: string }
 export interface CoordinatorOrigin extends MoveEnv { sessionId?: string; runId?: string; cwd?: string; pane?: string; parentPane?: string }
-export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; passportPath?: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string; remote?: string; observedHead?: string }
-export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From }
+export interface PreparedPart extends PlanPart { repo: string; org: string; path: string; passportPath?: string; figmaMcp?: string; figmaUrl?: string; branch: string; pr?: string; base?: string; remote?: string; observedHead?: string; targetBranch?: string; worktree?: string; scopeId?: string }
+export interface PreparedGroup { groupId: string; revisionHash: string; root: string; role: "parent" | "member" | "rework"; memberIdentity?: string; ownWork?: "implementation" | "coordination-only" }
+export interface PreparedCoordinator { doBinding?: import("./plan-binding.ts").PlanBinding; mode: CoordinatorMode; tickets: string[]; model: string; cwd: string; plan?: string; plans: Record<string, string>; parts: PreparedPart[]; prompt: string; skillsPath: string; resourcesPath: string; expected?: From; group?: PreparedGroup }
 
 const KEY = /^[A-Z][A-Z0-9]*-\d+$/;
 const fail = (message: string): never => { throw new Error(message); };
@@ -72,10 +75,78 @@ function settings(root: string, folder: string): void {
   linkTeammates(join(root, ".pi", "agents", "do"), join(folder, ".pi", "agents"));
 }
 
-export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root)): PreparedCoordinator {
+export function prepareDo(root: string, request: CoordinatorRequest, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root), delegatedGroup?: { groupId: string; revisionHash: string; member: string }): PreparedCoordinator {
   validateCoordinatorRequest(request);
   if (request.mode !== "do" || request.tickets.length !== 1) fail("prepareDo needs exactly one do ticket");
   const ticket = request.tickets[0]!;
+  const state = openDb(join(root, "yokemate.db"));
+  const rework = delegatedGroup ? undefined : state.prepare(`SELECT g.id,g.root_ticket,g.active_revision,g.phase,r.plan_binding_json,r.candidate_hash
+    FROM task_group g JOIN group_rework r ON r.group_id=g.id AND r.revision_hash=g.active_revision
+    WHERE g.root_ticket=? AND g.phase='review' AND r.state IN ('pending','running') ORDER BY r.updated_at DESC LIMIT 1`).get(ticket) as { id: string; root_ticket: string; active_revision: string; phase: string; plan_binding_json: string; candidate_hash: string } | undefined;
+  const activeGroup = rework ?? (delegatedGroup
+    ? state.prepare("SELECT id,root_ticket,active_revision,phase FROM task_group WHERE id=? AND active_revision=?").get(delegatedGroup.groupId, delegatedGroup.revisionHash) as { id: string; root_ticket: string; active_revision: string; phase: string } | undefined
+    : state.prepare("SELECT id,root_ticket,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('planned','running','blocked') ORDER BY updated_at DESC LIMIT 1").get(ticket) as { id: string; root_ticket: string; active_revision: string; phase: string } | undefined);
+  if (activeGroup) {
+    const revision = state.prepare("SELECT manifest_json,bindings_json FROM group_revision WHERE group_id=? AND revision_hash=?").get(activeGroup.id, activeGroup.active_revision) as { manifest_json: string; bindings_json: string } | undefined;
+    const activeRevision = revision ?? fail(`${ticket}: active group revision is missing`);
+    const manifest = JSON.parse(activeRevision.manifest_json) as { ownerProject: string; members: { ticket: string; ownWork: "implementation" | "coordination-only"; implementationRepos: string[] }[]; repositories: { repo: string; role: string }[] };
+    const bindings = JSON.parse(activeRevision.bindings_json) as { ticket: string; path: string }[];
+    if (rework) {
+      const reworkBinding = JSON.parse(rework.plan_binding_json) as { ticket: string; path: string; contentHash: string; scopeHash: string; repositories: string[] };
+      if (request.plan && resolve(request.plan) !== resolve(reworkBinding.path)) fail(`${ticket}: group rework plan differs from the recorded binding`);
+      const rootMember = state.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(activeGroup.id, activeGroup.active_revision, ticket) as { member_identity: string };
+      const allRows = state.prepare("SELECT repo,role FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(activeGroup.id, activeGroup.active_revision) as unknown as { repo: string; role: string }[];
+      const rows = allRows.filter((row) => reworkBinding.repositories.includes(row.repo));
+      if (!rows.length || rows.length !== reworkBinding.repositories.length) fail(`${ticket}: group rework repositories differ from the active group scope`);
+      const parts = rows.map((row): PreparedPart => {
+        const [org, name] = row.repo.split("/");
+        const passport = state.prepare("SELECT path,figma_mcp,figma_url FROM project WHERE org=? AND repo=?").get(org, name) as { path: string; figma_mcp: string | null; figma_url: string | null } | undefined;
+        if (!passport) throw new Error(`${row.repo}: passport is missing`);
+        const scope = resolveGroupWorkScope(state, join(root, "work", ticket), { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, memberIdentity: rootMember.member_identity, kind: "integration", repo: row.repo });
+        return { repo: row.repo, org: org!, role: row.role, roleAssumed: false, path: passport.path, passportPath: passport.path, figmaMcp: passport.figma_mcp ?? undefined, figmaUrl: passport.figma_url ?? undefined, branch: scope.branch!, targetBranch: scope.targetBranch!, worktree: scope.worktree!, remote: scope.remote!, scopeId: scope.scopeId, pr: scope.pr ?? undefined };
+      });
+      const model = request.model ?? modelForTicket(state, ticket, "do") ?? poolModel(dataRoot(root), "do");
+      const folder = join(root, "work", ticket);
+      settings(root, folder);
+      state.prepare("UPDATE group_rework SET state='running',updated_at=datetime('now') WHERE group_id=? AND revision_hash=? AND candidate_hash=? AND state IN ('pending','running')").run(activeGroup.id, activeGroup.active_revision, rework.candidate_hash);
+      state.close();
+      return { mode: "do", tickets: [ticket], model, cwd: folder, plan: reworkBinding.path, plans: { [ticket]: reworkBinding.path }, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:do-worker ${ticket}. This is group rework for candidate ${rework.candidate_hash}. Read ${reworkBinding.path} fully. Work only in the listed integration worktrees on branch ${ticket}; do not restart members or change external bases. Update the existing final PRs, run scoped readiness and independent review, then record the exact group rework result and call coordinator_finish done.`, group: { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, root: ticket, role: "rework" } };
+    }
+    const memberTicket = delegatedGroup?.member ?? ticket;
+    const member = manifest.members.find((item) => item.ticket === memberTicket);
+    const binding = bindings.find((item) => item.ticket === memberTicket);
+    const activeMember = member ?? fail(`${memberTicket}: active group member binding is missing`);
+    const activeBinding = binding ?? fail(`${memberTicket}: active group member binding is missing`);
+    const taskRoot = join(root, "work");
+    const folder = delegatedGroup ? join(taskRoot, activeGroup.root_ticket, "members", memberTicket) : join(taskRoot, activeGroup.root_ticket);
+    if (!inside(taskRoot, folder)) fail(`unsafe task folder ${folder}`);
+    if (existsSync(folder) && lstatSync(folder).isSymbolicLink()) fail(`task folder is a symlink: ${folder}`);
+    const repos = delegatedGroup ? activeMember.implementationRepos : manifest.repositories.map((item) => item.repo);
+    const roles = new Map(manifest.repositories.map((item) => [item.repo, item.role]));
+    const parts = repos.map((repo): PreparedPart => {
+      const [org, name] = repo.split("/");
+      const row = state.prepare("SELECT path,figma_mcp,figma_url FROM project WHERE org=? AND repo=?").get(org, name) as { path: string; figma_mcp: string | null; figma_url: string | null } | undefined;
+      const passport = row ?? fail(`${memberTicket}: no passport for ${repo}`);
+      const branch = memberTicket === activeGroup.root_ticket ? `${activeGroup.root_ticket}-own` : memberTicket;
+      if (delegatedGroup) {
+        const memberRow = state.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(activeGroup.id, activeGroup.active_revision, memberTicket) as { member_identity: string };
+        const scope = resolveGroupWorkScope(state, join(root, "work", activeGroup.root_ticket), { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, memberIdentity: memberRow.member_identity, kind: memberTicket === activeGroup.root_ticket ? "root-own" : "member", repo });
+        return { repo, org: org!, role: roles.get(repo) ?? "app", roleAssumed: false, path: passport.path, figmaMcp: passport.figma_mcp ?? undefined, figmaUrl: passport.figma_url ?? undefined, branch: scope.branch!, targetBranch: scope.targetBranch!, worktree: scope.worktree!, remote: scope.remote!, scopeId: scope.scopeId };
+      }
+      return { repo, org: org!, role: roles.get(repo) ?? "app", roleAssumed: false, path: passport.path, figmaMcp: passport.figma_mcp ?? undefined, figmaUrl: passport.figma_url ?? undefined, branch, targetBranch: activeGroup.root_ticket, worktree: join(folder, org!, name!) };
+    });
+    const model = request.model ?? modelForTicket(state, activeGroup.root_ticket, "do") ?? poolModel(dataRoot(root), "do");
+    mkdirSync(folder, { recursive: true });
+    settings(root, folder);
+    const group = { groupId: activeGroup.id, revisionHash: activeGroup.active_revision, root: activeGroup.root_ticket, role: delegatedGroup ? "member" as const : "parent" as const, ...(delegatedGroup ? { memberIdentity: delegatedGroup.member, ownWork: activeMember.ownWork } : {}) };
+    const passports = parts.map((part) => `- ${part.repo}: clone at ${part.path}, worktree ${part.worktree}, branch ${part.branch}, internal target ${part.targetBranch}`).join("\n");
+    const prompt = delegatedGroup
+      ? `/skill:do-worker ${memberTicket}. This is group ${activeGroup.id} revision ${activeGroup.active_revision}; read ${activeBinding.path} fully. Work only inside ${folder}. Use only the listed member scopes; every PR targets ${activeGroup.root_ticket}, never an external base. Project passports:\n${passports}\nWhen the scoped PRs are open and green, run pnpm record-report ${memberTicket} --part <org/repo>:<role>:<branch>:<pr-url> from ${folder}, then call coordinator_finish done.`
+      : `/skill:group-do-worker ${activeGroup.root_ticket}. Execute only group ${activeGroup.id} revision ${activeGroup.active_revision}. Start the durable scheduler with group_do_start, keep this cycle conversational, integrate only through group_integrate, and call coordinator_finish only after the group reaches review or a durable blocker.`;
+    state.close();
+    return { mode: "do", tickets: [memberTicket], model, cwd: folder, plan: activeBinding.path, plans: Object.fromEntries(bindings.map((item) => [item.ticket, item.path])), parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt, group };
+  }
+  state.close();
   const plan = resolvePlan(root, ticket, request.plan);
   const taskRoot = join(root, "work");
   const folder = join(taskRoot, ticket);
@@ -95,12 +166,19 @@ export function prepareDo(root: string, request: CoordinatorRequest, origin: Coo
 }
 
 export function markDoRunning(root: string, prepared: PreparedCoordinator, origin: CoordinatorOrigin, snapshot: RuntimeSettings = readRuntimeSettings(root)): void {
+  if (prepared.group) {
+    if (prepared.mode !== "do" || !prepared.plan) fail("prepared group do request is incomplete");
+    return;
+  }
   if (prepared.mode !== "do" || !prepared.plan || !prepared.expected) fail("prepared do request is incomplete");
   const ticket = prepared.tickets[0]!;
   const db = openDb(join(root, "yokemate.db"));
   const out = applyMove(db, "spawn", origin, ticket, () => {
+    const conflicting = db.prepare("SELECT kind,group_id FROM member_claim WHERE ticket=? AND state IN ('reserved','active','suspended') LIMIT 1").get(ticket) as { kind: string; group_id: string | null } | undefined;
+    if (conflicting) throw new Error(`${ticket}: claimed by ${conflicting.kind === "group" ? `group ${conflicting.group_id}` : "another single run"}`);
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES (?, ?, 'running') ON CONFLICT (ticket) DO UPDATE SET stage = 'running'").run(ticket, ticketUrl(db, ticket));
     db.prepare("UPDATE work SET folder = ?, plan = ?, updated_at = datetime('now') WHERE ticket = ?").run(prepared.cwd, prepared.plan!, ticket);
+    db.prepare("INSERT INTO member_claim (member_identity,ticket,kind,owners_json,state) VALUES (?,?,'single',?,'active')").run(`single:${ticket}`, ticket, JSON.stringify([{ runtimeId: origin.runId ?? "unknown", runId: origin.runId ?? "unknown", sessionId: origin.sessionId ?? "unknown" }]));
   }, { allowFresh: true, expected: prepared.expected, settings: snapshot });
   if (!out.ok) fail(out.refuse);
 }
@@ -117,6 +195,31 @@ export async function prepareShip(root: string, request: CoordinatorRequest): Pr
   validateCoordinatorRequest(request);
   if (request.mode !== "ship" || request.tickets.length !== 1) fail("prepareShip needs exactly one ship ticket");
   const db = openDb(join(root, "yokemate.db"));
+  const claim = groupClaimForTicket(db, request.tickets[0]!);
+  if (claim) {
+    const owner = db.prepare("SELECT root_ticket FROM task_group WHERE id=?").get(claim.groupId) as { root_ticket: string } | undefined;
+    if (!owner || owner.root_ticket !== request.tickets[0]) fail(`${request.tickets[0]}: claimed by active task group ${claim.groupId}; ship the group root instead`);
+  }
+  const group = db.prepare("SELECT id,active_revision,phase FROM task_group WHERE root_ticket=? AND active_revision IS NOT NULL AND phase IN ('accepted','shipping','done') ORDER BY updated_at DESC LIMIT 1").get(request.tickets[0]!) as { id: string; active_revision: string; phase: string } | undefined;
+  if (group) {
+    const ticket = request.tickets[0]!;
+    const acceptance = db.prepare("SELECT candidate_hash FROM group_acceptance WHERE group_id=? AND revision_hash=? AND state='current'").get(group.id, group.active_revision) as { candidate_hash: string } | undefined;
+    if (!acceptance) fail(`${ticket}: group has no current accepted candidate`);
+    const rootMember = db.prepare("SELECT member_identity FROM group_member WHERE group_id=? AND revision_hash=? AND ticket=?").get(group.id, group.active_revision, ticket) as { member_identity: string } | undefined;
+    const activeRootMember = rootMember ?? fail(`${ticket}: group root member is missing`);
+    const repositories = db.prepare("SELECT repo,role,remote,external_base,final_pr,head_sha FROM group_repository WHERE group_id=? AND revision_hash=? ORDER BY repo").all(group.id, group.active_revision) as unknown as { repo: string; role: string; remote: string; external_base: string; final_pr: string | null; head_sha: string | null }[];
+    const parts = repositories.map((repository): PreparedPart => {
+      if (!repository.final_pr || !repository.head_sha) fail(`${repository.repo}: accepted group final PR is incomplete`);
+      const [org, repo] = repository.repo.split("/");
+      const passport = db.prepare("SELECT path FROM project WHERE org=? AND repo=?").get(org, repo) as { path: string } | undefined;
+      const activePassport = passport ?? fail(`${repository.repo}: passport is missing`);
+      const scope = resolveGroupWorkScope(db, join(root, "work", ticket), { groupId: group.id, revisionHash: group.active_revision, memberIdentity: activeRootMember.member_identity, kind: "integration", repo: repository.repo });
+      return { repo: repository.repo, org: org!, role: repository.role, roleAssumed: false, path: scope.worktree!, passportPath: activePassport.path, branch: ticket, pr: repository.final_pr!, base: repository.external_base, remote: repository.remote, observedHead: repository.head_sha!, targetBranch: repository.external_base, worktree: scope.worktree!, scopeId: scope.scopeId };
+    });
+    const plan = resolvePlan(root, ticket);
+    const model = request.model ?? modelForTicket(db, ticket, "ship") ?? poolModel(dataRoot(root), "ship");
+    return { mode: "ship", tickets: [ticket], model, cwd: join(root, "work", ticket), plan, plans: { [ticket]: plan }, parts, skillsPath: join(root, ".pi", "skills"), resourcesPath: root, prompt: `/skill:ship-worker ${ticket}${request.note ? ` ${request.note}` : ""}. Ship only accepted group ${group.id} revision ${group.active_revision}, use coordinator_merge for every registered final PR, then call coordinator_finish with the truthful partial or complete outcome.`, group: { groupId: group.id, revisionHash: group.active_revision, root: ticket, role: "parent" } };
+  }
   const plans: Record<string, string> = {};
   const parts: PreparedPart[] = [];
   for (const ticket of request.tickets) {

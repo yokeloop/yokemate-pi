@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { PreparedCoordinator } from "./coordinator-launch.ts";
-import type { RuntimeIdentity } from "./coordinator-runtime.ts";
+import { runtimeEnv, type RuntimeIdentity } from "./coordinator-runtime.ts";
 import type { ExpectedCoordinatorModel } from "./coordinator-model.ts";
 import { JsonlObservation, OwnedChildState, RunSnapshots, errorMetadata, fileProvenance, sha256 } from "./subagent-runs.ts";
 import { processStarttime } from "./coordinator-control.ts";
@@ -59,7 +59,12 @@ export function startCoordinatorRpc(prepared: PreparedCoordinator, identity: Run
   const invocation = options.invocation ?? piInvocation(coordinatorInvocationArgs(prepared), prepared.resourcesPath);
   const log = openLog(prepared.cwd, `coordinator-${identity.runId}.log`);
   log?.(`[start ${new Date().toISOString()}] ${invocation.command} ${invocation.args.join(" ")}\n`);
-  const env: NodeJS.ProcessEnv = { ...process.env, YOKEMATE_MODE: identity.mode, YOKEMATE_TICKET: identity.ticket, YOKEMATE_ROLE: "coordinator", YOKEMATE_RUN_ID: identity.runId, YOKEMATE_PARENT_RUN_ID: identity.parentRunId, YOKEMATE_PARENT_SESSION_ID: identity.parentSessionId, YOKEMATE_PROJECT: JSON.stringify(identity.project), YOKEMATE_SUBAGENT_JSON_CONTRACT: "1" };
+  const groupScope = prepared.group ? {
+    YOKEMATE_GROUP_ROLE: prepared.group.role,
+    YOKEMATE_GROUP_SCOPE_PATHS: JSON.stringify(prepared.group.role === "parent" ? [] : prepared.parts.map((part) => part.worktree).filter((value): value is string => Boolean(value))),
+    YOKEMATE_GROUP_SCOPE_BRANCHES: JSON.stringify(prepared.group.role === "parent" ? [] : prepared.parts.map((part) => part.branch)),
+  } : {};
+  const env: NodeJS.ProcessEnv = { ...process.env, ...runtimeEnv(identity), ...groupScope, YOKEMATE_SUBAGENT_JSON_CONTRACT: "1" };
   delete env.HERDR_PANE_ID;
   delete env.YOKEMATE_PARENT_PANE;
   const snapshots = new RunSnapshots(prepared.resourcesPath);
