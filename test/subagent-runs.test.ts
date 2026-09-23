@@ -150,20 +150,22 @@ test("parser facts are byte-exact, cumulative and preserve authoritative final h
     const suffix = '"}';
     return Buffer.from(prefix + "x".repeat(bytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix)) + suffix);
   };
-  const exact = new JsonlObservation();
-  const exactWire = Buffer.concat([record(1024 * 1024), Buffer.from("\r\n")]);
-  for (let offset = 0; offset < exactWire.length; offset += 8191) exact.write(exactWire.subarray(offset, offset + 8191));
-  exact.end();
-  assert.equal(exact.protocolError, false);
-  assert.equal(exact.metadata().events.other, 1);
-  assert.equal(exact.metadata().stdoutBytes, exactWire.length);
-  assert.equal(exact.metadata().stdoutHash, sha256(exactWire));
+  for (const separator of ["\n", "\r\n"]) {
+    const exact = new JsonlObservation();
+    const exactWire = Buffer.concat([record(1024 * 1024), Buffer.from(separator)]);
+    for (let offset = 0; offset < exactWire.length; offset += 8191) exact.write(exactWire.subarray(offset, offset + 8191));
+    exact.end();
+    assert.equal(exact.protocolError, false);
+    assert.equal(exact.metadata().events.other, 1);
+    assert.equal(exact.metadata().stdoutBytes, exactWire.length);
+    assert.equal(exact.metadata().stdoutHash, sha256(exactWire));
 
-  const tooLarge = new JsonlObservation();
-  tooLarge.write(Buffer.concat([record(1024 * 1024 + 1), Buffer.from("\n")]))
-  tooLarge.end();
-  assert.deepEqual(tooLarge.metadata().firstParserError, { kind: "record_limit", offset: 0 });
-  assert.equal(tooLarge.metadata().parserErrorCounters.record_limit, 1);
+    const tooLarge = new JsonlObservation();
+    tooLarge.write(Buffer.concat([record(1024 * 1024 + 1), Buffer.from(separator)]));
+    tooLarge.end();
+    assert.deepEqual(tooLarge.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+    assert.equal(tooLarge.metadata().parserErrorCounters.record_limit, 1);
+  }
 
   const overflowEof = new JsonlObservation();
   overflowEof.write(record(1024 * 1024 + 2));
@@ -187,6 +189,16 @@ test("parser facts are byte-exact, cumulative and preserve authoritative final h
   assert.deepEqual(mixed.metadata().firstParserError, { kind: "invalid_json", offset: 0 });
   assert.deepEqual(mixed.metadata().lastParserError, { kind: "invalid_event", offset: 5 });
   assert.equal(mixed.metadata().stdoutHash, sha256(wire));
+
+  const invalidUtf8 = new JsonlObservation();
+  invalidUtf8.write(Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3]));
+  invalidUtf8.write(Buffer.from([0x28, 0x22, 0x7d, 0x0a]));
+  invalidUtf8.write(final);
+  invalidUtf8.end();
+  assert.equal(invalidUtf8.protocolError, true);
+  assert.equal(invalidUtf8.evidence().invalidUtf8, true);
+  assert.deepEqual(invalidUtf8.metadata().firstParserError, { kind: "invalid_json", offset: 0 });
+  assert.equal(invalidUtf8.finalText, finalText);
 
   const completeWithoutLf = new JsonlObservation();
   completeWithoutLf.write(final.subarray(0, -1));
@@ -260,29 +272,118 @@ test("patched producer summarizes only oversized agent_end messages and parser v
   assert.equal(JSON.stringify(toJsonEvent(small, { yokemateSubagentJsonContract: 1 })), JSON.stringify(small));
   assert.deepEqual(small, smallCopy);
 
+  const aggregateAt = (bytes: number) => {
+    const event = { type: "agent_end", messages: [{ role: "user", content: "" }], willRetry: false } as any;
+    const overhead = Buffer.byteLength(JSON.stringify(event));
+    event.messages[0].content = "x".repeat(bytes - overhead);
+    assert.equal(Buffer.byteLength(JSON.stringify(event)), bytes);
+    return event;
+  };
+  const exact = aggregateAt(1024 * 1024);
+  const over = aggregateAt(1024 * 1024 + 1);
+  assert.equal(toJsonEvent(exact, { yokemateSubagentJsonContract: 1 }), exact);
+  assert.equal((toJsonEvent(over, { yokemateSubagentJsonContract: 1 }) as any).messages, undefined);
+
   const messages = [{ role: "user", content: "é".repeat(600_000) }, { role: "assistant", content: "tail" }];
   const large = { type: "agent_end", messages, willRetry: true } as any;
-  const summarized = toJsonEvent(large, { yokemateSubagentJsonContract: 1 }) as any;
+  const largeCopy = structuredClone(large);
   const serializedMessages = JSON.stringify(messages);
+  assert.ok(Buffer.byteLength(JSON.stringify(large)) > JSON.stringify(large).length);
+  assert.equal(toJsonEvent(large), large);
+  assert.equal(toJsonEvent(large, { yokemateSubagentJsonContract: undefined }), large);
+  const summarized = toJsonEvent(large, { yokemateSubagentJsonContract: 1 }) as any;
   assert.equal(summarized.messages, undefined);
   assert.deepEqual(summarized.messagesSummary, { version: 1, count: 2, bytes: Buffer.byteLength(serializedMessages), sha256: sha256(serializedMessages) });
   assert.equal(summarized.willRetry, true);
+  assert.deepEqual(large, largeCopy);
   assert.equal(large.messages, messages);
 
-  const valid = new JsonlObservation();
-  valid.write(Buffer.from(JSON.stringify(summarized) + "\n"));
+  for (const type of ["future_event", "response", "message_end", "entry_appended"]) {
+    const event = { type, content: "é".repeat(600_000) } as any;
+    assert.ok(Buffer.byteLength(JSON.stringify(event)) > 1024 * 1024);
+    assert.equal(toJsonEvent(event, { yokemateSubagentJsonContract: 1 }), event);
+  }
+
+  const callbacks: any[] = [];
+  const valid = new JsonlObservation((event) => callbacks.push(event));
+  const emit = (event: unknown) => valid.write(Buffer.from(JSON.stringify(event) + "\n"));
+  emit({ type: "tool_execution_start", toolCallId: "active" });
+  emit({ type: "auto_retry_start" });
+  emit({ type: "compaction_start" });
+  emit(summarized);
+  assert.equal(valid.incomplete, true);
+  assert.equal(valid.evidence().agentSettled, false);
+  emit({ type: "tool_execution_end", toolCallId: "active" });
+  emit({ type: "auto_retry_end" });
+  emit({ type: "compaction_end" });
+  const final = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "authoritative" }], stopReason: "stop" } };
+  emit(final);
+  emit({ type: "agent_settled" });
+  emit({ type: "response", id: "next", success: true });
   valid.end();
   assert.equal(valid.protocolError, false);
-  for (const bad of [
+  assert.equal(valid.finalText, "authoritative");
+  assert.equal(valid.metadata().events.agent_end, 1);
+  assert.deepEqual(callbacks.slice(-3).map((event) => event.type), ["message_end", "agent_settled", "response"]);
+
+  const validSummary = summarized.messagesSummary;
+  const malformed = [
     { ...summarized, messages: [{ role: "user", content: "small" }] },
-    { ...summarized, messagesSummary: { ...summarized.messagesSummary, version: 2 } },
-    { ...summarized, messagesSummary: { ...summarized.messagesSummary, sha256: "A".repeat(64) } },
-  ]) {
-    const observed = new JsonlObservation();
+    { ...summarized, willRetry: "false" },
+    { ...summarized, extra: true },
+    { ...summarized, messagesSummary: { ...validSummary, version: 2 } },
+    { ...summarized, messagesSummary: { ...validSummary, count: -1 } },
+    { ...summarized, messagesSummary: { ...validSummary, count: 1.5 } },
+    { ...summarized, messagesSummary: { ...validSummary, count: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...summarized, messagesSummary: { ...validSummary, bytes: -1 } },
+    { ...summarized, messagesSummary: { ...validSummary, bytes: 1.5 } },
+    { ...summarized, messagesSummary: { ...validSummary, bytes: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...summarized, messagesSummary: { ...validSummary, sha256: "A".repeat(64) } },
+    { ...summarized, messagesSummary: { ...validSummary, extra: true } },
+    ...(["version", "count", "bytes", "sha256"] as const).map((key) => {
+      const summary = { ...validSummary };
+      delete summary[key];
+      return { ...summarized, messagesSummary: summary };
+    }),
+  ];
+  for (const bad of malformed) {
+    const dispatched: any[] = [];
+    const observed = new JsonlObservation((event) => dispatched.push(event));
     observed.write(Buffer.from(JSON.stringify(bad) + "\n"));
     observed.end();
     assert.deepEqual(observed.metadata().lastParserError, { kind: "invalid_event", offset: 0 });
+    assert.deepEqual(dispatched, []);
   }
+});
+
+test("producer-only aggregate contract keeps direct oversized records fatal", async () => {
+  const { JsonlObservation } = await import("../src/subagent-runs.ts");
+  const final = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "late final" }], stopReason: "stop" } };
+  const records = [
+    { type: "agent_end", messages: [{ role: "user", content: "x".repeat(10 * 1024 * 1024) }], willRetry: false },
+    { type: "future_event", content: "x".repeat(10 * 1024 * 1024) },
+    { type: "response", id: "oversized", success: true, data: "x".repeat(10 * 1024 * 1024) },
+  ];
+  for (const record of records) {
+    const dispatched: any[] = [];
+    const observed = new JsonlObservation((event) => dispatched.push(event));
+    observed.write(Buffer.from(JSON.stringify(record) + "\n"));
+    observed.write(Buffer.from(JSON.stringify(final) + "\n"));
+    observed.write(Buffer.from(JSON.stringify({ type: "agent_settled" }) + "\n"));
+    observed.end();
+    assert.equal(observed.protocolError, true);
+    assert.deepEqual(observed.metadata().firstParserError, { kind: "record_limit", offset: 0 });
+    assert.equal(observed.metadata().parserErrorCounters.record_limit, 1);
+    assert.deepEqual(dispatched.map((event) => event.type), ["message_end", "agent_settled"]);
+    assert.equal(observed.finalText, "late final");
+  }
+  const malformed = new JsonlObservation();
+  malformed.write(Buffer.from("x".repeat(10 * 1024 * 1024 + 1) + "\n"));
+  malformed.write(Buffer.from(JSON.stringify(final) + "\n"));
+  malformed.end();
+  assert.equal(malformed.protocolError, true);
+  assert.equal(malformed.metadata().parserErrorCounters.record_limit, 1);
+  assert.equal(malformed.finalText, "late final");
 });
 
 test("tool and retry remain incomplete until their actual end events", async () => {
