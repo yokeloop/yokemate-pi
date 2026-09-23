@@ -343,7 +343,8 @@ const cases = [
   ["baseline_read_heavy_24", "valid"], ["baseline_read_heavy_32", "valid"], ["baseline_read_heavy_parallel", "valid"],
   ["read_heavy_24", "valid"], ["read_heavy_32", "valid"], ["read_heavy_parallel", "valid"],
   ["parallel_max", "valid"], ["chain_max", "valid"], ["parent_cancel", "incomplete"], ["parallel", "valid"], ["chain_long", "valid"], ["chain", "invalid_reviewer_json"], ["missing", "missing_final"], ["invalid", "invalid_reviewer_json"],
-  ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"],
+  ["output_limit", "output_limit"], ["protocol_invalid", "protocol_error"], ["protocol_partial", "protocol_error"], ["protocol_overflow", "protocol_error"], ["protocol_oversized_unknown", "protocol_error"], ["protocol_oversized_control", "protocol_error"],
+  ["coordinator_aggregate", "valid"], ["child_aggregate", "valid"],
   ["old_final", "missing_final"], ["retry", "valid"], ["nonzero", "incomplete"], ["signal", "incomplete"], ["spawn_error", "incomplete"], ["cleanup_error", "valid"], ["write_cleanup_error", "incomplete"], ["diagnostic_error", "valid"], ["storage_error", "valid"], ["delivery_sync", "delivery_failed"], ["delivery_async", "delivery_failed"], ["delivery_sync_batch", "delivery_failed"], ["delivery_sync_both", "delivery_failed"], ["delivery_async_batch", "delivery_failed"], ["delivery_async_both", "delivery_failed"], ["delivery_async_after_observed", "valid"],
 ] as const;
 
@@ -373,23 +374,26 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   symlinkSync(join(root, ".pi/skills"), join(sandbox, ".pi/skills"));
   symlinkSync(join(root, "node_modules"), join(sandbox, "node_modules"));
   symlinkSync(provider, join(agentDir, "extensions/provider.ts"));
+  const loadedRuntimeExtension = join(agentDir, "extensions/subagent.ts");
+  if (["coordinator_aggregate", "child_aggregate"].includes(scenario)) writeFileSync(loadedRuntimeExtension, 'import extension from "../../.pi/extensions/subagent/index.ts";\nexport default process.env.YOKEMATE_ROLE === "coordinator" ? extension : () => {};\n');
   writeFileSync(join(cwd, ".pi/agents/task-reviewer.md"), "---\nname: task-reviewer\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn reviewer JSON.\n");
   writeFileSync(join(cwd, ".pi/agents/worker.md"), "---\nname: worker\ndescription: Deterministic transport fixture\ntools: read\n---\nReturn the requested output.\n");
   writeFileSync(join(cwd, ".pi/agents/plan-scout.md"), "---\nname: plan-scout\ndescription: Deterministic read-heavy fixture\ntools: read, grep, find, ls, bash\n---\nReturn the complete deterministic scout.\n");
   writeFileSync(join(sandbox, ".pi/agents/do-coordinator.md"), "Fixture coordinator");
-  writeFileSync(join(folder, "plan.md"), "fixture\n".repeat(6144));
+  writeFileSync(join(folder, "plan.md"), ["coordinator_aggregate", "child_aggregate"].includes(scenario) ? `${"x".repeat(39)}\n`.repeat(1024) : "fixture\n".repeat(6144));
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
   const runtimeCli = scenario.startsWith("baseline_") ? unpatchedCli : cli;
   const priorEnv = { ...process.env };
   for (const key of Object.keys(process.env)) if (!["PATH", "NODE_TEST_CONTEXT"].includes(key)) delete process.env[key];
   Object.assign(process.env, { HOME: sandbox, TMPDIR: join(sandbox, "tmp"), PI_CODING_AGENT_DIR: agentDir, YM204_FIXTURE_SOCKET: join(sandbox, "barrier.sock"), YM204_FIXTURE_REVIEW_CWD: root, YM204_FIXTURE_BASE: head, YM204_FIXTURE_HEAD: head, YM204_FIXTURE_SCENARIO: scenario, YM204_FIXTURE_READ_FILE: join(folder, "plan.md") });
-  if (scenario === "protocol_partial" || scenario === "protocol_overflow") {
+  if (["protocol_partial", "protocol_overflow", "coordinator_aggregate", "child_aggregate"].includes(scenario)) {
     process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(sandbox, "test/fixtures/subagent-json-relay.mjs");
-    process.env.YOKEMATE_SUBAGENT_TEST_FAULT = scenario === "protocol_partial" ? "eof_without_lf" : "record_overflow";
+    if (scenario === "protocol_partial" || scenario === "protocol_overflow") process.env.YOKEMATE_SUBAGENT_TEST_FAULT = scenario === "protocol_partial" ? "eof_without_lf" : "record_overflow";
     process.env.YOKEMATE_SUBAGENT_TEST_MANIFEST_DIR = relayFacts;
   }
   const sockets = new Set<Socket>();
   const loaded: any[] = [];
+  const rawAggregates: any[] = [];
   const observedPhases: string[] = [];
   let asyncFaultSocket: Socket | undefined;
   let working!: () => void;
@@ -405,6 +409,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       const event = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
       observedPhases.push(event.phase);
       if (event.phase === "loaded") loaded.push(event);
+      if (event.phase === "aggregate-raw") rawAggregates.push(event);
       if (scenario === "parent_cancel" && event.phase === "child-working") working();
       else if (event.phase === "async-fault-after-observed") { asyncFaultSocket = socket; return; }
       else if (scenario === "signal" && event.phase === "child-working") process.kill(event.data.pid, "SIGKILL");
@@ -422,14 +427,23 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
   const reports: any[] = [];
   let failureReason: string | undefined;
   let timeout: NodeJS.Timeout | undefined;
+  let aggregateSummaryEvent: any;
+  let childDeliveryObserved = false;
+  let resolveAggregateSettled!: () => void;
+  const aggregateSettled = new Promise<void>((resolve) => { resolveAggregateSettled = resolve; });
   try {
     await untilAborted(new Promise<void>((resolve) => server.listen(process.env.YM204_FIXTURE_SOCKET, resolve)), signal);
+    const runtimeOptions: any = { readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 };
+    if (!["coordinator_aggregate", "child_aggregate"].includes(scenario)) runtimeOptions.invocation = { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(sandbox, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] };
     rpc = startCoordinatorRpc({ mode: "do", tickets: ["YM-204"], model: "ym204-fixture/deterministic:high", cwd, plan: join(folder, "plan.md"), plans: {}, parts: [], prompt: "work", skillsPath: join(root, ".pi/skills"), resourcesPath: sandbox } as any,
       { runId: `owner-${scenario.replaceAll("_", "-")}`, parentSessionId: "fixture-parent", mode: "do", ticket: "YM-204", project: [], role: "coordinator", cwd, model: "ym204-fixture/deterministic:high" },
       { provider: "ym204-fixture", id: "deterministic", thinkingLevel: "high" },
       { onEvent(event) {
         if (rpc && scenario.startsWith("delivery_")) continueOwnedCoordinator(rpc, event, (reason) => { failureReason = reason; complete(); });
         if (scenario === "delivery_async_after_observed" && event.type === "extension_error" && event.event === "send_message") markLateAsyncError();
+        if (scenario === "coordinator_aggregate" && event.type === "agent_end" && (event as any).messagesSummary) aggregateSummaryEvent = event;
+        if (scenario === "coordinator_aggregate" && aggregateSummaryEvent && event.type === "agent_settled") resolveAggregateSettled();
+        if (scenario === "child_aggregate" && childDeliveryObserved && event.type === "agent_settled") { resolveAggregateSettled(); complete(); }
         const message = event.type === "message_end" ? event.message as any : undefined;
         const envelope = message?.details?.envelope;
         if (envelope) reports.push(message);
@@ -437,12 +451,58 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
         if (event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state") {
           const state = (event.entry as any).data;
           if (scenario.startsWith("delivery_async") && scenario !== "delivery_async_after_observed" && state.deliveries.length === 2 && state.deliveries.some((delivery: any) => delivery.state === "delivery_failed") && state.deliveries.every((delivery: any) => ["observed", "delivery_failed", "delivery_unknown"].includes(delivery.state))) markAsyncUpdated();
-          if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) { asyncFaultSocket?.end("release\n"); complete(); }
+          if (batch && !state.children.length && state.deliveries.length && state.deliveries.every((delivery: any) => delivery.state === "observed")) {
+            if (scenario === "child_aggregate") childDeliveryObserved = true;
+            else { asyncFaultSocket?.end("release\n"); complete(); }
+          }
         }
       }, onBlocked(reason) { failureReason = reason; complete(); } },
-      { invocation: { command: process.execPath, args: [runtimeCli, "--mode", "rpc", "--no-session", "--no-extensions", "-e", provider, "-e", runtimeExtension, "--skill", join(sandbox, ".pi/skills"), "--model", "ym204-fixture/deterministic:high"] }, readyTimeoutMs: 10000, stopGraceMs: scenario === "parent_cancel" ? 5000 : 50 });
+      runtimeOptions);
     await untilAborted(rpc.ready, signal);
     await untilAborted(rpc.request({ type: "prompt", message: "work" }), signal);
+    if (scenario === "coordinator_aggregate") {
+      await untilAborted(Promise.race([aggregateSettled, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`coordinator aggregate did not settle; phases=${observedPhases.join(",")}`)), 45000); })]), signal);
+      clearTimeout(timeout);
+      assert.equal(failureReason, undefined);
+      assert.ok(aggregateSummaryEvent);
+      assert.equal("messages" in aggregateSummaryEvent, false);
+      assert.equal(aggregateSummaryEvent.willRetry, false);
+      assert.equal(rawAggregates.length, 1);
+      const raw = rawAggregates[0];
+      assert.equal(raw.role, "coordinator");
+      assert.equal(raw.runId, `owner-${scenario.replaceAll("_", "-")}`);
+      assert.ok(raw.data.rawEventBytes > 1024 * 1024);
+      const checkpointFiles = readdirSync(relayFacts).filter((file) => file.endsWith("-checkpoint.json"));
+      assert.equal(checkpointFiles.length, 1);
+      const wire = JSON.parse(readFileSync(join(relayFacts, checkpointFiles[0]!), "utf8"));
+      assert.equal(wire.role, "coordinator");
+      assert.equal(wire.runId, raw.runId);
+      assert.equal(wire.summaries.length, 1);
+      const summary = wire.summaries[0];
+      assert.ok(summary.bytes < 1024 * 1024);
+      assert.ok(wire.maxNonAggregateRecordBytes < 1024 * 1024);
+      assert.equal(wire.readTools.ends, 40);
+      assert.equal(wire.readTools.errors, 0);
+      assert.deepEqual(new Set(wire.readTools.callIds), new Set(Array.from({ length: 40 }, (_, index) => `aggregate-read-${index + 1}`)));
+      assert.deepEqual(summary.messagesSummary, { version: 1, count: raw.data.count, bytes: raw.data.bytes, sha256: raw.data.sha256 });
+      assert.deepEqual(aggregateSummaryEvent.messagesSummary, summary.messagesSummary);
+      const stream = (rpc.diagnosticSnapshot() as any).stream;
+      assert.equal(stream.parserErrors, 0);
+      assert.ok(stream.events.agent_end >= 1);
+      assert.equal(rpc.process.exitCode, null);
+      assert.equal((rpc.diagnosticSnapshot() as any).cancellationInitiator, "unknown");
+      const state = await untilAborted(rpc.request({ type: "get_state" }), signal);
+      assert.equal(state.success, true);
+      assert.equal((state as any).data.model.provider, "ym204-fixture");
+      assert.equal((state as any).data.model.id, "deterministic");
+      const coordinatorLoaded = loaded.find((entry) => entry.role === "coordinator");
+      assert.equal(coordinatorLoaded.data.file, provider);
+      assert.equal(coordinatorLoaded.data.tools.find((tool: any) => tool.name === "subagent")?.path, loadedRuntimeExtension);
+      assert.equal(coordinatorLoaded.data.commands.find((command: any) => command.name === "yokemate-coordinator-ready")?.path, loadedRuntimeExtension);
+      console.log(JSON.stringify({ piVersion, scenario, baseSha: head, headSha: head, role: raw.role, runId: raw.runId, raw: raw.data, wire, ordering: ["agent_end", "agent_settled", "get_state"], cli: fileProvenance(cli), producer: fileProvenance(resolve(cli, "../modes/json-event.js")), rpcProducer: fileProvenance(resolve(cli, "../modes/rpc/rpc-mode.js")), extension: fileProvenance(runtimeExtension) }));
+      rpc.acceptTerminal();
+      return;
+    }
     if (scenario === "parent_cancel") {
       await untilAborted(childWorking, signal);
       const fs = await import("node:fs");
@@ -475,7 +535,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       assert.ok(child.lifecycle.closeAt);
       return;
     }
-    const deliveryTimeout = scenario === "chain_max" || scenario.includes("read_heavy") ? 45000 : 10000;
+    const deliveryTimeout = scenario === "chain_max" || scenario.includes("read_heavy") || scenario.includes("aggregate") ? 45000 : 10000;
     await untilAborted(Promise.race([delivered, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(`${scenario}: report not observed; phases=${observedPhases.join(",")}`)), deliveryTimeout); })]), signal);
     if (scenario === "delivery_async_after_observed") {
       await untilAborted(lateAsyncError, signal);
@@ -503,6 +563,61 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     assert.equal(failureReason, undefined, scenario);
     assert.ok(batch, scenario);
     const results = batch.results;
+    if (scenario === "child_aggregate") {
+      assert.equal(rawAggregates.length, 1);
+      const raw = rawAggregates[0];
+      const result = results[0];
+      assert.equal(raw.role, "executor");
+      assert.equal(raw.runId, result.identity.runId);
+      assert.ok(raw.data.rawEventBytes > 1024 * 1024);
+      const factFiles = readdirSync(relayFacts).filter((file) => file.endsWith(".json") && !file.endsWith("-checkpoint.json"));
+      const relayReports = factFiles.map((file) => JSON.parse(readFileSync(join(relayFacts, file), "utf8")));
+      const wire = relayReports.find((report) => report.role === "executor" && report.runId === raw.runId);
+      assert.ok(wire);
+      assert.equal(wire.summaries.length, 1);
+      assert.ok(wire.summaries[0].bytes < 1024 * 1024);
+      assert.ok(wire.maxNonAggregateRecordBytes < 1024 * 1024);
+      assert.equal(wire.readTools.ends, 40);
+      assert.equal(wire.readTools.errors, 0);
+      assert.deepEqual(new Set(wire.readTools.callIds), new Set(Array.from({ length: 40 }, (_, index) => `aggregate-read-${index + 1}`)));
+      assert.deepEqual(wire.summaries[0].messagesSummary, { version: 1, count: raw.data.count, bytes: raw.data.bytes, sha256: raw.data.sha256 });
+      assert.equal(result.processOutcome, "exited");
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.signal, null);
+      assert.equal(result.stopReason, "stop");
+      assert.equal(result.payloadOutcome, "valid");
+      assert.equal(result.reviewVerdict, "approved");
+      assert.deepEqual(JSON.parse(result.payload), { status: "approved", findings: [] });
+      assert.equal(result.diagnostics.stream.parserErrors, 0);
+      assert.ok(result.diagnostics.stream.events.agent_end >= 1);
+      assert.equal(result.cancellationInitiator, undefined);
+      const resultReport = reports.find((message) => message.details.envelope.kind === "result" && message.details.envelope.identity.runId === raw.runId);
+      const batchReport = reports.find((message) => message.details.envelope.kind === "batch");
+      assert.ok(resultReport);
+      assert.ok(batchReport);
+      const resultEnvelope = resultReport.details.envelope;
+      const batchResult = batchReport.details.envelope.results[0];
+      assert.deepEqual(resultEnvelope.identity, batchResult.identity);
+      for (const field of ["actualTaskHash", "processOutcome", "exitCode", "signal", "stopReason", "payloadOutcome", "reviewVerdict", "payload"] as const) assert.deepEqual(resultEnvelope[field], batchResult[field], field);
+      assert.equal(batchResult.identity.runId, raw.runId);
+      assert.equal(batchResult.identity.batchId, result.identity.batchId);
+      assert.equal(typeof resultReport.details.deliveryId, "string");
+      assert.equal(typeof resultReport.details.envelopeHash, "string");
+      assert.equal(typeof batchReport.details.deliveryId, "string");
+      assert.equal(typeof batchReport.details.envelopeHash, "string");
+      const finalChildState = rpc.events.filter((event) => event.type === "entry_appended" && (event.entry as any)?.customType === "yokemate-child-state").at(-1) as any;
+      const matchingDeliveries = finalChildState.entry.data.deliveries.filter((delivery: any) => delivery.runIds.includes(raw.runId));
+      assert.equal(matchingDeliveries.length, 2);
+      assert.ok(matchingDeliveries.every((delivery: any) => delivery.state === "observed"));
+      assert.deepEqual(new Set(matchingDeliveries.map((delivery: any) => delivery.deliveryId)), new Set([resultReport.details.deliveryId, batchReport.details.deliveryId]));
+      assert.deepEqual(new Set(matchingDeliveries.map((delivery: any) => delivery.envelopeHash)), new Set([resultReport.details.envelopeHash, batchReport.details.envelopeHash]));
+      assert.equal(rpc.childState.busyCount(), 0);
+      const state = await untilAborted(rpc.request({ type: "get_state" }), signal);
+      assert.equal(state.success, true);
+      assert.equal((state as any).data.model.provider, "ym204-fixture");
+      assert.equal((state as any).data.model.id, "deterministic");
+      console.log(JSON.stringify({ piVersion, scenario, baseSha: head, headSha: head, role: raw.role, runId: raw.runId, raw: raw.data, wire, ordering: ["agent_end", "close", "result", "batch", "observed", "agent_settled", "get_state"], terminal: result, deliveries: [resultReport.details.deliveryId, batchReport.details.deliveryId], cli: fileProvenance(cli), producer: fileProvenance(resolve(cli, "../modes/json-event.js")), printProducer: fileProvenance(resolve(cli, "../modes/print-mode.js")), extension: fileProvenance(runtimeExtension) }));
+    }
     const profileScenario = scenario.replace(/^baseline_/, "");
     assert.equal(results[scenario === "chain" ? 1 : 0].payloadOutcome, outcome, scenario);
     if (scenario === "chain") {
@@ -539,10 +654,19 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
     if (scenario === "nonzero") assert.equal(results[0].exitCode, 7);
     if (["spawn_error", "write_cleanup_error"].includes(scenario)) assert.equal(results[0].processOutcome, "spawn_error");
     if (outcome !== "valid") assert.equal(results[scenario === "chain" ? 1 : 0].reviewVerdict, null);
+    if (scenario === "protocol_oversized_unknown" || scenario === "protocol_oversized_control") {
+      assert.equal(results[0].payloadOutcome, "protocol_error");
+      assert.equal(results[0].reviewVerdict, null);
+      assert.equal(results[0].diagnostics.stream.parserErrorCounters.record_limit, 1);
+      assert.equal(results[0].diagnostics.stream.finalTextPresent, true);
+      assert.equal(results[0].processOutcome, "exited");
+      assert.equal(results[0].exitCode, 0);
+      assert.equal(results[0].signal, null);
+    }
     assert.ok(reports.length >= 2, scenario);
     assert.ok(reports.every((message) => message.details.display?.version === 1), scenario);
     const terminalReport = reports.find((message) => message.details.envelope.kind === (scenario.startsWith("chain") ? "chain" : "result")) ?? reports[0];
-    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /protocol_error: invalid_json/, protocol_partial: /protocol_error: partial_record/, protocol_overflow: /protocol_error: record_limit/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/ };
+    const reasons: Record<string, RegExp> = { missing: /missing final/, invalid: /invalid reviewer JSON/, output_limit: /output limit/, protocol_invalid: /protocol_error: invalid_json/, protocol_partial: /protocol_error: partial_record/, protocol_overflow: /protocol_error: record_limit/, protocol_oversized_unknown: /protocol_error: record_limit/, protocol_oversized_control: /protocol_error: record_limit/, old_final: /missing final/, nonzero: /exit 7/, signal: /signal SIGKILL/, spawn_error: /spawn ENOSPC/, chain: /invalid reviewer JSON/ };
     if (reasons[scenario]) assert.match(terminalReport.details.display.failureReason, reasons[scenario], scenario);
     if (scenario === "protocol_partial" || scenario === "protocol_overflow") {
       const factFiles = readdirSync(relayFacts).filter((file) => file.endsWith(".json"));
@@ -587,6 +711,15 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
       if (!["diagnostic_error", "spawn_error", "write_cleanup_error"].includes(scenario) && results[0].diagnostics?.snapshotStorage?.state !== "unavailable") {
         const childSnapshot = ownedSnapshots.find((snapshot) => snapshot.runId === results[0].identity.runId);
         assert.equal(childSnapshot.process.exitCode, results[0].exitCode, scenario);
+        if (scenario === "child_aggregate") {
+          assert.equal(childSnapshot.lifecycle.processClosed, true);
+          assert.ok(childSnapshot.lifecycle.closeAt);
+          assert.equal(childSnapshot.process.outcome, "exited");
+          assert.equal(childSnapshot.process.exitCode, 0);
+          assert.equal(childSnapshot.process.signal ?? null, null);
+          assert.equal(childSnapshot.stream.parserErrors, 0);
+          assert.ok(childSnapshot.stream.events.agent_end >= 1);
+        }
         assert.equal(childSnapshot.resources.guard.path, join(sandbox, "src/guards.ts"));
         assert.equal(childSnapshot.resources.extension.path, runtimeExtension);
       }
@@ -605,6 +738,7 @@ async function runFaultScenario(scenario: typeof cases[number][0], outcome: type
 }
 
 for (const [scenario, outcome] of cases) {
-  test(`real Pi ${scenario} retains primary outcomes`, { timeout: scenario === "chain_max" || scenario.includes("read_heavy") ? 60000 : 30000 }, (t) =>
+  const title = scenario === "coordinator_aggregate" ? "real Pi coordinator_aggregate summarizes before settled and next RPC" : scenario === "child_aggregate" ? "real Pi child_aggregate closes cleanly before correlated delivery and next RPC" : `real Pi ${scenario} retains primary outcomes`;
+  test(title, { timeout: scenario === "chain_max" || scenario.includes("read_heavy") || scenario.includes("aggregate") ? 60000 : 30000 }, (t) =>
     runBoundedRuntimeCase(t, (signal) => runFaultScenario(scenario, outcome, signal)));
 }

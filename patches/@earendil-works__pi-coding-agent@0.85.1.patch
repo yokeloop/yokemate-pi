@@ -128,3 +128,16 @@ index beea0e8287b6c403ba7b1855c3f0dd6161afdd72..1553cf3c52c1db50453633f2d53071ac
              }
          });
          unsubscribeBackpressure =
+diff --git a/dist/modes/rpc/rpc-mode.js b/dist/modes/rpc/rpc-mode.js
+--- a/dist/modes/rpc/rpc-mode.js
++++ b/dist/modes/rpc/rpc-mode.js
+@@ -263,7 +263,8 @@ export async function runRpcMode(runtimeHost) {
+         unsubscribe?.();
+         unsubscribeBackpressure?.();
+         unsubscribe = session.subscribe((event) => {
+-            output(toJsonEvent(event));
++            const yokemateSubagentJsonContract = process.env.YOKEMATE_SUBAGENT_JSON_CONTRACT === "1" ? 1 : undefined;
++            output(toJsonEvent(event, { yokemateSubagentJsonContract }));
+             if (event.type === "agent_settled") {
+                 void checkShutdownRequested();
+             }

@@ -77,6 +77,40 @@ test("coordinator RPC blocks invalid state, model mismatch, and thinking mismatc
   }
 });
 
+test("coordinator RPC blocks direct oversized aggregate, unknown and control records", async () => {
+  const scenarios = [
+    ["oversized-agent-end", "agent_end"],
+    ["oversized-unknown", "future_event"],
+    ["oversized-control", "response"],
+  ] as const;
+  for (const [scenario, forbiddenType] of scenarios) {
+    let release!: () => void;
+    let blockedReason: string | undefined;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const rpc = startCoordinatorRpc(prepared, identity, expected, {
+      onBlocked(reason) { blockedReason = reason; release(); },
+    }, {
+      invocation: { command: process.execPath, args: ["--experimental-strip-types", fixture] },
+      readyTimeoutMs: 1000,
+      stopGraceMs: 100,
+    });
+    try {
+      await rpc.ready;
+      const before = rpc.events.length;
+      rpc.send({ type: scenario });
+      await Promise.race([blocked, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${scenario} was not blocked`)), 2000))]);
+      assert.equal(blockedReason, "coordinator RPC protocol_error");
+      assert.equal(rpc.process.exitCode, null);
+      assert.equal(rpc.events.slice(before).some((event) => event.type === forbiddenType), false);
+      const stream = (rpc.diagnosticSnapshot() as any).stream;
+      assert.equal(stream.parserErrorCounters.record_limit, 1);
+      assert.deepEqual(stream.firstParserError, { kind: "record_limit", offset: stream.lastParserError.offset });
+    } finally {
+      await rpc.stop();
+    }
+  }
+});
+
 test("coordinator RPC stays owned and alive after an accepted prompt until teardown", async () => {
   let delayed!: () => void;
   let grandchildPid: number | undefined;
