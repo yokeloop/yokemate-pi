@@ -26,6 +26,16 @@ const prepared = {
 const identity = { runId: "run-1", parentSessionId: "parent", mode: "do" as const, ticket: "YM-1", project: [], role: "coordinator" as const, cwd: process.cwd(), model: "test/model" };
 const expected = { provider: "test", id: "model", thinkingLevel: "high" as const };
 
+async function waitForProcessGone(pid: number, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { process.kill(pid, 0); }
+    catch { return; }
+    if (Date.now() >= deadline) throw new Error(`process ${pid} remained alive after cleanup`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 test("coordinator model normalization delegates colon IDs and thinking to Pi", () => {
   const models = [
     { provider: "test", id: "model", name: "model" },
@@ -140,6 +150,7 @@ test("coordinator RPC stays owned and alive after an accepted prompt until teard
     await rpc.stop();
   }
   assert.notEqual(rpc.process.exitCode, null);
+  await waitForProcessGone(grandchildPid!);
   assert.throws(() => process.kill(grandchildPid!, 0));
   assert.equal(rpc.hasLiveDescendants(), false);
   assert.ok(existsSync(join(taskRoot, "logs", "coordinator-run-1.log")));
@@ -185,6 +196,7 @@ test("RPC stop absorbs expected EPIPE and resolves", async () => {
     await stopping;
     assert.deepEqual(pipeErrors, ["EPIPE"]);
     assert.deepEqual(blocked, []);
+    await waitForProcessGone(rpc.process.pid!);
     assert.throws(() => process.kill(rpc.process.pid!, 0));
     assert.equal(rpc.hasLiveDescendants(), false);
   } finally {

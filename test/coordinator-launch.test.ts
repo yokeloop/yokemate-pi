@@ -16,12 +16,33 @@ import { socketDir } from "../src/inbox.ts";
 async function waitForFile(file: string): Promise<void> {
   if (existsSync(file)) return;
   mkdirSync(join(file, ".."), { recursive: true });
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      watcher.close();
+      if (error) reject(error);
+      else resolve();
+    };
     const watcher = watch(join(file, ".."), (_event, name) => {
-      if (name === file.split("/").at(-1) && existsSync(file)) { watcher.close(); resolve(); }
+      if (name === file.split("/").at(-1) && existsSync(file)) finish();
     });
-    if (existsSync(file)) { watcher.close(); resolve(); }
+    watcher.once("error", finish);
+    const timer = setTimeout(() => finish(new Error(`file did not appear: ${file}`)), 10_000);
+    if (existsSync(file)) finish();
   });
+}
+
+async function waitForProcessGone(pid: number, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { process.kill(pid, 0); }
+    catch { return; }
+    if (Date.now() >= deadline) throw new Error(`process ${pid} remained alive after cleanup`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 function root(): string {
@@ -193,7 +214,10 @@ test("failed coordinator starts release duplicate reservations and capacity befo
       assert.equal(widgets.at(-1), undefined);
       const cancelled = await cancellation;
       assert.deepEqual(cancelled.content, [{ type: "text", text: `${runId} cancelled` }]);
-      for (const pid of pids) assert.throws(() => process.kill(pid, 0));
+      for (const pid of pids) {
+        await waitForProcessGone(pid);
+        assert.throws(() => process.kill(pid, 0));
+      }
       const again = await tool.definition.execute("cancel-again", { cancelRun: runId }, undefined, () => undefined, ctx);
       assert.deepEqual(again.content, cancelled.content);
       const cancelledRuns = new Set([...runs.map((run) => run.runId), ...extra.map((run) => run.runId)]);

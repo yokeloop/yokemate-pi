@@ -181,7 +181,8 @@ def supervise(command, timeout, cleanup_timeout, resource_root=None, absolute_ti
     timed_out = False
     try:
         while child.poll() is None and interrupted["signal"] is None:
-            descendants(os.getpid(), root_identity, known)
+            current = descendants(os.getpid(), root_identity, known)
+            reap_identities({pid: identity for pid, identity in current.items() if pid != child.pid})
             if time.monotonic() >= deadline:
                 timed_out = True
                 break
