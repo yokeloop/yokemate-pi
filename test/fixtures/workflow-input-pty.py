@@ -77,16 +77,29 @@ try:
             emit({"id": ident, "ok": True})
             break
 finally:
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        ended, _ = os.waitpid(pid, os.WNOHANG)
-        if ended:
-            break
-        read_pty(0.05)
-    else:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        os.waitpid(pid, 0)
-    os.close(master)
+    try:
+        deadline = time.monotonic() + 3
+        ended = 0
+        while time.monotonic() < deadline:
+            ended, _ = os.waitpid(pid, os.WNOHANG)
+            if ended:
+                break
+            read_pty(0.05)
+        if not ended:
+            try:
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                ended, _ = os.waitpid(pid, os.WNOHANG)
+                if ended:
+                    break
+                time.sleep(0.02)
+            if not ended:
+                raise RuntimeError("PTY child did not reap after SIGKILL")
+    finally:
+        os.close(master)

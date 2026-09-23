@@ -6,9 +6,10 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
+import { createInterface, type Interface } from "node:readline";
 import { test } from "node:test";
 import { openDb } from "../src/db.ts";
+import { closeOwnedServer, stopOwnedProcess } from "./fixtures/runtime-resources.ts";
 
 const source = join(import.meta.dirname, "..");
 const baselineSha = "8b0c417989bf7dce8129f3e4f4f7b2f2ad7d1d46";
@@ -18,33 +19,59 @@ interface FixtureEvent { phase: string; at: number; [key: string]: unknown }
 class Driver {
   readonly process: ChildProcessWithoutNullStreams;
   private serial = 0;
-  private readonly pending = new Map<number, (value: any) => void>();
+  private readonly pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private readonly lines: Interface;
+  private stopPromise?: Promise<void>;
   readonly stderr: Buffer[] = [];
   readonly ready: Promise<void>;
   constructor(root: string, env: NodeJS.ProcessEnv, command: string[]) {
     this.process = spawn("python3", [join(source, "test", "fixtures", "workflow-input-pty.py")], { cwd: root, env: { ...env, WORKFLOW_PTY_CWD: root, WORKFLOW_PTY_COMMAND: Buffer.from(JSON.stringify(command)).toString("base64") }, stdio: ["pipe", "pipe", "pipe"] });
     this.process.stderr.on("data", (chunk) => { this.stderr.push(Buffer.from(chunk)); if (this.stderr.reduce((sum, item) => sum + item.length, 0) > 64 * 1024) this.stderr.shift(); });
     let resolveReady!: () => void;
-    this.ready = new Promise((resolve) => { resolveReady = resolve; });
-    createInterface({ input: this.process.stdout }).on("line", (line) => {
+    let rejectReady!: (error: Error) => void;
+    let ready = false;
+    this.ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    this.lines = createInterface({ input: this.process.stdout });
+    this.lines.on("line", (line) => {
       const value = JSON.parse(line);
-      if (value.event === "ready") { resolveReady(); return; }
-      const resolve = this.pending.get(value.id);
-      if (resolve) { this.pending.delete(value.id); resolve(value); }
+      if (value.event === "ready") { ready = true; resolveReady(); return; }
+      const pending = this.pending.get(value.id);
+      if (pending) { clearTimeout(pending.timer); this.pending.delete(value.id); pending.resolve(value); }
     });
+    const failed = (error: Error) => {
+      if (!ready) rejectReady(error);
+      for (const [id, pending] of this.pending) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+        this.pending.delete(id);
+      }
+    };
+    this.process.once("error", (error) => failed(error));
+    this.process.once("close", (code, signal) => { this.lines.close(); failed(new Error(`PTY helper closed before completion: code=${code} signal=${signal}`)); });
   }
   request(action: string, data: Record<string, unknown> = {}, timeout = 15000): Promise<any> {
     const id = ++this.serial;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`PTY command timed out: ${action}`)); }, timeout);
-      this.pending.set(id, (value) => { clearTimeout(timer); resolve(value); });
-      this.process.stdin.write(JSON.stringify({ id, action, ...data }) + "\n");
+      this.pending.set(id, { resolve, reject, timer });
+      this.process.stdin.write(JSON.stringify({ id, action, ...data }) + "\n", (error) => {
+        if (!error) return;
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pending.delete(id);
+        pending.reject(error);
+      });
     });
   }
-  async stop(): Promise<void> {
-    if (this.process.exitCode === null) await this.request("terminate").catch(() => {});
-    if (this.process.exitCode === null) await Promise.race([once(this.process, "exit"), new Promise((resolve) => setTimeout(resolve, 5000))]);
-    if (this.process.exitCode === null) this.process.kill("SIGKILL");
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = (async () => {
+      if (this.process.exitCode === null && this.process.signalCode === null) await this.request("terminate", {}, 2000).catch(() => undefined);
+      await stopOwnedProcess(this.process);
+      this.lines.close();
+    })();
+    return this.stopPromise;
   }
 }
 
@@ -52,8 +79,8 @@ async function createTarget(parent: string, kind: "baseline" | "head"): Promise<
   const root = join(parent, kind);
   mkdirSync(root, { recursive: true });
   const archive = join(parent, `${kind}.tar`);
-  execFileSync("git", ["-C", source, "archive", "--format=tar", `--output=${archive}`, baselineSha]);
-  execFileSync("tar", ["-xf", archive, "-C", root]);
+  execFileSync("git", ["-C", source, "archive", "--format=tar", `--output=${archive}`, baselineSha], { timeout: 30_000 });
+  execFileSync("tar", ["-xf", archive, "-C", root], { timeout: 30_000 });
   if (kind === "head") {
     rmSync(join(root, "src"), { recursive: true, force: true });
     rmSync(join(root, ".pi", "extensions", "subagent"), { recursive: true, force: true });
@@ -71,12 +98,12 @@ async function createTarget(parent: string, kind: "baseline" | "head"): Promise<
   writeFileSync(plan, "# YM-1 — fixture\n\n## Goal\nExercise workflow input.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Run.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Production.\n\n## Acceptance\nOne fixture run.\n");
   const clone = join(root, "clone");
   mkdirSync(clone);
-  execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe" });
-  execFileSync("git", ["-C", clone, "config", "user.email", "fixture@example.invalid"]);
-  execFileSync("git", ["-C", clone, "config", "user.name", "Fixture"]);
+  execFileSync("git", ["init", "-b", "main", clone], { stdio: "pipe", timeout: 30_000 });
+  execFileSync("git", ["-C", clone, "config", "user.email", "fixture@example.invalid"], { timeout: 30_000 });
+  execFileSync("git", ["-C", clone, "config", "user.name", "Fixture"], { timeout: 30_000 });
   writeFileSync(join(clone, "README.md"), "fixture\n");
-  execFileSync("git", ["-C", clone, "add", "README.md"]);
-  execFileSync("git", ["-C", clone, "commit", "-m", "fixture"], { stdio: "pipe" });
+  execFileSync("git", ["-C", clone, "add", "README.md"], { timeout: 30_000 });
+  execFileSync("git", ["-C", clone, "commit", "-m", "fixture"], { stdio: "pipe", timeout: 30_000 });
   const db = openDb(join(root, "yokemate.db"));
   db.prepare("INSERT INTO project (org,repo,path,tracker,tracker_key,model) VALUES ('org','repo',?,'github','YM','workflow-input-fixture/deterministic')").run(clone);
   db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES ('YM-1','u','planned',?)").run(plan);
@@ -101,7 +128,11 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
   const events: FixtureEvent[] = [];
   const extractionSockets = new Set<Socket>();
   const mainSockets = new Set<Socket>();
+  const acceptedSockets = new Set<Socket>();
+  const releaseSocket = (socket: Socket) => { if (!socket.destroyed && !socket.writableEnded) socket.end("release\n"); };
   const server = createServer((socket) => {
+    acceptedSockets.add(socket);
+    socket.on("error", () => socket.destroy());
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
@@ -112,9 +143,9 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
       events.push(event);
       if (event.phase === "extraction_enter") extractionSockets.add(socket);
       else if (event.phase === "main_enter" && scenario === "hold-main") mainSockets.add(socket);
-      else socket.end("release\n");
+      else releaseSocket(socket);
     });
-    socket.on("close", () => { extractionSockets.delete(socket); mainSockets.delete(socket); });
+    socket.on("close", () => { acceptedSockets.delete(socket); extractionSockets.delete(socket); mainSockets.delete(socket); });
   });
   server.listen(socketPath);
   await once(server, "listening");
@@ -179,7 +210,7 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
       assert.ok(events.some((event) => event.phase === "session_shutdown"), `session shutdown hook did not run: ${JSON.stringify(events.map((event) => event.phase))}`);
       assert.ok(events.some((event) => event.phase === "extraction_abort"), `session shutdown did not fence held extraction: ${JSON.stringify(events.map((event) => event.phase))}`);
       assert.ok(extractionSockets.size > 0, "session shutdown released the provider before the lifecycle fence was observed");
-      for (const socket of extractionSockets) socket.end("release\n");
+      for (const socket of extractionSockets) releaseSocket(socket);
       const releaseDeadline = Date.now() + 5000;
       while (!events.some((event) => event.phase === "extraction_released") && Date.now() < releaseDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
     } else if (options.trigger) {
@@ -187,8 +218,8 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
       while (!events.some((event) => event.phase === "extraction_abort") && Date.now() < abortDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
       assert.ok(events.some((event) => event.phase === "extraction_abort"), `${options.trigger} did not abort extraction: ${JSON.stringify(events.map((event) => event.phase))}`);
     }
-    for (const socket of extractionSockets) socket.end("release\n");
-    for (const socket of mainSockets) socket.end("release\n");
+    for (const socket of extractionSockets) releaseSocket(socket);
+    for (const socket of mainSockets) releaseSocket(socket);
     if (!mainBeforeRelease && options.trigger !== "session_shutdown") await driver.request("wait", { needle: mainMarker, timeout: 10 }, 15000);
     let elapsedMs: number | undefined;
     if (options.warning) {
@@ -221,15 +252,22 @@ async function runCase(root: string, scenario: Scenario, input: string, options:
     const sentinelVisible = terminalSnapshot.contains[0] as boolean;
     return { extractionCount: events.filter((event) => event.phase === "extraction_enter").length, renderBeforeRelease, mainBeforeRelease, phases: events.map((event) => event.phase), elapsedMs, runCount, reservedBeforeRelease, toolEndedBeforeRelease, sentinelVisible };
   } finally {
-    for (const socket of extractionSockets) socket.destroy();
+    for (const socket of acceptedSockets) socket.destroy();
     await driver.stop();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    rmSync(runtime, { recursive: true, force: true });
+    await closeOwnedServer(server, acceptedSockets);
+    const removalDeadline = Date.now() + 2_000;
+    while (existsSync(runtime)) {
+      try { rmSync(runtime, { recursive: true, force: true }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || Date.now() >= removalDeadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
   }
 }
 
 test("real Pi TUI input pipeline is nonblocking and ordinary input skips extraction", { timeout: 300000 }, async () => {
-  execFileSync("python3", ["-c", "import pty,termios,fcntl,selectors"]);
+  execFileSync("python3", ["-c", "import pty,termios,fcntl,selectors"], { timeout: 10_000 });
   const folder = mkdtempSync(join(tmpdir(), "ym-workflow-input-"));
   try {
     const baseline = await createTarget(folder, "baseline");
