@@ -965,8 +965,10 @@ export default function (pi: ExtensionAPI) {
 	const authorityByCycle = new Map<string, DoAuthorityStore>();
 	const groupRuntimes = new Map<string, { runtime: GroupRuntime; db: DatabaseSync }>();
 	const wakeGroupRuntimes = (): void => { for (const entry of groupRuntimes.values()) entry.runtime.resume(); };
-	const unsubscribeRuntimeCapacity = subscribeRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `runtime:${process.pid}:${randomUUID()}`, wakeGroupRuntimes);
-	let runtimeCapacitySubscribed = true;
+	let unsubscribeRuntimeCapacity: (() => void) | undefined;
+	function ensureRuntimeCapacitySubscription(): void {
+		unsubscribeRuntimeCapacity ??= subscribeRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), `runtime:${process.pid}:${randomUUID()}`, wakeGroupRuntimes);
+	}
 	type GroupExecutionBinding = { kind: "group"; groupId: string; root: string; revisionHash: string; executionHash: string };
 	const approvedGroupBindings = new Map<string, GroupExecutionBinding>();
 	const currentGroupBinding = (ticket: string): GroupExecutionBinding | undefined => {
@@ -2692,7 +2694,8 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", async (event) => {
 		shuttingDown = true;
-		if (runtimeCapacitySubscribed) { runtimeCapacitySubscribed = false; unsubscribeRuntimeCapacity(); }
+		unsubscribeRuntimeCapacity?.();
+		unsubscribeRuntimeCapacity = undefined;
 		const revoked = revokeAuthority(event.reason === "reload" ? "session_reload" : event.reason === "fork" ? "session_fork" : "session_shutdown");
 		workflowExtraction = undefined;
 		removeTerminalInputListener?.();
@@ -3357,6 +3360,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				});
 				const schedulerSettings = readRuntimeSettings(root);
+				ensureRuntimeCapacitySubscription();
 				let runtime!: GroupRuntime;
 				runtime = startGroupDo(db, groupId, revisionHash, manifest, {
 					capacity: () => runtime.snapshot().active.length + availableRuntimeCapacity(path.join(ENGINE_ROOT, "yokemate.db"), schedulerSettings.policy.guards.parallelConcurrencyLimit ? schedulerSettings.limits.maxConcurrency : Number.MAX_SAFE_INTEGER, "running"),
