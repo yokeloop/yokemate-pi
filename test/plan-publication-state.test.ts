@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db.ts";
-import { assertPlanBinding, readCandidatePlanSnapshot, readPlanWriterSnapshot, readRecordedPlanBinding, reconcilePlanWriterArtifact, resolvePlanWriterScope } from "../src/plan-binding.ts";
+import { assertPlanBinding, parsePlanWriterFinalPath, PlanWriterArtifactError, readCandidatePlanSnapshot, readPlanWriterSnapshot, readRecordedPlanBinding, reconcilePlanWriterArtifact, resolvePlanWriterScope } from "../src/plan-binding.ts";
 import { acceptPlanRecord, acceptPublication, acceptPublicationDelivery, acceptScoutArtifact, markPublicationResult, markSuccessfulRecord, planRecordById, publicationAcceptanceById, publicationById, publicationFor, readPublicationArtifact, reserveCanonicalUrl, writePublicationArtifact } from "../src/plan-publication-state.ts";
 import { sha256 } from "../src/subagent-runs.ts";
 
@@ -69,8 +69,22 @@ test("YM-221 exact snapshot and reconciliation", () => {
     const file = join(folder, "YM-1-exact result-plan.md");
     mkdirSync(folder, { recursive: true });
     writeFileSync(file, plan());
-    const exact = readPlanWriterSnapshot(root, scope, file);
-    assert.equal(exact.contentHash, sha256(readFileSync(file)));
+    // Production formatting parser AND snapshot reader: the regex alone accepts
+    // spaces, so a same-line pair of paths must still fail artifact validation.
+    for (const text of ["/tmp/plain-plan.md", "[k7x2] /tmp/plain-plan.md"])
+      assert.equal(parsePlanWriterFinalPath("YM-1", text), "/tmp/plain-plan.md");
+    const valid = [file, `[k7x2] ${file}`, `  ${file}  `, `${file}\n`, `[k7x2] ${file}\n`, `\r\n[k7x2] ${file}\r\n`];
+    for (const text of valid) {
+      assert.equal(parsePlanWriterFinalPath("YM-1", text), file);
+      const exact = readPlanWriterSnapshot(root, scope, parsePlanWriterFinalPath("YM-1", text));
+      assert.equal(exact.contentHash, sha256(readFileSync(file)));
+      assert.deepEqual(exact.bytes, readFileSync(file));
+    }
+    for (const text of ["", "relative/plan.md", `Saved plan: ${file}`, `[other] ${file}`, `[k7x2] [k7x2] ${file}`, `[plan](${file})`, `\`\`\`\n${file}\n\`\`\``, `${file}\n${file}`, `${file}\x00suffix`, `${file}\x7fsuffix`]) {
+      assert.throws(() => parsePlanWriterFinalPath("YM-1", text), (error) => error instanceof PlanWriterArtifactError && error.code === "invalid_plan_path", text);
+    }
+    for (const text of [`${file} ${file}`, `[k7x2] ${file} ready`])
+      assert.throws(() => readPlanWriterSnapshot(root, scope, parsePlanWriterFinalPath("YM-1", text)), PlanWriterArtifactError);
     assert.equal(reconcilePlanWriterArtifact(root, scope).path, file);
     assert.throws(() => readPlanWriterSnapshot(root, scope, join(folder, "plan.md")), /invalid_plan_path/);
     const secondFolder = join(scope.knowledgeRoot, "ai", "YM-1-second");

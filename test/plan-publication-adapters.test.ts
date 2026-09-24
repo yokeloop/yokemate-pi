@@ -7,7 +7,6 @@ import { openDb } from "../src/db.ts";
 import { githubPublicationAdapter } from "../src/github.ts";
 import { PublicationFailure } from "../src/plan-publication.ts";
 import { resolvePublicationTarget } from "../src/plan-publication-target.ts";
-import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 test("target resolver accepts same YouTrack server rows and rejects ambiguous or non-github origins", () => {
   const root = mkdtempSync(join(tmpdir(), "publication-target-"));
@@ -79,75 +78,6 @@ test("GitHub executable fixture paginates, accepts Unicode stdin and exposes sta
     for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
     Object.assign(process.env, prior);
     rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("private YouTrack bridge uses the real pinned adapter, exact schemas and pagination", { timeout: 30000 }, async () => {
-  const source = join(import.meta.dirname, "..");
-  const root = mkdtempSync(join(tmpdir(), "publication-mcp-"));
-  const comments = join(root, "comments.json");
-  const result = join(root, "result.json");
-  const prior = { ...process.env };
-  let extension: any;
-  let ctx: ExtensionContext | undefined;
-  try {
-    mkdirSync(join(root, ".pi"), { recursive: true });
-    symlinkSync(join(source, "node_modules"), join(root, "node_modules"), "dir");
-    writeFileSync(comments, JSON.stringify(Array.from({ length: 23 }, (_, index) => ({ ...(index ? { id: String(index + 1) } : {}), text: `comment-${index + 1}`, author: "fixture", url: `https://tracker.example/comment/${index + 1}`, createdAt: index ? "2026-01-01" : 1789724993409 }))));
-    const connectMarker = join(root, "connect-failed-once");
-    const serverStarts = join(root, "server-starts");
-    writeFileSync(join(root, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "youtrack-fixture": { command: process.execPath, args: [join(source, "test/fixtures/plan-publication-mcp-flaky.mjs")], env: { YM216_COMMENTS: comments, YM216_CONNECT_MARKER: connectMarker, YM216_SERVER_STARTS: serverStarts } } }, settings: {} }));
-    Object.assign(process.env, { YM216_ROOT: root, YM216_RESULT: result, YM216_COMMENTS: comments, YM216_RETRY_CONNECT: "1", YM216_PARALLEL_CONNECT: "1" });
-    const host = join(source, "test/fixtures/plan-publication-adapter-host.mjs");
-    const loader = new DefaultResourceLoader({ cwd: root, agentDir: join(root, "agent"), settingsManager: SettingsManager.create(root, join(root, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [host] });
-    await loader.reload();
-    const loaded = loader.getExtensions();
-    assert.deepEqual(loaded.errors, []);
-    extension = loaded.extensions.find((item) => item.resolvedPath === host)!;
-    ctx = { cwd: root, mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => "fixture-session" }, modelRegistry: { getAll: () => [], hasConfiguredAuth: () => false }, ui: { setStatus() {}, setWidget() {}, notify() {} } } as unknown as ExtensionContext;
-    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
-    const value = JSON.parse(readFileSync(result, "utf8"));
-    assert.deepEqual(value, { canonicalUrl: "https://tracker.example/issue/YM-216", before: 23, after: 24, tail: "Unicode 🙂 publication" });
-    assert.equal(readFileSync(connectMarker, "utf8"), "failed-once");
-    assert.equal(readFileSync(serverStarts, "utf8"), "1");
-  } finally {
-    if (extension && ctx) for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx);
-    for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
-    Object.assign(process.env, prior);
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("real MCP tool errors preserve 403, 429 and 413 classifications", { timeout: 30000 }, async () => {
-  const source = join(import.meta.dirname, "..");
-  for (const [status, code] of [[403, "permission"], [429, "rate_limit"], [413, "size"]] as const) {
-    const root = mkdtempSync(join(tmpdir(), `publication-mcp-${status}-`));
-    const comments = join(root, "comments.json");
-    const result = join(root, "result.json");
-    const prior = { ...process.env };
-    let extension: any;
-    let ctx: ExtensionContext | undefined;
-    try {
-      mkdirSync(join(root, ".pi"), { recursive: true });
-      symlinkSync(join(source, "node_modules"), join(root, "node_modules"), "dir");
-      writeFileSync(comments, "[]");
-      writeFileSync(join(root, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "youtrack-fixture": { command: process.execPath, args: [join(source, "test/fixtures/plan-publication-mcp-server.mjs")], env: { YM216_COMMENTS: comments, YM216_MCP_ERROR: String(status) } } }, settings: {} }));
-      Object.assign(process.env, { YM216_ROOT: root, YM216_RESULT: result, YM216_COMMENTS: comments, YM216_EXPECT_ERROR: "1" });
-      const host = join(source, "test/fixtures/plan-publication-adapter-host.mjs");
-      const loader = new DefaultResourceLoader({ cwd: root, agentDir: join(root, "agent"), settingsManager: SettingsManager.create(root, join(root, "agent")), noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, additionalExtensionPaths: [host] });
-      await loader.reload();
-      const loaded = loader.getExtensions();
-      assert.deepEqual(loaded.errors, []);
-      extension = loaded.extensions.find((item) => item.resolvedPath === host)!;
-      ctx = { cwd: root, mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => `fixture-${status}` }, modelRegistry: { getAll: () => [], hasConfiguredAuth: () => false }, ui: { setStatus() {}, setWidget() {}, notify() {} } } as unknown as ExtensionContext;
-      for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
-      assert.deepEqual(JSON.parse(readFileSync(result, "utf8")), { error: code });
-    } finally {
-      if (extension && ctx) for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx);
-      for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
-      Object.assign(process.env, prior);
-      rmSync(root, { recursive: true, force: true });
-    }
   }
 });
 

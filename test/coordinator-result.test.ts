@@ -5,13 +5,15 @@ import { join } from "node:path";
 import { prepareDo, type PreparedCoordinator } from "../src/coordinator-launch.ts";
 import { verifyCoordinatorOutcome, verifyGate, type GateFacts, type GatePartFacts, type RollupEntry } from "../src/coordinator-result.ts";
 import { openDb } from "../src/db.ts";
+import { requiredJobs } from "../src/required-checks.ts";
 import { git, green, notify, stand, withShim, writePr, writeReceipt } from "./fixtures/gate-stand.ts";
 
 const HEAD = "a".repeat(40);
 const BASE = "b".repeat(40);
-const required = [{ workflow: "ci", job: "checks" }, { workflow: "ci", job: "pi-loader-smoke" }];
+// Synthetic multi-job workflow, not yokemate's actual CI contract.
+const required = requiredJobs([{ path: "fixture.yml", text: "name: ci\non: pull_request\njobs:\n  checks:\n    runs-on: ubuntu-latest\n  secondary-check:\n    runs-on: ubuntu-latest\n" }]);
 
-function part(overrides: Partial<GatePartFacts> = {}, rollup: RollupEntry[] = [green("checks"), green("pi-loader-smoke"), notify]): GatePartFacts {
+function part(overrides: Partial<GatePartFacts> = {}, rollup: RollupEntry[] = [green("checks"), green("secondary-check"), notify]): GatePartFacts {
   return {
     repo: "org/repo",
     pr: { url: "https://github.com/org/repo/pull/1", state: "OPEN", headRefName: "YM-1", headRefOid: HEAD, baseRefName: "main", baseRefOid: BASE, statusCheckRollup: rollup },
@@ -38,15 +40,15 @@ test("verifyGate refuses each broken fact with its own reason", () => {
   assert.match(reason(verifyGate(facts(part({ receipt: { ...base.receipt!, exit: 1 } })))), /^org\/repo: ready receipt records a failed bootstrap \(exit 1\)/);
   assert.match(reason(verifyGate(facts(part({ baseInHead: false })))), /^org\/repo: base main is at bbbbbbb and it is not in the PR head/);
   assert.match(reason(verifyGate(facts(part({}, [notify])))), /^org\/repo: required job ci\/checks is missing from the PR checks/);
-  assert.match(reason(verifyGate(facts(part({}, [{ ...green("checks"), status: "IN_PROGRESS", conclusion: null }, green("pi-loader-smoke")])))), /^org\/repo: required job ci\/checks is pending/);
-  assert.match(reason(verifyGate(facts(part({}, [{ ...green("checks"), conclusion: "SKIPPED" }, green("pi-loader-smoke")])))), /^org\/repo: required job ci\/checks is SKIPPED/);
-  assert.match(reason(verifyGate(facts(part({}, [green("checks"), { ...green("pi-loader-smoke"), conclusion: "FAILURE" }])))), /^org\/repo: required job ci\/pi-loader-smoke is FAILURE/);
+  assert.match(reason(verifyGate(facts(part({}, [{ ...green("checks"), status: "IN_PROGRESS", conclusion: null }, green("secondary-check")])))), /^org\/repo: required job ci\/checks is pending/);
+  assert.match(reason(verifyGate(facts(part({}, [{ ...green("checks"), conclusion: "SKIPPED" }, green("secondary-check")])))), /^org\/repo: required job ci\/checks is SKIPPED/);
+  assert.match(reason(verifyGate(facts(part({}, [green("checks"), { ...green("secondary-check"), conclusion: "FAILURE" }])))), /^org\/repo: required job ci\/secondary-check is FAILURE/);
 });
 
 test("verifyGate passes a green part and an empty CI contract with a receipt", () => {
   assert.deepEqual(verifyGate(facts(part())), { ok: true, heads: { "org/repo": HEAD } });
   assert.deepEqual(verifyGate(facts(part({ required: [] }, []))), { ok: true, heads: { "org/repo": HEAD } });
-  assert.deepEqual(verifyGate(facts(part({}, [{ ...green("checks (22)") }, green("pi-loader-smoke / smoke")]))), { ok: true, heads: { "org/repo": HEAD } });
+  assert.deepEqual(verifyGate(facts(part({}, [{ ...green("checks (22)") }, green("secondary-check / smoke")]))), { ok: true, heads: { "org/repo": HEAD } });
 });
 
 test("verifyGate names the second part when it is the broken one", () => {
@@ -100,11 +102,11 @@ test("do verification runs the gate on the recorded PR", async () => {
     db.prepare("INSERT INTO part (work_id, repo, role, branch, pr) VALUES (?, 'org/repo', 'app', 'YM-9', 'https://github.com/org/repo/pull/34')").run(work.id);
     writeReceipt(s);
     await withShim(s, () => {
-      writePr(s, "34", [{ ...green("checks"), conclusion: "FAILURE" }, green("pi-loader-smoke"), notify]);
+      writePr(s, "34", [{ ...green("checks"), conclusion: "FAILURE" }, notify]);
       assert.match(verifyCoordinatorOutcome(s.root, prepared, { outcome: "done", summary: "" }).reason ?? "", /required job ci\/checks is FAILURE/);
-      writePr(s, "34", [{ ...green("checks"), status: "IN_PROGRESS", conclusion: null }, green("pi-loader-smoke"), notify]);
+      writePr(s, "34", [{ ...green("checks"), status: "IN_PROGRESS", conclusion: null }, notify]);
       assert.match(verifyCoordinatorOutcome(s.root, prepared, { outcome: "done", summary: "" }).reason ?? "", /is pending/);
-      writePr(s, "34", [green("checks"), green("pi-loader-smoke"), notify]);
+      writePr(s, "34", [green("checks"), notify]);
       assert.deepEqual(verifyCoordinatorOutcome(s.root, prepared, { outcome: "done", summary: "" }), { ok: true, parts: ["org/repo"] });
     });
     assert.equal(git(s.worktree, "rev-parse", "--abbrev-ref", "HEAD"), "YM-9");

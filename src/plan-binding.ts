@@ -139,6 +139,13 @@ export class PlanWriterArtifactError extends Error {
   }
 }
 
+/** Formatting only: containment, regular-file and exact-byte checks belong to the snapshot reader. */
+export function parsePlanWriterFinalPath(ticket: string, text: string): string {
+  const target = /^(?:\[k7x2\] )?(\/[^\x00-\x1f\x7f]+)$/.exec(text.trim());
+  if (!target) throw new PlanWriterArtifactError(ticket, "invalid_plan_path");
+  return target[1]!;
+}
+
 const canonicalOrg = /^[A-Za-z0-9_-]+$/;
 const canonicalRepo = /^[A-Za-z0-9_.-]+$/;
 const writerSlug = /^[^/\x00-\x1f\x7f]+$/;

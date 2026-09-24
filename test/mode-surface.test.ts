@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { closeModeSurface, openModeSurface, parseSurfaceArgs } from "../src/mode-surface.ts";
+import { resolveLaunch, resolvePlanTargets } from "../src/mode-tab.ts";
 
 test("surface controls stop at the first separator and protect mode option values", () => {
   assert.deepEqual(parseSurfaceArgs(["YM-1"]), { surface: "tab", model: undefined, words: ["YM-1"], literal: [] });
@@ -14,6 +15,41 @@ test("surface controls stop at the first separator and protect mode option value
   });
   assert.deepEqual(parseSurfaceArgs(["--project", "--model"], ["--project"]).words, ["--project", "--model"]);
   assert.deepEqual(parseSurfaceArgs(["--tab"]).words, ["--tab"]);
+});
+
+test("argument matrix resolves ordered key identities and literal worker words without launching", () => {
+  const cases = [
+    { args: ["YM-1", "YM-2", "--", "--split", "--model", "literal"], tickets: ["YM-1", "YM-2"], words: [["YM-1", "--split", "--model", "literal"], ["YM-2", "--split", "--model", "literal"]] },
+    { args: ["--split", "--model", "explicit", "YM-1", "fix", "YM-2", "--", "YM-99"], tickets: ["YM-1"], words: [["YM-1", "fix", "YM-2", "YM-99"]] },
+    { args: ["fix", "problem", "--", "YM-1"], tickets: [""], words: [["fix", "problem", "YM-1"]] },
+    { args: ["--", "YM-1", "--model", "literal"], tickets: [""], words: [["YM-1", "--model", "literal"]] },
+  ];
+  for (const row of cases) {
+    const parsed = parseSurfaceArgs(row.args);
+    const targets = resolvePlanTargets(parsed);
+    assert.deepEqual(targets.map((target) => target.ticket), row.tickets);
+    assert.deepEqual(targets.map((target) => target.workerWords), row.words);
+    for (const target of targets) {
+      const launch = resolveLaunch("/root", "plan", target.ticket, "", parsed.model, "parent", undefined, parsed.surface, target.workerWords);
+      assert.equal(launch.prompt, `/skill:plan ${target.workerWords.join(" ")}`);
+      assert.equal(launch.model, parsed.model);
+      assert.equal(launch.surface, parsed.surface);
+      assert.equal(launch.env.some((word) => word.startsWith("YOKEMATE_TICKET=")), Boolean(target.ticket));
+    }
+  }
+});
+
+test("open surface forwards only explicit Pi isolation, not stale session/run or unrelated secrets", (t) => {
+  const injected = { PI_CODING_AGENT_DIR: "/isolated agent", PI_CODING_AGENT_SESSION_DIR: "/isolated sessions", PI_SESSION_ID: "stale", YOKEMATE_RUN_ID: "stale", UNRELATED_SECRET: "sentinel" };
+  const previous = Object.keys(injected).map((key) => [key, process.env[key]] as const);
+  t.after(() => { for (const [key, value] of previous) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
+  Object.assign(process.env, injected);
+  const calls: string[][] = [];
+  openModeSurface("tab", "parent", "workspace", "/root", "label", ["YOKEMATE_RUN_ID=fresh"], (args) => {
+    calls.push(args);
+    return { result: { tab: { tab_id: "tab" }, root_pane: { pane_id: "pane" } } };
+  });
+  assert.deepEqual(calls[0]!.slice(8), ["--env", "YOKEMATE_RUN_ID=fresh", "--env", "PI_CODING_AGENT_DIR=/isolated agent", "--env", "PI_CODING_AGENT_SESSION_DIR=/isolated sessions"]);
 });
 
 test("awaited close targets only the stored exact surface ID", async () => {

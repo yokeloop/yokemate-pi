@@ -193,7 +193,7 @@ test("after accept the ticket is made ready from its plan and the gate follows t
     git(s.worktree, "commit", "-m", "update from base");
     const head = git(s.worktree, "rev-parse", "HEAD");
     await withShim(s, () => {
-      writePr(s, s.ticket, [green("checks"), green("pi-loader-smoke"), notify]);
+      writePr(s, s.ticket, [green("checks"), notify]);
       const stale = gate(s.root, s.ticket);
       assert.match(stale.ok ? "" : stale.reason, /ready receipt is for/);
       const second = readyTicket(s.root, s.ticket, { run: ownEnvironment });

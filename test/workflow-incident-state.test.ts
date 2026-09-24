@@ -114,6 +114,16 @@ test("recovered plan records require immutable incident and correlated writer pr
     assert.equal(record.source_kind, "engineer-accepted-input");
     assert.equal(record.incident_id, consumed.incident.id);
     assert.equal(record.writer_run_id, "writer-run");
+    // The same draft/record cannot acquire foreign writer or stale input/task provenance.
+    for (const change of [
+      { writer_run_id: "foreign-writer" }, { writer_task_hash: sha256("foreign task") },
+      { writer_actual_task_hash: sha256("stale actual task") }, { accepted_input_id: consumed.value.id + 1 },
+      { planning_identity: "foreign-plan" }, { plan_path: "/foreign-plan.md" },
+    ]) assert.throws(() => recordWriterDraft(db, { ...draft, ...change }));
+    const writer = { runId: draft.writer_run_id, taskHash: draft.writer_task_hash, actualTaskHash: draft.writer_actual_task_hash };
+    for (const change of [{ runId: "foreign-writer" }, { taskHash: sha256("foreign task") }, { actualTaskHash: sha256("stale actual task") }])
+      assert.throws(() => acceptPlanRecord(db, { ...base, writer: { ...writer, ...change } }), /artifact_invalid/);
+    assert.equal(acceptPlanRecord(db, { ...base, writer }).id, record.id);
     db.close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

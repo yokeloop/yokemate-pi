@@ -21,6 +21,7 @@ test("research MCP checks exact server, tool, and payload", () => {
   try {
     assert.equal(classifyResearchMcp("firecrawl", "firecrawl_search", { query: "docs", limit: 1 }, identity).ok, true);
     assert.equal(classifyResearchMcp("firecrawl", "firecrawl_search", { query: "docs", command: "rm" }, identity).ok, false);
+    assert.equal(classifyResearchMcp("youtrack-acme", "get_issue_fields_schema", { projectKey: "ACME" }, identity).ok, true);
     assert.equal(classifyResearchMcp("youtrack-acme", "create_issue", { project: "ACME", summary: "Research" }, identity).ok, true);
     assert.equal(classifyResearchMcp("youtrack-acme", "create_issue", { project: "OTHER", summary: "Research" }, identity).ok, false);
   } finally {

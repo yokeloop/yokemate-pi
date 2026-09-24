@@ -29,12 +29,6 @@ function piInvocation(args: string[], root: string): { command: string; args: st
   const contract = readFileSync(join(packageRoot, "dist", "modes", "json-event.js"), "utf8");
   if (!contract.includes("YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1")) throw new Error("pinned Pi JSON contract patch is unavailable");
   const cli = realpathSync(join(packageRoot, "dist", "cli.js"));
-  const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
-  if (relay && process.env.NODE_TEST_CONTEXT) {
-    const canonicalRelay = realpathSync(relay);
-    if (canonicalRelay.split("/").at(-1) !== "subagent-json-relay.mjs") throw new Error("invalid test JSON relay");
-    return { command: process.execPath, args: [canonicalRelay, cli, ...args] };
-  }
   return { command: process.execPath, args: [cli, ...args] };
 }
 export function coordinatorInvocationArgs(prepared: Pick<PreparedCoordinator, "mode" | "model" | "cwd" | "skillsPath" | "resourcesPath">): string[] {

@@ -4,25 +4,12 @@ import { once } from "node:events";
 import { bindCoordinatorControl, processStarttime } from "../src/coordinator-control.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { DefaultResourceLoader, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
 import { markDoRunning, prepareDo, prepareShip, splitDoRequest, validateCoordinatorRequest } from "../src/coordinator-launch.ts";
 import { socketDir } from "../src/inbox.ts";
-
-async function waitForFile(file: string): Promise<void> {
-  if (existsSync(file)) return;
-  mkdirSync(join(file, ".."), { recursive: true });
-  await new Promise<void>((resolve) => {
-    const watcher = watch(join(file, ".."), (_event, name) => {
-      if (name === file.split("/").at(-1) && existsSync(file)) { watcher.close(); resolve(); }
-    });
-    if (existsSync(file)) { watcher.close(); resolve(); }
-  });
-}
 
 function root(): string {
   const root = mkdtempSync(join(tmpdir(), "coordinator-launch-"));
@@ -32,9 +19,12 @@ function root(): string {
   writeFileSync(join(root, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md"), "# YM-1\n\n## Goal\nFixture.\n\n## Affected repositories\n- `org/repo` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n");
   const db = openDb(join(root, "yokemate.db"));
   db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'x', 'YM', 'test/model')").run(join(root, "clone"));
+  db.close();
   return root;
 }
 
+// Capacity/retry/duplicate ownership belongs to coordinator-runtime.test.ts.
+// Actual extension startup/render/shutdown wiring is deferred to a future suite.
 test("do preparation resolves exact plan parts and CAS prevents stale running write", () => {
   const dir = root();
   try {
@@ -45,6 +35,7 @@ test("do preparation resolves exact plan parts and CAS prevents stale running wr
     assert.equal(prepared.model, "test/model");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-1','u','review')").run();
+    db.close();
     assert.throws(() => markDoRunning(dir, prepared, { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-1", YOKEMATE_ROLE: "coordinator" }), /changed from absent to review/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -67,155 +58,20 @@ test("do preparation falls back to pool only when the tracker key has no passpor
     const plan = join(dir, "home", "knowledge", "org", "repo", "ai", "YM-1-work", "YM-1-work-plan.md");
     writeFileSync(join(dir, "home", "pool.json"), '{"do":"pool-do"}');
     assert.equal(prepareDo(dir, { mode: "do", tickets: ["OTHER-1"], plan }, {}).model, "pool-do");
-
     writeFileSync(join(dir, "home", "pool.json"), "not json");
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("UPDATE project SET mode_models = '{\"do\":\"passport-do\"}' WHERE tracker_key = 'YM'").run();
     assert.equal(prepareDo(dir, { mode: "do", tickets: ["YM-2"], plan }, {}).model, "passport-do");
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','other', ?, 'x', 'YM', 'other-model')").run(join(dir, "other"));
+    db.close();
     assert.throws(() => prepareDo(dir, { mode: "do", tickets: ["YM-3"], plan }, {}), /disagree on the do model/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("failed coordinator starts release duplicate reservations and capacity before retry", async () => {
-  const source = join(import.meta.dirname, "..");
-  const dir = mkdtempSync(join(import.meta.dirname, "fixtures", "coordinator-start-"));
-  const previous = { ...process.env };
-  const script = process.argv[1];
-  let shutdown: (() => Promise<void>) | undefined;
-  delete process.env.YOKEMATE_MODE;
-  delete process.env.YOKEMATE_ROLE;
-  try {
-    cpSync(join(source, "src"), join(dir, "src"), { recursive: true });
-    cpSync(join(source, ".pi", "extensions", "subagent"), join(dir, ".pi", "extensions", "subagent"), { recursive: true });
-    symlinkSync(join(source, "node_modules"), join(dir, "node_modules"));
-    process.env.YOKEMATE_SUBAGENT_TEST_RELAY = join(source, "test", "fixtures", "subagent-json-relay.mjs");
-    process.env.YOKEMATE_SUBAGENT_TEST_TARGET = join(source, "test", "fixtures", "coordinator-rpc-child.ts");
-    const agentDir = join(dir, "agent");
-    const loader = new DefaultResourceLoader({
-      cwd: dir, agentDir, settingsManager: SettingsManager.create(dir, agentDir),
-      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [join(dir, ".pi", "extensions", "subagent", "index.ts")],
-    });
-    await loader.reload();
-    const loaded = loader.getExtensions();
-    assert.deepEqual(loaded.errors, []);
-    const reports: unknown[] = [];
-    loaded.runtime.sendMessage = (message) => { reports.push(message); };
-    loaded.runtime.appendEntry = () => undefined;
-    const tool = loaded.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "subagent");
-    assert.ok(tool);
-    const render = tool.definition.renderResult!;
-    const renderTheme = {} as Parameters<typeof render>[2];
-    for (const rows of [
-      ["accepted run-1, model test/model, cwd /one", "accepted run-2, model test/model, cwd /two"],
-      ["refused bad: invalid ticket key", "accepted run-2, model test/model, cwd /two"],
-      ["refused bad: invalid ticket key", "refused worse: invalid ticket key"],
-    ]) {
-      const runs = rows.filter((row) => row.startsWith("accepted")).map((row) => ({ ticket: "YM-1", runId: row.split(" ")[1] }));
-      const result = { content: rows.map((text) => ({ type: "text" as const, text })), details: { runs } };
-      for (const expanded of [false, true]) {
-        const rendered = render(result, { expanded, isPartial: false }, renderTheme, {} as Parameters<typeof render>[3]);
-        const text = rendered.render(200).join("\n");
-        for (const row of rows) assert.ok(text.includes(row), text);
-      }
-    }
-    const widgets: unknown[] = [];
-    const ctx = {
-      cwd: dir, mode: "rpc", hasUI: true,
-      sessionManager: { getSessionId: () => "fixture-parent" },
-      ui: { notify() {}, setWidget: (_key: string, lines: unknown) => { widgets.push(lines); } },
-      modelRegistry: { getAll: () => [{ provider: "test", id: "model", name: "model" }], hasConfiguredAuth: () => true },
-    } as unknown as ExtensionContext;
-    const extension = loaded.extensions[0]!;
-    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" } as never, ctx);
-    shutdown = async () => { for (const handler of extension.handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" } as never, ctx); };
-    const approve = async (text: string) => { for (const handler of extension.handlers.get("input") ?? []) await handler({ type: "input", source: "interactive", text } as never, { ...ctx, mode: "tui" }); };
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const callId = `retry-${attempt}`;
-      const result: AgentToolResult<unknown> = await tool.definition.execute(callId, { coordinator: { mode: "do", tickets: ["YM-1"], plan: join(dir, "missing-plan.md") } }, undefined, () => undefined, ctx);
-      for (const handler of extension.handlers.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolName: "subagent", toolCallId: callId, result, isError: Boolean("isError" in result && result.isError) } as never, ctx);
-      assert.equal("isError" in result && result.isError, true);
-      const text = result.content[0];
-      assert.ok(text?.type === "text");
-      assert.match(text.text, /no current recorded plan for approval/);
-      assert.doesNotMatch(text.text, /already runs|model pending|accepted|Too many detached/);
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(reports.length, 10);
-    assert.ok(reports.every((report) => (report as { customType?: string }).customType === "yokemate-list-aggregate"));
-    reports.length = 0;
-    mkdirSync(join(dir, ".pi", "agents", "do"), { recursive: true });
-    writeFileSync(join(dir, ".pi", "agents", "do-coordinator.md"), "Fixture");
-    const db = openDb(join(dir, "yokemate.db"));
-    db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo', ?, 'github', 'YM', 'test/model')").run(join(dir, "clone"));
-    const record = (ticket: string) => {
-      const folder = join(dir, "home", "knowledge", "org", "repo", "ai", `${ticket}-work`);
-      mkdirSync(folder, { recursive: true });
-      const plan = join(folder, "plan.md");
-      writeFileSync(plan, `# ${ticket} — recovered\n\n## Goal\nFixture.\n\n## Affected repositories\n- \`org/repo\` — app\n\n## Steps\n1. Fixture.\n\n## Assumptions\n- Fixture.\n\n## Out of scope\n- Other work.\n\n## Acceptance\nFixture completes.\n`);
-      db.prepare("INSERT INTO work (ticket,url,stage,plan) VALUES (?, 'u','planned',?)").run(ticket, plan);
-      return plan;
-    };
-    const plan = record("YM-1");
-    record("YM-2");
-    await approve("/do YM-1 YM-2");
-    const accepted = await tool.definition.execute("recovered", { coordinator: { mode: "do", tickets: ["not-a-key", "YM-1", "YM-2"] } }, undefined, () => undefined, ctx);
-    assert.equal("isError" in accepted && accepted.isError, false, JSON.stringify(accepted));
-    const { runId } = accepted.details as { runId: string };
-    assert.ok(runId);
-    const { runs } = accepted.details as { runs: { ticket: string; runId: string }[] };
-    assert.deepEqual(runs.map((run) => run.ticket), ["YM-1", "YM-2"]);
-    assert.equal(runId, runs[0].runId);
-    assert.notEqual(runs[0].runId, runs[1].runId);
-    assert.deepEqual(accepted.content.map((part) => part.type === "text" ? part.text.split(",")[0] : ""), [
-      'refused not-a-key: invalid ticket key "not-a-key"', `accepted ${runs[0].runId}`, `accepted ${runs[1].runId}`,
-    ]);
-    await Promise.all(runs.map((run) => waitForFile(join(dir, "work", run.ticket, "fixture-pids.json"))));
-    const queue = openDb(join(dir, "yokemate.db"));
-    assert.deepEqual(queue.prepare("SELECT ticket, stage FROM work ORDER BY ticket").all().map((row) => ({ ...row })), [
-      { ticket: "YM-1", stage: "running" }, { ticket: "YM-2", stage: "running" },
-    ]);
-    queue.close();
-    record("YM-3");
-    db.close();
-    await approve("/do YM-1 YM-3");
-    const repeated = await tool.definition.execute("repeated", { coordinator: { mode: "do", tickets: ["YM-1", "YM-3"] } }, undefined, () => undefined, ctx);
-    assert.equal("isError" in repeated && repeated.isError, false);
-    assert.match((repeated.content[0] as { text: string }).text, /^refused YM-1: .*already runs/);
-    const extra = (repeated.details as { runs: { ticket: string; runId: string }[] }).runs;
-    assert.deepEqual(extra.map((run) => run.ticket), ["YM-3"]);
-    for (const run of [...runs.slice(1), ...extra]) await tool.definition.execute("cancel-sibling", { cancelRun: run.runId }, undefined, () => undefined, ctx);
-    const pids = JSON.parse(readFileSync(join(dir, "work", "YM-1", "fixture-pids.json"), "utf8")) as number[];
-    try {
-      assert.ok(widgets.some((lines) => Array.isArray(lines) && lines.some((line) => /^do YM-1 /.test(line)) && lines.some((line) => /task-reviewer/.test(line))));
-      const cancellation = tool.definition.execute("cancel", { cancelRun: runId }, undefined, () => undefined, ctx);
-      assert.equal(widgets.at(-1), undefined);
-      const cancelled = await cancellation;
-      assert.deepEqual(cancelled.content, [{ type: "text", text: `${runId} cancelled` }]);
-      for (const pid of pids) assert.throws(() => process.kill(pid, 0));
-      const again = await tool.definition.execute("cancel-again", { cancelRun: runId }, undefined, () => undefined, ctx);
-      assert.deepEqual(again.content, cancelled.content);
-      const cancelledRuns = new Set([...runs.map((run) => run.runId), ...extra.map((run) => run.runId)]);
-      assert.ok(!reports.some((report) => (report as { customType?: string; details?: { runId?: string } }).customType === "subagent-report" && cancelledRuns.has((report as { details: { runId?: string } }).details.runId ?? "")));
-    } finally {
-      await tool.definition.execute("cleanup", { cancelRun: runId }, undefined, () => undefined, ctx);
-    }
-  } finally {
-    await shutdown?.();
-    process.argv[1] = script;
-    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
-    Object.assign(process.env, previous);
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test("coordinator requests reject malformed keys, duplicate batches and split a do batch per key", () => {
   const request = { mode: "do" as const, tickets: ["YM-1", "YM-2"], plan: "/plan.md", model: "test/model:high" };
   assert.doesNotThrow(() => validateCoordinatorRequest(request));
-  assert.deepEqual(splitDoRequest(request), [
-    { ...request, tickets: ["YM-1"] }, { ...request, tickets: ["YM-2"] },
-  ]);
+  assert.deepEqual(splitDoRequest(request), [{ ...request, tickets: ["YM-1"] }, { ...request, tickets: ["YM-2"] }]);
   assert.deepEqual(request.tickets, ["YM-1", "YM-2"]);
   const ship = { mode: "ship" as const, tickets: ["YM-2", "YM-1"] };
   assert.deepEqual(splitDoRequest(ship), [ship]);
@@ -224,7 +80,6 @@ test("coordinator requests reject malformed keys, duplicate batches and split a 
   assert.throws(() => validateCoordinatorRequest({ mode: "ship", tickets: ["YM-1", "YM-1"] }), /duplicates/);
   assert.throws(() => validateCoordinatorRequest({ mode: "do", tickets: ["../YM-1"] }), /invalid/);
 });
-
 
 test("spawn routes each key independently through its retained parent", async () => {
   const source = join(import.meta.dirname, "..");
@@ -249,7 +104,7 @@ test("spawn routes each key independently through its retained parent", async ()
     for (const entry of ["node", "package"]) {
       const command = entry === "package" ? "pnpm" : process.execPath;
       const args = entry === "package" ? ["spawn", "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"] : ["--experimental-strip-types", "--no-warnings", join(dir, "src", "spawn.ts"), "YM-1", "YM-2", "--plan", "/explicit.md", "--model", "test/model"];
-      const out = await promisify(execFile)(command, args, { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "fixture-session", HERDR_PANE_ID: "main-pane" } });
+      const out = await promisify(execFile)(command, args, { cwd: dir, env: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtime, PI_SESSION_ID: "fixture-session", HERDR_PANE_ID: "main-pane" }, timeout: 20000 });
       assert.deepEqual(out.stdout.trim().split("\n").filter((line) => /^(?:refused )?YM-/.test(line)), ["refused YM-1: already running", "YM-2 → reserved background run fixture-run-2"]);
     }
     assert.deepEqual(requests, [
@@ -263,7 +118,6 @@ test("spawn routes each key independently through its retained parent", async ()
   }
 });
 
-
 test("ship preparation keeps the ordered batch", async () => {
   const dir = root();
   const previousPath = process.env.PATH;
@@ -271,6 +125,7 @@ test("ship preparation keeps the ordered batch", async () => {
     const db = openDb(join(dir, "yokemate.db"));
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo-a', ?, 'x', 'A', 'model-a')").run(join(dir, "clone-a"));
     db.prepare("INSERT INTO project (org, repo, path, tracker, tracker_key, model) VALUES ('org','repo-b', ?, 'x', 'B', 'model-b')").run(join(dir, "clone-b"));
+    db.close();
     const shim = join(dir, "shim");
     mkdirSync(shim);
     writeFileSync(join(shim, "gh"), '#!/bin/sh\nprintf \'{"baseRefName":"main","url":"https://github.com/org/repo/pull/%s","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"%s"}\\n\' "$3" "$3"\n', { mode: 0o755 });

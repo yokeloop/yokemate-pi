@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 const requirePi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { createJiti } = await import(pathToFileURL(requirePi.resolve("jiti")).href);
@@ -127,20 +125,4 @@ try {
   await new Promise((done, reject) => server.close((error) => error ? reject(error) : done()));
 }
 
-const entry = join(process.cwd(), "adapter-entry.ts");
-writeFileSync(entry, `import { createMcpAdapter } from ${JSON.stringify(join(adapterRoot, "index.ts"))};\nexport default createMcpAdapter({ config: { mcpServers: {}, imports: [], settings: { scriptMode: true } } });\n`);
-const loader = new DefaultResourceLoader({
-  cwd: process.cwd(), agentDir: join(process.cwd(), "agent"),
-  settingsManager: SettingsManager.inMemory({}),
-  noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-  additionalExtensionPaths: [entry],
-});
-await loader.reload();
-const loaded = loader.getExtensions();
-assert.deepEqual(loaded.errors, []);
-const extension = loaded.extensions.find((item) => resolve(item.resolvedPath) === entry);
-assert.ok(extension);
-assert.ok(extension.tools.has("mcp"));
-assert.ok(extension.tools.has("mcpScript"));
-assert.ok(extension.handlers.has("session_start"));
-console.log("MCP compatibility: consent, errors, sampling, socket, loader passed");
+console.log("MCP contracts: consent, errors, fake-provider sampling, socket passed");

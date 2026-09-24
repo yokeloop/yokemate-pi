@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { test } from "node:test";
-import { DEFAULT_SUBAGENT_LIMITS, GUARD_IDS, RuntimeSettingsError, readRuntimeSettings, resolveRuntimeSettings } from "../src/guard-policy.ts";
+import { DEFAULT_SUBAGENT_LIMITS, GUARD_IDS, RuntimeSettingsError, formatGuardPolicy, readRuntimeSettings, resolveRuntimeSettings, subagentAdmission, subagentConcurrency } from "../src/guard-policy.ts";
 
 const source = join(tmpdir(), "runtime-settings", ".pi", "settings.json");
 
@@ -28,6 +28,34 @@ test("runtime settings resolve missing blocks, full presets and independent over
     assert.equal(off.policy.guards[id], false);
     assert.equal(off.policy.workflowApproval, false);
     for (const neighbor of GUARD_IDS.filter((key) => key !== id)) assert.equal(off.policy.guards[neighbor], true);
+  }
+  // Exhaustive on/off/neighbor consumer checks are in-process, not surface × runtime launches.
+  for (const id of GUARD_IDS) for (const enabled of [true, false]) {
+    const settings = resolveRuntimeSettings({ guardPolicy: { guards: { [id]: enabled } }, subagent: { maxParallelTasks: 2, maxConcurrency: 1, maxDetached: 4 } }, source);
+    const expected = Object.fromEntries(GUARD_IDS.map((key) => [key, key === id ? enabled : true]));
+    assert.deepEqual(settings.policy.guards, expected);
+    const formatted = formatGuardPolicy(settings);
+    assert.ok(formatted.includes(`enabled=${GUARD_IDS.filter((key) => expected[key]).join(", ")}`));
+    assert.ok(formatted.includes(`disabled=${enabled ? "none" : id}.`));
+    assert.ok(formatted.includes("maxParallelTasks=2; maxConcurrency=1; maxDetached=4; yolo=false; workflowApproval=true"));
+    assert.match(formatted, /Immutable boundaries:.*remain mandatory/);
+    assert.equal(subagentAdmission(settings, "parallel", 3, 0) !== null, expected.parallelTaskLimit);
+    assert.equal(subagentAdmission(settings, "single", 1, 4) !== null, expected.detachedLimit);
+    assert.equal(subagentAdmission(settings, "chain", 20, 0), null);
+    assert.equal(subagentConcurrency(settings, 3), expected.parallelConcurrencyLimit ? 1 : 3);
+  }
+  for (const yolo of [true, false]) for (const workflowApproval of [true, false]) {
+    const settings = resolveRuntimeSettings({ guardPolicy: { yolo, workflowApproval } }, source);
+    assert.equal(settings.policy.workflowApproval, workflowApproval);
+    assert.deepEqual(settings.policy.guards, Object.fromEntries(GUARD_IDS.map((id) => [id, !yolo])));
+    assert.ok(formatGuardPolicy(settings).includes(`yolo=${yolo}; workflowApproval=${workflowApproval};`));
+    assert.equal(subagentAdmission(settings, "parallel", 9, 0) !== null, !yolo);
+    assert.equal(subagentConcurrency(settings, 9), yolo ? 9 : 4);
+  }
+  for (const [field, value] of [["maxParallelTasks", 6], ["maxConcurrency", 2], ["maxDetached", 12]] as const) {
+    const settings = resolveRuntimeSettings({ subagent: { [field]: value } }, source);
+    assert.deepEqual(settings.limits, { ...DEFAULT_SUBAGENT_LIMITS, [field]: value });
+    assert.ok(formatGuardPolicy(settings).includes(`${field}=${value}`));
   }
   assert.deepEqual(resolveRuntimeSettings({ subagent: { maxParallelTasks: 12 } }, source).limits, { maxParallelTasks: 12, maxConcurrency: 4, maxDetached: 12 });
   assert.deepEqual(resolveRuntimeSettings({ subagent: { maxParallelTasks: 5, maxConcurrency: 3, maxDetached: 6 } }, source).limits, { maxParallelTasks: 5, maxConcurrency: 3, maxDetached: 6 });

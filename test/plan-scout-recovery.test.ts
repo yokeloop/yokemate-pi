@@ -93,7 +93,7 @@ test("invalid UTF-8 and record overflow remain monotonic loss evidence while gen
   assert.equal(invalid.evidence().errors[0]?.kind, "invalid_utf8");
 
   const overflow = new JsonlObservation();
-  overflow.write(Buffer.from("x".repeat(1024 * 1024 + 1) + "\n"));
+  overflow.write(Buffer.from("x".repeat(10 * 1024 * 1024 + 1) + "\n"));
   overflow.end();
   assert.equal(overflow.evidence().recordLimit, true);
   assert.equal(overflow.evidence().lostSource, true);

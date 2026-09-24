@@ -16,12 +16,13 @@ process.stdin.on("data", (chunk) => {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
     const command = JSON.parse(line) as { id?: string; type?: string; message?: string };
+    // Payload alone reaches 10 MiB; JSON framing puts each record above the ceiling.
     if (command.type === "oversized-unknown") {
-      send({ type: "future_event", content: "x".repeat(1024 * 1024) });
+      send({ type: "future_event", content: "x".repeat(10 * 1024 * 1024) });
     } else if (command.type === "oversized-control") {
-      send({ type: "response", id: "oversized", success: true, data: "x".repeat(1024 * 1024) });
+      send({ type: "response", id: "oversized", success: true, data: "x".repeat(10 * 1024 * 1024) });
     } else if (command.type === "oversized-agent-end") {
-      send({ type: "agent_end", messages: [{ role: "user", content: "x".repeat(1024 * 1024) }], willRetry: false });
+      send({ type: "agent_end", messages: [{ role: "user", content: "x".repeat(10 * 1024 * 1024) }], willRetry: false });
     } else if (command.type === "get_commands") {
       send({ type: "response", id: command.id, success: true, data: { commands: [{ name: "yokemate-coordinator-ready" }, { name: "skill:do-worker" }] } });
     } else if (command.type === "get_state") {

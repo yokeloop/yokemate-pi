@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import { boundBatchResult, ChildRuns, deliveryFor, matchingObservedReview, reportContent, resultEnvelope, reviewerVerdict, sha256, PAYLOAD_LIMIT } from "../src/subagent-runs.ts";
 import { buildReportDisplay } from "../src/subagent-report.ts";
 
+// Incoming JSONL ceiling; producer summaries and batch envelopes stay at 1 MiB.
+const JSONL_RECORD_LIMIT = 10 * 1024 * 1024;
 const cwd = process.cwd();
 const headSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 const task = { agent: "task-reviewer", task: "exact task", review: { baseSha: headSha, headSha } };
@@ -133,7 +135,7 @@ test("JSONL observation preserves split UTF-8 and the last assistant only", asyn
 
 test("JSONL framing reports malformed, unfinished and overflow records without retaining secrets", async () => {
   const { JsonlObservation } = await import("../src/subagent-runs.ts");
-  for (const bytes of [Buffer.from('{bad-private}\n'), Buffer.from('{"unfinished":"private"}'), Buffer.from('x'.repeat(1024 * 1024 + 1) + '\n')]) {
+  for (const bytes of [Buffer.from('{bad-private}\n'), Buffer.from('{"unfinished":"private"}'), Buffer.from('x'.repeat(JSONL_RECORD_LIMIT + 1) + '\n')]) {
     const observed = new JsonlObservation();
     observed.write(bytes);
     observed.end();
@@ -152,7 +154,7 @@ test("parser facts are byte-exact, cumulative and preserve authoritative final h
   };
   for (const separator of ["\n", "\r\n"]) {
     const exact = new JsonlObservation();
-    const exactWire = Buffer.concat([record(1024 * 1024), Buffer.from(separator)]);
+    const exactWire = Buffer.concat([record(JSONL_RECORD_LIMIT), Buffer.from(separator)]);
     for (let offset = 0; offset < exactWire.length; offset += 8191) exact.write(exactWire.subarray(offset, offset + 8191));
     exact.end();
     assert.equal(exact.protocolError, false);
@@ -161,14 +163,14 @@ test("parser facts are byte-exact, cumulative and preserve authoritative final h
     assert.equal(exact.metadata().stdoutHash, sha256(exactWire));
 
     const tooLarge = new JsonlObservation();
-    tooLarge.write(Buffer.concat([record(1024 * 1024 + 1), Buffer.from(separator)]));
+    tooLarge.write(Buffer.concat([record(JSONL_RECORD_LIMIT + 1), Buffer.from(separator)]));
     tooLarge.end();
     assert.deepEqual(tooLarge.metadata().firstParserError, { kind: "record_limit", offset: 0 });
     assert.equal(tooLarge.metadata().parserErrorCounters.record_limit, 1);
   }
 
   const overflowEof = new JsonlObservation();
-  overflowEof.write(record(1024 * 1024 + 2));
+  overflowEof.write(record(JSONL_RECORD_LIMIT + 2));
   overflowEof.end();
   overflowEof.end();
   assert.deepEqual(overflowEof.metadata().firstParserError, { kind: "record_limit", offset: 0 });
