@@ -30,6 +30,7 @@ function fixture() {
   for (const name of ["pi", "herdr"]) {
     writeFileSync(join(bin, name), `#!${process.execPath}
 import fs from "node:fs";
+if (process.env.PATH !== ${JSON.stringify(bin)}) throw new Error("application PATH escaped shim isolation");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.JOURNAL, JSON.stringify({ executable: fs.realpathSync(process.argv[1]), args }) + "\\n");
 if (${JSON.stringify(name)} === "pi") {
@@ -54,15 +55,28 @@ if (${JSON.stringify(name)} === "pi") {
     writeFileSync(journal, "");
     let command = process.execPath;
     let argv = ["--experimental-strip-types", "--no-warnings", "src/mode-tab.ts", ...args];
+    let launcherPath = bin;
     if (packageEntry) {
-      const pnpm = (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, "pnpm")).find((path) => existsSync(path));
+      const searchPath = (process.env.PATH ?? "").split(delimiter);
+      const pnpm = searchPath.map((dir) => join(dir, "pnpm")).find((path) => existsSync(path));
       assert.ok(pnpm, "package canary needs installed pnpm");
       command = realpathSync(pnpm);
       argv = args;
+      // setup-pnpm installs a shell wrapper needing these utilities before Node starts.
+      // Keep them out of the application's PATH, which the package script resets to bin.
+      const bootstrapBin = join(root, "pnpm-bootstrap");
+      mkdirSync(bootstrapBin, { recursive: true });
+      for (const name of ["sed", "dirname", "uname"]) {
+        const source = searchPath.map((dir) => join(dir, name)).find((path) => existsSync(path));
+        assert.ok(source, `pnpm launcher needs ${name}`);
+        const target = join(bootstrapBin, name);
+        if (!existsSync(target)) symlinkSync(realpathSync(source), target);
+      }
+      launcherPath = `${bin}${delimiter}${bootstrapBin}`;
     }
     const out = spawnSync(command, argv, {
       cwd: root, encoding: "utf8", timeout: 20000,
-      env: { PATH: bin, HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_RUNTIME_DIR: root,
+      env: { PATH: launcherPath, HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_RUNTIME_DIR: root,
         HERDR_ENV: "1", HERDR_PANE_ID: ids.parent, HERDR_WORKSPACE_ID: "w-fixture", JOURNAL: journal, ...extra },
     });
     assert.equal(out.error, undefined);
