@@ -44,6 +44,14 @@ const alive: TicketState = { resolved: false, assignedToMe: true, title: "t" };
 
 // 1. Sync never deletes: closed / reassigned / vanished tickets stay in the
 // queue and come back as divergences for the view to show.
+test("subagent tool surface exposes parent-owned merge/finalize operations", () => {
+  const source = fs.readFileSync(new URL("../.pi/extensions/subagent/index.ts", import.meta.url), "utf8");
+  assert.match(source, /name: "coordinator_merge"/);
+  assert.match(source, /requestShipFinalize\(ENGINE_ROOT, runId/);
+  assert.match(source, /finalizeShip: async \(runId, finalizeOrigin\)/);
+  assert.ok(source.indexOf("requestShipFinalize(ENGINE_ROOT, runId") < source.indexOf("outcome proposed"));
+});
+
 test("sync keeps every row, reports divergence", async () => {
   const db = memDb();
   insertWork(db, "ACME-1");

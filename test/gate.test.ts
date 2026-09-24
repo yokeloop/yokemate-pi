@@ -12,9 +12,9 @@ test("gate reads the parts from the plan and checks the branch's PR", async () =
     writeReceipt(s);
     const head = git(s.worktree, "rev-parse", "HEAD");
     await withShim(s, () => {
-      writePr(s, "YM-9", [green("checks"), green("pi-loader-smoke"), notify]);
+      writePr(s, "YM-9", [green("checks"), notify]);
       assert.deepEqual(gate(s.root, "YM-9"), { ok: true, heads: { "org/repo": head } });
-      writePr(s, "YM-9", [green("checks"), green("pi-loader-smoke"), notify], { headRefOid: "e".repeat(40) });
+      writePr(s, "YM-9", [green("checks"), notify], { headRefOid: "e".repeat(40) });
       const refused = gate(s.root, "YM-9");
       assert.equal(refused.ok, false);
       assert.match(refused.ok ? "" : refused.reason, /differs from local branch/);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-test("patched MCP adapter preserves consent, sampling, transport and real Pi loading", { timeout: 60_000 }, () => {
+test("patched MCP adapter preserves consent, fake-provider sampling and transport contracts", { timeout: 60_000 }, () => {
   const sandbox = mkdtempSync(join(tmpdir(), "ym204-mcp-compat-"));
   try {
     const output = execFileSync(process.execPath, [join(import.meta.dirname, "fixtures/mcp-adapter-compat.mjs")], {
@@ -23,7 +23,7 @@ test("patched MCP adapter preserves consent, sampling, transport and real Pi loa
       encoding: "utf8",
       maxBuffer: 1_000_000,
     });
-    assert.match(output, /MCP compatibility: consent, errors, sampling, socket, loader passed/);
+    assert.match(output, /MCP contracts: consent, errors, fake-provider sampling, socket passed/);
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
   }

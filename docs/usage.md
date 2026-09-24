@@ -60,7 +60,7 @@ pnpm add-project <путь-к-клону> --tracker <org:KEY> [--model <m>] [--m
 - `/journal` — запись в `home/journal/YYYY-MM.md`: только реальные итоги и решения с их «почему», по одной записи на проект.
 - `/worklog acme-eu [заметка]` — новый tab по умолчанию (`--split` — split): называешь период словами («залогаем 15 августа», «за неделю»), он собирает следы (журнал, коммиты, календарь), предлагает раскладку часов по тикетам, ты правишь — подтверждённые строки уходят в YouTrack. Панель закрываешь ты. Итоги тикетов («дата тикет запланировано/сделано/принято») команды дописывают в `home/journal/YYYY-MM.md` сами.
 - `/note [тема]` — новый tab по умолчанию (`--split` — split): беседа о пуле или проекте без права правок — гвард режет всё пишущее вне `home/notes/`. «Сохрани» → md-заметка в `home/notes/` + `pnpm note-save` (коммит и пуш только `home/notes/`), «выгрузи в гист» → secret-гист со ссылкой в панели. Панель закрываешь ты.
-- `pnpm test` — смоук за секунды; `pnpm metrics` — качество диалога по журналам.
+- `pnpm test` — сокращённый набор без настоящих Pi/herdr и вложенных test runners, один file worker. Остались Node/socket/git/package fixtures; runtime-интеграционное покрытие намеренно снято до будущего suite. Время выполнения неизвестно до отдельно разрешённой проверки. `pnpm metrics` — качество диалога по журналам.
 - Канарейка `[k7x2]` — каждый ответ любой сессии этого корня (главный чат, паны, вкладки /do) начинается с литерального маркера `[k7x2]`; правило стоит в хвосте AGENTS.md.
   Маркер пропал или исказился хотя бы на символ — контекст сессии деградировал, перезапусти её.
   Никакой автоматики за маркером нет — это визуальный сигнал, реакция на него твоя.
@@ -101,7 +101,7 @@ Review rework использует отдельный receipt и registered work
 
 YM-219 отдельно исправляет нормализацию main-pane stamp; это не approval mechanism и не часть YM-214.
 
-Matrix cells называют consumer и public regression case; not-applicable означает отсутствие соответствующего действия на поверхности. Исполняемый manifest в `test/runtime-settings-manifest.test.ts` запускает именованные public-entry adapters, принимает только фактически прошедшие case IDs и требует evidence для каждой applicable cell; сами adapters проверяют on, off и neighbor-still-on.
+Matrix cells описывают контракт consumers и regression IDs; not-applicable означает отсутствие соответствующего действия на поверхности. Форму и синхронизацию матрицы проверяет `test/runtime-settings.test.ts`; on/off/neighbor и enforcement проверяются нижнеуровневыми settings/guard/state tests. Это не гарантия исполнения каждой публичной поверхности в каждом `pnpm test`: real-runtime проверки сняты, а entrypoint checks выборочны.
 
 <!-- runtime-settings-matrix -->
 | setting | typed | tool | cli | pane | ordinary | coordinator |

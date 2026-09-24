@@ -14,7 +14,6 @@ test("the notify workflow is not a required check", () => {
 test("every job of the ci workflow is required", () => {
   assert.deepEqual(requiredJobs([workflow("ci.yml"), workflow("telegram-notify.yml")]), [
     { workflow: "ci", job: "checks" },
-    { workflow: "ci", job: "pi-loader-smoke" },
   ]);
 });
 

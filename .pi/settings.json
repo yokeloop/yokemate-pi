@@ -2,6 +2,11 @@
   "guardPolicy": {
     "yolo": false
   },
+  "subagent": {
+    "maxParallelTasks": 32,
+    "maxConcurrency": 16,
+    "maxDetached": 32
+  },
   "extensions": [
     "../src/guards.ts",
     "../src/bus.ts",

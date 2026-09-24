@@ -95,8 +95,15 @@ test("writes are idempotent, conflicts fail, and diagnostics updates never chang
     assert.equal(store.writeReport(key, "one", { delivery: { state: "observed" } }).ok, true);
     assert.equal(store.writeReport(key, "two", {}).code, "artifact_conflict");
     assert.equal(store.updateDiagnostics(key, { delivery: { state: "observed" } }).ok, true);
-    const read = store.readReport(key)!;
+    // Reopen and idempotency, not an engine/session restart: a second object
+    // sees the same canonical bytes and repeated writes allocate no new pair.
+    const before = fs.readdirSync(box.reports).sort();
+    const reopened = new SubagentReportStore(box.reports);
+    assert.equal(reopened.writeReport(key, "one", { delivery: { state: "observed" } }).ok, true);
+    const read = reopened.readReport(key)!;
+    assert.deepEqual(fs.readdirSync(box.reports).sort(), before);
     assert.equal(read.report.toString(), "one");
+    assert.equal((read.diagnostics.canonical as any).hash, sha256("one"));
     assert.equal((read.diagnostics.diagnostics as any).delivery.state, "observed");
     fs.writeFileSync(read.archive.reportPath!, "tampered");
     assert.equal(store.readReport(key), undefined);

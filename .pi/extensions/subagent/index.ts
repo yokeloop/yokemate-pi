@@ -13,7 +13,7 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { readCandidatePlanSnapshot, readRecordedPlanBinding, readWorkflowBindingSnapshot, assertPlanBinding, toPlanBinding, readPlanWriterSnapshot, reconcilePlanWriterArtifact, resolvePlanWriterScope, PlanWriterArtifactError, type PlanBinding, type PlanWriterScope } from "../../../src/plan-binding.ts";
+import { readCandidatePlanSnapshot, readRecordedPlanBinding, readWorkflowBindingSnapshot, assertPlanBinding, toPlanBinding, readPlanWriterSnapshot, reconcilePlanWriterArtifact, resolvePlanWriterScope, parsePlanWriterFinalPath, PlanWriterArtifactError, type PlanBinding, type PlanWriterScope } from "../../../src/plan-binding.ts";
 import { DoAuthorityStore, isWorkflowCandidate, PendingWorkflowExtraction, validateExtraction, WORKFLOW_EXTRACTION_INSTRUCTION, type ApprovalParent, type InputGeneration, type WorkflowCancellationReason, type WorkflowExtractionTerminal } from "../../../src/workflow-approval.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -413,13 +413,6 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 		const contract = fs.readFileSync(path.join(packageRoot, "dist", "modes", "json-event.js"), "utf8");
 		if (!contract.includes("YOKEMATE_SUBAGENT_JSON_CONTRACT_VERSION = 1")) throw new Error("pinned Pi JSON contract patch is unavailable");
 		pinnedPiCli = fs.realpathSync(path.join(packageRoot, "dist", "cli.js"));
-	}
-	const relay = process.env.YOKEMATE_SUBAGENT_TEST_RELAY;
-	if (relay && process.env.NODE_TEST_CONTEXT) {
-		const canonicalRelay = fs.realpathSync(relay);
-		const fixtureRoot = fs.realpathSync(path.join(ENGINE_ROOT, "test", "fixtures"));
-		if (path.dirname(canonicalRelay) !== fixtureRoot || path.basename(canonicalRelay) !== "subagent-json-relay.mjs") throw new Error("invalid test JSON relay");
-		return { command: process.execPath, args: [canonicalRelay, pinnedPiCli, ...args] };
 	}
 	return { command: process.execPath, args: [pinnedPiCli, ...args] };
 }
@@ -2607,9 +2600,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				if (!scope) throw new PlanWriterArtifactError(result.identity.ticket, "scope_not_found");
 				if (result.payloadOutcome === "valid") {
-					const target = /^(?:\[k7x2\] )?(\/[^\x00-\x1f\x7f]+)$/.exec(result.payload.trim());
-					if (!target) throw new PlanWriterArtifactError(result.identity.ticket, "invalid_plan_path");
-					draft = readPlanWriterSnapshot(ENGINE_ROOT, scope, target[1]!);
+					const target = parsePlanWriterFinalPath(result.identity.ticket, result.payload);
+					draft = readPlanWriterSnapshot(ENGINE_ROOT, scope, target);
 				} else {
 					source = "reconciled";
 					draft = reconcilePlanWriterArtifact(ENGINE_ROOT, scope);

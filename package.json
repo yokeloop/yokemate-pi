@@ -6,7 +6,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "on-me": "node --experimental-strip-types --no-warnings src/whats-on-me.ts",
-    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 test/*.test.ts",
     "add-project": "node --experimental-strip-types --no-warnings src/add-project.ts",
     "set-model": "node --experimental-strip-types --no-warnings src/set-model.ts",
     "export-projects": "node --experimental-strip-types --no-warnings src/export-projects.ts",

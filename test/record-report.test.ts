@@ -8,7 +8,7 @@ import { git, green, notify, stand, withShim, writePr, writeReceipt, type Stand 
 
 const env = { YOKEMATE_MODE: "do", YOKEMATE_TICKET: "YM-9", YOKEMATE_ROLE: "coordinator" } as const;
 const part = { repo: "org/repo", role: "app", branch: "YM-9", pr: "https://github.com/org/repo/pull/34" };
-const passing = [green("checks"), green("pi-loader-smoke"), notify];
+const passing = [green("checks"), notify];
 
 function running(s: Stand): void {
   openDb(join(s.root, "yokemate.db")).prepare("INSERT INTO work (ticket, url, stage) VALUES ('YM-9','u','running')").run();

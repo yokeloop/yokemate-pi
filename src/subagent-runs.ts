@@ -431,7 +431,8 @@ export function cancellationResult(runId: string, targetKind: CancellationTarget
   return Object.freeze({ version: 1, kind: "cancellation", runId, targetKind, status, terminal, ...(reason ? { reason } : {}), ...(identity ? { identity } : {}), ...(result ? { processOutcome: result.processOutcome, exitCode: result.exitCode, signal: result.signal, actualTaskHash: result.actualTaskHash } : {}), ...(initiator ? { cancellationInitiator: initiator } : {}) });
 }
 
-const RECORD_LIMIT = 1024 * 1024;
+const RECORD_LIMIT = 10 * 1024 * 1024;
+const BATCH_RECORD_LIMIT = 1024 * 1024;
 export type ScoutEvidenceErrorKind = "invalid_json" | "invalid_event" | "record_limit" | "partial_record" | "invalid_utf8" | "lost_source" | "exhausted_evidence";
 export interface ScoutEvidenceHistory {
   kind: ScoutEvidenceErrorKind;
@@ -1168,7 +1169,7 @@ function batchPayloadQuota(identities: readonly ChildIdentity[]): number {
   const delivery = deliveryFor(envelope);
   const message = { role: "custom", customType: "subagent-report", content: reportContent(envelope, delivery), display: true, timestamp: Date.now(), details: { version: 1, deliveryId: delivery.deliveryId, envelopeHash: delivery.envelopeHash, envelope } };
   const overhead = Buffer.byteLength(JSON.stringify({ type: "message_end", message }));
-  const quota = Math.floor((RECORD_LIMIT - overhead - 4096 - identities.length * 4096) / identities.length);
+  const quota = Math.floor((BATCH_RECORD_LIMIT - overhead - 4096 - identities.length * 4096) / identities.length);
   if (quota < 0) throw new Error("subagent batch identity exceeds JSONL transport budget");
   return identities.length >= 16 ? Math.min(quota, 8192) : quota;
 }

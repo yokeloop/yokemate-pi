@@ -9,6 +9,7 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -17,16 +18,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: pnpm install --frozen-lockfile --prod=false
-      - run: pnpm exec tsc --noEmit
+      - run: pnpm exec tsc --noEmit --singleThreaded
       - run: pnpm test
+        timeout-minutes: 10
       - run: git diff --check "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.sha }}"
-  pi-loader-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 10.34.5 }
-      - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-      - run: pnpm install --frozen-lockfile --prod=false
-      - run: node --experimental-strip-types --no-warnings --test test/research-mcp-loader.test.ts

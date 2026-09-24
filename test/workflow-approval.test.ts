@@ -88,6 +88,9 @@ test("English negative execution commands revoke their addressed active cycle", 
 });
 
 test("model extraction is strict and bound to literal current input and known binding references", () => {
+  assert.deepEqual(validateExtraction({ kind: "none" }, "ordinary text", []), { kind: "none" });
+  for (const invalid of [null, "none", {}, { kind: "none", ticket: "YM-1" }])
+    assert.throws(() => validateExtraction(invalid, "ordinary text", []), /extraction/);
   const raw = "план согласован YM-1, запускай";
   const value = { kind: "approve-ready-do", ticket: "YM-1", binding: "content", actions: ["do"], evidence: [{ start: 0, end: raw.length, text: raw }] };
   assert.deepEqual(validateExtraction(value, raw, [binding]), value);
@@ -129,13 +132,16 @@ test("pending extraction shares one deadline and makes timeout or cancellation t
   let timer!: () => void;
   const store = new DoAuthorityStore(parent);
   const generation = store.beginInput("Plan and then do YM-1");
-  const operation = new PendingWorkflowExtraction(parent, store, generation, { timeoutMs: 20, wallNow: () => 1000 + monotonic, monotonicNow: () => monotonic, setTimer: (callback) => { timer = callback; return 1; }, clearTimer: () => {} });
+  let scheduledMs = 0;
+  const operation = new PendingWorkflowExtraction(parent, store, generation, { wallNow: () => 1000 + monotonic, monotonicNow: () => monotonic, setTimer: (callback, milliseconds) => { timer = callback; scheduledMs = milliseconds; return 1; }, clearTimer: () => {} });
+  assert.equal(scheduledMs, 15000);
+  assert.equal(operation.deadline, 15010);
   let release!: (value: any) => void;
   let effects = 0;
   operation.start(() => new Promise((resolve) => { release = resolve; }));
   const first = operation.wait();
   const second = operation.wait();
-  monotonic = 30;
+  monotonic = 15010;
   timer();
   assert.equal(operation.controller.signal.aborted, true);
   assert.equal((await first).outcome, "timeout");
@@ -145,11 +151,38 @@ test("pending extraction shares one deadline and makes timeout or cancellation t
   assert.equal(effects, 0);
   assert.equal(operation.cancel("new_input"), false);
 
-  const nextGeneration = store.beginInput("Plan and then do YM-1");
-  const cancelled = new PendingWorkflowExtraction(parent, store, nextGeneration, { timeoutMs: 20, setTimer: () => 2, clearTimer: () => {} });
-  assert.equal(cancelled.cancel("interrupt"), true);
-  assert.equal(cancelled.cancel("interrupt"), false);
-  assert.deepEqual((await cancelled.wait()).reason, "interrupt");
+  for (const reason of ["new_input", "interrupt", "session_switch", "session_fork", "session_tree", "session_reload", "session_shutdown"] as const) {
+    const nextGeneration = store.beginInput("Plan and then do YM-1");
+    const cancelled = new PendingWorkflowExtraction(parent, store, nextGeneration, { setTimer: () => 2, clearTimer: () => {} });
+    assert.equal(cancelled.cancel(reason), true);
+    assert.equal(cancelled.cancel(reason), false);
+    assert.equal(cancelled.controller.signal.aborted, true);
+    assert.equal(cancelled.settle({ outcome: "approval", effect: () => { effects++; } }), false);
+    assert.equal((await cancelled.wait()).reason, reason);
+  }
+  assert.equal(effects, 0);
+});
+
+test("extraction terminal outcomes and overdue success need no provider or real-time wait", async () => {
+  const store = new DoAuthorityStore(parent);
+  let now = 0;
+  let effects = 0;
+  for (const outcome of ["none", "invalid", "approval", "model_error"] as const) {
+    const operation = new PendingWorkflowExtraction(parent, store, store.beginInput("Run YM-1"), { monotonicNow: () => now, setTimer: () => 1, clearTimer: () => {} });
+    operation.start(async () => {
+      if (outcome === "model_error") throw new Error("private provider sentinel");
+      return { outcome };
+    });
+    const terminal = await operation.wait();
+    assert.equal(terminal.outcome, outcome);
+    assert.doesNotMatch(JSON.stringify(terminal), /private provider sentinel/);
+    assert.equal(operation.settle({ outcome: "approval", effect: () => { effects++; } }), false);
+  }
+  const overdue = new PendingWorkflowExtraction(parent, store, store.beginInput("Run YM-1"), { monotonicNow: () => now, setTimer: () => 1, clearTimer: () => {} });
+  now = 15000; // Deadline applies even if the timer callback has not run yet.
+  overdue.settle({ outcome: "approval", effect: () => { effects++; } });
+  assert.equal((await overdue.wait()).outcome, "timeout");
+  assert.equal(effects, 0);
 });
 
 test("invalidateUnconsumed preserves active cycles and invalidates unused receipts", () => {
